@@ -4,11 +4,13 @@
 
 <img width="1866" height="1777" alt="image" src="https://github.com/user-attachments/assets/957ee239-8c77-4e32-b28f-db39fd03f597" />
 
-
 - reAct tool calling
 - opentelemetry tracing
 - short term memory
 - long term memory
+  - Procedural
+  - Semantic
+  - Episodic
 - context management
 - skill support
 - mcp servers support (stdio and http (Dynamic Client Registration support only))
@@ -46,7 +48,9 @@
 
 ### Long Term Memory
 
-- Long term memories are saved on exit in ChromaDB.
+- Procedural: Saved as skills. Learning loop creates/updates skills at the end of the session.
+- Semantic: Saved in Vector DB. User scoped. (To test, use the same user id)
+- Episodic: Saved in Vector DB. User and Session scoped. (To test, use the same user id and session id)
 
 ### MCP Servers
 

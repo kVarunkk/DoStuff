@@ -10,3 +10,7 @@ mcp_client_registrations.json
 mcp_config.json
 agent_sessions.db
 DOSTUFF.md
+skills/*
+!skills/skill-creator/
+!skills/supabase-migration-checker/
+!skills/react-performance-optimizer/

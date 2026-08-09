@@ -5,7 +5,7 @@ import uuid
 import sys
 from agent.run_agent import run_agent
 from lib.genai_client import get_client
-from lib.memory.memory_store import ChromaMemoryStore
+from lib.memory.semantic_memory_store import ChromaMemoryStore
 from helpers.agent.save_memories_and_exit import save_memories_and_exit
 from helpers.skills.discover_skills import discover_skills
 from helpers.agent.constants import SYSTEM_INSTRUCTIONS
@@ -14,6 +14,7 @@ from helpers.mcp.load_mcp_config import load_mcp_config
 from lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
 from lib.memory.session_store import SQLiteSessionStore
 from helpers.agent.learn_from_session import learn_from_session
+from lib.memory.episodic_memory_store import ChromaEpisodicStore
 
 async def main(session_id: str, user_id: str, system_instructions: str):
     client = get_client()
@@ -26,6 +27,7 @@ async def main(session_id: str, user_id: str, system_instructions: str):
         print(f"✨ Starting brand new session '{session_id}'.")
 
     memory_store = ChromaMemoryStore()
+    episodic_memory_store = ChromaEpisodicStore()
     mcp_registration_store = MCPClientRegistrationStore()
     mcp_tool_registry_store = MCPToolRegistryStore()
     mcp_client = MCPClient(registration_store=mcp_registration_store, tool_registry_store=mcp_tool_registry_store)
@@ -73,6 +75,7 @@ async def main(session_id: str, user_id: str, system_instructions: str):
             user_id=user_id,
             store=store,
             memory_store=memory_store,
+            episodic_store=episodic_memory_store,
             system_instructions=system_instructions,
             mcp_client=mcp_client,
             current_session_history=current_session_history
@@ -81,7 +84,7 @@ async def main(session_id: str, user_id: str, system_instructions: str):
         print("\nInterrupted. Saving memories and running the learning loop before exit...")
         exit_results = await asyncio.gather(
                             learn_from_session(current_session_history, mcp_client, session_id),
-                            save_memories_and_exit(current_session_history, user_id, memory_store),
+                            save_memories_and_exit(current_session_history, user_id, session_id, memory_store, episodic_memory_store),
                             return_exceptions=True
                         )
         for idx, res in enumerate(exit_results):
@@ -133,9 +136,9 @@ if __name__ == "__main__":
         user_id = str(uuid.uuid4())
 
     print(f"USER ID: {user_id}\n")
-    #  5b866b35-a41a-4907-863f-412d8e6bea8c
+    # 78d80156-f029-412a-8c43-d9f67d03a6a8
     print(f"SESSION ID: {session_id}\n")
-    # b043ef76-6a61-478e-894a-8585cc29e2d4
+    # 5e43325a-cb6c-4901-834c-036f418ce850
     try:
         asyncio.run(main(session_id, user_id, system_instructions))
     except KeyboardInterrupt:

@@ -33,17 +33,17 @@ def run_code(
 
     Args:
         script_path: Path relative to the project root, e.g.
-            'skills/summarizer/scripts/run.py' or 'agent_workspace/script.py'.
-        args: Command-line arguments to pass to the script. Any argument that is
+            'skills/../..' or 'agent_workspace/../..'.
+        args: A list of command-line arguments to pass to the script. Any argument that is
             itself a file path must also be given relative to the project root
-            (e.g. 'agent_workspace/data.json') — it is not resolved further.
+            (e.g. ['agent_workspace/data.json']) — it is not resolved further.
         language: Explicit language override ('python', 'javascript', 'typescript').
             Auto-detected from the file extension if omitted.
         timeout: Maximum execution time in seconds before the process is killed.
     """
     args = args or []
 
-    safe_script_path = resolve_safe_path(script_path)  # raises if unsafe/missing root check
+    safe_script_path = resolve_safe_path(script_path) 
     if not safe_script_path.exists():
         return json.dumps({"success": False, "error": f"Script not found: {script_path}"})
 
@@ -65,7 +65,7 @@ def run_code(
         return json.dumps({
             "success": result.returncode == 0,
             "exit_code": result.returncode,
-            "stdout": result.stdout.strip()[:5000],   # cap output size, mirrors the JSON-blob-in-context issue from earlier
+            "stdout": result.stdout.strip()[:5000],   
             "stderr": result.stderr.strip()[:2000],
         })
     except subprocess.TimeoutExpired:
