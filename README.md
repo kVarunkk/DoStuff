@@ -2,7 +2,8 @@
 
 ## AI Agent Harness
 
-<img width="1866" height="1777" alt="image" src="https://github.com/user-attachments/assets/957ee239-8c77-4e32-b28f-db39fd03f597" />
+<img width="3199" height="2009" alt="image" src="https://github.com/user-attachments/assets/8057e0d8-6b43-49f4-8022-6fa752f6131b" />
+
 
 - reAct tool calling
 - opentelemetry tracing
