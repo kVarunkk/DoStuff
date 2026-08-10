@@ -5,20 +5,30 @@ from lib.genai_client import get_client
 from opentelemetry import trace as otel_trace
 import os
 from dotenv import load_dotenv
-from tools.definitions import tool_schemas
+from tools.definitions import TOOL_SCHEMAS
 
 load_dotenv()  
 model = os.getenv("MODEL")
 
 @traced("model_call")
-async def call_agent(steps_history: list[StepParam], system_instruction: str):
+async def call_agent(steps_history: list[StepParam], system_instruction: str, tool_names: list[str] | None = None):
     client = get_client()
+
+    if tool_names is None:
+        tool_names = list(TOOL_SCHEMAS.keys())
+
+    active_schemas = [
+        {"type": "function", **TOOL_SCHEMAS[name]}
+        for name in tool_names
+        if name in TOOL_SCHEMAS
+    ]    
 
     async def _make_request():
         return await client.interactions.create(
             model=model,
             input=steps_history,
-            tools=[{"type": "function", **schema} for schema in tool_schemas],
+            # tools=[{"type": "function", **schema} for schema in tool_schemas],
+            tools=active_schemas,
             store=False,
             system_instruction=system_instruction,
         )

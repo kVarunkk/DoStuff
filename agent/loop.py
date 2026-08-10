@@ -14,7 +14,7 @@ import asyncio
 from agent.run_tool import run_tool
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient,  working_history: list,   turn_type: Literal['interactive_loop', 'learning_loop'], current_session_history: list = [], steps_history: list = [],  store: SessionStore | None = None) -> None:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient,  working_history: list,   turn_type: Literal['interactive_loop', 'learning_loop', 'subagent_loop'], current_session_history: list = [], steps_history: list = [],  store: SessionStore | None = None) -> str:
 
     iteration = 0
     last_input_tokens = 0
@@ -65,7 +65,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         turn_span.set_status(Status(StatusCode.OK))
                         iter_span.set_status(Status(StatusCode.OK))
                         print(f"\n\nAgent: {final_text}")
-                        break
+                        return final_text
     
                 function_calls = [
                     (
@@ -85,7 +85,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     print(f"-> Calling local tool: {fn_name}({fn_args})")
     
                 results = await asyncio.gather(
-                    *(run_tool(fn_name=fn_name, fn_args=dict(fn_args), mcp_client=mcp_client) for fn_name, fn_args, _ in function_calls),
+                    *(run_tool(fn_name=fn_name, fn_args=dict(fn_args), mcp_client=mcp_client, session_id=session_id, turn_id=turn_id) for fn_name, fn_args, _ in function_calls),
                     return_exceptions=True,
                 )
                 final_results = []
@@ -96,7 +96,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 
                         if confirm.strip().lower() == "y":
                             resumed_args = {**fn_args, **result.resume_args}
-                            result = await run_tool(fn_name=fn_name, fn_args=resumed_args, mcp_client=mcp_client)
+                            result = await run_tool(fn_name=fn_name, fn_args=resumed_args, mcp_client=mcp_client, session_id=session_id, turn_id=turn_id)
                         else:
                             result = "Error: User declined to allow this action."
                 
@@ -116,7 +116,9 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     iter_span.set_status(Status(StatusCode.OK))
     
         else:
-            print(f"Reached maximum iterations ({MAX_ITERATIONS}) without receiving a model output. Ending the agent loop.")
+            msg = f"Reached maximum iterations ({MAX_ITERATIONS}) without receiving a model output. Ending the agent loop."
+            print(msg)
             turn_span.set_attribute("outcome", "max_iterations_exceeded")  
             turn_span.set_status(Status(StatusCode.ERROR, "max_iterations_exceeded"))
+            return msg
     

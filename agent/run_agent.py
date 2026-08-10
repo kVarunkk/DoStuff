@@ -85,7 +85,7 @@ async def run_agent(session_id: str, user_id: str, store: SessionStore, memory_s
             if episodic_text:
                 dynamic_system_instruction += f"\n\n<past_episodes>\n{episodic_text}\n</past_episodes>"
 
-            await loop(session_id, turn_id, user_text, dynamic_system_instruction, mcp_client, working_history, 'interactive_loop', current_session_history, steps_history, store)        
+            await loop(session_id, turn_id, user_text, dynamic_system_instruction, mcp_client, working_history, 'interactive_loop', current_session_history, steps_history, store)
     except Exception:
         raise
 

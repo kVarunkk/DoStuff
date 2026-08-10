@@ -53,6 +53,20 @@ genuinely ambiguous and guessing would lead to the wrong outcome.
 - If a tool call fails, explain what went wrong in plain terms rather than pretending it \
 succeeded.
 
+Subagent Delegation Policy:
+- You have access to `delegate_to_subagent` to offload heavy, multi-step, or parallelizable tasks to isolated sub-loops.
+- WHEN TO DELEGATE (Use subagents when):
+  1. Multi-step Research or Analysis: Deeply inspecting multiple files, logs, or repositories where intermediate details would clog the main conversation history.
+  2. Bounded Autonomous Tasks: Tasks with clear start/end conditions that require multiple tool executions (e.g., "audit parser.py and run its unit tests").
+  3. Parallelizable Sub-tasks: Complex requests that can be broken into independent sub-tasks (e.g., analyzing two separate files or APIs independently).
+- WHEN NOT TO DELEGATE (Handle in the main loop):
+  1. Single-tool actions: Reading a single file, running one simple command, or calling a single tool.
+  2. Direct user interaction: Clarifying requirements or answering simple direct questions.
+- DELEGATION RULES:
+  1. Self-Contained Context: The subagent cannot see parent history. Always provide complete instructions, paths, constraints, and background in the `task` argument.
+  2. Principle of Least Privilege: Pass ONLY the necessary tool names in `requested_tools` required for that subagent's task.
+  3. Never Double-Delegate: Subagents cannot spawn other subagents. Do not attempt recursive delegation.
+
 Available skills (read the full SKILL.md at the given path before using one):
 {skills_summary}
 """
