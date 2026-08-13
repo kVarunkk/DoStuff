@@ -21,14 +21,19 @@ async def call_agent(steps_history: list[StepParam], system_instruction: str, to
         {"type": "function", **TOOL_SCHEMAS[name]}
         for name in tool_names
         if name in TOOL_SCHEMAS
+    ]
+
+    built_in_tools = [
+        {
+            "type": "google_search"
+        }
     ]    
 
     async def _make_request():
         return await client.interactions.create(
             model=model,
             input=steps_history,
-            # tools=[{"type": "function", **schema} for schema in tool_schemas],
-            tools=active_schemas,
+            tools=active_schemas + built_in_tools,
             store=False,
             system_instruction=system_instruction,
         )

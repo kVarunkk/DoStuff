@@ -10,12 +10,13 @@ from tools.mcp.get_mcp_tool_details import get_mcp_tool_details
 from tools.mcp.search_mcp_tools import search_mcp_tools
 from tools.run_code import run_code
 from tools.delegate_to_subagent import delegate_to_subagent
+from typing import Any
 
 def create_function_schema(callable):
     schema = types.FunctionDeclaration.from_callable(
-    callable = callable,
-    client = get_client()._api_client
-).to_json_dict()
+        callable = callable,
+        client = get_client()._api_client
+    ).to_json_dict()
 
     if "parameters" not in schema:
         schema["parameters"] = {"type": "object", "properties": {}, "required": []}
@@ -41,7 +42,7 @@ tool_schemas = [write_file_schema, read_file_schema, delete_file_schema, list_fi
 
 TOOL_MAP = { "read_file": read_file,"write_file": write_file, "delete_file": delete_file, "list_files": list_files, "get_current_datetime": get_current_datetime, "search_mcp_tools": search_mcp_tools, "get_mcp_tool_details": get_mcp_tool_details, "call_mcp_tool": call_mcp_tool, "run_code": run_code, "delegate_to_subagent": delegate_to_subagent}
 
-TOOL_SCHEMAS = {
-    schema["name"]: schema 
+TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    str(schema["name"]): schema 
     for schema in tool_schemas
 }
