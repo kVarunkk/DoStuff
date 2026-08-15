@@ -71,7 +71,7 @@ class MCPClient:
                     raise ImportError(
                         "streamable_http_client not available — upgrade with `pip install --upgrade mcp`."
                     )
-                http_client = await stack.enter_async_context(httpx2.AsyncClient(headers=req_headers, timeout=timeout))
+                http_client = await stack.enter_async_context(httpx2.AsyncClient(headers=req_headers, timeout=timeout, event_hooks={"response": [self._log_response]}))
                 self.server_meta[server_name]["http_client"] = http_client
                 http_ctx = streamable_http_client(url=url, http_client=http_client)
                 read, write, *_ = await stack.enter_async_context(http_ctx)
@@ -179,5 +179,10 @@ class MCPClient:
         self.server_stacks.clear()
         self.servers.clear()
         self.mcp_tools.clear()
+
+    async def _log_response(self, response):
+        if response.is_error:
+            await response.aread()
+            print(f"HTTP ERROR {response.status_code}: {response.text}")    
 
 

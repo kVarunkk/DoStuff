@@ -1,16 +1,16 @@
 from lib.mcp.mcp_client import MCPClient
 import json
 
-async def search_mcp_tools(query: str) -> list[dict[str, str]]:
+async def search_mcp_tools(query: str) -> str:
     """Search available MCP tools by keyword across connected MCP servers.
     
     Args:
         query: Keywords or description to search for matching tools.
         
     Returns:
-        List of matching tools with tool name and short description only.
+        String of matching tools with tool name and short description only.
     """
-    return []
+    return ""
 
 async def _impl_search_mcp_tools(query: str, mcp_client: MCPClient) -> str:
     """Discovers relevant MCP tools using semantic vector search in ChromaDB,

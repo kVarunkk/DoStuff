@@ -12,6 +12,7 @@ from lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
 CLIENT_ID = "mcp-generic-client"
 REDIRECT_PORT = 8085
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/callback"
+CLIENT_ID_METADATA_DOCUMENT="https://d1b7jdanqdrk6e.cloudfront.net/DoStuff/client-metadata.json"
 
 
 class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
@@ -70,7 +71,7 @@ def parse_www_authenticate(header_value: str) -> dict:
     return params
 
 
-async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) -> tuple[str, str, str, str]:
+async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) -> tuple[str, str, str, str, bool]:
     """Vendor-agnostic OAuth discovery, per RFC 9728 (protected resource metadata)
     and RFC 8414 (authorization server metadata), with an OIDC discovery fallback.
 
@@ -115,6 +116,7 @@ async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) ->
         auth_endpoint = meta_data.get("authorization_endpoint")
         token_endpoint = meta_data.get("token_endpoint")
         registration_endpoint = meta_data.get("registration_endpoint")
+        client_id_metadata_document_supported = meta_data.get("client_id_metadata_document_supported") or False
 
         if not auth_endpoint or not token_endpoint:
             raise ValueError("Discovered metadata is missing 'authorization_endpoint' or 'token_endpoint'")
@@ -123,7 +125,7 @@ async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) ->
             supported = meta_data["scopes_supported"]
             requested_scope = " ".join([s for s in supported if s in ["openid", "profile", "email"]] or supported[:2])
 
-        return auth_endpoint, token_endpoint, requested_scope, registration_endpoint
+        return auth_endpoint, token_endpoint, requested_scope, registration_endpoint, client_id_metadata_document_supported
 
 
 async def authenticate_via_oauth(mcp_server_url: str, www_auth_header: str, registration_store: MCPClientRegistrationStore, server_name: str) -> dict:
@@ -131,12 +133,14 @@ async def authenticate_via_oauth(mcp_server_url: str, www_auth_header: str, regi
     local browser + loopback listener, and returns an access token.
     """
 
-    auth_endpoint, token_endpoint, scope, registration_endpoint = await discover_oauth_endpoints(mcp_server_url, www_auth_header)
+    auth_endpoint, token_endpoint, scope, registration_endpoint, client_id_metadata_document_supported = await discover_oauth_endpoints(mcp_server_url, www_auth_header)
 
     existing_registration = await registration_store.get(server_name)
 
     if existing_registration and existing_registration.get("client_id"):
         client_id = existing_registration["client_id"]
+    elif client_id_metadata_document_supported:
+        client_id = CLIENT_ID_METADATA_DOCUMENT
     else:
         if not registration_endpoint:
             raise ValueError(

@@ -2,13 +2,13 @@ from typing import Any
 from lib.mcp.mcp_client import MCPClient
 import json 
 
-def get_mcp_tool_details(name: str) -> dict[str, Any]:
+def get_mcp_tool_details(name: str) -> str:
     """Inspect and return the full JSON input schema for a specific MCP tool.
     
     Args:
         name: Exact name of the MCP tool discovered via search_tools.
     """
-    return {}
+    return ""
 
 def _impl_get_mcp_tool_details(name: str, mcp_client: MCPClient) -> str:
     if name not in mcp_client.mcp_tools:
