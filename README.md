@@ -4,23 +4,24 @@
 
 <img width="3199" height="2009" alt="image" src="https://github.com/user-attachments/assets/8057e0d8-6b43-49f4-8022-6fa752f6131b" />
 
-
 - reAct tool calling
-- opentelemetry tracing
 - short term memory
 - long term memory
   - Procedural
   - Semantic
   - Episodic
 - context management
-- skill support
-- mcp servers support (stdio and http (Dynamic Client Registration support only))
+- agent skills
+- mcp servers (stdio and http support)
 - self-learning loop
+- litellm python sdk
+- opentelemetry tracing
 
 ## Setup
 
 - run `git clone https://github.com/kVarunkk/DoStuff.git`
 - create a `.env` in the root and refer `.env.example` for the variables
+  - Refer to [litellm supported models](https://models.litellm.ai/) and [the official docs](https://docs.litellm.ai/docs/providers) for more info.
 - create and activate a `venv`
 - run `pip install -r requirements.txt`
 - create a `DOSTUFF.md` for giving your agent a personality. Take inspiration from `DOSTUFF.sample.md`

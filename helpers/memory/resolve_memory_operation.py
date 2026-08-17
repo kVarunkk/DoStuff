@@ -1,12 +1,6 @@
 import json
-from lib.genai_client import get_client
-import os
-from dotenv import load_dotenv
-
-load_dotenv()  
-model = os.getenv("MODEL")
-
-client = get_client()
+from litellm import acompletion, ModelResponse
+from lib.model import MODEL
 
 async def resolve_memory_operation(user_id: str, new_fact: dict, memory_store) -> None:
     similar = await memory_store.query(user_id, new_fact["value"], top_k=3)
@@ -29,12 +23,21 @@ NEW FACT: {new_fact["value"]}
 EXISTING MEMORIES:
 {json.dumps(similar, indent=2)}
 """
+    response = await acompletion(
+        model=MODEL,
+        messages=[
+            {"role": "user", "content": decision_prompt}
+        ],
+    )
+    
+    if isinstance(response, ModelResponse):
+        raw_json_string = response.choices[0].message.content or ""
+    else:
+        raw_json_string = ""
 
-    interaction = await client.interactions.create(model=model, input=decision_prompt)
-    output_text = getattr(interaction, "output_text", "") or ""
-    cleaned = output_text.strip().removeprefix("```json").removesuffix("```").strip()
+    cleaned = raw_json_string.strip().removeprefix("```json").removesuffix("```").strip()
     decision = json.loads(cleaned)
-
+    
     if decision["operation"] == "NOOP":
         return
     elif decision["operation"] == "UPDATE":

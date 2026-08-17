@@ -4,7 +4,6 @@ import asyncio
 import uuid
 import sys
 from agent.run_agent import run_agent
-from lib.genai_client import get_client
 from lib.memory.semantic_memory_store import ChromaMemoryStore
 from helpers.agent.save_memories_and_exit import save_memories_and_exit
 from helpers.skills.discover_skills import discover_skills
@@ -17,7 +16,6 @@ from helpers.agent.learn_from_session import learn_from_session
 from lib.memory.episodic_memory_store import ChromaEpisodicStore
 
 async def main(session_id: str, user_id: str, system_instructions: str):
-    client = get_client()
     store = SQLiteSessionStore(db_path="agent_sessions.db")
 
     existing_history = await store.load(session_id)
@@ -80,7 +78,8 @@ async def main(session_id: str, user_id: str, system_instructions: str):
             mcp_client=mcp_client,
             current_session_history=current_session_history
         )
-    except:
+    except (Exception, asyncio.CancelledError) as e:
+        print(f"Exception: {e}")
         print("\nInterrupted. Saving memories and running the learning loop before exit...")
         exit_results = await asyncio.gather(
                             learn_from_session(current_session_history, mcp_client, session_id),
@@ -97,15 +96,6 @@ async def main(session_id: str, user_id: str, system_instructions: str):
         except (asyncio.TimeoutError, Exception, ExceptionGroup) as e:
             print(f"⚠️ Warning: MCP client cleanup completed with warning/timeout: {e}")
     
-        print("Closing API client...")
-        try:
-            await client.aclose()
-        except Exception as e:
-            print(f"⚠️ Warning: API client close error: {e}")
-            
-        print("Client closed. Done.")
-
-
 if __name__ == "__main__":
     skills = discover_skills()
     skills_summary = "\n\n".join(
@@ -136,9 +126,7 @@ if __name__ == "__main__":
         user_id = str(uuid.uuid4())
 
     print(f"USER ID: {user_id}\n")
-    # 78d80156-f029-412a-8c43-d9f67d03a6a8
     print(f"SESSION ID: {session_id}\n")
-    # 5e43325a-cb6c-4901-834c-036f418ce850
     try:
         asyncio.run(main(session_id, user_id, system_instructions))
     except KeyboardInterrupt:

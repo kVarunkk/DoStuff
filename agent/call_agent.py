@@ -1,41 +1,29 @@
 from google.genai._gaos.lib.compat_errors import BadRequestError
 from lib.tracing import traced
-from google.genai._gaos.types.interactions.step import StepParam
-from lib.genai_client import get_client
 from opentelemetry import trace as otel_trace
-import os
-from dotenv import load_dotenv
 from tools.definitions import TOOL_SCHEMAS
-
-load_dotenv()  
-model = os.getenv("MODEL")
+from litellm import acompletion
+from lib.model import MODEL
 
 @traced("model_call")
-async def call_agent(steps_history: list[StepParam], system_instruction: str, tool_names: list[str] | None = None):
-    client = get_client()
-
+async def call_agent(steps_history: list, system_instruction: str, tool_names: list[str] | None = None):
     if tool_names is None:
         tool_names = list(TOOL_SCHEMAS.keys())
 
     active_schemas = [
-        {"type": "function", **TOOL_SCHEMAS[name]}
+        TOOL_SCHEMAS[name]
         for name in tool_names
         if name in TOOL_SCHEMAS
     ]
 
-    built_in_tools = [
-        {
-            "type": "google_search"
-        }
-    ]    
+    messages = [{"role": "system", "content": system_instruction}] + steps_history    
 
     async def _make_request():
-        return await client.interactions.create(
-            model=model,
-            input=steps_history,
-            tools=active_schemas + built_in_tools,
-            store=False,
-            system_instruction=system_instruction,
+        return await acompletion(
+            model=MODEL,
+            messages=messages,
+            tools=active_schemas,
+            drop_invalid_params=True 
         )
 
     try:
@@ -50,7 +38,7 @@ async def call_agent(steps_history: list[StepParam], system_instruction: str, to
     if usage is not None:
         span = otel_trace.get_current_span()
         span.set_attribute("usage.total_tokens", getattr(usage, "total_tokens", 0))
-        span.set_attribute("usage.input_tokens", getattr(usage, "total_input_tokens", 0))
-        span.set_attribute("usage.output_tokens", getattr(usage, "total_output_tokens", 0))
+        span.set_attribute("usage.input_tokens", getattr(usage, "prompt_tokens", 0))
+        span.set_attribute("usage.output_tokens", getattr(usage, "completion_tokens", 0))
 
     return interaction

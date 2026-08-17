@@ -1,14 +1,11 @@
 import json
-import os
 import time
 from datetime import datetime
-from dotenv import load_dotenv
 from lib.memory.types import SessionEpisodicExtraction
-from lib.genai_client import get_client
 from helpers.memory.format_transcript import format_transcript
+from litellm import acompletion, ModelResponse
+from lib.model import MODEL
 
-load_dotenv()
-model = os.getenv("MODEL")
 
 EPISODIC_EXTRACTION_PROMPT = """Review this conversation transcript and extract significant, discrete moments worth remembering as episodic memories for future sessions.
 
@@ -33,26 +30,26 @@ async def extract_episodes(
     user_id: str, 
 ) -> list[dict]:
     """Extracts atomic episodic memory cards formatted ready for ChromaDB storage."""
-    client = get_client()
-
     conversation_text = format_transcript(steps_history, type="memory_update")
     prompt = EPISODIC_EXTRACTION_PROMPT.format(conversation=conversation_text)
 
     try:
-        interaction = await client.interactions.create(
-            model=model,
-            input=prompt,
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": SessionEpisodicExtraction.model_json_schema(),
-            },
+        response = await acompletion(
+            model=MODEL,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            response_format=SessionEpisodicExtraction, 
         )
 
-        output_text = getattr(interaction, "output_text", "") or ""
+        if isinstance(response, ModelResponse):
+            raw_json_string = response.choices[0].message.content or ""
+        else:
+            raw_json_string = ""    
 
-        cleaned = output_text.strip().removeprefix("```json").removesuffix("```").strip()
-        data = json.loads(cleaned)
+        cleaned = raw_json_string.strip().removeprefix("```json").removesuffix("```").strip()
+        extracted_data = SessionEpisodicExtraction.model_validate_json(cleaned)
+        data = extracted_data.model_dump()
 
         if isinstance(data, dict):
             episodes = data.get("episodes", [])

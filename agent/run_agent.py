@@ -46,9 +46,9 @@ async def run_agent(session_id: str, user_id: str, store: SessionStore, memory_s
             turn_id_var.set(turn_id)
     
             user_step = {
-                    "type": "user_input",
-                    "content": [{"type": "text", "text": user_text}],
-                }
+                "role": "user",
+                "content": user_text,
+            }    
            
             await append_step(user_step, steps_history, working_history, current_session_history, session_id, store, 'interactive_loop')
     
@@ -87,6 +87,6 @@ async def run_agent(session_id: str, user_id: str, store: SessionStore, memory_s
 
             await loop(session_id, turn_id, user_text, dynamic_system_instruction, mcp_client, working_history, 'interactive_loop', current_session_history, steps_history, store)
     except Exception:
-        raise
+        raise 
 
            

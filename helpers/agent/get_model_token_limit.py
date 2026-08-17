@@ -1,12 +1,11 @@
-from lib.genai_client import get_client
-import os
-from dotenv import load_dotenv
+import litellm
+from lib.model import MODEL
 
-load_dotenv()  
-model = os.getenv("MODEL") or ""
+def get_model_token_limit():
+    try:
+        model_info = litellm.get_model_info(model=MODEL)
+        token_limit = model_info.get("max_input_tokens") or 10000
+        return token_limit
+    except Exception:
+        return 10000
 
-async def get_model_token_limit():
-    client = get_client()
-    model_info = await client.models.get(model=model)
-    token_limit = model_info.input_token_limit or 10000
-    return token_limit

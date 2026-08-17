@@ -27,3 +27,10 @@ class SessionEpisodicExtraction(BaseModel):
     episodes: List[AtomicEpisode] = Field(
         description="List of atomic episodic memories extracted from the conversation."
     )
+
+class SemanticMemory(BaseModel):
+    key: str = Field(description="Name of memory")
+    value: str = Field(description="Value of memory")
+
+class SessionSemanticMemoriesExtraction(BaseModel):
+    facts: List[SemanticMemory] = Field(description="List of semantic memories extracted from conversation.")    

@@ -12,7 +12,6 @@ async def save_memories_and_exit(
     episodic_store: ChromaEpisodicStore,
 ) -> None:
     print("\nWE ARE NOW SAVING YOUR MEMORIES. THIS MIGHT TAKE SOME TIME...")
-
     async def _process_semantic_memory():
         try:
             facts = await extract_memories(steps_history)

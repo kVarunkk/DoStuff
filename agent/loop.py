@@ -9,16 +9,15 @@ from typing import Literal
 from agent.call_agent import call_agent
 from opentelemetry.trace import Status, StatusCode
 from helpers.agent.append_step import append_step
-from helpers.agent.extract_text import extract_text
 import asyncio
 from agent.run_tool import run_tool
-
+import json
 
 async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient,  working_history: list,   turn_type: Literal['interactive_loop', 'learning_loop', 'subagent_loop'], current_session_history: list = [], steps_history: list = [],  store: SessionStore | None = None) -> str:
 
     iteration = 0
     last_input_tokens = 0
-    token_limit = await get_model_token_limit()
+    token_limit = get_model_token_limit()
     context_token_threshold = int(token_limit * 0.8)
     keep_recent_token_budget = int(context_token_threshold * 0.15)
     compaction_notes = ""
@@ -33,7 +32,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             with tracer.start_as_current_span("iteration") as iter_span:
                 iter_span.set_attribute("iteration_number", iteration)
 
-                # context compaction if needed
+                # context compaction
                 if last_input_tokens > context_token_threshold:
                     working_history, new_summary = await compact_context(working_history, keep_recent_token_budget)
                     compaction_notes = f"{compaction_notes}\n{new_summary}".strip()
@@ -42,44 +41,48 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 
                 # agent call  
                 interaction = await call_agent(steps_history=working_history, system_instruction=dynamic_system_instruction + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else ""))
+
+                # token tracking
                 usage = getattr(interaction, "usage", None)
                 if usage:
-                    last_input_tokens = getattr(usage, "total_input_tokens", last_input_tokens)
+                    last_input_tokens = getattr(usage, "total_tokens", last_input_tokens)
 
-                interaction_steps = getattr(interaction, "steps", None)
-    
-                if not interaction_steps:
+                message = interaction.choices[0].message
+                tool_calls = getattr(message, "tool_calls", None)
+                content = getattr(message, "content", None)
+
+                if content and not tool_calls:
+                    model_step = {
+                        "role": "assistant",
+                        "content": content,
+                    }
+                    await append_step(model_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
+                    
+                    turn_span.set_attribute("outcome", "success")
+                    turn_span.set_status(Status(StatusCode.OK))
                     iter_span.set_status(Status(StatusCode.OK))
-                    continue
+                    print(f"\n\nAgent: {content}")
+                    return content
     
-                for step in interaction_steps:
-                    dumped = step.model_dump()
-                    await append_step(dumped, steps_history, working_history, current_session_history, session_id, store, turn_type)
-    
-                last_step = interaction_steps[-1]
+                if not tool_calls:
+                    iter_span.set_status(Status(StatusCode.OK))
+                    continue    
 
-                if getattr(last_step, "type", None) == "model_output":
-                    final_text = extract_text(last_step)
-                    if final_text is not None:
-                        turn_span.set_attribute("outcome", "success")
-                        turn_span.set_status(Status(StatusCode.OK))
-                        iter_span.set_status(Status(StatusCode.OK))
-                        print(f"\n\nAgent: {final_text}")
-                        return final_text
+                function_calls = []
+                for tool_call in tool_calls:
+                    if tool_call.type == "function":
+                        fn_name = tool_call.function.name
+                        fn_args = json.loads(tool_call.function.arguments) if isinstance(tool_call.function.arguments, str) else tool_call.function.arguments
+                        fn_id = tool_call.id
+                        function_calls.append((fn_name, fn_args, fn_id))
     
-                function_calls = [
-                    (
-                        getattr(step, "name", None),
-                        getattr(step, "arguments", None) or {},
-                        getattr(step, "id", None),
-                    )
-                    for step in interaction_steps
-                    if getattr(step, "type", None) == "function_call"
-                ]
+                assistant_tool_step = {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [t.model_dump() for t in tool_calls]
+                }
+                await append_step(assistant_tool_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
     
-                if not function_calls:
-                    iter_span.set_status(Status(StatusCode.OK)) 
-                    continue
     
                 for fn_name, fn_args, _ in function_calls:
                     print(f"-> Calling local tool: {fn_name}({fn_args})")
@@ -107,10 +110,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 
                 for fn_name, fn_id, result in final_results:
                     result_step = {
+                        "role": "tool",
                         "name": fn_name,
-                        "result": result,
-                        "id": fn_id,
-                        "type": "function_result",
+                        "tool_call_id": fn_id,
+                        "content": str(result)
                     }
                     await append_step(result_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
                     iter_span.set_status(Status(StatusCode.OK))

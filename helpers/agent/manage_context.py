@@ -1,10 +1,6 @@
-from lib.genai_client import get_client
 import json
-import os
-from dotenv import load_dotenv
-
-load_dotenv()  
-model = os.getenv("MODEL")
+from litellm import acompletion, ModelResponse
+from lib.model import MODEL
 
 def estimate_tokens(step: dict) -> int:
     """Rough token estimate for a single step dict. Not exact — real tokenization
@@ -33,15 +29,26 @@ def split_by_token_budget(
         step_tokens = estimate_tokens(step)
 
         if running_total + step_tokens > keep_token_budget and recent_steps:
-            # don't cut here if it would leave an incomplete function-call sequence
-            if recent_steps[0].get("type") in ("function_call", "function_result", "thought"):
+            # condition 1
+            if step.get("role") == "assistant" and "tool_calls" in step:
+                # If we already took the tool results, we MUST include this assistant step
                 recent_steps.insert(0, step)
                 running_total += step_tokens
                 continue
+            # condition 2
+            if step.get("role") == "tool":
+                # If we hit a tool, we must grab it and continue backward to find its assistant block
+                recent_steps.insert(0, step)
+                running_total += step_tokens
+                continue
+            # condition 3
             break
 
         recent_steps.insert(0, step)
         running_total += step_tokens
+
+    while recent_steps and recent_steps[0].get("role") == "tool":
+        recent_steps.pop(0)    
 
     split_index = len(steps_history) - len(recent_steps)
     return steps_history[:split_index], steps_history[split_index:]
@@ -67,8 +74,6 @@ async def compact_context(steps_history: list[dict], keep_token_budget: int) -> 
     if not old_steps:
         return steps_history, ""
 
-    client = get_client()
-
     summary_prompt = (
         "Summarize the key facts, decisions, and outcomes from this conversation "
         "history in a compact paragraph. Preserve names, dates, and any commitments "
@@ -76,10 +81,14 @@ async def compact_context(steps_history: list[dict], keep_token_budget: int) -> 
         f"{json.dumps(old_steps, default=str)}"
     )
 
-    summary_interaction = await client.interactions.create(
-        model=model,
-        input=summary_prompt,
+    response = await acompletion(
+        model=MODEL,
+        messages=[{"role": "user", "content": summary_prompt}],
     )
-    summary_text = getattr(summary_interaction, "output_text", "") or ""
+
+    if isinstance(response, ModelResponse):
+        summary_text = response.choices[0].message.content or ""
+    else:
+        summary_text = ""    
 
     return recent_steps, summary_text

@@ -1,12 +1,8 @@
 import json
-from lib.genai_client import get_client
-import os
-from dotenv import load_dotenv
 from helpers.memory.format_transcript import format_transcript
-
-load_dotenv()  
-model = os.getenv("MODEL")
-
+from litellm import acompletion, ModelResponse
+from lib.model import MODEL
+from lib.memory.types import SessionSemanticMemoriesExtraction
 
 EXTRACTION_PROMPT = """Review this conversation history and extract durable facts worth
 remembering about the user for future conversations — preferences, recurring names,
@@ -27,21 +23,36 @@ Conversation:
 """
 
 async def extract_memories(steps_history: list[dict]) -> list[dict]:
-    client = get_client()
-
     conversation_text = format_transcript(steps_history, type="memory_update")
     prompt = EXTRACTION_PROMPT.format(conversation=conversation_text)
 
-    interaction = await client.interactions.create(
-        model=model,
-        input=prompt,
+    response = await acompletion(
+        model=MODEL,
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
+        response_format=SessionSemanticMemoriesExtraction
     )
 
-    output_text = getattr(interaction, "output_text", "") or ""
+    if isinstance(response, ModelResponse):
+        raw_json_string = response.choices[0].message.content or ""
+    else:
+        raw_json_string = ""    
+
+    cleaned = raw_json_string.strip().removeprefix("```json").removesuffix("```").strip()
+    data = json.loads(cleaned)
+
+    if isinstance(data, dict):
+        facts = data.get("facts", [])
+    elif isinstance(data, list):
+        facts = data
+    else:
+        facts = []
+
+    if not isinstance(facts, list):
+        return []    
 
     try:
-        cleaned = output_text.strip().removeprefix("```json").removesuffix("```").strip()
-        facts = json.loads(cleaned)
         if isinstance(facts, list):
             return [
                 f for f in facts
