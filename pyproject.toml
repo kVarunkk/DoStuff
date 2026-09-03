@@ -39,9 +39,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/varunkumawat/agent-1"
-Repository = "https://github.com/varunkumawat/agent-1"
-Issues = "https://github.com/varunkumawat/agent-1/issues"
+Homepage = "https://github.com/kVarunkk/DoStuff/blob/README.md"
+Repository = "https://github.com/kVarunkk/DoStuff"
+Issues = "https://github.com/kVarunkk/DoStuff/issues"
 
 [project.scripts]
 dostuff = "dostuff.cli:app"

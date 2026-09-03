@@ -105,27 +105,27 @@ In the TUI:
 
 ## CLI reference
 
-| Command | Description |
-|---|---|
-| `dostuff` | Launch the interactive TUI |
-| `dostuff --session <id>` | Resume a prior session |
-| `dostuff --user <id>` | Override the user ID |
-| `dostuff init` | Create `.dostuff/` in the current directory |
-| `dostuff config` | Show resolved config paths and values |
-| `dostuff doctor` | Health check (config, data dir, user ID) |
-| `dostuff session-list` | List all past sessions with their working dirs |
+| Command                  | Description                                    |
+| ------------------------ | ---------------------------------------------- |
+| `dostuff`                | Launch the interactive TUI                     |
+| `dostuff --session <id>` | Resume a prior session                         |
+| `dostuff --user <id>`    | Override the user ID                           |
+| `dostuff init`           | Create `.dostuff/` in the current directory    |
+| `dostuff config`         | Show resolved config paths and values          |
+| `dostuff doctor`         | Health check (config, data dir, user ID)       |
+| `dostuff session-list`   | List all past sessions with their working dirs |
 
 ---
 
 ## TUI controls
 
-| Key / command | Action |
-|---|---|
-| `Enter` | Submit message |
-| `Ctrl+J` | Insert a newline (multi-line input) |
-| `/exit` | Save memories and quit |
-| `Ctrl+Q` | Graceful quit with save |
-| `/help` | Show available in-TUI commands |
+| Key / command | Action                              |
+| ------------- | ----------------------------------- |
+| `Enter`       | Submit message                      |
+| `Ctrl+J`      | Insert a newline (multi-line input) |
+| `/exit`       | Save memories and quit              |
+| `Ctrl+Q`      | Graceful quit with save             |
+| `/help`       | Show available in-TUI commands      |
 
 **Visual elements:**
 
@@ -159,12 +159,12 @@ mcp:
   config_path: ~/.dostuff/mcp_config.json
 
 tracing:
-  enabled: false          # default OFF (no 4317 noise)
-  exporter: "otlp"        # otlp | console | none
+  enabled: false # default OFF (no 4317 noise)
+  exporter: "otlp" # otlp | console | none
 
 model:
-  name: "openai/gpt-4o-mini"      # litellm format: provider/model
-  api_key_env: "OPENAI_API_KEY"   # name of the env var holding the key
+  name: "openai/gpt-4o-mini" # litellm format: provider/model
+  api_key_env: "OPENAI_API_KEY" # name of the env var holding the key
 ```
 
 See [`config.example.yaml`](./config.example.yaml) for a full template.
@@ -194,13 +194,13 @@ OTEL_ENABLED=true OTEL_EXPORTER=console dostuff
 
 The `name` field uses [litellm format](https://docs.litellm.ai/docs/providers): `provider/model-name`.
 
-| Provider | Model name | API key env |
-|---|---|---|
-| OpenAI | `openai/gpt-4o-mini` | `OPENAI_API_KEY` |
+| Provider  | Model name                             | API key env         |
+| --------- | -------------------------------------- | ------------------- |
+| OpenAI    | `openai/gpt-4o-mini`                   | `OPENAI_API_KEY`    |
 | Anthropic | `anthropic/claude-3-5-sonnet-20240620` | `ANTHROPIC_API_KEY` |
-| Gemini | `gemini/gemini-3.1-flash-lite` | `GEMINI_API_KEY` |
-| Groq | `groq/llama-3.1-70b-versatile` | `GROQ_API_KEY` |
-| Ollama | `ollama/llama3.1` | _(none)_ |
+| Gemini    | `gemini/gemini-3.1-flash-lite`         | `GEMINI_API_KEY`    |
+| Groq      | `groq/llama-3.1-70b-versatile`         | `GROQ_API_KEY`      |
+| Ollama    | `ollama/llama3.1`                      | _(none)_            |
 
 If `name` has no `/`, the `provider` field is auto-prepended.
 
@@ -240,14 +240,14 @@ MCP servers extend the agent with new tools. Configure them in `~/.dostuff/mcp_c
 }
 ```
 
-| Field | Required for | Notes |
-|---|---|---|
-| `transport` | optional | `stdio` (default) or `http` |
-| `command` | stdio | Executable (`npx`, `uvx`, ...) |
-| `args` | stdio | Argument list |
-| `env` | stdio | Env vars for the child process |
-| `url` | http | Remote MCP server URL |
-| `headers` | http | HTTP headers |
+| Field       | Required for | Notes                          |
+| ----------- | ------------ | ------------------------------ |
+| `transport` | optional     | `stdio` (default) or `http`    |
+| `command`   | stdio        | Executable (`npx`, `uvx`, ...) |
+| `args`      | stdio        | Argument list                  |
+| `env`       | stdio        | Env vars for the child process |
+| `url`       | http         | Remote MCP server URL          |
+| `headers`   | http         | HTTP headers                   |
 
 MCP connections start in a background worker, so the TUI never blanks during boot. Each server is announced with a `✓` or `✗` in the message area.
 
@@ -321,7 +321,7 @@ Tracing is **OFF by default** to avoid spurious `localhost:4317` errors.
 # ~/.dostuff/config.yaml
 tracing:
   enabled: true
-  exporter: "console"   # or "otlp"
+  exporter: "console" # or "otlp"
   endpoint: "localhost:4317"
 ```
 
@@ -416,5 +416,5 @@ dostuff/
 ## Project metadata
 
 - **Author:** [varun](mailto:varunkumawatleap2@gmail.com)
-- **Repository:** https://github.com/<you>/dostuff
-- **Issues:** https://github.com/<you>/dostuff/issues
+- **Repository:** https://github.com/kVarunkk/DoStuff
+- **Issues:** https://github.com/kVarunkk/DoStuff/issues
