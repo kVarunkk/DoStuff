@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dostuff"
-version = "0.1.0"
+version = "0.1.1"
 description = "DoStuff - AI agent harness with global CLI, pipx install, and persistent session storage"
 readme = "README.md"
 license = "MIT"
