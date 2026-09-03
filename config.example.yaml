@@ -1,0 +1,19 @@
+# DoStuff global config (env vars override these values)
+# Place at: ~/.dostuff/config.yaml
+
+data:
+  global_dir: ~/.dostuff/data
+
+mcp:
+  config_path: ~/.dostuff/mcp_config.json
+
+tracing:
+  enabled: false           # default off; no localhost:4317 noise
+  endpoint: "localhost:4317"
+  service_name: "dostuff"
+  exporter: "otlp"         # otlp | console | none
+
+model:
+  provider: "openai"        # openai | anthropic | gemini | groq | ollama | mistral | openrouter
+  name: "openai/gpt-4o-mini"  # litellm format: 'provider/model' (env MODEL overrides)
+  api_key_env: "OPENAI_API_KEY"  # env var name that holds the secret (see ~/.dostuff/.env)

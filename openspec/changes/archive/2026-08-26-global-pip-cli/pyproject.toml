@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dostuff"
+version = "0.1.0"
+description = "Global pip-installable CLI for the agent harness"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "dostuff team"}
+]
+keywords = ["agent", "cli", "local-agent", "dostuff"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "typer>=0.9.0",
+    "litellm>=0.18.0",
+    "chroma>=0.0.5",
+    "sqlite3",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+dostuff = "dostuff.cli:main"
+
+[project.optional-dependencies]
+project = [
+    "pyyaml>=6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["dostuff*"]

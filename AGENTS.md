@@ -1,0 +1,2 @@
+- you need to work in the `./dostuff` directory. that is the main source code.
+- copy changed file to the package after each change

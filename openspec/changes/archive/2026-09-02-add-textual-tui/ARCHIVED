@@ -1,0 +1,6 @@
+CHANGE: add-textual-tui
+ARCHIVED: yes
+DATE: 2026-01-01
+STATUS: complete — all 25 original + 9 new tasks (5/6/7) verified
+CODE: dostuff/cli_tui.py (real TUI), dostuff/agent/loop.py (usage emit)
+VERIFIED: Shift+Enter → Ctrl+J; adapter ask/got_input; per-turn tokens ↑↓; cumulative status bar; full-width colored backgrounds via CSS; no Header; transparent bg
