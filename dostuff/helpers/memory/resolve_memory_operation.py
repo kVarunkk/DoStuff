@@ -7,9 +7,12 @@ async def resolve_memory_operation(user_id: str, new_fact: dict, memory_store) -
 
     if not similar:
         await memory_store.upsert_fact(user_id, new_fact)
-        print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: SIMILAR NOT FOUND, KEY: {new_fact["key"] or "unknown"}, VALUE: {new_fact["value"]}")
+        k = new_fact.get('key') or 'unknown'
+        v = new_fact.get('value', '')
+        print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: SIMILAR NOT FOUND, KEY: {k}, VALUE: {v}")
         return
 
+    v_prompt = new_fact.get('value', '')
     decision_prompt = f"""You manage a user's long-term memory. Given a NEW fact and
 EXISTING related memories, decide ONE operation:
 - ADD: new fact is genuinely new information, unrelated to existing ones
@@ -18,7 +21,7 @@ EXISTING related memories, decide ONE operation:
 
 Return JSON: {{"operation": "ADD"|"UPDATE"|"NOOP", "replace_key": "<existing key or null>"}}
 
-NEW FACT: {new_fact["value"]}
+NEW FACT: {v_prompt}
 
 EXISTING MEMORIES:
 {json.dumps(similar, indent=2)}
@@ -43,7 +46,11 @@ EXISTING MEMORIES:
     elif decision["operation"] == "UPDATE":
         key_to_replace = decision.get("replace_key") or new_fact["key"]
         await memory_store.upsert_fact(user_id, {"key": key_to_replace, "value": new_fact["value"]})
-        print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: UPDATE, KEY: {key_to_replace}, VALUE: {new_fact["value"]}")
+        k_to = key_to_replace or new_fact.get('key') or 'unknown'
+        v_to = new_fact.get('value', '')
+        print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: UPDATE, KEY: {k_to}, VALUE: {v_to}")
     else:  # ADD
         await memory_store.upsert_fact(user_id, new_fact)
-        print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: ADD, KEY: {new_fact["key"] or "unknown"}, VALUE: {new_fact["value"]}")
+        k_add = new_fact.get('key') or 'unknown'
+        v_add = new_fact.get('value', '')
+        print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: ADD, KEY: {k_add}, VALUE: {v_add}")

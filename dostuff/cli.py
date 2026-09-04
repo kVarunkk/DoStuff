@@ -37,10 +37,7 @@ def init():
     # Create project config.yaml with template
     config_template = """# Project-specific config (overrides ~/.dostuff/config.yaml)
 # Uncomment any section below to override the global config.
-# Full reference: https://github.com/<you>/dostuff/blob/main/config.example.yaml
-
-# data:
-#   mode: "project"  # use project data dir instead of global
+# Full reference: https://github.com/kVarunkk/DoStuff/blob/package-structure/config.example.yaml
 
 # mcp:
 #   config_path: "mcp_config.json"  # project-specific MCP servers

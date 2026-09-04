@@ -4,21 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dostuff"
-version = "0.1.1"
+version = "0.1.2"
 description = "DoStuff - AI agent harness with global CLI, pipx install, and persistent session storage"
 readme = "README.md"
 license = "MIT"
 authors = [
     { name = "Varun Kumawat", email = "varunkumawatleap2@gmail.com" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
@@ -39,7 +40,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kVarunkk/DoStuff/blob/README.md"
+Homepage = "https://github.com/kVarunkk/DoStuff/blob/package-structure/README.md"
 Repository = "https://github.com/kVarunkk/DoStuff"
 Issues = "https://github.com/kVarunkk/DoStuff/issues"
 

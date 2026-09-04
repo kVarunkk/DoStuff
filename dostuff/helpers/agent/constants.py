@@ -1,5 +1,5 @@
 COMMANDS = {"/exit", "/clear", "/help"}
-MAX_ITERATIONS = 15
+MAX_ITERATIONS = 25
 KEEP_RECENT_STEPS = 15  
 PROJECT_ROOT = "."
 WORKSPACE_ROOT = "."

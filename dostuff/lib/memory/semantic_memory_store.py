@@ -25,8 +25,8 @@ class SemanticMemoryStore(MemoryStore):
     async def upsert_fact(self, user_id: str, fact: dict) -> None:
         """Low-level write — used by resolve_memory_operation, not called directly elsewhere."""
         self._collection.upsert(
-            ids=[f"{user_id}:{fact['key']}"],
-            documents=[f"User's {fact['key'].replace('_', ' ')} is {fact['value']}"],
+            ids=[f"{user_id}:{fact.get('key')}"],
+            documents=[f"User's {fact.get('key','').replace('_', ' ')} is {fact.get('value', '')}"],
             metadatas=[{"user_id": user_id, "key": fact["key"], "value": fact["value"]}],
         )
 

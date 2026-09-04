@@ -4,7 +4,9 @@
 
 **A pip-installable AI agent harness with a Textual TUI, persistent sessions, and MCP tool support.**
 
-[![Python](https://img.shields.io/badge/Python-3.10+-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![PyPI](https://img.shields.io/badge/PyPI-published-3776ab?style=flat-square&logo=pypi)](https://pypi.org/project/dostuff/)
+
+[![Python](https://img.shields.io/badge/Python-3.11+-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![litellm](https://img.shields.io/badge/litellm-any--provider-blueviolet?style=flat-square)](https://docs.litellm.ai/docs/providers)
 [![MCP](https://img.shields.io/badge/MCP-compatible-success?style=flat-square)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
@@ -376,7 +378,7 @@ OTEL_ENABLED=true OTEL_EXPORTER=console dostuff
 > [!WARNING]
 > **`pip install .` fails**
 >
-> Requires Python 3.10+. Upgrade pip first:
+> Requires Python 3.11+. Upgrade pip first:
 >
 > ```bash
 > pip install --upgrade pip
