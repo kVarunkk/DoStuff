@@ -1,2 +1,3 @@
 - you need to work in the `./dostuff` directory. that is the main source code.
 - copy changed file to the package after each change
+- Before reporting errors one by one: run `python -m mypy dostuff/cli_tui.py --ignore-missing-imports` to find ALL type/syntax errors at once. you should run this on every file that you have changed not just `cli_tui.py`. This avoids the "loader_widget possibly unbound" / "Name loader_widget" / "Unexpected indent" cascade. Install mypy with `pip install mypy` if missing.

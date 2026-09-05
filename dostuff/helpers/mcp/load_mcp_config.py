@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from typing import Dict, Any
+from dostuff.helpers.ui.emit import emit
 
 def load_mcp_config(config_path: str | None = None) -> Dict[str, Any]:
     """Loads MCP server configurations from JSON.
@@ -22,11 +23,11 @@ def load_mcp_config(config_path: str | None = None) -> Dict[str, Any]:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    print(f"[MCP] Loaded config from: {file_path}")
+                    emit(f"[MCP] Loaded config from: {file_path}", msg_type="system")
                     return data.get("mcpServers", {})
             except Exception as e:
-                print(f"❌ Failed to load '{file_path}': {e}")
+                emit(f"❌ Failed to load '{file_path}': {e}", msg_type="error")
                 return {}
 
-    print("⚠️  Config file not found (tried global + .dostuff/ + cwd). Starting without MCP servers.")
+    emit("⚠️  Config file not found (tried global + .dostuff/ + cwd). Starting without MCP servers.", msg_type="error")
     return {}

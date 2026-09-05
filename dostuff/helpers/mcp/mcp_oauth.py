@@ -32,7 +32,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", 0))
             if content_length:
                 body = self.rfile.read(content_length).decode("utf-8")
-                print(f"RAW POST BODY: {body}")
+                # print(f"RAW POST BODY: {body}")
     
                 content_type = self.headers.get("Content-Type", "")
                 if "application/json" in content_type:
@@ -172,7 +172,7 @@ async def authenticate_via_oauth(mcp_server_url: str, www_auth_header: str, regi
 
     auth_url = f"{auth_endpoint}?{urllib.parse.urlencode(params)}"
 
-    print(f"\nOpening browser for OAuth authentication ({mcp_server_url})...")
+    # print(f"\nOpening browser for OAuth authentication ({mcp_server_url})...")
     webbrowser.open(auth_url)
 
     server = http.server.HTTPServer(("localhost", REDIRECT_PORT), OAuthCallbackHandler)

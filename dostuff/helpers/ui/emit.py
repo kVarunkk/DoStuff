@@ -21,4 +21,4 @@ def emit(message: str, msg_type: str = "system") -> None:
             return
         except Exception:
             pass  # fall through to stdout
-    print(message, file=sys.stderr if msg_type == "error" else sys.stdout)
+    # print(message, file=sys.stderr if msg_type == "error" else sys.stdout)

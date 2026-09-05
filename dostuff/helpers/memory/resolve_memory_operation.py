@@ -9,7 +9,7 @@ async def resolve_memory_operation(user_id: str, new_fact: dict, memory_store) -
         await memory_store.upsert_fact(user_id, new_fact)
         k = new_fact.get('key') or 'unknown'
         v = new_fact.get('value', '')
-        print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: SIMILAR NOT FOUND, KEY: {k}, VALUE: {v}")
+        # print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: SIMILAR NOT FOUND, KEY: {k}, VALUE: {v}")
         return
 
     v_prompt = new_fact.get('value', '')
@@ -48,9 +48,9 @@ EXISTING MEMORIES:
         await memory_store.upsert_fact(user_id, {"key": key_to_replace, "value": new_fact["value"]})
         k_to = key_to_replace or new_fact.get('key') or 'unknown'
         v_to = new_fact.get('value', '')
-        print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: UPDATE, KEY: {k_to}, VALUE: {v_to}")
+        # print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: UPDATE, KEY: {k_to}, VALUE: {v_to}")
     else:  # ADD
         await memory_store.upsert_fact(user_id, new_fact)
         k_add = new_fact.get('key') or 'unknown'
         v_add = new_fact.get('value', '')
-        print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: ADD, KEY: {k_add}, VALUE: {v_add}")
+        # print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: ADD, KEY: {k_add}, VALUE: {v_add}")

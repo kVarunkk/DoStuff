@@ -14,14 +14,15 @@ async def save_memories_and_exit(
     from dostuff.helpers.ui.emit import emit
     emit("\nWE ARE NOW SAVING YOUR MEMORIES. THIS MIGHT TAKE SOME TIME...", msg_type="system")
     async def _process_semantic_memory():
+        from dostuff.helpers.ui.emit import emit
         try:
             facts = await extract_memories(steps_history)
             if facts:
                 await memory_store.add(user_id, facts)
-                from dostuff.helpers.ui.emit import emit
                 emit(f" Saved {len(facts)} semantic fact(s).", msg_type="system")
         except Exception as e:
-            print(f"⚠️ Error saving semantic memory: {e}")
+            emit(f"⚠️ Error saving semantic memory: {e}", msg_type="error")
+            # print(f"⚠️ Error saving semantic memory: {e}")
 
     async def _process_episodic_memory():
         from dostuff.helpers.ui.emit import emit
@@ -37,7 +38,8 @@ async def save_memories_and_exit(
                 await episodic_store.add(episodes)
                 emit(f" Saved {len(episodes)} atomic episode(s).", msg_type="system")
         except Exception as e:
-            print(f"⚠️ Error saving episodic memory: {e}")
+            # print(f"⚠️ Error saving episodic memory: {e}")
+            emit(f"⚠️ Error saving episodic memory: {e}", msg_type="error")
 
     await asyncio.gather(
         _process_semantic_memory(),

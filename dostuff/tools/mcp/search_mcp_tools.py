@@ -35,7 +35,8 @@ async def _impl_search_mcp_tools(query: str, mcp_client: MCPClient) -> str:
                     "server": tool["server_name"],
                 })
         except Exception as e:
-            print(f"[ToolRegistry] Semantic search failed ({e}), falling back to memory search.")
+            pass
+            # print(f"[ToolRegistry] Semantic search failed ({e}), falling back to memory search.")
 
     # Fallback: In-memory keyword search if vector search fails or yields no results
     if not results and hasattr(mcp_client, "mcp_tools"):

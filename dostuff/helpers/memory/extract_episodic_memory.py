@@ -5,7 +5,7 @@ from dostuff.lib.memory.types import SessionEpisodicExtraction
 from dostuff.helpers.memory.format_transcript import format_transcript
 from litellm import acompletion, ModelResponse
 from dostuff.lib.model import MODEL
-
+from dostuff.helpers.ui.emit import emit
 
 EPISODIC_EXTRACTION_PROMPT = """Review this conversation transcript and extract significant, discrete moments worth remembering as episodic memories for future sessions.
 
@@ -93,5 +93,5 @@ async def extract_episodes(
         return formatted_records
 
     except (json.JSONDecodeError, AttributeError, Exception) as e:
-        print(f"⚠️ Error during episodic memory extraction: {e}")
+        emit(f"⚠️ Error during episodic memory extraction: {e}", msg_type="error")
         return []

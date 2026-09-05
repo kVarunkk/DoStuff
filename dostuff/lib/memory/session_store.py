@@ -190,6 +190,16 @@ class SQLiteSessionStore(SessionStore):
                     return {"session_id": row[0], "working_dir": row[1]}
                 return None
 
+    def get_session_meta_sync(self, session_id: str) -> dict | None:
+        import sqlite3
+        conn = sqlite3.connect(str(self.db_path))
+        cur = conn.execute("SELECT session_id, working_dir FROM sessions WHERE session_id = ?", (session_id,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {"session_id": row[0], "working_dir": row[1]}
+        return None
+
     async def list(self) -> list[tuple[str, str]]:
         await self._init_db()
         async with aiosqlite.connect(self.db_path) as db:

@@ -46,8 +46,26 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     with tracer.start_as_current_span("context_compaction") as compaction_span:
                         compaction_span.set_attribute("steps_after", len(working_history))
                 
-                # agent call  
-                interaction = await call_agent(steps_history=working_history, system_instruction=dynamic_system_instruction + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else ""))
+                # Check for user cancel via ESC
+                if adapter and hasattr(adapter, "_cancelled") and adapter._cancelled:
+                    await _emit("system", "Turn cancelled by user (ESC).")
+                    return "Cancelled by user (ESC)."
+
+                # agent call — with 3 retries on failure
+                interaction = None
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        interaction = await call_agent(steps_history=working_history, system_instruction=dynamic_system_instruction + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else ""))
+                        break
+                    except Exception as e:
+                        last_err = e
+                        if attempt < 2:
+                            await _emit("system", f"Retrying... ({attempt+1}/3) — {e}")
+                        continue
+                if interaction is None:
+                    await _emit("error", f"Agent call failed after 3 retries: {last_err}")
+                    return f"Failed after 3 attempts: {last_err}"
 
                 # token tracking
                 usage = getattr(interaction, "usage", None)
@@ -122,8 +140,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         else:
                             if adapter and hasattr(adapter, "emit"):
                                 adapter.emit("confirm", result.message)
-                            else:
-                                print(f"\nConfirmation needed: {result.message}")
+                            # else:
+                            #     print(f"\nConfirmation needed: {result.message}")
                             confirm = await asyncio.to_thread(input, "Allow this? [y/n]: ")
                             confirm = confirm.strip().lower() == "y"
 
@@ -153,8 +171,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             msg = f"Reached maximum iterations ({MAX_ITERATIONS}) without receiving a model output. Ending the agent loop."
             if adapter and hasattr(adapter, "emit"):
                 adapter.emit("system", msg)
-            else:
-                print(msg)
+            # Suppress stdout noise in TUI mode; adapter handles display
             turn_span.set_attribute("outcome", "max_iterations_exceeded")  
             turn_span.set_status(Status(StatusCode.ERROR, "max_iterations_exceeded"))
             return msg

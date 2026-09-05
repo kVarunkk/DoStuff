@@ -110,7 +110,7 @@ class MCPClient:
                 },
             }
 
-        print(f"Connected to '{server_name}' ({len(tools_response.tools)} tools indexed)")
+        # print(f"Connected to '{server_name}' ({len(tools_response.tools)} tools indexed)")
 
     async def _get_or_refresh_token(self, server_name: str, url: str) -> str | None:
         """Probes the server for an auth challenge and runs the OAuth flow if needed.
@@ -144,7 +144,8 @@ class MCPClient:
                 return token_data["access_token"]
 
         except Exception as e:
-            print(f"[{server_name}] Auth pre-flight check failed: {e}")
+            # print(f"[{server_name}] Auth pre-flight check failed: {e}")
+            pass
 
         return None
 
@@ -181,6 +182,6 @@ class MCPClient:
     async def _log_response(self, response):
         if response.is_error:
             await response.aread()
-            print(f"HTTP ERROR {response.status_code}: {response.text}")    
+            # print(f"HTTP ERROR {response.status_code}: {response.text}")    
 
 

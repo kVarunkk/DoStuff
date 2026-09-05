@@ -74,6 +74,7 @@ class TuiAdapter:
         self._confirm_loop: asyncio.AbstractEventLoop | None = None
         self._last_turn_usage: dict = {}
         self._session_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self._cancelled: bool = False
     # ── Called by loop() ───────────────────────────────────────────────────────
 
     def emit(self, event_type: str, data) -> None:
@@ -86,10 +87,11 @@ class TuiAdapter:
         # Map event_type to msg_type for CSS styling
         type_to_msg = {
             "tool_call": "tool",
-            "tool_result": "tool",
+            "tool_result": "tool-result",
             "confirm": "confirm",
             "system": "system",
             "usage": "system",
+            "error": "error",
         }
         msg_type = type_to_msg.get(event_type, "agent")
         label = event_type.upper().replace("_", " ")
@@ -143,12 +145,14 @@ class DostuffTUI(App):
     .msg-system { background: #3a3a3a; color: #ccc; }
     .msg-spacer { height: 2; background: transparent; }
     .msg-tool { background: #1b6e5a; color: white;  }
+    .msg-tool-result { background: #2a8c71; color: white;  }
     .msg-agent { color: white; background: transparent; }
     #input { height: 1fr; max-height: 20%; border-top: solid white; border-bottom: solid white; padding: 1; }
     #status { height: auto; color: #888888; text-align: center; padding: 0 1; }
     """
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit", priority=True),
+        Binding("esc", "cancel", "Cancel", priority=True),
     ]
 
     # ── Setup (mirrors core/agent.py run() + run_agent()) ──────────────────────
@@ -156,27 +160,29 @@ class DostuffTUI(App):
     def __init__(
         self,
         session_id: str,
-        user_id: str,
         **kwargs,
     ):
+        print("⏳ Loading session...", flush=True)
         super().__init__(**kwargs)
         self.session_id = session_id
-        self.user_id = user_id
-        self._message_lines: list[str] = []
         self.adapter = TuiAdapter(self)
         from dostuff.helpers.ui.emit import set_adapter
         set_adapter(self.adapter)
 
+        # Cwd already switched in cli.py before TUI launched; Config now reads from correct cwd
+        print("⏳ Loading config...", flush=True)
         self.config = Config()
-        self._is_resumed = False
-
-        # Stores (same as run())
+        print("⏳ Initializing session store...", flush=True)
         self.store = SQLiteSessionStore(
             db_path=str(self.config.get_data_dir() / "sessions.db")
         )
+
+        self._is_resumed = False
         persist_path = str(self.config.get_data_dir() / "chroma")
+        print("⏳ Initializing memory stores...", flush=True)
         self.memory_store = SemanticMemoryStore(persist_path=persist_path)
         self.episodic_store = EpisodicMemoryStore(persist_path=persist_path)
+        print("⏳ Initializing MCP client...", flush=True)
         self.reg_store = MCPClientRegistrationStore(
             path=str(self.config.get_data_dir() / "mcp_client_registrations.json")
         )
@@ -227,21 +233,16 @@ class DostuffTUI(App):
             self._system_instructions += "\n\n## Project Instructions\n" + project_instructions
         self._pending_workers: list = []  # graceful-shutdown worker tracking
 
-        # Session ID + user ID
-        self.user_id = self.user_id or self.config.get_user_id()
+        # Session ID + user ID (single-user: always from Config)
+        self.user_id = self.config.get_user_id()
         session_id_var.set(self.session_id)
 
         # Load history
         self.steps_history = await self.store.load(self.session_id)
 
-        # Working dir preservation
+        # Save current cwd to session meta for future resumes
         existing_meta = await self.store.get_session_meta(self.session_id)
-        existing_wd = (
-            str(existing_meta.get("working_dir"))
-            if existing_meta and existing_meta.get("working_dir")
-            else None
-        )
-        wd_to_save = existing_wd or str(Path.cwd())
+        wd_to_save = str(Path.cwd())
         await self.store.save_session_meta(self.session_id, wd_to_save)
 
         # Product branding header
@@ -267,26 +268,29 @@ class DostuffTUI(App):
                 role = step.get("role", "?")
                 content = step.get("content", "")
                 tool_calls = step.get("tool_calls")
-                if not content and tool_calls:
+                # Match live TuiAdapter.emit() label format: [TOOL CALL] name(args) / [TOOL RESULT] result
+                is_tool_call = not content and tool_calls
+                is_tool_result = role == "tool"
+                if is_tool_call:
                     tc = tool_calls[0].get("function", {})
                     name = tc.get("name", "?")
                     args = tc.get("arguments", "")
                     content = f"[TOOL CALL] {name}({args})"
+                    mt = "tool"
+                elif is_tool_result:
+                    content = f"[TOOL RESULT] {content}"
+                    mt = "tool-result"
+                elif role == "user":
+                    mt = "user"
+                    content = content
+                else:
+                    mt = "agent"
                 if content:
-                    if role == "user":
-                        mt = "user"
-                    elif role == "tool":
-                        mt = "tool"          # green bg for tool results
-                    elif tool_calls:
-                        mt = "tool"          # green bg for tool-call assistant steps
-                    else:
-                        mt = "agent"
                     # Truncate historical tool/agent content the same as live
-                    if mt in ("agent", "tool") and len(content) > 600:
+                    if mt in ("agent", "tool", "tool-result") and len(content) > 600:
                         content = content[:600].rstrip() + f"\n… [+{len(content) - 600} chars truncated]"
                     self._append(content, msg_type=mt)
-                    # Spacer for visual separation between history turns
-                    self._append("", msg_type="spacer")
+                    # No spacer in history to keep tool call/result pairs tight
         else:
             self._append(f"▶ New session '{self.session_id}'.")
 
@@ -351,7 +355,7 @@ class DostuffTUI(App):
 
         # Built-in commands
         if cmd == "/exit":
-            self.run_worker(self.action_quit(), name="exit_worker", thread=True)  # not tracked; triggers shutdown
+            self.run_worker(self.action_quit(), name="exit_worker", thread=True)
             return
         # if cmd == "/history":
         #     print_history(self.steps_history)
@@ -367,10 +371,8 @@ class DostuffTUI(App):
             self._append(f"Commands: {', '.join(sorted(COMMANDS))}")
             return
 
-        # Spacer + user message + spacer with full-width colored backgrounds
-        self._append(" ", msg_type="spacer")
+        # User message — no spacer before/after to keep tight with tool/agent messages
         self._append(text, msg_type="user")
-        self._append(" ", msg_type="spacer")
 
         # Normal turn — run via worker (tracked for graceful shutdown)
         self._pending_workers.append(self.run_worker(
@@ -382,6 +384,8 @@ class DostuffTUI(App):
     # ── One agent turn (same pre/post logic as run_agent()) ────────────────────
 
     async def _run_turn(self, user_text: str) -> None:
+        loader_text: str = ""
+        loader_widget: Static | None = None
         try:
             turn_id = uuid.uuid4().hex
             turn_id_var.set(turn_id)
@@ -424,9 +428,8 @@ class DostuffTUI(App):
             if episodic_text:
                 dynamic_instructions += f"\n\n<past_episodes>\n{episodic_text}\n</past_episodes>"
 
-            # Call agent loop (single turn) — show loader since response takes time
-            self._show_loader("Working...")
-            self._last_turn_usage = {}
+            loader_widget = self._show_loader("Working...")
+            self._last_turn_usage: dict = {}
             result = await agent_loop(
                 self.session_id,
                 turn_id,
@@ -463,36 +466,69 @@ class DostuffTUI(App):
                 self._append(agent_text, msg_type="agent")
                 if tokens_suffix:
                     self._append(tokens_suffix, msg_type="system")
+                try:
+                    self._stop_loader(loader_widget)
+                except Exception:
+                    pass
             self._call_from_thread(_show)
 
         except Exception as e:
+            try:
+                self._stop_loader(loader_widget)
+            except Exception:
+                pass
             self._call_from_thread(
                 lambda: self._append(f"Turn error: {e}", msg_type="error")
             )
 
     # ── Loader helpers (fix 4: response/network loader) ─────────────────────────
 
-    def _show_loader(self, label: str = "  ⏳ loading...") -> str:
-        """Show temporary loader message; returns loader id (the line content) for removal."""
-        loader_text = f"[loader] {label}"
-        self._append(loader_text, msg_type="system")
-        return loader_text
+    def _show_loader(self, label: str = "Working...") -> Static:
+        """Show loader message in conversation. Returns the Static widget so it can be cleared."""
+        loader_text = f"⏳ {label}"
+        loader_widget = Static(loader_text, classes="msg msg-system", markup=False)
+        msg_container = self.query_one("#msg-container", Vertical)
+        msg_container.mount(loader_widget)
+        self._loader_widget = loader_widget
+        self._scroll_after_layout()
+        return loader_widget
 
-    def _stop_loader(self, loader_text: str) -> None:
-        # We can't easily delete Static widgets; instead update status or append "done"
-        pass  # The loader message stays; next message shows progress
+    def _stop_loader(self, loader_widget: Static | None) -> None:
+        """Hide loader widget from conversation stream."""
+        if loader_widget is None:
+            return
+        try:
+            loader_widget.update("")
+            loader_widget.styles.display = "none"
+        except Exception:
+            pass
+        if getattr(self, "_loader_widget", None) is loader_widget:
+            self._loader_widget = None
+
+    async def action_cancel(self) -> None:
+        """Cancel current agent turn (ESC) — sets adapter flag; loop can check."""
+        self.adapter._cancelled = True
+        # Also show in status bar
+        self.call_from_thread(lambda: self._update_status(working=False, loader="⏹ Cancelled"))
+        self._append("Cancelled by user (ESC).", msg_type="system")
 
     async def action_quit(self) -> None:
-        """Graceful shutdown: cancel pending work, save, then exit."""
+        """Threaded worker — _cleanup uses call_from_thread to render messages."""
+        self.run_worker(
+            self._run_cleanup_and_exit(),
+            name="cleanup_worker",
+            thread=True,
+        )
+
+    async def _run_cleanup_and_exit(self) -> None:
+        # Show save message (threaded worker → call_from_thread renders correctly)
+        self.call_from_thread(lambda: self._append("Saving session..."))
         try:
-            self._call_from_thread(lambda: self._append("Saving session..."))
-            await asyncio.sleep(0.05)  # let TUI render the message
             await self._cleanup_and_save_session()
-        except Exception as e:
-            self._call_from_thread(lambda: self._append(f"Save error: {e}"))
-        # Let "Goodbye" render before TUI shuts down
-        await asyncio.sleep(0.3)
-        await super().action_quit()
+        except Exception:
+            pass
+        # Schedule exit() on event loop from thread
+        self.call_from_thread(self.exit)
 
     # ── Exit (save memories + cleanup, like run() exit block) ─────────────────
 
@@ -520,11 +556,9 @@ class DostuffTUI(App):
                 self.memory_store,
                 self.episodic_store,
             )
-            self._call_from_thread(
-                lambda: self._append(f"Session saved. Goodbye! (cancelled {cancelled} pending task(s))")
-            )
+            self._append(f"Session saved. Goodbye! (cancelled {cancelled} pending task(s))")
         except Exception as e:
-            self._call_from_thread(lambda: self._append(f"Save error: {e}"))
+            self._append(f"Save error: {e}")
         finally:
             # 4. MCP cleanup with strict timeout
             try:
@@ -555,9 +589,15 @@ class DostuffTUI(App):
             "error": "msg msg-error",
             "spacer": "msg-spacer",
             "tool": "msg msg-tool",
+            "tool-result": "msg msg-tool-result",
         }.get(msg_type, "msg msg-agent")
         msg = Static(line, classes=css_class, markup=False)
-        msg_container.mount(msg)
+        # Mount before loader (so loader stays at bottom of stream)
+        loader = getattr(self, "_loader_widget", None)
+        if loader is not None and loader.is_mounted:
+            msg_container.mount(msg, before=loader)
+        else:
+            msg_container.mount(msg)
         # Defer scroll until after this mount refreshes so wrapped messages have final height.
         self.call_after_refresh(self._scroll_after_layout)
 
@@ -599,8 +639,8 @@ class DostuffTUI(App):
                 self._call_from_thread(lambda n=name, err=str(e): self._append(f"  ✗ {n}: {err}", msg_type="error"))
         self._call_from_thread(lambda: self._append(f"MCP ready ({len(self.mcp_client.servers)} server(s)).", msg_type="system"))
 
-    def _update_token_display(self) -> None:
-        """Update the status bar with cumulative session tokens."""
+    def _update_token_display(self, working: bool = False, loader: str = "") -> None:
+        """Update the status bar with cumulative session tokens (and optional loader)."""
         def _fmt(n: int) -> str:
             if n < 1000:
                 return str(n)
@@ -613,12 +653,13 @@ class DostuffTUI(App):
         cwd_str = os.getcwd()
         cwd_display = cwd_str if len(cwd_str) < 36 else "..." + cwd_str[-33:]
         sid_short = self.session_id[:8]
-        status_str = f"📁 {cwd_display}  •  sess: {sid_short}  •  {'resumed' if is_resumed else 'new'}  •  ↑{p} ↓{c}"
+        loader_str = f"  •  {loader}" if (working and loader) else ""
+        status_str = f"📁 {cwd_display}  •  sess: {sid_short}  •  {'resumed' if is_resumed else 'new'}  •  ↑{p} ↓{c}{loader_str}"
         self.query_one("#status", Static).update(status_str)
 
-    def _update_status(self, is_resumed: bool = False) -> None:
+    def _update_status(self, is_resumed: bool = False, working: bool = False, loader: str = "") -> None:
         self._is_resumed = is_resumed
-        self._update_token_display()
+        self._update_token_display(working=working, loader=loader)
 
     def _call_from_thread(self, fn) -> None:
         """Schedule fn on the main Textual event loop. Safe if already on main thread."""

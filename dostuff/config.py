@@ -3,12 +3,8 @@ import yaml
 import os
 from dotenv import load_dotenv
 
-# Load .env for secrets (API keys). Check global, then project override.
-_dostuff_home = Path.home() / ".dostuff"
-for _env_path in [_dostuff_home / ".env", _dostuff_home / "project" / ".env", Path.cwd() / ".dostuff" / ".env"]:
-    if _env_path.exists():
-        load_dotenv(_env_path)
-        break
+# Module-level .env loading removed — env files are now loaded lazily in Config.load()
+# so they can be re-read after a cwd change (e.g. resuming a session from a different directory).
 
 class Config:
     def __init__(self, path: Path | None = None):
@@ -52,6 +48,12 @@ class Config:
         )
 
     def load(self):
+        # Lazy .env loading — supports session resume from different cwd
+        _dostuff_home = Path.home() / ".dostuff"
+        for _env_path in [_dostuff_home / ".env", Path.cwd() / ".dostuff" / ".env"]:
+            if _env_path.exists():
+                load_dotenv(_env_path)
+                break
         if self.path.exists():
             with open(self.path) as f:
                 self.raw = yaml.safe_load(f)

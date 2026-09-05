@@ -7,24 +7,34 @@ app = typer.Typer()
 def main(
     ctx: typer.Context = typer.Option(None),
     session: str = typer.Option(None, "--session", help="Session ID (default: new UUID)"),
-    user: str = typer.Option(None, "--user", help="User ID (default: from ~/.dostuff/user_id)"),
 ):
     if ctx.invoked_subcommand is not None:
         return  # subcommand (init/config/doctor/session_list/resume) — don't start agent
-    from dostuff.config import Config
 
-    config = Config()
-    user_id = user or config.get_user_id()
-    session_id = session or (sys.argv[0] + "_" + __import__("uuid").uuid4().hex[:8])
+    # Compute session_id and switch cwd before TUI init (Config loaded inside TUI)
+    import sqlite3, uuid
+    from pathlib import Path
+    session_id = session or (sys.argv[0] + "_" + uuid.uuid4().hex[:8])
     if session is None and session_id.startswith(sys.argv[0]):
-        session_id = __import__("uuid").uuid4().hex[:16]
-    typer.echo(f"USER: {user_id}  SESSION: {session_id}")
-    typer.echo(f"DATA_DIR: {config.get_data_dir()}")
-    typer.echo("Starting TUI...")
-    typer.echo("STARTING DoStuff...")
-    # Real TUI — default experience (not skeleton)
+        session_id = uuid.uuid4().hex[:16]
+
+    # Switch to session's saved cwd BEFORE TUI starts
+    try:
+        _home_db = str(Path.home() / ".dostuff" / "data" / "sessions.db")
+        conn = sqlite3.connect(_home_db)
+        cur = conn.execute("SELECT working_dir FROM sessions WHERE session_id = ?", (session_id,))
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            import os
+            os.chdir(row[0])
+    except Exception:
+        pass
+
+    # User ID and data dir handled by Config().get_user_id() inside TUI
+    typer.echo(f"Starting TUI for session: {session_id}")
     from dostuff.cli_tui import DostuffTUI
-    tui_app = DostuffTUI(session_id=session_id, user_id=user_id)
+    tui_app = DostuffTUI(session_id=session_id)
     tui_app.run()
 
 @app.command()
@@ -33,8 +43,6 @@ def init():
     cwd = pathlib.Path.cwd()
     proj_dir = cwd / ".dostuff"
     proj_dir.mkdir(exist_ok=True)
-    
-    # Create project config.yaml with template
     config_template = """# Project-specific config (overrides ~/.dostuff/config.yaml)
 # Uncomment any section below to override the global config.
 # Full reference: https://github.com/kVarunkk/DoStuff/blob/package-structure/config.example.yaml
@@ -51,19 +59,14 @@ def init():
 #   exporter: "otlp"
 """
     (proj_dir / "config.yaml").write_text(config_template)
-    
-    # Create directories
     (proj_dir / "skills").mkdir(exist_ok=True)
-    
     typer.echo(f"Initialized project at {cwd}")
 
 @app.command()
 def config():
     from dostuff.config import Config
-
     cfg = Config()
     typer.echo(f"Global config: {cfg.global_path}")
-    # typer.echo(f"Data mode: {cfg.raw.get('data',{}).get('mode','global')}")
     typer.echo(f"Data dir: {cfg.get_data_dir()}")
     typer.echo(f"User ID: {cfg.get_user_id()}")
 
@@ -71,7 +74,6 @@ def config():
 def doctor():
     typer.echo("Health check: dostuff package installed.")
     from dostuff.config import Config
-
     cfg = Config()
     typer.echo(f"  Global config: {cfg.global_path} (exists={cfg.global_path.exists()})")
     cwd = __import__('pathlib').Path.cwd()
@@ -98,5 +100,3 @@ def session_list():
         for sid, wd in rows:
             typer.echo(f"{sid:<36} | {str(wd):<60}")
     asyncio.run(_run())
-
-

@@ -48,8 +48,8 @@ async def _impl_delegate_to_subagent(
     requested_set = set(requested_tools) if requested_tools else set(DEFAULT_SUBAGENT_TOOLS)
     allowed_tool_names = list(requested_set - RESTRICTED_SUBAGENT_TOOLS)
 
-    print(f"requested tools: {requested_tools}")
-    print(f"allowed tools: {allowed_tool_names}")
+    # print(f"requested tools: {requested_tools}")
+    # print(f"allowed tools: {allowed_tool_names}")
 
     # 2. Frame the subagent system prompt
     subagent_system_instruction = f"""{BASE_SUBAGENT_INSTRUCTIONS}
@@ -63,12 +63,12 @@ async def _impl_delegate_to_subagent(
                "content": [{"type": "text", "text": task}],
            }
        ]
-    print(f"role: {role}")
-    print(f"user prompt: {task}")
+    # print(f"role: {role}")
+    # print(f"user prompt: {task}")
 
     # 4. Run the subagent in an isolated context loop (fresh steps_history, smaller iteration cap)
     subagent_result = await loop(session_id, turn_id, task, subagent_system_instruction, mcp_client, working_history, 'subagent_loop', allowed_tool_names)
 
-    print(f"subagent result: {subagent_result}")
+    # print(f"subagent result: {subagent_result}")
     
     return subagent_result

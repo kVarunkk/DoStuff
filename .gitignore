@@ -29,3 +29,5 @@ TEST_PLAN.md
 .agents
 temp_check
 venv*
+.mypy_cache/
+FUTURE.md
