@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - In Progress
+
+### Added
+- **Streaming agent response** (`stream=True`): `_consume_stream()` accumulates `delta.content`/`delta.tool_calls`; adapter `emit("partial")`; live widget updates; `stream_options={"include_usage": True}`.
+- **Usage tracking in stream mode**: `stream_options={"include_usage": True}` added; final usage-only chunk captured (`choices=[]`, `usage` non-null) after `continue` check removed.
+- **Prompt queue during work**: `self._prompt_queue` + `_process_prompt_queue()`; queued prompts execute sequentially.
+- **Live timer (`threading.Thread`)**: Updates status bar `⏳ {elapsed}s`; loader shows `Working...` (no freeze text, no timer embedded).
+- **Loader persistence / removal**: `_freeze_final_time()` removed; loader stays mounted; messages mount `before=loader_widget`.
+- **Markdown formatting on agent/user messages**: `rich.markdown.Markdown` used for agent/user content; system/tool labels stay plain (`markup=False`) so bracket tags (`[TOOL CALL]`) remain visible.
+
+### Fixed
+- **Tool call accumulation in stream**: Captured `fn.name` from `fn.name` (not `arguments` fallback); `tc_key` uses `index` (primary) or `id` (fallback); instance-bound `lambda` for `model_dump()`.
+- **Rate limit / usage omission**: `stream_options` added; universal provider limitation confirmed (stream chunks omit usage except final chunk).
+- **Token counts hidden when 0**: `token_str` conditional; non-streamed turns show real usage, streamed turns don't until final chunk.
+- **`GeneratorExit` / `BaseExceptionGroup` suppression**: Added to `_consume_stream()` for `mcp` library anyio generator cleanup during stream end.
+- **MCP `streamable_http_client` crash (`RuntimeError: cancel scope`)**: Suppressed in stream loop; cleanup handled.
+- **Package sync**: Source files (`cli_tui.py`, `loop.py`, `call_agent.py`, `config.py`, `extract_semantic_memories.py`, `extract_episodic_memory.py`) copied to installed `dostuff/` package after each edit.
+- **`.env` lazy loading** (`Config.load()`), `--user` removal, loader persistence, live timer, queue, `ctrl+q` freeze, `call_from_thread` fix, `_fmt_tokens` consolidation already in 0.1.3; stream completes 0.1.3 work.
+
+### Changed
+- **Status bar formatting**: `📁 {cwd} • sess: {sid} • ↑{p} ↓{c}{loader}`; "new"/"resumed" keywords removed; loader no longer freezes final time.
+- **Loader behavior**: `_clear_loader()` added then removed (caused abrupt app close when called from `run_worker` thread without `call_from_thread`).
+- **`stream=True` architecture verified**: `await acompletion(..., stream=True)` (not raw coroutine); `types.SimpleNamespace` used (no `FakeResponse`); `_update_streaming_widget()` replaces and accumulates cumulative text.
+
+### Removed
+- `--user` flag removed (already in 0.1.3).
+- `_freeze_final_time()` removed (loader no longer freezes; kept visible).
+
 ## [0.1.3] - 2026-09-05
 
 ### Added

@@ -2,6 +2,8 @@
 import asyncio
 import copy
 import os
+import threading
+import time
 import uuid
 from pathlib import Path
 from textual.app import App, ComposeResult
@@ -9,6 +11,8 @@ from textual.message import Message
 from textual.widgets import Static, TextArea
 from textual.containers import Vertical, VerticalScroll
 from textual.binding import Binding
+from rich.text import Text
+from rich.markdown import Markdown as RichMarkdown
 from textual.events import Key
 
 from dostuff.config import Config
@@ -75,6 +79,10 @@ class TuiAdapter:
         self._last_turn_usage: dict = {}
         self._session_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._cancelled: bool = False
+        self._cancel_event: asyncio.Event = asyncio.Event()
+        self._streaming_widget: Static | None = None
+        self._streamed_text: str = ""  # accumulated streaming text for current turn
+        self.stream_token = True  # supports streaming text
     # ── Called by loop() ───────────────────────────────────────────────────────
 
     def emit(self, event_type: str, data) -> None:
@@ -92,14 +100,22 @@ class TuiAdapter:
             "system": "system",
             "usage": "system",
             "error": "error",
+            "partial": "partial",
+            "partial_thought": "system",
         }
         msg_type = type_to_msg.get(event_type, "agent")
-        label = event_type.upper().replace("_", " ")
-        # Truncate long tool results for clean TUI display
+        # Pre-compute text so partial lambda captures the value safely
         text = str(data)
+        if event_type == "partial":
+            # Update streaming widget in-place (no new lines)
+            self._app.call_from_thread(
+                lambda t=text: self._app._update_streaming_widget(t)
+            )
+            return
         MAX = 600
         if len(text) > MAX:
             text = text[:MAX].rstrip() + f"\n… [+{len(str(data)) - MAX} chars truncated]"
+        label = event_type.upper().replace("_", " ")
         self._app.call_from_thread(
             lambda: self._app._append(f"[{label}] {text}", msg_type=msg_type)
         )
@@ -197,6 +213,11 @@ class DostuffTUI(App):
         self.current_session_history: list = []
         self._setup_done = False
         self._system_instructions: str = ""
+        self._loader_widget: Static | None = None  # loader widget at bottom of stream
+        self._prompt_queue: list = []
+        self._turn_in_progress: bool = False
+        self._turn_start_time: float | None = None
+        self._timer_thread = None
 
     # ── Compose UI ─────────────────────────────────────────────────────────────
 
@@ -255,7 +276,7 @@ class DostuffTUI(App):
 ▓▓▓▓ ░░▓▓▓ ░▓▓▓▓░░  ▓░░  ▓▓▓ ░▓░░░░░▓░░░░░  
  ░░░░ ░ ░░░ ░░░░░ ░  ░░   ░░░ ░░░    ░░     
   ░░░░   ░░░  ░░░░    ░    ░░░  ░     ░     
-                                    v0.1.3
+                                    v0.1.4
             """,
             msg_type="system",
         )
@@ -371,15 +392,20 @@ class DostuffTUI(App):
             self._append(f"Commands: {', '.join(sorted(COMMANDS))}")
             return
 
-        # User message — no spacer before/after to keep tight with tool/agent messages
-        self._append(text, msg_type="user")
-
-        # Normal turn — run via worker (tracked for graceful shutdown)
-        self._pending_workers.append(self.run_worker(
-            self._run_turn(text),
-            name=f"turn_{uuid.uuid4().hex[:6]}",
-            thread=True,
-        ))
+        # User message — only append if starting a new turn; queued messages append in _run_turn
+        if not self._turn_in_progress:
+            self._append(text, msg_type="user")
+            self._turn_in_progress = True
+            self._pending_workers.append(self.run_worker(
+                self._run_turn(text),
+                name=f"turn_{uuid.uuid4().hex[:6]}",
+                thread=True,
+            ))
+        else:
+            # Queue the prompt — user sees no new message until turn ends
+            self._prompt_queue.append(text)
+            self._update_status(working=True, loader="Queued")
+            self._append(f"✓ Queued — will run after current turn (position {len(self._prompt_queue)})", msg_type="system")
 
     # ── One agent turn (same pre/post logic as run_agent()) ────────────────────
 
@@ -391,7 +417,7 @@ class DostuffTUI(App):
             turn_id_var.set(turn_id)
             working_history = copy.deepcopy(self.steps_history)
 
-            # Append step
+            # Append step for session history (chat display handled separately)
             user_step = {"role": "user", "content": user_text}
             await append_step(
                 user_step,
@@ -428,8 +454,22 @@ class DostuffTUI(App):
             if episodic_text:
                 dynamic_instructions += f"\n\n<past_episodes>\n{episodic_text}\n</past_episodes>"
 
+            # loader_widget = self._show_loader("Working...")
+            # self._last_turn_usage: dict = {}
+            # # Start live timer (threading.Timer runs on main thread via call_from_thread)
+            # self._turn_start_time = time.time()
+            # self._stop_timer()
+            # self._start_timer()
+
             loader_widget = self._show_loader("Working...")
             self._last_turn_usage: dict = {}
+            self._turn_start_time = time.time()
+            self._stop_timer()
+            self._turn_in_progress = True   # <-- restore before starting new timer/turn
+            self._start_timer()
+            # Reset cancel state for new turn
+            self.adapter._cancelled = False
+            self.adapter._cancel_event.clear()
             result = await agent_loop(
                 self.session_id,
                 turn_id,
@@ -447,45 +487,96 @@ class DostuffTUI(App):
             # Capture agent response for display (real integration — not placeholder)
             agent_text = result or "(no response)"
 
-            def _fmt(n: int) -> str:
-                if n < 1000:
-                    return str(n)
-                if n < 1_000_000:
-                    return f"{n/1000:.1f}k"
-                return f"{n/1_000_000:.1f}M"
-
             # Save updated history
             await self.store.save(self.session_id, self.steps_history)
 
             turn_u = self._last_turn_usage
             tokens_suffix = ""
             if turn_u and (turn_u.get("prompt_tokens") or turn_u.get("completion_tokens")):
-                tokens_suffix = f"  [on #2c2c2c] ↑{_fmt(turn_u.get('prompt_tokens', 0))} ↓{_fmt(turn_u.get('completion_tokens', 0))} [/on #2c2c2c]"
+                tokens_suffix = f"  [on #2c2c2c] ↑{self._fmt_tokens(turn_u.get('prompt_tokens', 0))} ↓{self._fmt_tokens(turn_u.get('completion_tokens', 0))} [/on #2c2c2c]"
 
             def _show():
                 self._append(agent_text, msg_type="agent")
                 if tokens_suffix:
                     self._append(tokens_suffix, msg_type="system")
-                try:
-                    self._stop_loader(loader_widget)
-                except Exception:
-                    pass
+                # Clear streaming widget (final message shown above)
+                sw = getattr(self, "_streaming_widget", None)
+                if sw is not None:
+                    try:
+                        sw.update("")
+                        sw.styles.display = "none"
+                    except Exception:
+                        pass
+                    self._streaming_widget = None
+                # try:
+                #     self._clear_loader()
+                # except Exception:
+                #     pass
             self._call_from_thread(_show)
 
         except Exception as e:
-            try:
-                self._stop_loader(loader_widget)
-            except Exception:
-                pass
+            # try:
+            #     self._clear_loader()
+            # except Exception:
+            #     pass
             self._call_from_thread(
                 lambda: self._append(f"Turn error: {e}", msg_type="error")
             )
+        finally:
+            # Stop live timer
+            if self._timer_thread is not None:
+                try:
+                    # Signal thread to exit; don't wait long since it exits quickly
+                    self._turn_in_progress = False
+                    self._timer_thread.join(timeout=0.3)
+                except Exception:
+                    pass
+                self._timer_thread = None
+            self._turn_start_time = None
+            self._turn_in_progress = False
+            # Clear loader (turn done)
+            # try:
+            #     self._clear_loader()
+            # except Exception:
+            #     pass
+            # Process queued prompts after turn completes
+            await self._process_prompt_queue()
+
+    # ── Prompt queue (run queued prompts after current turn) ────────────────────
+
+    async def _process_prompt_queue(self) -> None:
+        """Drain queued prompts — show queued message, then run turn."""
+        if not self._prompt_queue:
+            return
+        next_text = self._prompt_queue.pop(0)
+        # Show queued user message in chat (not shown when queued originally)
+        self._call_from_thread(lambda: self._append(f"{next_text}", msg_type="user"))
+        queue_depth = len(self._prompt_queue)
+        if queue_depth > 0:
+            self._call_from_thread(
+                lambda q=queue_depth: self._append(f"📥 {q} queued", msg_type="system")
+            )
+        # Keep visible queue indicator in status bar (show remaining depth)
+        self._update_status(working=True, loader="Queued")
+        self._turn_in_progress = True
+        self._pending_workers.append(self.run_worker(
+            self._run_turn(next_text),
+            name=f"turn_{uuid.uuid4().hex[:6]}",
+            thread=True,
+        ))
 
     # ── Loader helpers (fix 4: response/network loader) ─────────────────────────
 
     def _show_loader(self, label: str = "Working...") -> Static:
-        """Show loader message in conversation. Returns the Static widget so it can be cleared."""
-        loader_text = f"⏳ {label}"
+        """Show (or update) loader message in conversation. Returns the Static widget."""
+        existing = self._loader_widget
+        if existing is not None and existing.parent is not None:
+            # Reuse existing loader widget — reset visibility, update text
+            existing.styles.display = "block"
+            existing.update(f"{label}")
+            return existing
+        # Create new loader
+        loader_text = f"{label}"
         loader_widget = Static(loader_text, classes="msg msg-system", markup=False)
         msg_container = self.query_one("#msg-container", Vertical)
         msg_container.mount(loader_widget)
@@ -494,7 +585,7 @@ class DostuffTUI(App):
         return loader_widget
 
     def _stop_loader(self, loader_widget: Static | None) -> None:
-        """Hide loader widget from conversation stream."""
+        """Hide loader widget from conversation stream (clear)."""
         if loader_widget is None:
             return
         try:
@@ -505,11 +596,74 @@ class DostuffTUI(App):
         if getattr(self, "_loader_widget", None) is loader_widget:
             self._loader_widget = None
 
+    # ── Live timer helpers ──────────────────────────────────────────────
+
+    def _start_timer(self) -> None:
+        """Start background timer thread that updates loader every 0.1s."""
+        # Stop any old thread cleanly without resetting _turn_in_progress
+        old = self._timer_thread
+        self._timer_thread = None
+        if old is not None and old.is_alive():
+            old.join(timeout=0.5)
+        self._timer_thread = threading.Thread(target=self._timer_worker, daemon=True)
+        self._timer_thread.start()
+
+    def _stop_timer(self) -> None:
+        """Stop the timer thread."""
+        # The timer thread checks self._turn_in_progress to exit
+        # Note: don't set False here; caller (finally) sets it after freeze
+        if self._timer_thread is not None:
+            self._timer_thread.join(timeout=1.0)
+            self._timer_thread = None
+
+    def _timer_worker(self) -> None:
+        """Worker thread: updates status bar with elapsed time every 0.1s."""
+        while self._turn_in_progress and not (getattr(getattr(self, "adapter", None), "_cancelled", False) or False):
+            turn_start = getattr(self, "_turn_start_time", None)
+            if turn_start is not None:
+                elapsed = time.time() - turn_start
+                elapsed_str = f"⏳ {elapsed:.1f}s"
+                try:
+                    self.call_from_thread(
+                        lambda e=elapsed_str: self._update_status(working=True, loader=e)
+                    )
+                except Exception:
+                    pass
+            time.sleep(0.1)
+
+    def _update_streaming_widget(self, text: str) -> None:
+        """Update or create the streaming message widget (single block, append mode)."""
+        w = getattr(self, "_streaming_widget", None)
+        if w is not None and getattr(w, "parent", None) is not None:
+            w.update(text[:1000])  # already cumulative
+            return
+        # Mount at bottom before loader
+        msg_container = self.query_one("#msg-container", Vertical)
+        loader = getattr(self, "_loader_widget", None)
+        w = Static(text[:1000], classes="msg msg-agent", markup=False)
+        self._streaming_widget = w
+        if loader is not None and getattr(loader, "parent", None) is not None:
+            msg_container.mount(w, before=loader)
+        else:
+            msg_container.mount(w)
+        self._scroll_after_layout()
+
+    # def _clear_loader(self) -> None:
+    #     """Remove loader widget completely after turn completes."""
+    #     loader = getattr(self, "_loader_widget", None)
+    #     if loader is not None:
+    #         try:
+    #             if getattr(loader, "parent", None) is not None:
+    #                 loader.remove()
+    #         except Exception:
+    #             pass
+    #     self._loader_widget = None
+
     async def action_cancel(self) -> None:
-        """Cancel current agent turn (ESC) — sets adapter flag; loop can check."""
+        """Cancel current agent turn (ESC) — sets adapter event; loop can check."""
         self.adapter._cancelled = True
-        # Also show in status bar
-        self.call_from_thread(lambda: self._update_status(working=False, loader="⏹ Cancelled"))
+        self.adapter._cancel_event.set()
+        self._update_status(working=False, loader="⏹ Cancelled")
         self._append("Cancelled by user (ESC).", msg_type="system")
 
     async def action_quit(self) -> None:
@@ -560,9 +714,12 @@ class DostuffTUI(App):
         except Exception as e:
             self._append(f"Save error: {e}")
         finally:
-            # 4. MCP cleanup with strict timeout
+            # 4. MCP cleanup with strict timeout (suppress anyio cross-task errors on shutdown)
             try:
                 await asyncio.wait_for(self.mcp_client.cleanup(), timeout=3.0)
+            except (ValueError, RuntimeError, BaseExceptionGroup):
+                # anyio cancel-scope + Python 3.14 cross-loop issue in mcp/streamable_http_client
+                pass
             except Exception:
                 pass
             # 5. Force-stop any lingering litellm logging workers (background threads)
@@ -591,10 +748,13 @@ class DostuffTUI(App):
             "tool": "msg msg-tool",
             "tool-result": "msg msg-tool-result",
         }.get(msg_type, "msg msg-agent")
-        msg = Static(line, classes=css_class, markup=False)
+        if msg_type in ("agent", "user") and isinstance(line, str) and line:
+            msg = Static(RichMarkdown(line), classes=css_class, markup=False)
+        else:
+            msg = Static(str(line) if line else "", classes=css_class, markup=False)
         # Mount before loader (so loader stays at bottom of stream)
         loader = getattr(self, "_loader_widget", None)
-        if loader is not None and loader.is_mounted:
+        if loader is not None and loader.is_mounted and loader.parent is msg_container:
             msg_container.mount(msg, before=loader)
         else:
             msg_container.mount(msg)
@@ -634,32 +794,41 @@ class DostuffTUI(App):
                     url=cfg.get("url"),
                     headers=cfg.get("headers"),
                 )
-                self._call_from_thread(lambda n=name: self._append(f"  ✓ {n}", msg_type="system"))
+                self._call_from_thread(lambda n=name: self._append(f"✓ {n}", msg_type="system"))
             except Exception as e:
                 self._call_from_thread(lambda n=name, err=str(e): self._append(f"  ✗ {n}: {err}", msg_type="error"))
         self._call_from_thread(lambda: self._append(f"MCP ready ({len(self.mcp_client.servers)} server(s)).", msg_type="system"))
 
     def _update_token_display(self, working: bool = False, loader: str = "") -> None:
         """Update the status bar with cumulative session tokens (and optional loader)."""
-        def _fmt(n: int) -> str:
-            if n < 1000:
-                return str(n)
-            if n < 1_000_000:
-                return f"{n/1000:.1f}k"
-            return f"{n/1_000_000:.1f}M"
         su = self.adapter._session_usage
-        p, c = _fmt(su.get("prompt_tokens", 0)), _fmt(su.get("completion_tokens", 0))
+        p, c = self._fmt_tokens(su.get("prompt_tokens", 0)), self._fmt_tokens(su.get("completion_tokens", 0))
         is_resumed = self._is_resumed
         cwd_str = os.getcwd()
         cwd_display = cwd_str if len(cwd_str) < 36 else "..." + cwd_str[-33:]
         sid_short = self.session_id[:8]
         loader_str = f"  •  {loader}" if (working and loader) else ""
-        status_str = f"📁 {cwd_display}  •  sess: {sid_short}  •  {'resumed' if is_resumed else 'new'}  •  ↑{p} ↓{c}{loader_str}"
+        # Only show token counts if non-zero (streamed turns may not report usage yet)
+        token_str = f"  ↑{p} ↓{c}" if (p or c) else ""
+        status_str = f"📁 {cwd_display}  •  sess: {sid_short}  •  {token_str}{loader_str}"
         self.query_one("#status", Static).update(status_str)
 
     def _update_status(self, is_resumed: bool = False, working: bool = False, loader: str = "") -> None:
         self._is_resumed = is_resumed
+        # Queue depth indicator in status bar
+        queue_text = f"📥 {len(self._prompt_queue)} queued" if self._prompt_queue else ""
+        if loader and queue_text:
+            loader = f"{loader}  {queue_text}"
+        elif queue_text:
+            loader = queue_text
         self._update_token_display(working=working, loader=loader)
+
+    def _fmt_tokens(self, n: int) -> str:
+        if n < 1000:
+            return str(n)
+        if n < 1_000_000:
+            return f"{n/1000:.1f}k"
+        return f"{n/1_000_000:.1f}M"
 
     def _call_from_thread(self, fn) -> None:
         """Schedule fn on the main Textual event loop. Safe if already on main thread."""
@@ -685,6 +854,4 @@ class DostuffTUI(App):
 
     
     
-
-   
 

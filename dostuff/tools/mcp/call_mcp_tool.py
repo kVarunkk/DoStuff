@@ -31,6 +31,21 @@ async def _impl_call_mcp_tool(
     if name not in mcp_client.mcp_tools:
         raise KeyError(f"Tool '{name}' not found across any connected MCP servers.")
 
+    # Some LLMs (via litellm) pass arguments as a JSON-encoded string instead of a dict.
+    # Parse it to dict to satisfy MCP server's pydantic validation.
+    if isinstance(arguments, str):
+        import json
+        try:
+            arguments = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            raise TypeError(
+                f"Tool '{name}' received arguments as a string that is not valid JSON: {arguments!r}"
+            )
+    if not isinstance(arguments, dict):
+        raise TypeError(
+            f"Tool '{name}' arguments must be a dict, got {type(arguments).__name__}"
+        )
+
     server_name = mcp_client.mcp_tools[name]["server_name"]
     session = mcp_client.servers[server_name]
     server_info = mcp_client.server_meta.get(server_name, {})

@@ -5,7 +5,7 @@ from litellm import acompletion
 from dostuff.lib.model import MODEL
 
 @traced("model_call")
-async def call_agent(steps_history: list, system_instruction: str, tool_names: list[str] | None = None):
+async def call_agent(steps_history: list, system_instruction: str, tool_names: list[str] | None = None, stream: bool = False):
     if tool_names is None:
         tool_names = list(TOOL_SCHEMAS.keys())
 
@@ -15,7 +15,19 @@ async def call_agent(steps_history: list, system_instruction: str, tool_names: l
         if name in TOOL_SCHEMAS
     ]
 
-    messages = [{"role": "system", "content": system_instruction}] + steps_history    
+    messages = [{"role": "system", "content": system_instruction}] + steps_history
+
+    if stream:
+        # Await the coroutine to get the async iterator (CustomStreamWrapper)
+        return await acompletion(
+            model=MODEL,
+            messages=messages,
+            tools=active_schemas,
+            drop_invalid_params=True,
+            stream=True,
+            stream_options={"include_usage": True},
+            thinking_config={"include_thoughts": True},
+        )
 
     async def _make_request():
         return await acompletion(

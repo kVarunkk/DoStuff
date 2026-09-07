@@ -26,13 +26,29 @@ async def extract_memories(steps_history: list[dict]) -> list[dict]:
     conversation_text = format_transcript(steps_history, type="memory_update")
     prompt = EXTRACTION_PROMPT.format(conversation=conversation_text)
 
-    response = await acompletion(
-        model=MODEL,
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        response_format=SessionSemanticMemoriesExtraction
-    )
+    # 3 retries on failure (matches main loop pattern)
+    response = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = await acompletion(
+                model=MODEL,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                response_format=SessionSemanticMemoriesExtraction
+            )
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                from dostuff.helpers.ui.emit import emit
+                emit(f"Memory extraction retrying... ({attempt+1}/3) — {e}", msg_type="system")
+            continue
+    if response is None:
+        from dostuff.helpers.ui.emit import emit
+        emit(f"Memory extraction failed after 3 retries: {last_err}", msg_type="error")
+        return []
 
     if isinstance(response, ModelResponse):
         raw_json_string = response.choices[0].message.content or ""

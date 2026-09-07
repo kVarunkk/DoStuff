@@ -34,13 +34,27 @@ async def extract_episodes(
     prompt = EPISODIC_EXTRACTION_PROMPT.format(conversation=conversation_text)
 
     try:
-        response = await acompletion(
-            model=MODEL,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            response_format=SessionEpisodicExtraction, 
-        )
+        # 3 retries on failure (matches main loop pattern)
+        response = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                response = await acompletion(
+                    model=MODEL,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ],
+                    response_format=SessionEpisodicExtraction,
+                )
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    emit(f"Episodic extraction retrying... ({attempt+1}/3) — {e}", msg_type="system")
+                continue
+        if response is None:
+            emit(f"Episodic extraction failed after 3 retries: {last_err}", msg_type="error")
+            return []
 
         if isinstance(response, ModelResponse):
             raw_json_string = response.choices[0].message.content or ""
@@ -48,8 +62,24 @@ async def extract_episodes(
             raw_json_string = ""    
 
         cleaned = raw_json_string.strip().removeprefix("```json").removesuffix("```").strip()
-        extracted_data = SessionEpisodicExtraction.model_validate_json(cleaned)
-        data = extracted_data.model_dump()
+        # Handle empty array case ("[]") which the LLM returns when no episodes.
+        # SessionEpisodicExtraction expects an object {"episodes": [...]}, not a bare array.
+        if cleaned in ("[]", ""):
+            return []
+        try:
+            extracted_data = SessionEpisodicExtraction.model_validate_json(cleaned)
+            data = extracted_data.model_dump()
+        except Exception:
+            # If the LLM returned a bare array (e.g. [{"event_type": ...}, ...]), wrap it.
+            try:
+                wrapped = json.loads(cleaned)
+                if isinstance(wrapped, list):
+                    extracted_data = SessionEpisodicExtraction(episodes=wrapped)
+                    data = extracted_data.model_dump()
+                else:
+                    raise
+            except Exception:
+                raise
 
         if isinstance(data, dict):
             episodes = data.get("episodes", [])

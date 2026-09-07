@@ -12,6 +12,7 @@ from dostuff.helpers.agent.append_step import append_step
 import asyncio
 from dostuff.agent.run_tool import run_tool
 import json
+from dostuff.helpers.agent.consume_stream import consume_stream as _consume_stream
 
 async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient,  working_history: list,   turn_type: Literal['interactive_loop', 'learning_loop', 'subagent_loop'], current_session_history: list = [], steps_history: list = [],  store: SessionStore | None = None, adapter: Optional[Any] = None) -> str:
 
@@ -46,17 +47,26 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     with tracer.start_as_current_span("context_compaction") as compaction_span:
                         compaction_span.set_attribute("steps_after", len(working_history))
                 
-                # Check for user cancel via ESC
-                if adapter and hasattr(adapter, "_cancelled") and adapter._cancelled:
-                    await _emit("system", "Turn cancelled by user (ESC).")
-                    return "Cancelled by user (ESC)."
+                # Check for user cancel via ESC (event-based, thread-safe)
+                if adapter and hasattr(adapter, "_cancel_event"):
+                    if adapter._cancel_event.is_set() or adapter._cancelled:
+                        adapter._cancelled = False
+                        adapter._cancel_event.clear()
+                        await _emit("system", "Turn cancelled by user (ESC).")
+                        return "Cancelled by user (ESC)."
 
                 # agent call — with 3 retries on failure
                 interaction = None
                 last_err = None
                 for attempt in range(3):
                     try:
-                        interaction = await call_agent(steps_history=working_history, system_instruction=dynamic_system_instruction + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else ""))
+                        interaction = await call_agent(
+                            steps_history=working_history,
+                            system_instruction=dynamic_system_instruction + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else ""),
+                            stream=bool(adapter and hasattr(adapter, "stream_token")),
+                        )
+                        if hasattr(interaction, "__aiter__"):
+                            interaction = await _consume_stream(interaction, adapter, _emit)
                         break
                     except Exception as e:
                         last_err = e
@@ -66,6 +76,14 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 if interaction is None:
                     await _emit("error", f"Agent call failed after 3 retries: {last_err}")
                     return f"Failed after 3 attempts: {last_err}"
+
+                # Re-check cancel after call_agent returns (ESC may have fired during the call)
+                if adapter and hasattr(adapter, "_cancel_event"):
+                    if adapter._cancel_event.is_set() or adapter._cancelled:
+                        adapter._cancelled = False
+                        adapter._cancel_event.clear()
+                        await _emit("system", "Turn cancelled by user (ESC).")
+                        return "Cancelled by user (ESC)."
 
                 # token tracking
                 usage = getattr(interaction, "usage", None)
@@ -132,6 +150,14 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     ) for fn_name, fn_args, _ in function_calls),
                     return_exceptions=True,
                 )
+
+                # Check cancel after tool execution (ESC may have fired during tool calls)
+                if adapter and hasattr(adapter, "_cancel_event"):
+                    if adapter._cancel_event.is_set() or adapter._cancelled:
+                        adapter._cancelled = False
+                        adapter._cancel_event.clear()
+                        await _emit("system", "Turn cancelled by user (ESC).")
+                        return "Cancelled by user (ESC)."
                 final_results = []
                 for (fn_name, fn_args, fn_id), result in zip(function_calls, results):
                     if isinstance(result, ConfirmationRequired):

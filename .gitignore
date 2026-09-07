@@ -31,3 +31,4 @@ temp_check
 venv*
 .mypy_cache/
 FUTURE.md
+.vscode
