@@ -1,5 +1,7 @@
 from dostuff.lib.exceptions import ConfirmationRequired
 from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path
+import difflib
+from pathlib import Path
 
 def write_file(path: str, content: str, overwrite: bool = False) -> str:
     """Writes content to a file inside the project directory. Creates the file
@@ -26,6 +28,56 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
         )
 
     safe_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Compute diff if file existed (before overwrite/write)
+    diff_text = ""
+    previous_content = ""
+    if safe_path.is_file():
+        previous_content = safe_path.read_text(encoding="utf-8")
+    else:
+        previous_content = ""  # new file
+
     safe_path.write_text(content, encoding="utf-8")
 
-    return f"File written successfully: {path}"
+    if previous_content != content:
+        diff_lines = list(difflib.unified_diff(
+            previous_content.splitlines(keepends=True),
+            content.splitlines(keepends=True),
+            fromfile=path,
+            tofile=path,
+        ))
+        diff_text = "".join(diff_lines)
+        if not diff_text:
+            diff_text = f"(new file: +{len(content.splitlines())} lines)"
+
+    result = f"File written: {path}"
+    if diff_text:
+        added = sum(1 for line in diff_text.splitlines() if line.startswith("+"))
+        removed = sum(1 for line in diff_text.splitlines() if line.startswith("-"))
+        # Pi-style edit format with original line numbers and dark backgrounds
+        colored_lines = []
+        old_line = new_line = 0
+        for ln in diff_text.splitlines(keepends=True):
+            s = ln.rstrip("\n")
+            if s.startswith("@@"):
+                parts = s.split()
+                try:
+                    old_line = int(parts[1].split(",")[0].lstrip("-"))
+                    new_line = int(parts[2].split(",")[0].lstrip("+"))
+                except Exception:
+                    pass
+                continue
+            if s.startswith("---") or s.startswith("+++"):
+                continue
+            if ln.startswith("-") and not s.startswith("---"):
+                colored_lines.append(f" {old_line:>3}    \033[41m{s}\033[0m\n")
+                old_line += 1
+            elif ln.startswith("+") and not s.startswith("+++"):
+                colored_lines.append(f" {new_line:>3}    \033[42m{s}\033[0m\n")
+                new_line += 1
+            else:
+                colored_lines.append(f" {old_line:>3}    {s}\n")
+                old_line += 1; new_line += 1
+        colored_diff = "".join(colored_lines)
+        result += f" (Δ +{added} / -{removed} lines)\n{colored_diff}"
+    return result

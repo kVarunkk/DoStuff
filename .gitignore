@@ -32,3 +32,4 @@ venv*
 .mypy_cache/
 FUTURE.md
 .vscode
+random_file.txt

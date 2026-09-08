@@ -50,9 +50,14 @@ def init():
 # mcp:
 #   config_path: "mcp_config.json"  # project-specific MCP servers
 
-# model:
-#   name: "openai/gpt-4o-mini"  # litellm format
-#   api_key_env: "OPENAI_API_KEY"  # env var with key (never put key in YAML)
+# models (multi-model support; active selects which to use; env MODEL overrides):
+# models:
+#   - name: "gemini/gemini-3.1-flash-lite-preview"
+#     provider: "gemini"
+#     active: true
+#   - name: "openrouter/openrouter/free"
+#     provider: "openrouter"
+#     active: false
 
 # tracing:
 #   enabled: false

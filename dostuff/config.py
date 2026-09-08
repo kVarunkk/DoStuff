@@ -19,16 +19,48 @@ class Config:
         self.mcp_path = Path((self.raw.get("mcp", {}) or {}).get("config_path", str(Path.home() / ".dostuff" / "mcp_config.json")))
         # Model / provider selection (env overrides YAML for secrets)
         # Litellm format: model.name can be "provider/model" (e.g. gemini/gemini-3.1-flash-lite)
-        m = self.raw.get("model", {}) or {}
-        _name_raw = m.get("name", "")
-        if "/" in _name_raw:
-            self.provider = os.environ.get("MODEL_PROVIDER") or _name_raw.split("/")[0] or "openai"
-            self.model_name = os.environ.get("MODEL") or _name_raw or "openai/gpt-4o-mini"
+        # Model selection: YAML supports `models` list or legacy `model` dict.
+        # Env MODEL overrides YAML; pick first entry with active: true.
+        active_provider = ""
+        raw_models = self.raw.get("models", [])
+        active_model_name = None
+        if isinstance(raw_models, list):
+            for entry in raw_models:
+                if isinstance(entry, dict) and entry.get("active") is True:
+                    active_model_name = entry.get("name", "")
+                    active_provider = entry.get("provider", "")
+                    break
+        # Fallback: legacy single model block
+        if not active_model_name:
+            m = self.raw.get("model", {}) or {}
+            active_model_name = m.get("name", "") if isinstance(m, dict) else ""
+        # Env override
+        env_model = os.environ.get("MODEL", "")
+        final_model = env_model or active_model_name or "openai/gpt-4o-mini"
+        # Derive provider/model (entry-level provider overrides bare names)
+        if "/" in final_model:
+            self.provider = active_provider or final_model.split("/")[0] or "openai"
+            self.model_name = final_model
         else:
-            self.provider = os.environ.get("MODEL_PROVIDER") or m.get("provider", "openai")
-            self.model_name = os.environ.get("MODEL") or _name_raw or "gpt-4o-mini"
+            # Derive provider from entry-level provider, or infer from name prefix
+            _name = final_model or active_model_name
+            prov_candidates = [active_provider] if active_provider else []
+            # Try provider from entry dict explicitly
+            if isinstance(raw_models, list) and active_model_name:
+                for entry in raw_models:
+                    if isinstance(entry, dict) and entry.get("name") == active_model_name:
+                        prov_candidates.insert(0, entry.get("provider", ""))
+                        break
+            # Infer known prefixes
+            for prefix in ("gemini", "anthropic", "openai", "groq", "mistral", "openrouter", "ollama"):
+                if _name.startswith(prefix) or f"/{prefix}" in _name or f"{prefix}/" in _name:
+                    prov_candidates.append(prefix)
+                    break
+            derived_provider = next((p for p in prov_candidates if p), "openai")
+            self.provider = derived_provider
+            self.model_name = f"{derived_provider}/{_name}" if not ("/" in _name) else f"{derived_provider}/{_name}"
         # API key loaded from .env (not YAML) — see setup instructions
-        self.api_key_env = m.get("api_key_env", self.provider.upper() + "_API_KEY")
+        self.api_key_env = (self.raw.get("model", {}) or {}).get("api_key_env", self.provider.upper() + "_API_KEY")
         # Tracing config (env vars override config.yaml)
         t = self.raw.get("tracing", {}) or {}
         self.tracing_enabled = (
