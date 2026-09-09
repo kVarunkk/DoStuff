@@ -30,7 +30,6 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
     safe_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Compute diff if file existed (before overwrite/write)
-    diff_text = ""
     previous_content = ""
     if safe_path.is_file():
         previous_content = safe_path.read_text(encoding="utf-8")
@@ -39,6 +38,7 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
 
     safe_path.write_text(content, encoding="utf-8")
 
+    diff_lines = []
     if previous_content != content:
         diff_lines = list(difflib.unified_diff(
             previous_content.splitlines(keepends=True),
@@ -46,18 +46,15 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
             fromfile=path,
             tofile=path,
         ))
-        diff_text = "".join(diff_lines)
-        if not diff_text:
-            diff_text = f"(new file: +{len(content.splitlines())} lines)"
 
     result = f"File written: {path}"
-    if diff_text:
-        added = sum(1 for line in diff_text.splitlines() if line.startswith("+"))
-        removed = sum(1 for line in diff_text.splitlines() if line.startswith("-"))
-        # Pi-style edit format with original line numbers and dark backgrounds
+    if diff_lines:
+        added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
+
         colored_lines = []
         old_line = new_line = 0
-        for ln in diff_text.splitlines(keepends=True):
+        for ln in diff_lines:                    
             s = ln.rstrip("\n")
             if s.startswith("@@"):
                 parts = s.split()
@@ -69,15 +66,18 @@ def write_file(path: str, content: str, overwrite: bool = False) -> str:
                 continue
             if s.startswith("---") or s.startswith("+++"):
                 continue
-            if ln.startswith("-") and not s.startswith("---"):
-                colored_lines.append(f" {old_line:>3}    \033[41m{s}\033[0m\n")
+            if s.startswith("\\ No newline at end of file"):
+                continue
+            if ln.startswith("-"):
+                colored_lines.append(f"  {old_line:>3}    \033[48;5;52m{s}\033[0m")
                 old_line += 1
-            elif ln.startswith("+") and not s.startswith("+++"):
-                colored_lines.append(f" {new_line:>3}    \033[42m{s}\033[0m\n")
+            elif ln.startswith("+"):
+                colored_lines.append(f"  {new_line:>3}    \033[48;5;22m{s}\033[0m")
                 new_line += 1
             else:
-                colored_lines.append(f" {old_line:>3}    {s}\n")
-                old_line += 1; new_line += 1
-        colored_diff = "".join(colored_lines)
+                colored_lines.append(f"  {new_line:>3}    {s}")
+                old_line += 1
+                new_line += 1
+        colored_diff = "\n".join(colored_lines)
         result += f" (Δ +{added} / -{removed} lines)\n{colored_diff}"
     return result
