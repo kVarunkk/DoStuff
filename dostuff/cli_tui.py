@@ -83,6 +83,8 @@ class TuiAdapter:
         self._streaming_widget: Static | None = None
         self._streamed_text: str = ""  # accumulated streaming text for current turn
         self.stream_token = True  # supports streaming text
+        self._last_context_window_percent = ""
+        self._token_display = ""
     # ── Called by loop() ───────────────────────────────────────────────────────
 
     def emit(self, event_type: str, data) -> None:
@@ -90,7 +92,28 @@ class TuiAdapter:
             self._last_turn_usage = data
             for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
                 self._session_usage[k] = self._session_usage.get(k, 0) + (data.get(k) or 0)
-            self._app.call_from_thread(self._app._update_token_display)
+            su = self._session_usage
+            p_str = self._app._fmt_tokens(su.get("prompt_tokens", 0)) if hasattr(self._app, "_fmt_tokens") else str(su.get("prompt_tokens", 0))
+            c_str = self._app._fmt_tokens(su.get("completion_tokens", 0)) if hasattr(self._app, "_fmt_tokens") else str(su.get("completion_tokens", 0))
+            new_display = f" ↑{p_str} ↓{c_str}" if (su.get("prompt_tokens", 0) or su.get("completion_tokens", 0)) else self._token_display
+            self._token_display = new_display
+            self._app.call_from_thread(
+                lambda cp=self._last_context_window_percent, tc=self._token_display: self._app._update_token_display(context_window_percent=cp, token_counts=tc)
+            )
+            return
+        if event_type == "status" and isinstance(data, dict):
+            # Context window percentage update
+            percent_str_raw = data.get("context_window_percent", "")
+            limit_raw = data.get("token_limit", 0)
+            limit_str = self._app._fmt_tokens(limit_raw) if isinstance(limit_raw, int) and hasattr(self._app, "_fmt_tokens") else ""
+            if limit_str:
+                percent_display = f"{percent_str_raw}/{limit_str}"
+            else:
+                percent_display = percent_str_raw
+            self._last_context_window_percent = percent_display
+            self._app.call_from_thread(
+                lambda ps=percent_display: self._app._update_status(context_window_percent=ps)
+            )
             return
         # Map event_type to msg_type for CSS styling
         type_to_msg = {
@@ -178,7 +201,7 @@ class DostuffTUI(App):
         session_id: str,
         **kwargs,
     ):
-        print("⏳ Loading session...", flush=True)
+        print(" Loading session...", flush=True)
         super().__init__(**kwargs)
         self.session_id = session_id
         self.adapter = TuiAdapter(self)
@@ -186,19 +209,19 @@ class DostuffTUI(App):
         set_adapter(self.adapter)
 
         # Cwd already switched in cli.py before TUI launched; Config now reads from correct cwd
-        print("⏳ Loading config...", flush=True)
+        print(" Loading config...", flush=True)
         self.config = Config()
-        print("⏳ Initializing session store...", flush=True)
+        print(" Initializing session store...", flush=True)
         self.store = SQLiteSessionStore(
             db_path=str(self.config.get_data_dir() / "sessions.db")
         )
 
         self._is_resumed = False
         persist_path = str(self.config.get_data_dir() / "chroma")
-        print("⏳ Initializing memory stores...", flush=True)
+        print(" Initializing memory stores...", flush=True)
         self.memory_store = SemanticMemoryStore(persist_path=persist_path)
         self.episodic_store = EpisodicMemoryStore(persist_path=persist_path)
-        print("⏳ Initializing MCP client...", flush=True)
+        print(" Initializing MCP client...", flush=True)
         self.reg_store = MCPClientRegistrationStore(
             path=str(self.config.get_data_dir() / "mcp_client_registrations.json")
         )
@@ -265,6 +288,22 @@ class DostuffTUI(App):
         existing_meta = await self.store.get_session_meta(self.session_id)
         wd_to_save = str(Path.cwd())
         await self.store.save_session_meta(self.session_id, wd_to_save)
+        # Initialize token tracking from session meta
+        total_from_meta = (existing_meta.get("total_tokens") or 0) if existing_meta else 0
+        self.adapter._session_usage["total_tokens"] = total_from_meta
+        meta_p = (existing_meta.get("prompt_tokens") or 0) if existing_meta else 0
+        meta_c = (existing_meta.get("completion_tokens") or 0) if existing_meta else 0
+        self.adapter._session_usage["prompt_tokens"] = meta_p
+        self.adapter._session_usage["completion_tokens"] = meta_c
+        self.adapter._token_display = f" ↑{self._fmt_tokens(meta_p)} ↓{self._fmt_tokens(meta_c)}" or " ↑0 ↓0"
+        from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
+        token_limit = get_model_token_limit()
+        percent = (total_from_meta / token_limit * 100) if token_limit > 0 else 0
+        percent_str = f"{percent:.1f}%"
+        limit_str = self._fmt_tokens(token_limit) if token_limit else ""
+        self.adapter._last_context_window_percent = f"{percent_str}/{limit_str}" if limit_str else percent_str
+        # Direct status update — on_mount is already main thread
+        self._update_status(context_window_percent=self.adapter._last_context_window_percent)
 
         # Product branding header
         self._append(
@@ -283,7 +322,7 @@ class DostuffTUI(App):
         self._append("", msg_type="spacer")
 
         if existing_meta:
-            self._append(f"▶ Resumed session '{self.session_id}' ({len(self.steps_history)} step(s)).")
+            self._append(f" Resumed session '{self.session_id}' ({len(self.steps_history)} step(s)).")
             # Render previous steps to Messages (3.1) — preserve tool role with green bg
             for step in self.steps_history:
                 role = step.get("role", "?")
@@ -309,7 +348,7 @@ class DostuffTUI(App):
                 if content:
                     self._append(content, msg_type=mt)
         else:
-            self._append(f"▶ New session '{self.session_id}'.")
+            self._append(f" New session '{self.session_id}'.")
 
         # Skills loaded (announced like MCP servers)
         skills = discover_skills()
@@ -396,8 +435,8 @@ class DostuffTUI(App):
         else:
             # Queue the prompt — user sees no new message until turn ends
             self._prompt_queue.append(text)
-            self._update_status(working=True, loader="Queued")
-            self._append(f"✓ Queued — will run after current turn (position {len(self._prompt_queue)})", msg_type="system")
+            self._update_status(working=True, loader="Queued", context_window_percent=self.adapter._last_context_window_percent)
+            self._append(f" Queued — will run after current turn (position {len(self._prompt_queue)})", msg_type="system")
 
     # ── One agent turn (same pre/post logic as run_agent()) ────────────────────
 
@@ -508,7 +547,7 @@ class DostuffTUI(App):
                 final_elapsed = time.time() - self._turn_start_time
             self._turn_start_time = None
             self._turn_in_progress = False
-            self.call_from_thread(lambda e=final_elapsed: self._update_status(working=False, loader=f"⏹  {e:.1f}s" if e > 0 else ""))
+            self.call_from_thread(lambda e=final_elapsed, cp=self.adapter._last_context_window_percent: self._update_status(working=False, loader=f" {e:.1f}s" if e > 0 else "", context_window_percent=cp))
             self._call_from_thread(lambda: self._stop_loader(loader_widget))
             # Defensive stream cleanup via thread
             def _cleanup_stream():
@@ -535,10 +574,10 @@ class DostuffTUI(App):
         queue_depth = len(self._prompt_queue)
         if queue_depth > 0:
             self._call_from_thread(
-                lambda q=queue_depth: self._append(f"📥 {q} queued", msg_type="system")
+                lambda q=queue_depth: self._append(f" {q} queued", msg_type="system")
             )
         # Keep visible queue indicator in status bar (show remaining depth)
-        self._update_status(working=True, loader="Queued")
+        self._update_status(working=True, loader="Queued", context_window_percent=self.adapter._last_context_window_percent)
         self._turn_in_progress = True
         self._pending_workers.append(self.run_worker(
             self._run_turn(next_text),
@@ -603,10 +642,10 @@ class DostuffTUI(App):
             turn_start = getattr(self, "_turn_start_time", None)
             if turn_start is not None:
                 elapsed = time.time() - turn_start
-                elapsed_str = f"⏳ {elapsed:.1f}s"
+                elapsed_str = f" {elapsed:.1f}s"
                 try:
                     self.call_from_thread(
-                        lambda e=elapsed_str: self._update_status(working=True, loader=e)
+                        lambda e=elapsed_str, cp=self.adapter._last_context_window_percent: self._update_status(working=True, loader=e, context_window_percent=cp)
                     )
                 except Exception:
                     pass
@@ -633,7 +672,7 @@ class DostuffTUI(App):
         """Cancel current agent turn (ESC) — sets adapter event; loop can check."""
         self.adapter._cancelled = True
         self.adapter._cancel_event.set()
-        self._update_status(working=False, loader="⏹ Cancelled")
+        self._update_status(working=False, loader=" Cancelled")
         self._append("Cancelled by user (ESC).", msg_type="system")
 
     async def action_quit(self) -> None:
@@ -754,7 +793,7 @@ class DostuffTUI(App):
 
     async def _connect_mcp_servers(self, mcp_servers: dict) -> None:
         """Background MCP connection so TUI never blanks."""
-        self._append("  ⏳ connecting...", msg_type="system")
+        self._append("   connecting...", msg_type="system")
         for name, cfg in mcp_servers.items():
             transport = cfg.get("transport", "stdio")
             try:
@@ -767,37 +806,38 @@ class DostuffTUI(App):
                     url=cfg.get("url"),
                     headers=cfg.get("headers"),
                 )
-                self._call_from_thread(lambda n=name: self._append(f"✓ {n}", msg_type="system"))
+                self._call_from_thread(lambda n=name: self._append(f" {n}", msg_type="system"))
             except Exception as e:
-                self._call_from_thread(lambda n=name, err=str(e): self._append(f"  ✗ {n}: {err}", msg_type="error"))
+                self._call_from_thread(lambda n=name, err=str(e): self._append(f"   {n}: {err}", msg_type="error"))
         self._call_from_thread(lambda: self._append(f"MCP ready ({len(self.mcp_client.servers)} server(s)).", msg_type="system"))
 
-    def _update_token_display(self, working: bool = False, loader: str = "") -> None:
+    def _update_token_display(self, working: bool = False, loader: str = "", context_window_percent: str = "") -> None:
         """Update the status bar with cumulative session tokens (and optional loader)."""
-        su = self.adapter._session_usage
-        p, c = self._fmt_tokens(su.get("prompt_tokens", 0)), self._fmt_tokens(su.get("completion_tokens", 0))
-        is_resumed = self._is_resumed
+        loader_str = f"{loader}" if loader else "0.0s "
         cwd_str = os.getcwd()
         cwd_display = cwd_str.replace(str(Path.home()), "~")
         cwd_display = cwd_display if len(cwd_display) < 36 else "..." + cwd_display[-33:]
-        sid_short = self.session_id[:8]
-        loader_str = f"  •  {loader}" if loader else ""
-        # Only show token counts if non-zero (streamed turns may not report usage yet)
-        token_str = f" ↑{p} ↓{c}" if (p or c) else ""
+        sid = self.session_id
+        # Token counts: adapter-managed state, same lifecycle as percent
+        token_str = getattr(self.adapter, '_token_display', '') or " ↑0 ↓0"
+    
+        if context_window_percent:
+            self.adapter._last_context_window_percent = context_window_percent
+        display_percent = context_window_percent or self.adapter._last_context_window_percent
+    
         from dostuff.lib.model import MODEL as ACTIVE_MODEL
-        status_str = f"📁 {cwd_display}  •  sess: {sid_short}  •  {ACTIVE_MODEL}  •  {token_str}{loader_str}"
+        status_str = f"{cwd_display}  {sid}  {ACTIVE_MODEL}  {token_str}  {display_percent}  {loader_str} "
         self.query_one("#status", Static).update(status_str)
 
-    def _update_status(self, is_resumed: bool = False, working: bool = False, loader: str = "") -> None:
+    def _update_status(self, is_resumed: bool = False, working: bool = False, loader: str = "", context_window_percent: str = "") -> None:
         self._is_resumed = is_resumed
-        # Queue depth indicator in status bar
-        queue_text = f"📥 {len(self._prompt_queue)} queued" if self._prompt_queue else ""
+        queue_text = f" {len(self._prompt_queue)} queued" if self._prompt_queue else ""
         if loader and queue_text:
             loader = f"{loader}  {queue_text}"
         elif queue_text:
             loader = queue_text
-        self._update_token_display(working=working, loader=loader)
-
+        self._update_token_display(working=working, loader=loader, context_window_percent=context_window_percent)
+    
     def _fmt_tokens(self, n: int) -> str:
         if n < 1000:
             return str(n)

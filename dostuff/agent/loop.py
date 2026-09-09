@@ -31,6 +31,11 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     compaction_notes = ""
     current_session_history = current_session_history if current_session_history is not None else []
     steps_history = steps_history if steps_history is not None else []
+    
+    # Track total tokens per session for window percentage
+    session_total_tokens = adapter._session_usage.get("total_tokens", 0) if adapter else 0
+    session_prompt_tokens = adapter._session_usage.get("prompt_tokens", 0) if adapter else 0
+    session_completion_tokens = adapter._session_usage.get("completion_tokens", 0) if adapter else 0
 
     with tracer.start_as_current_span("turn") as turn_span:
         turn_span.set_attribute("session_id", session_id)
@@ -130,6 +135,13 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     
                 if usage_dict:
                     await _emit("usage", usage_dict)
+                    session_total_tokens += usage_dict.get("total_tokens", 0)
+                    session_prompt_tokens += usage_dict.get("prompt_tokens", 0)
+                    session_completion_tokens += usage_dict.get("completion_tokens", 0)
+                    if store is not None and hasattr(store, "update_session_tokens"):
+                        await store.update_session_tokens(session_id, session_total_tokens, session_prompt_tokens, session_completion_tokens)
+                    percent = (session_total_tokens / token_limit * 100) if token_limit > 0 else 0
+                    await _emit("status", {"context_window_percent": f"{percent:.1f}%", "token_limit": token_limit})
     
                 if not choices:
                     iter_span.set_status(Status(StatusCode.OK))

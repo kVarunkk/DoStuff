@@ -100,8 +100,15 @@ def session_list():
         if not rows:
             typer.echo("No past sessions.")
             return
-        typer.echo(f"{'SESSION':<36} | {'WORKING_DIR':<60}")
-        typer.echo("-" * 100)
-        for sid, wd in rows:
-            typer.echo(f"{sid:<36} | {str(wd):<60}")
+        typer.echo(f"{'SESSION':<36} | {'LAST_USED':<20} | {'WORKING_DIR':<60}")
+        typer.echo("-" * 125)
+        for sid, wd, last in rows:
+            from datetime import datetime
+            last_fmt = ""
+            try:
+                if last:
+                    last_fmt = datetime.fromisoformat(str(last).replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                last_fmt = str(last or "")
+            typer.echo(f"{sid:<36} | {last_fmt:<20} | {str(wd):<60}")
     asyncio.run(_run())
