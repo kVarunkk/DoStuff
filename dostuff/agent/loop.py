@@ -1,11 +1,9 @@
 from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
 from dostuff.lib.exceptions import ConfirmationRequired
 from dostuff.lib.mcp.mcp_client import MCPClient
-from dostuff.lib.memory.session_store import SessionStore
 from dostuff.lib.tracing import tracer
 from dostuff.helpers.agent.constants import MAX_ITERATIONS
 from dostuff.helpers.agent.manage_context import compact_context
-from typing import Literal, Optional, Any
 from dostuff.agent.call_agent import call_agent
 from opentelemetry.trace import Status, StatusCode
 from dostuff.helpers.agent.append_step import append_step
@@ -14,7 +12,7 @@ from dostuff.agent.run_tool import run_tool
 import json
 from dostuff.helpers.agent.consume_stream import consume_stream as _consume_stream
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient,  working_history: list,   turn_type: Literal['interactive_loop', 'learning_loop', 'subagent_loop'], current_session_history: list | None = None, steps_history: list | None = None,  store: SessionStore | None = None, adapter: Optional[Any] = None) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: ..., current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True) -> str:
 
     async def _emit(et, data):
         if adapter and hasattr(adapter, "emit"):
@@ -24,18 +22,26 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 pass
 
     iteration = 0
-    last_input_tokens = 0
     token_limit = get_model_token_limit()
     context_token_threshold = int(token_limit * 0.5)
-    keep_recent_token_budget = int(context_token_threshold * 0.15)
-    compaction_notes = ""
+    keep_recent_token_budget = min(int(token_limit * 0.15), 20000)
+    compaction_notes = compaction_notes or ""
     current_session_history = current_session_history if current_session_history is not None else []
     steps_history = steps_history if steps_history is not None else []
     
-    # Track total tokens per session for window percentage
-    session_total_tokens = adapter._session_usage.get("total_tokens", 0) if adapter else 0
-    session_prompt_tokens = adapter._session_usage.get("prompt_tokens", 0) if adapter else 0
-    session_completion_tokens = adapter._session_usage.get("completion_tokens", 0) if adapter else 0
+    # auto compaction triggers at 50% of the model's token limit and keeps at least 15%/20k tokens of the most recent steps in the working history. Rest are summarized into a compact summary appended to the system instruction. Manual compaction can be triggered with the /compact command, which will also produce a summary appended to the system instruction.
+    if last_input_tokens > context_token_threshold:
+        working_history, new_summary = await compact_context(working_history, keep_recent_token_budget)
+        compaction_notes = f"{compaction_notes}\n{new_summary}".strip() if new_summary else compaction_notes
+        with tracer.start_as_current_span("context_compaction") as compaction_span:
+            compaction_span.set_attribute("steps_after", len(working_history))
+        if store is not None and hasattr(store, "save_session_meta"):
+            try:
+                await store.save_session_meta(session_id, prompt_tokens=session_prompt_tokens, completion_tokens=session_completion_tokens, total_tokens=session_total_tokens, compaction_notes=compaction_notes, working_history=json.dumps(working_history), last_input_tokens=last_input_tokens)
+            except Exception:
+                pass
+        await _emit("system", "Auto compaction performed due to token threshold exceeded.")
+        await _emit("system", compaction_notes)
 
     with tracer.start_as_current_span("turn") as turn_span:
         turn_span.set_attribute("session_id", session_id)
@@ -47,13 +53,6 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             iteration += 1
             with tracer.start_as_current_span("iteration") as iter_span:
                 iter_span.set_attribute("iteration_number", iteration)
-    
-                # context compaction
-                if last_input_tokens > context_token_threshold:
-                    working_history, new_summary = await compact_context(working_history, keep_recent_token_budget)
-                    compaction_notes = f"{compaction_notes}\n{new_summary}".strip()
-                    with tracer.start_as_current_span("context_compaction") as compaction_span:
-                        compaction_span.set_attribute("steps_after", len(working_history))
     
                 # Check for user cancel via ESC (event-based, thread-safe)
                 if adapter and hasattr(adapter, "_cancel_event"):
@@ -73,7 +72,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         interaction, model_span = await call_agent(
                             steps_history=working_history,
                             system_instruction=dynamic_system_instruction + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else ""),
-                            stream=bool(adapter and hasattr(adapter, "stream_token")),
+                            stream=stream,
                         )
                         if hasattr(interaction, "__aiter__"):
                             interaction = await _consume_stream(interaction, adapter, _emit)
@@ -101,11 +100,6 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     
                 # token tracking
                 usage = getattr(interaction, "usage", None)
-                if usage:
-                    last_input_tokens = getattr(usage, "total_tokens", last_input_tokens)
-    
-                # CustomStreamWrapper does not expose `choices` in its static type,
-                # although the completed interaction provides it at runtime.
                 choices = getattr(interaction, "choices", None)
                 message = choices[0].message if choices else None
                 tool_calls = getattr(message, "tool_calls", None) if message else None
@@ -138,9 +132,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     session_total_tokens += usage_dict.get("total_tokens", 0)
                     session_prompt_tokens += usage_dict.get("prompt_tokens", 0)
                     session_completion_tokens += usage_dict.get("completion_tokens", 0)
+                    current_context_tokens = usage_dict.get("prompt_tokens", 0)
                     if store is not None and hasattr(store, "update_session_tokens"):
-                        await store.update_session_tokens(session_id, session_total_tokens, session_prompt_tokens, session_completion_tokens)
-                    percent = (session_total_tokens / token_limit * 100) if token_limit > 0 else 0
+                        await store.update_session_tokens(session_id, session_total_tokens, session_prompt_tokens, session_completion_tokens, current_context_tokens)
+                    percent = (current_context_tokens / token_limit * 100) if token_limit > 0 else 0
                     await _emit("status", {"context_window_percent": f"{percent:.1f}%", "token_limit": token_limit})
     
                 if not choices:

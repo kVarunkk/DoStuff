@@ -13,7 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Prompt queue during work**: `self._prompt_queue` + `_process_prompt_queue()`; queued prompts execute sequentially.
 - **Live timer (`threading.Thread`)**: Updates status bar `⏳ {elapsed}s`; loader shows `Working...` (no freeze text, no timer embedded).
 - **Loader persistence / removal**: `_freeze_final_time()` removed; loader stays mounted; messages mount `before=loader_widget`.
-- **Markdown formatting on agent/user messages**: `rich.markdown.Markdown` used for agent/user content; system/tool labels stay plain (`markup=False`) so bracket tags (`[TOOL CALL]`) remain visible.
+- **Manual `/compact` command**: `_compact_session()` loads DB truth, compacts with `0.15 * token_limit` budget (capped 20K), 60s timeout, loader, DB save (`compaction_notes` + `working_history`), and adapter sync.
+- **Context window percentage**: status bar shows `%` of context window filled from turn-level `prompt_tokens` / `token_limit`; persisted in DB via `last_input_tokens` and restored on resume.
+- **Auto compaction**: threshold set to 50% of context window; uses turn-level prompt tokens; compacts before iteration loop.
+- **Context window percentage**: status bar shows `%` of context window filled from turn-level `prompt_tokens` / `token_limit`; persisted in DB via `last_input_tokens` and restored on resume.
+- **Auto compaction**: threshold set to 50% of context window; uses turn-level prompt tokens; compacts before iteration loop.
+- **Token persistence**: DB `prompt_tokens`/`completion_tokens`/`total_tokens` saved per turn; `last_input_tokens` column added for context percentage.
+- **Session last-used time**: `sessions.last_used` updated on every `save_session_meta`; shown in `session-list`.
 
 ### Fixed
 - **Tool call accumulation in stream**: Captured `fn.name` from `fn.name` (not `arguments` fallback); `tc_key` uses `index` (primary) or `id` (fallback); instance-bound `lambda` for `model_dump()`.

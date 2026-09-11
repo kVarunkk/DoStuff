@@ -1,6 +1,7 @@
 """Real TUI for dostuff — full agent experience via textual, not skeleton."""
 import asyncio
 import copy
+import json
 import os
 import threading
 import time
@@ -14,7 +15,6 @@ from textual.binding import Binding
 from rich.text import Text
 from rich.markdown import Markdown as RichMarkdown
 from textual.events import Key
-
 from dostuff.config import Config
 from dostuff.helpers.agent.load_identity import load_identity
 from dostuff.helpers.agent.load_project_instructions import load_project_instructions
@@ -32,7 +32,11 @@ from dostuff.agent.loop import loop as agent_loop
 from dostuff.helpers.agent.append_step import append_step
 from dostuff.helpers.agent.save_memories_and_exit import save_memories_and_exit
 from dostuff.helpers.mcp.load_mcp_config import load_mcp_config
-
+from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
+from dostuff.helpers.agent.manage_context import compact_context
+from dostuff.helpers.ui.emit import set_adapter
+from dostuff.helpers.agent.constants import COMMANDS
+from dostuff.lib.model import MODEL as ACTIVE_MODEL
 
 class EnterSubmits(TextArea):
     """TextArea where Enter submits and Shift+Enter inserts a newline."""
@@ -81,14 +85,16 @@ class TuiAdapter:
         self._cancelled: bool = False
         self._cancel_event: asyncio.Event = asyncio.Event()
         self._streaming_widget: Static | None = None
-        self._streamed_text: str = ""  # accumulated streaming text for current turn
-        self.stream_token = True  # supports streaming text
+        self._streamed_text: str = "" 
         self._last_context_window_percent = ""
         self._token_display = ""
     # ── Called by loop() ───────────────────────────────────────────────────────
 
     def emit(self, event_type: str, data) -> None:
         if event_type == "usage" and isinstance(data, dict):
+            # Display-only cache for the status bar. loop() no longer reads this back —
+            # it receives its own token/session totals as explicit parameters from
+            # session_meta. Do not reintroduce a read-path from here into loop().
             self._last_turn_usage = data
             for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
                 self._session_usage[k] = self._session_usage.get(k, 0) + (data.get(k) or 0)
@@ -127,17 +133,13 @@ class TuiAdapter:
             "partial_thought": "system",
         }
         msg_type = type_to_msg.get(event_type, "agent")
-        # Pre-compute text so partial lambda captures the value safely
         text = str(data)
         if event_type == "partial":
-            # Update streaming widget in-place (no new lines)
             self._app.call_from_thread(
                 lambda t=text: self._app._update_streaming_widget(t)
             )
             return
-        # MAX = 600
-        # if len(text) > MAX:
-        #     text = text[:MAX].rstrip() + f"\n… [+{len(str(data)) - MAX} chars truncated]"
+       
         label = event_type.upper().replace("_", " ")
         self._app.call_from_thread(
             lambda: self._app._append(f"[{label}] {text}", msg_type=msg_type)
@@ -205,7 +207,6 @@ class DostuffTUI(App):
         super().__init__(**kwargs)
         self.session_id = session_id
         self.adapter = TuiAdapter(self)
-        from dostuff.helpers.ui.emit import set_adapter
         set_adapter(self.adapter)
 
         # Cwd already switched in cli.py before TUI launched; Config now reads from correct cwd
@@ -252,16 +253,19 @@ class DostuffTUI(App):
 
     # ── On ready: bootstrap session (like run() + start of run_agent()) ────────
 
+# Seed the adapter's display cache from persisted session_meta so the status
+# bar shows correct totals before the first turn runs. This is a one-time
+# UI bootstrap only — loop() never reads these fields; it receives its own
+# token totals as explicit parameters (see _run_turn) fetched fresh from
+# store each turn.
     async def on_mount(self) -> None:
         if self._setup_done:
             return
         self._setup_done = True
 
-        # Model env
         if MODEL:
             os.environ.setdefault("MODEL", MODEL)
 
-        # Skills + identity
         skills = discover_skills()
         skills_summary = "\n\n".join(
             f"- name: {s['name']}\n  description: {s['description']}\n  location: {s['location']}"
@@ -277,35 +281,42 @@ class DostuffTUI(App):
             self._system_instructions += "\n\n## Project Instructions\n" + project_instructions
         self._pending_workers: list = []  # graceful-shutdown worker tracking
 
-        # Session ID + user ID (single-user: always from Config)
         self.user_id = self.config.get_user_id()
         session_id_var.set(self.session_id)
 
-        # Load history
+        existing_meta = None
         self.steps_history = await self.store.load(self.session_id)
 
         # Save current cwd to session meta for future resumes
         existing_meta = await self.store.get_session_meta(self.session_id)
         wd_to_save = str(Path.cwd())
-        await self.store.save_session_meta(self.session_id, wd_to_save)
+        await self.store.save_session_meta(
+            self.session_id,
+            working_dir=wd_to_save,
+            prompt_tokens=(existing_meta.get("prompt_tokens") or 0) if existing_meta else 0,
+            completion_tokens=(existing_meta.get("completion_tokens") or 0) if existing_meta else 0,
+            total_tokens=(existing_meta.get("total_tokens") or 0) if existing_meta else 0,
+            compaction_notes=(existing_meta.get("compaction_notes") or "") if existing_meta else "",
+            working_history=(existing_meta.get("working_history") or "") if existing_meta else "",
+            last_input_tokens=(existing_meta.get("last_input_tokens") or 0) if existing_meta else 0,
+        )
         # Initialize token tracking from session meta
         total_from_meta = (existing_meta.get("total_tokens") or 0) if existing_meta else 0
-        self.adapter._session_usage["total_tokens"] = total_from_meta
         meta_p = (existing_meta.get("prompt_tokens") or 0) if existing_meta else 0
         meta_c = (existing_meta.get("completion_tokens") or 0) if existing_meta else 0
+        meta_last_input = (existing_meta.get("last_input_tokens") or 0) if existing_meta else 0
+        
         self.adapter._session_usage["prompt_tokens"] = meta_p
         self.adapter._session_usage["completion_tokens"] = meta_c
+        self.adapter._session_usage["total_tokens"] = total_from_meta
         self.adapter._token_display = f" ↑{self._fmt_tokens(meta_p)} ↓{self._fmt_tokens(meta_c)}" or " ↑0 ↓0"
-        from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
         token_limit = get_model_token_limit()
-        percent = (total_from_meta / token_limit * 100) if token_limit > 0 else 0
+        percent = (meta_last_input / token_limit * 100) if token_limit > 0 else 0
         percent_str = f"{percent:.1f}%"
         limit_str = self._fmt_tokens(token_limit) if token_limit else ""
-        self.adapter._last_context_window_percent = f"{percent_str}/{limit_str}" if limit_str else percent_str
-        # Direct status update — on_mount is already main thread
-        self._update_status(context_window_percent=self.adapter._last_context_window_percent)
 
-        # Product branding header
+        self._update_status(context_window_percent=f"{percent_str}/{limit_str}" if limit_str else percent_str)
+
         self._append(
             r"""
 ▓▓▓▓   ▓▓▓   ▓▓▓▓ ▓▓▓▓▓ ▓   ▓ ▓▓▓▓▓ ▓▓▓▓▓   
@@ -392,6 +403,55 @@ class DostuffTUI(App):
 
     # ── Input handler (mirrors run_agent() while loop + commands) ───────────────
 
+    async def _compact_session(self) -> None:
+        
+        try:
+            loader_widget = self._show_loader("Compacting...")
+            self._update_status(working=True, loader="Compacting")
+            # Force load from DB (truth), ignore adapter stale state
+            meta = await self.store.get_session_meta(self.session_id) if self.store else None
+            db_notes = meta.get("compaction_notes", "") if meta else ""
+            db_wh = meta.get("working_history", "") if meta else ""
+            db_prompt_tokens = (meta.get("prompt_tokens") or 0) if meta else 0
+            db_completion_tokens = (meta.get("completion_tokens") or 0) if meta else 0
+            db_total_tokens = (meta.get("total_tokens") or 0) if meta else 0
+            db_last_input_tokens = (meta.get("last_input_tokens") or 0) if meta else 0
+            if db_wh:
+                working_history = json.loads(db_wh)
+            else:
+                working_history = copy.deepcopy(self.steps_history) if hasattr(self, 'steps_history') else []
+            working = copy.deepcopy(working_history)
+            budget = min(int(get_model_token_limit() * 0.15), 20000)
+            # if len(working) > 1:
+            try:
+                working, summary = await asyncio.wait_for(compact_context(working, budget), timeout=60)
+            except asyncio.TimeoutError:
+                self._append("Compact timed out", msg_type="error")
+                summary = ""
+            if summary:
+                combined_notes = f"{db_notes}\n{summary}".strip() if db_notes else summary
+                # Compaction only shrinks working_history — token counts are
+                # preserved from session_meta, not re-derived from the adapter.
+                await self.store.save_session_meta(
+                    self.session_id,
+                    working_dir=str(Path.cwd()),
+                    prompt_tokens=db_prompt_tokens,
+                    completion_tokens=db_completion_tokens,
+                    total_tokens=db_total_tokens,
+                    compaction_notes=combined_notes,
+                    working_history=json.dumps(working),
+                    last_input_tokens=db_last_input_tokens,
+                )
+                self._append(f"Context compacted. Notes: {combined_notes}", msg_type="system")
+            else:
+                self._append("No summary produced — no compaction needed", msg_type="system")
+           
+            if loader_widget is not None:
+                self._stop_loader(loader_widget)
+            self._update_status(working=False, loader="0.0s")
+        except Exception as e:
+            self._append(f"Compact failed: {e}", msg_type="error")
+
     def on_enter_submits_submitted(self, event: EnterSubmits.Submitted | None) -> None:
         # Use event.text (captured before any clearing) so confirmation works
         text = event.text if event is not None else ""
@@ -418,8 +478,10 @@ class DostuffTUI(App):
             asyncio.create_task(self.store.save(self.session_id, []))
             self._append("History cleared.")
             return
+        if cmd == "/compact":
+            asyncio.create_task(self._compact_session())
+            return
         if cmd == "/help":
-            from dostuff.helpers.agent.constants import COMMANDS
             self._append(f"Commands: {', '.join(sorted(COMMANDS))}")
             return
 
@@ -441,12 +503,19 @@ class DostuffTUI(App):
     # ── One agent turn (same pre/post logic as run_agent()) ────────────────────
 
     async def _run_turn(self, user_text: str) -> None:
-        loader_text: str = ""
         loader_widget: Static | None = None
         try:
             turn_id = uuid.uuid4().hex
+
+            meta = await self.store.get_session_meta(self.session_id) if self.store else None
+            working_history = json.loads(meta.get("working_history", "[]")) if meta and meta.get("working_history") else []
+            compaction_notes = (meta.get("compaction_notes") or "") if meta else ""
+            session_prompt_tokens = (meta.get("prompt_tokens") or 0) if meta else 0
+            session_completion_tokens = (meta.get("completion_tokens") or 0) if meta else 0
+            session_total_tokens = (meta.get("total_tokens") or 0) if meta else 0
+            last_input_tokens = (meta.get("last_input_tokens") or 0) if meta else 0
+
             turn_id_var.set(turn_id)
-            working_history = copy.deepcopy(self.steps_history)
 
             # Append step for session history (chat display handled separately)
             user_step = {"role": "user", "content": user_text}
@@ -486,7 +555,7 @@ class DostuffTUI(App):
                 dynamic_instructions += f"\n\n<past_episodes>\n{episodic_text}\n</past_episodes>"
 
             loader_widget = self._show_loader("Working...")
-            self._last_turn_usage: dict = {}
+            # self._last_turn_usage: dict = {}
             self._turn_start_time = time.time()
             self._stop_timer()
             self._turn_in_progress = True   # <-- restore before starting new timer/turn
@@ -494,6 +563,7 @@ class DostuffTUI(App):
             # Reset cancel state for new turn
             self.adapter._cancelled = False
             self.adapter._cancel_event.clear()
+
             result = await agent_loop(
                 self.session_id,
                 turn_id,
@@ -506,6 +576,12 @@ class DostuffTUI(App):
                 self.steps_history,
                 self.store,
                 adapter=self.adapter,
+                compaction_notes=compaction_notes,
+                session_prompt_tokens=session_prompt_tokens,
+                session_completion_tokens=session_completion_tokens,
+                session_total_tokens=session_total_tokens,
+                last_input_tokens=last_input_tokens,
+                stream=True,
             )
 
             # Capture agent response for display (real integration — not placeholder)
@@ -513,7 +589,6 @@ class DostuffTUI(App):
 
             # Save updated history
             await self.store.save(self.session_id, self.steps_history)
-
 
             def _show():
                 self._append(agent_text, msg_type="agent")
@@ -823,9 +898,8 @@ class DostuffTUI(App):
     
         if context_window_percent:
             self.adapter._last_context_window_percent = context_window_percent
-        display_percent = context_window_percent or self.adapter._last_context_window_percent
+        display_percent = self.adapter._last_context_window_percent
     
-        from dostuff.lib.model import MODEL as ACTIVE_MODEL
         status_str = f"{cwd_display}  {sid}  {ACTIVE_MODEL}  {token_str}  {display_percent}  {loader_str} "
         self.query_one("#status", Static).update(status_str)
 

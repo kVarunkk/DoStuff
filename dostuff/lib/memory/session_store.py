@@ -27,8 +27,13 @@ class SessionStore(ABC):
         ...
 
     @abstractmethod
-    async def update_session_tokens(self, session_id: str, total_tokens: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
+    async def update_session_tokens(self, session_id: str, total_tokens: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0, last_input_tokens: int = 0) -> None:
         """Persist session token count and last-used timestamp."""
+        ...
+
+    @abstractmethod
+    async def save_session_meta(self, session_id: str, working_dir: str | None = None, prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0, compaction_notes: str = "", working_history: str = "", last_input_tokens: int = 0) -> None:
+        """Persist session meta (tokens, notes, compacted working history)."""
         ...
 
 
@@ -43,7 +48,10 @@ class InMemorySessionStore(SessionStore):
     async def load(self, session_id: str) -> list[dict[str, Any]]:
         return copy.deepcopy(self._sessions.get(session_id, []))
 
-    async def update_session_tokens(self, session_id: str, total_tokens: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
+    async def update_session_tokens(self, session_id: str, total_tokens: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0, last_input_tokens: int = 0) -> None:
+        pass
+
+    async def save_session_meta(self, session_id: str, working_dir: str | None = None, prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0, compaction_notes: str = "", working_history: str = "", last_input_tokens: int = 0) -> None:
         pass
 
     async def save(self, session_id: str, steps_history: list[dict[str, Any]]) -> None:
@@ -115,6 +123,14 @@ class SQLiteSessionStore(SessionStore):
                 pass
             try:
                 await db.execute("ALTER TABLE sessions ADD COLUMN total_tokens INTEGER DEFAULT 0;")
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE sessions ADD COLUMN compaction_notes TEXT DEFAULT '';")
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE sessions ADD COLUMN working_history TEXT DEFAULT '';")
             except Exception:
                 pass
             try:
@@ -192,18 +208,27 @@ class SQLiteSessionStore(SessionStore):
                 """,
                 (session_id, next_order, json.dumps(step)),
             )
+            # Load working_history only (notes preserved separately by compact save)
+            meta_row = await db.execute("SELECT working_history FROM sessions WHERE session_id = ?", (session_id,))
+            meta = await meta_row.fetchone()
+            working = json.loads(meta[0]) if meta and meta[0] else []
+            working.append(step)
+            await db.execute(
+                "UPDATE sessions SET working_history = ? WHERE session_id = ?",
+                (json.dumps(working), session_id),
+            )
             await db.commit()        
-    async def save_session_meta(self, session_id: str, working_dir: str | None = None, prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0) -> None:
+    async def save_session_meta(self, session_id: str, working_dir: str | None = None, prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0, compaction_notes: str = "", working_history: str = "", last_input_tokens: int = 0) -> None:
         import datetime, os
         await self._init_db()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT OR IGNORE INTO sessions (session_id, working_dir, created_at) VALUES (?, ?, ?)",
-                (session_id, working_dir or os.getcwd(), datetime.datetime.now().isoformat()),
+                "INSERT OR IGNORE INTO sessions (session_id, working_dir, created_at, compaction_notes, working_history, last_input_tokens) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, working_dir or os.getcwd(), datetime.datetime.now().isoformat(), compaction_notes, working_history, last_input_tokens),
             )
             await db.execute(
-                "UPDATE sessions SET working_dir = ?, prompt_tokens = ?, completion_tokens = ?, total_tokens = ?, last_used = ? WHERE session_id = ?",
-                (working_dir or os.getcwd(), prompt_tokens, completion_tokens, total_tokens, datetime.datetime.now().isoformat(), session_id),
+                "UPDATE sessions SET working_dir = ?, prompt_tokens = ?, completion_tokens = ?, total_tokens = ?, last_used = ?, compaction_notes = ?, working_history = ?, last_input_tokens = ? WHERE session_id = ?",
+                (working_dir or os.getcwd(), prompt_tokens, completion_tokens, total_tokens, datetime.datetime.now().isoformat(), compaction_notes, working_history, last_input_tokens, session_id),
             )
             await db.commit()
 
@@ -211,43 +236,26 @@ class SQLiteSessionStore(SessionStore):
         await self._init_db()
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                "SELECT session_id, working_dir, prompt_tokens, completion_tokens, total_tokens, last_used FROM sessions WHERE session_id = ?", (session_id,),
+                "SELECT session_id, working_dir, prompt_tokens, completion_tokens, total_tokens, last_input_tokens, last_used, compaction_notes, working_history FROM sessions WHERE session_id = ?", (session_id,),
             ) as cursor:
                 row = await cursor.fetchone()
                 if row:
-                    return {"session_id": row[0], "working_dir": row[1], "prompt_tokens": row[2] or 0, "completion_tokens": row[3] or 0, "total_tokens": row[4] or 0, "last_used": row[5]}
+                    return {"session_id": row[0], "working_dir": row[1], "prompt_tokens": row[2] or 0, "completion_tokens": row[3] or 0, "total_tokens": row[4] or 0, "last_input_tokens": row[5] or 0, "last_used": row[6], "compaction_notes": row[7] or "", "working_history": row[8] or ""}
                 return None
 
-    async def update_session_tokens(self, session_id: str, total_tokens: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
+    async def update_session_tokens(self, session_id: str, total_tokens: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0, last_input_tokens: int = 0) -> None:
         import datetime
         await self._init_db()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT OR IGNORE INTO sessions (session_id, total_tokens, prompt_tokens, completion_tokens, last_used) VALUES (?, ?, ?, ?, ?)",
-                (session_id, total_tokens, prompt_tokens, completion_tokens, datetime.datetime.now().isoformat()),
+                "INSERT OR IGNORE INTO sessions (session_id, total_tokens, prompt_tokens, completion_tokens, last_input_tokens, last_used) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, total_tokens, prompt_tokens, completion_tokens, last_input_tokens, datetime.datetime.now().isoformat()),
             )
             await db.execute(
-                "UPDATE sessions SET total_tokens = ?, prompt_tokens = ?, completion_tokens = ?, last_used = ? WHERE session_id = ?",
-                (total_tokens, prompt_tokens, completion_tokens, datetime.datetime.now().isoformat(), session_id),
+                "UPDATE sessions SET total_tokens = ?, prompt_tokens = ?, completion_tokens = ?, last_input_tokens = ?, last_used = ? WHERE session_id = ?",
+                (total_tokens, prompt_tokens, completion_tokens, last_input_tokens, datetime.datetime.now().isoformat(), session_id),
             )
             await db.commit()
-
-    def get_session_meta_sync(self, session_id: str) -> dict | None:
-        import sqlite3
-        conn = sqlite3.connect(str(self.db_path))
-        cur = conn.execute("SELECT session_id, working_dir, prompt_tokens, completion_tokens, total_tokens, last_used FROM sessions WHERE session_id = ?", (session_id,))
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            return {
-                "session_id": row[0],
-                "working_dir": row[1],
-                "prompt_tokens": row[2] or 0,
-                "completion_tokens": row[3] or 0,
-                "total_tokens": row[4] or 0,
-                "last_used": row[3],
-            }
-        return None
 
     async def list(self) -> list[tuple[str, str, str | None]]:
         await self._init_db()
