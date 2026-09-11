@@ -1,4 +1,6 @@
+from dostuff.helpers.agent.loop_check_cancelled import loop_check_cancelled
 from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
+from dostuff.helpers.agent.loop_emit import loop_emit
 from dostuff.lib.exceptions import ConfirmationRequired
 from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.tracing import tracer
@@ -13,14 +15,6 @@ import json
 from dostuff.helpers.agent.consume_stream import consume_stream as _consume_stream
 
 async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: ..., current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True) -> str:
-
-    async def _emit(et, data):
-        if adapter and hasattr(adapter, "emit"):
-            try:
-                adapter.emit(et, data)
-            except Exception:
-                pass
-
     iteration = 0
     token_limit = get_model_token_limit()
     context_token_threshold = int(token_limit * 0.5)
@@ -40,8 +34,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 await store.save_session_meta(session_id, prompt_tokens=session_prompt_tokens, completion_tokens=session_completion_tokens, total_tokens=session_total_tokens, compaction_notes=compaction_notes, working_history=json.dumps(working_history), last_input_tokens=last_input_tokens)
             except Exception:
                 pass
-        await _emit("system", "Auto compaction performed as token threshold exceeded.")
-        await _emit("system", f"Context compacted. Notes: {compaction_notes}")
+        await loop_emit("system", "Auto compaction performed as token threshold exceeded.", adapter=adapter)
+        await loop_emit("system", f"Context compacted. Notes: {compaction_notes}", adapter=adapter)
 
     with tracer.start_as_current_span("turn") as turn_span:
         turn_span.set_attribute("session_id", session_id)
@@ -54,13 +48,9 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             with tracer.start_as_current_span("iteration") as iter_span:
                 iter_span.set_attribute("iteration_number", iteration)
     
-                # Check for user cancel via ESC (event-based, thread-safe)
-                if adapter and hasattr(adapter, "_cancel_event"):
-                    if adapter._cancel_event.is_set() or adapter._cancelled:
-                        adapter._cancelled = False
-                        adapter._cancel_event.clear()
-                        await _emit("system", "Turn cancelled by user (ESC).")
-                        return "Cancelled by user (ESC)."
+               
+                if await loop_check_cancelled(steps_history, working_history, current_session_history, session_id, store, turn_type, adapter=adapter):
+                    return "Cancelled by user."
     
                 # agent call, with 3 retries on failure (manual span)
                 interaction = None
@@ -75,7 +65,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                             stream=stream,
                         )
                         if hasattr(interaction, "__aiter__"):
-                            interaction = await _consume_stream(interaction, adapter, _emit)
+                            interaction = await _consume_stream(interaction, adapter, loop_emit)
                         break
                     except Exception as e:
                         last_err = e
@@ -84,19 +74,15 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                             model_span.set_status(Status(StatusCode.ERROR, str(e)))
                             model_span.end()
                         if attempt < 2:
-                            await _emit("system", f"Retrying... ({attempt+1}/3) — {e}")
+                            await loop_emit("system", f"Retrying... ({attempt+1}/3) — {e}", adapter=adapter)
                         continue
                 if interaction is None:
-                    await _emit("error", f"Agent call failed after 3 retries: {last_err}")
+                    await loop_emit("error", f"Agent call failed after 3 retries: {last_err}", adapter=adapter)
                     return f"Failed after 3 attempts: {last_err}"
     
-                # Re-check cancel after call_agent returns (ESC may have fired during the call)
-                if adapter and hasattr(adapter, "_cancel_event"):
-                    if adapter._cancel_event.is_set() or adapter._cancelled:
-                        adapter._cancelled = False
-                        adapter._cancel_event.clear()
-                        await _emit("system", "Turn cancelled by user (ESC).")
-                        return "Cancelled by user (ESC)."
+               
+                if await loop_check_cancelled(steps_history, working_history, current_session_history, session_id, store, turn_type, adapter):
+                    return "Cancelled by user."   
 
                 usage_dict = None
                 # token tracking
@@ -130,7 +116,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     model_span.end()
     
                 if usage_dict:
-                    await _emit("usage", usage_dict)
+                    await loop_emit("usage", usage_dict, adapter=adapter)
                     session_total_tokens += usage_dict.get("total_tokens", 0)
                     session_prompt_tokens += usage_dict.get("prompt_tokens", 0)
                     session_completion_tokens += usage_dict.get("completion_tokens", 0)
@@ -138,8 +124,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     if store is not None and hasattr(store, "update_session_tokens"):
                         await store.update_session_tokens(session_id, session_total_tokens, session_prompt_tokens, session_completion_tokens, current_context_tokens)
                     percent = (current_context_tokens / token_limit * 100) if token_limit > 0 else 0
-                    await _emit("status", {"context_window_percent": f"{percent:.1f}%", "token_limit": token_limit})
-    
+                    await loop_emit("status", {"context_window_percent": f"{percent:.1f}%", "token_limit": token_limit}, adapter=adapter)
+
                 if not choices:
                     iter_span.set_status(Status(StatusCode.OK))
                     continue
@@ -175,23 +161,38 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 }
     
                 for fn_name, fn_args, _ in function_calls:
-                    await _emit("tool_call", f"{fn_name}({fn_args})")
+                    await loop_emit("tool_call", f"{fn_name}({fn_args})", adapter=adapter)
     
-                results = await asyncio.gather(
-                    *(asyncio.wait_for(
+                tasks = [
+                    asyncio.ensure_future(asyncio.wait_for(
                         run_tool(fn_name=fn_name, fn_args=dict(fn_args), mcp_client=mcp_client, session_id=session_id, turn_id=turn_id),
                         timeout=120.0
-                    ) for fn_name, fn_args, _ in function_calls),
-                    return_exceptions=True,
-                )
-    
-                # Check cancel after tool execution (ESC may have fired during tool calls)
-                if adapter and hasattr(adapter, "_cancel_event"):
-                    if adapter._cancel_event.is_set() or adapter._cancelled:
-                        adapter._cancelled = False
-                        adapter._cancel_event.clear()
-                        await _emit("system", "Turn cancelled by user (ESC).")
-                        return "Cancelled by user (ESC)."
+                    ))
+                    for fn_name, fn_args, _ in function_calls
+                ]
+
+                cancelled_mid_tools = False
+                while True:
+                    done, pending = await asyncio.wait(tasks, timeout=0.3)
+                    if not pending:
+                        break
+                    if adapter and hasattr(adapter, "_cancel_event") and (adapter._cancel_event.is_set() or adapter._cancelled):
+                        cancelled_mid_tools = True
+                        for t in pending:
+                            t.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        break
+
+                if cancelled_mid_tools and adapter and hasattr(adapter, "_cancel_event"):
+                    if await loop_check_cancelled(steps_history, working_history, current_session_history, session_id, store, turn_type, adapter):
+                        return "Cancelled by user."
+
+                results = []
+                for t in tasks:
+                    try:
+                        results.append(t.result())
+                    except Exception as e:
+                        results.append(e)
     
                 final_results = []
                 for (fn_name, fn_args, fn_id), result in zip(function_calls, results):
@@ -214,7 +215,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         result = f"Error: {result}"
     
                     final_results.append((fn_name, fn_id, result))
-                    await _emit("tool_result", f"{fn_name}: {str(result)}")
+                    await loop_emit("tool_result", f"{fn_name}: {str(result)}", adapter=adapter)
+
+                if await loop_check_cancelled(steps_history, working_history, current_session_history, session_id, store, turn_type, adapter):
+                    return "Cancelled by user."
 
                 # append the assistant step with tool calls to the history before appending the tool results, so that there is no history corruption if the loop crashes after the assistant step but before the tool results are appended
                 await append_step(assistant_tool_step, steps_history, working_history, current_session_history, session_id, store, turn_type)    

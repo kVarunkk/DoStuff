@@ -193,7 +193,7 @@ class DostuffTUI(App):
     """
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit", priority=True),
-        Binding("esc", "cancel", "Cancel", priority=True),
+        Binding("escape", "cancel", "Cancel", priority=True),
     ]
 
     # ── Setup (mirrors core/agent.py run() + run_agent()) ──────────────────────
@@ -747,7 +747,6 @@ class DostuffTUI(App):
         self.adapter._cancelled = True
         self.adapter._cancel_event.set()
         self._update_status(working=False, loader=" Cancelled")
-        self._append("Cancelled by user (ESC).", msg_type="system")
 
     async def action_quit(self) -> None:
         """Threaded worker — _cleanup uses call_from_thread to render messages."""

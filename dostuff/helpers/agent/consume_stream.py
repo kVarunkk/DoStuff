@@ -15,6 +15,9 @@ async def consume_stream(stream_iter, adapter, emit_fn):
     async for chunk in stream_iter:
         chunk_count += 1
         last_chunk = chunk
+        
+        if adapter and hasattr(adapter, "_cancel_event") and (adapter._cancel_event.is_set() or adapter._cancelled):
+            break
         # Capture usage-only chunk (empty choices, real usage) BEFORE skipping
         u = getattr(chunk, "usage", None)
         if u is not None:
