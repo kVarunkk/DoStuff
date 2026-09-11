@@ -424,12 +424,11 @@ class DostuffTUI(App):
             budget = min(int(get_model_token_limit() * 0.15), 20000)
             # if len(working) > 1:
             try:
-                working, summary = await asyncio.wait_for(compact_context(working, budget), timeout=60)
+                working, summary = await asyncio.wait_for(compact_context(working, budget, db_notes or ""), timeout=60)
             except asyncio.TimeoutError:
                 self._append("Compact timed out", msg_type="error")
                 summary = ""
             if summary:
-                combined_notes = f"{db_notes}\n{summary}".strip() if db_notes else summary
                 # Compaction only shrinks working_history — token counts are
                 # preserved from session_meta, not re-derived from the adapter.
                 await self.store.save_session_meta(
@@ -438,11 +437,11 @@ class DostuffTUI(App):
                     prompt_tokens=db_prompt_tokens,
                     completion_tokens=db_completion_tokens,
                     total_tokens=db_total_tokens,
-                    compaction_notes=combined_notes,
+                    compaction_notes=summary,
                     working_history=json.dumps(working),
                     last_input_tokens=db_last_input_tokens,
                 )
-                self._append(f"Context compacted. Notes: {combined_notes}", msg_type="system")
+                self._append(f"Context compacted. Notes: {summary}", msg_type="system")
             else:
                 self._append("No summary produced — no compaction needed", msg_type="system")
            

@@ -31,8 +31,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     
     # auto compaction triggers at 50% of the model's token limit and keeps at least 15%/20k tokens of the most recent steps in the working history. Rest are summarized into a compact summary appended to the system instruction. Manual compaction can be triggered with the /compact command, which will also produce a summary appended to the system instruction.
     if last_input_tokens > context_token_threshold:
-        working_history, new_summary = await compact_context(working_history, keep_recent_token_budget)
-        compaction_notes = f"{compaction_notes}\n{new_summary}".strip() if new_summary else compaction_notes
+        working_history, new_summary = await compact_context(working_history, keep_recent_token_budget, compaction_notes or "")
+        compaction_notes = f"{new_summary}".strip() if new_summary else compaction_notes
         with tracer.start_as_current_span("context_compaction") as compaction_span:
             compaction_span.set_attribute("steps_after", len(working_history))
         if store is not None and hasattr(store, "save_session_meta"):
@@ -40,8 +40,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 await store.save_session_meta(session_id, prompt_tokens=session_prompt_tokens, completion_tokens=session_completion_tokens, total_tokens=session_total_tokens, compaction_notes=compaction_notes, working_history=json.dumps(working_history), last_input_tokens=last_input_tokens)
             except Exception:
                 pass
-        await _emit("system", "Auto compaction performed due to token threshold exceeded.")
-        await _emit("system", compaction_notes)
+        await _emit("system", "Auto compaction performed as token threshold exceeded.")
+        await _emit("system", f"Context compacted. Notes: {compaction_notes}")
 
     with tracer.start_as_current_span("turn") as turn_span:
         turn_span.set_attribute("session_id", session_id)
@@ -173,7 +173,6 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     "content": content,
                     "tool_calls": [t.model_dump() for t in tool_calls]
                 }
-                await append_step(assistant_tool_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
     
                 for fn_name, fn_args, _ in function_calls:
                     await _emit("tool_call", f"{fn_name}({fn_args})")
@@ -216,6 +215,9 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     
                     final_results.append((fn_name, fn_id, result))
                     await _emit("tool_result", f"{fn_name}: {str(result)}")
+
+                # append the assistant step with tool calls to the history before appending the tool results, so that there is no history corruption if the loop crashes after the assistant step but before the tool results are appended
+                await append_step(assistant_tool_step, steps_history, working_history, current_session_history, session_id, store, turn_type)    
     
                 for fn_name, fn_id, result in final_results:
                     result_step = {

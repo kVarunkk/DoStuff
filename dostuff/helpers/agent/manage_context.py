@@ -54,7 +54,7 @@ def split_by_token_budget(
     return steps_history[:split_index], steps_history[split_index:]
 
 
-async def compact_context(steps_history: list[dict], keep_token_budget: int) -> tuple[list[dict], str]:
+async def compact_context(steps_history: list[dict], keep_token_budget: int, existing_notes: str = "") -> tuple[list[dict], str]:
     """Produces a compacted view of steps_history for sending to the model, without
     mutating the original list — callers should keep the full steps_history intact
     for the durable store/audit trail, and only use the returned recent_steps for
@@ -75,10 +75,12 @@ async def compact_context(steps_history: list[dict], keep_token_budget: int) -> 
         return steps_history, ""
 
     summary_prompt = (
-        "Summarize the key facts, decisions, and outcomes from this conversation "
-        "history in a compact paragraph. Preserve names, dates, and any commitments "
-        "made. Do not include reasoning or tool call mechanics.\n\n"
-        f"{json.dumps(old_steps, default=str)}"
+        "Produce a structured session summary with exactly these sections:\n"
+        "- Goal\n- Constraints & Preferences\n- Progress (Done / In Progress / Blocked)\n- Key Decisions\n- Next Steps\n- Critical Context (file paths, session IDs, DB paths)\n"
+        "- Turn Context (original request, early progress, suffix notes)\n"
+        "Use bullet lists under each. Keep concise. Preserve names, dates, metrics, session IDs, and file paths.\n\n"
+        f"Existing compaction notes (merge/update these):\n{existing_notes}\n\n"
+        f"History steps to summarize:\n{json.dumps(old_steps, default=str)}"
     )
 
     response = await acompletion(
