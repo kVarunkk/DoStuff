@@ -97,23 +97,25 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         adapter._cancel_event.clear()
                         await _emit("system", "Turn cancelled by user (ESC).")
                         return "Cancelled by user (ESC)."
-    
+
+                usage_dict = None
                 # token tracking
                 usage = getattr(interaction, "usage", None)
                 choices = getattr(interaction, "choices", None)
                 message = choices[0].message if choices else None
                 tool_calls = getattr(message, "tool_calls", None) if message else None
                 content = getattr(message, "content", None) if message else None
+
+                if usage:
+                    usage_dict = {
+                        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                    }
     
                 # close model_span exactly once, here, before any continue/return below
-                usage_dict = None
                 if model_span is not None and model_span.is_recording():
-                    if usage:
-                        usage_dict = {
-                            "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                            "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-                        }
+                    if usage_dict:
                         model_span.set_attribute("usage.prompt_tokens", usage_dict["prompt_tokens"])
                         model_span.set_attribute("usage.completion_tokens", usage_dict["completion_tokens"])
                         model_span.set_attribute("usage.total_tokens", usage_dict["total_tokens"])
