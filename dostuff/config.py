@@ -14,7 +14,7 @@ class Config:
         self.path = path
         self.raw = {}
         self.load()
-        self.data_dir = Path((self.raw.get("data", {}) or {}).get("global_dir", str(Path.home() / ".dostuff" / "data")))
+        self.data_dir = Path.home() / ".dostuff" / "data"
         self.user_id_path = Path.home() / ".dostuff" / "user_id"
         self.mcp_path = Path((self.raw.get("mcp", {}) or {}).get("config_path", str(Path.home() / ".dostuff" / "mcp_config.json")))
         # Model / provider selection (env overrides YAML for secrets)
@@ -76,7 +76,7 @@ class Config:
         )
         self.tracing_exporter = os.environ.get(
             "OTEL_EXPORTER",
-            t.get("exporter", "otlp"),  # otlp | console | none
+            t.get("exporter", "otlp"),  # otlp | none
         )
 
     def load(self):

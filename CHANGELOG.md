@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Live timer (`threading.Thread`)**: Updates status bar `⏳ {elapsed}s`; loader shows `Working...` (no freeze text, no timer embedded).
 - **Loader persistence / removal**: `_freeze_final_time()` removed; loader stays mounted; messages mount `before=loader_widget`.
 - **Manual `/compact` command**: `_compact_session()` loads DB truth, compacts with `0.15 * token_limit` budget (capped 20K), 60s timeout, loader, DB save (`compaction_notes` + `working_history`), and adapter sync.
+- **Console trace disabled:** `ConsoleSpanExporter` removed from `tracing.py`; OTLP file trace (`~/.dostuff/data/traces/{sid}.jsonl`) planned for Jaeger.
 - **Structured compaction summary:** `compact_context` prompt now requires sections (Goal, Constraints, Progress, Decisions, Next Steps, Critical Context, Turn Context); existing `compaction_notes` passed to LLM for merge/update.
 - **ESC cancel confirmed done:** cancellation event wired through adapter + loop; stream interruption verified.
 - **Context window percentage**: status bar shows `%` of context window filled from turn-level `prompt_tokens` / `token_limit`; persisted in DB via `last_input_tokens` and restored on resume.

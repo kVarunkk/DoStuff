@@ -54,9 +54,10 @@ if _enabled:
     resource = Resource(attributes={SERVICE_NAME: str(_service or "dostuff")})
     provider = SdkTracerProvider(resource=resource)
 
-    if _exporter == "console":
-        provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
-    elif _exporter in ("otlp", ""):
+    # if _exporter == "console":
+        # Console output disabled — OTLP file trace planned; no console noise in TUI
+        # provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    if _exporter in ("otlp", ""):
         provider.add_span_processor(
             BatchSpanProcessor(OTLPSpanExporter(endpoint=_endpoint, insecure=True))
         )

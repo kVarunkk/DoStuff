@@ -1,16 +1,12 @@
-# DoStuff global config (env vars override these values)
-# Place at: ~/.dostuff/config.yaml
 tracing:
-  enabled: false # default off; no localhost:4317 noise
-  endpoint: "localhost:4317"
-  service_name: "dostuff"
-  exporter: "otlp" # otlp | console | none
+  enabled: true # default OFF
+  exporter: "otlp" # otlp | none
 
+# Multi-model selection: active marks the selected model
 models:
-  - name: "gemini/gemini-3.1-flash-lite-preview" # litellm format: 'provider/model' (env MODEL overrides)
-    provider: "gemini"
+  - name: "openai/gpt-4o-mini"
+    provider: "openai"
     active: true
-  - name: "openrouter/openrouter/free"
-    provider: "openrouter"
+  - name: "gemini/gemini-3.1-flash-lite"
+    provider: "gemini"
     active: false
-  # api_key_env: "GEMINI_API_KEY" # optional per-entry override

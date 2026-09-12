@@ -482,6 +482,7 @@ class DostuffTUI(App):
             return
         if cmd == "/help":
             self._append(f"Commands: {', '.join(sorted(COMMANDS))}")
+            self._append("Shortcuts: ESC=cancel turn, Ctrl+Q=quit, Ctrl+J=newline in input")
             return
 
         # User message — only append if starting a new turn; queued messages append in _run_turn
@@ -553,7 +554,7 @@ class DostuffTUI(App):
             if episodic_text:
                 dynamic_instructions += f"\n\n<past_episodes>\n{episodic_text}\n</past_episodes>"
 
-            loader_widget = self._show_loader("Working...")
+            loader_widget = self._show_loader("Working... (ESC to cancel)")
             # self._last_turn_usage: dict = {}
             self._turn_start_time = time.time()
             self._stop_timer()
@@ -866,7 +867,7 @@ class DostuffTUI(App):
 
     async def _connect_mcp_servers(self, mcp_servers: dict) -> None:
         """Background MCP connection so TUI never blanks."""
-        self._append("   connecting...", msg_type="system")
+        # self._append("   connecting...", msg_type="system")
         for name, cfg in mcp_servers.items():
             transport = cfg.get("transport", "stdio")
             try:
@@ -879,9 +880,9 @@ class DostuffTUI(App):
                     url=cfg.get("url"),
                     headers=cfg.get("headers"),
                 )
-                self._call_from_thread(lambda n=name: self._append(f" {n}", msg_type="system"))
+                self._call_from_thread(lambda n=name: self._append(f"{n}", msg_type="system"))
             except Exception as e:
-                self._call_from_thread(lambda n=name, err=str(e): self._append(f"   {n}: {err}", msg_type="error"))
+                self._call_from_thread(lambda n=name, err=str(e): self._append(f"{n}: {err}", msg_type="error"))
         self._call_from_thread(lambda: self._append(f"MCP ready ({len(self.mcp_client.servers)} server(s)).", msg_type="system"))
 
     def _update_token_display(self, working: bool = False, loader: str = "", context_window_percent: str = "") -> None:
@@ -898,7 +899,7 @@ class DostuffTUI(App):
             self.adapter._last_context_window_percent = context_window_percent
         display_percent = self.adapter._last_context_window_percent
     
-        status_str = f"{cwd_display}  {sid}  {ACTIVE_MODEL}  {token_str}  {display_percent}  {loader_str} "
+        status_str = f"/help {cwd_display}  {sid}  {ACTIVE_MODEL}  {token_str}  {display_percent}  {loader_str} "
         self.query_one("#status", Static).update(status_str)
 
     def _update_status(self, is_resumed: bool = False, working: bool = False, loader: str = "", context_window_percent: str = "") -> None:
