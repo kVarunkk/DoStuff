@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-09-15
+
+### Fixed
+
+- **DB migration `last_input_tokens`:** `session_store.py` `_init_db` now runs `ALTER TABLE sessions ADD COLUMN last_input_tokens INTEGER DEFAULT 0`; fixes `OperationalError: no such column` on fresh install / resume with older DB.
+
 ## [0.1.4] - 2026-09-12
 
 ### Added

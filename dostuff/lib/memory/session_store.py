@@ -137,6 +137,10 @@ class SQLiteSessionStore(SessionStore):
                 await db.execute("ALTER TABLE sessions ADD COLUMN last_used TEXT;")
             except Exception:
                 pass
+            try:
+                await db.execute("ALTER TABLE sessions ADD COLUMN last_input_tokens INTEGER DEFAULT 0;")
+            except Exception:
+                pass
             await db.commit()
 
         self._initialized = True
