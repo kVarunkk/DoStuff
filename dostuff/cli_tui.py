@@ -242,6 +242,7 @@ class DostuffTUI(App):
         self._turn_in_progress: bool = False
         self._turn_start_time: float | None = None
         self._timer_thread = None
+        self.max_iterations = self.config.max_iterations
 
     # ── Compose UI ─────────────────────────────────────────────────────────────
 
@@ -326,7 +327,7 @@ class DostuffTUI(App):
 ▓▓▓▓ ░░▓▓▓ ░▓▓▓▓░░  ▓░░  ▓▓▓ ░▓░░░░░▓░░░░░  
  ░░░░ ░ ░░░ ░░░░░ ░  ░░   ░░░ ░░░    ░░     
   ░░░░   ░░░  ░░░░    ░    ░░░  ░     ░     
-                                    v0.1.5
+                                    v0.1.6
             """,
             msg_type="system",
         )
@@ -582,6 +583,7 @@ class DostuffTUI(App):
                 session_total_tokens=session_total_tokens,
                 last_input_tokens=last_input_tokens,
                 stream=True,
+                max_iterations=self.max_iterations,
             )
 
             # Capture agent response for display (real integration — not placeholder)

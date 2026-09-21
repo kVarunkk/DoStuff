@@ -2,6 +2,7 @@ from pathlib import Path
 import yaml
 import os
 from dotenv import load_dotenv
+from dostuff.helpers.agent.constants import MAX_ITERATIONS
 
 # Module-level .env loading removed — env files are now loaded lazily in Config.load()
 # so they can be re-read after a cwd change (e.g. resuming a session from a different directory).
@@ -74,6 +75,8 @@ class Config:
             "OTEL_SERVICE_NAME",
             t.get("service_name", "dostuff"),
         )
+        loop_cfg = self.raw.get("loop", {}) if isinstance(self.raw, dict) else {}
+        self.max_iterations = int(loop_cfg.get("max_iterations", MAX_ITERATIONS)) if loop_cfg.get("max_iterations") is not None else MAX_ITERATIONS
         self.tracing_exporter = os.environ.get(
             "OTEL_EXPORTER",
             t.get("exporter", "otlp"),  # otlp | none

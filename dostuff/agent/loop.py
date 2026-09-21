@@ -14,7 +14,7 @@ from dostuff.agent.run_tool import run_tool
 import json
 from dostuff.helpers.agent.consume_stream import consume_stream as _consume_stream
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: ..., current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: ..., current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS) -> str:
     iteration = 0
     token_limit = get_model_token_limit()
     context_token_threshold = int(token_limit * 0.5)
@@ -43,7 +43,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
         turn_span.set_attribute("turn_id", turn_id)
         turn_span.set_attribute("user_input", user_text)
 
-        while iteration < MAX_ITERATIONS:
+        max_iter = max_iterations
+        while iteration < max_iter:
             iteration += 1
             with tracer.start_as_current_span("iteration") as iter_span:
                 iter_span.set_attribute("iteration_number", iteration)
@@ -233,7 +234,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     await append_step(result_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
                     iter_span.set_status(Status(StatusCode.OK))
         else:
-            msg = f"Reached maximum iterations ({MAX_ITERATIONS}) without receiving a model output. Ending the agent loop."
+            msg = f"Reached maximum iterations ({max_iter}) without receiving a model output. Ending the agent loop."
             if adapter and hasattr(adapter, "emit"):
                 adapter.emit("system", msg)
             turn_span.set_attribute("outcome", "max_iterations_exceeded")

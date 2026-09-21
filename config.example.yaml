@@ -10,3 +10,6 @@ models:
   - name: "gemini/gemini-3.1-flash-lite"
     provider: "gemini"
     active: false
+
+loop:
+  max_iterations: 100  # max agent turns before forced exit; ESC cancels anytime
