@@ -2,6 +2,7 @@
 .env.local
 venv/
 .venv/
+.venv*/
 *.log
 __pycache__/
 *.pyc
@@ -22,7 +23,6 @@ mcp_config.json
 agent_sessions.db
 DOSTUFF.md
 /archive/
-/tests/
 .test_venv/
 dostuff.egg-info
 TEST_PLAN.md
@@ -32,5 +32,14 @@ venv*
 .mypy_cache/
 FUTURE.md
 .vscode
-random_file.txt
 plan
+tests/snapshots/*.tmp
+.pytest_cache/
+.claude
+NOTES.md
+.env.*
+.coverage
+htmlcov/
+.ruff_cache/
+AGENTS.md
+openspec/
