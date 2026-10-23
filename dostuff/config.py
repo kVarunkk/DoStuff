@@ -1,11 +1,36 @@
 from pathlib import Path
+from typing import Any
 import yaml
 import os
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 from dostuff.helpers.agent.constants import MAX_ITERATIONS
 
-# Module-level .env loading removed — env files are now loaded lazily in Config.load()
-# so they can be re-read after a cwd change (e.g. resuming a session from a different directory).
+SUBAGENT_MAX_ITERATIONS = 25
+MAX_TOOL_OUTPUT_CHARS = 30_000
+MAX_RETRIES = 6
+RETRY_MAX_DELAY_S = 60.0
+KNOWN_PROVIDERS = ("gemini", "anthropic", "openai", "groq", "mistral", "openrouter", "ollama")
+
+
+def _block(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    """A config block as a dict — tolerates a missing key, `key:` with no value, or a non-dict."""
+    value = raw.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def load_env_files(cwd: Path | None = None) -> None:
+    """Load `~/.dostuff/.env` then `./.dostuff/.env`; project values override user values.
+
+    Variables already set in the real environment always win. This is the only place
+    `.env` files are read.
+    """
+    merged: dict[str, str] = {}
+    for env_path in (Path.home() / ".dostuff" / ".env", (cwd or Path.cwd()) / ".dostuff" / ".env"):
+        if env_path.is_file():
+            merged.update({k: v for k, v in dotenv_values(env_path).items() if v is not None})
+    for key, value in merged.items():
+        os.environ.setdefault(key, value)
+
 
 class Config:
     def __init__(self, path: Path | None = None):
@@ -13,57 +38,26 @@ class Config:
         if path is None:
             path = self.global_path
         self.path = path
-        self.raw = {}
+        self.raw: dict[str, Any] = {}
         self.load()
         self.data_dir = Path.home() / ".dostuff" / "data"
         self.user_id_path = Path.home() / ".dostuff" / "user_id"
-        self.mcp_path = Path((self.raw.get("mcp", {}) or {}).get("config_path", str(Path.home() / ".dostuff" / "mcp_config.json")))
-        # Model / provider selection (env overrides YAML for secrets)
-        # Litellm format: model.name can be "provider/model" (e.g. gemini/gemini-3.1-flash-lite)
-        # Model selection: YAML supports `models` list or legacy `model` dict.
-        # Env MODEL overrides YAML; pick first entry with active: true.
-        active_provider = ""
-        raw_models = self.raw.get("models", [])
-        active_model_name = None
+        self.mcp_path = Path(_block(self.raw, "mcp").get("config_path", str(Path.home() / ".dostuff" / "mcp_config.json")))
+        # Model selection: YAML supports a `models` list (first entry with active: true) or a
+        # legacy `model` block. litellm wants "provider/model".
+        active_entry: dict[str, Any] = {}
+        raw_models = self.raw.get("models") or []
         if isinstance(raw_models, list):
-            for entry in raw_models:
-                if isinstance(entry, dict) and entry.get("active") is True:
-                    active_model_name = entry.get("name", "")
-                    active_provider = entry.get("provider", "")
-                    break
-        # Fallback: legacy single model block
-        if not active_model_name:
-            m = self.raw.get("model", {}) or {}
-            active_model_name = m.get("name", "") if isinstance(m, dict) else ""
-        # Env override
-        env_model = os.environ.get("MODEL", "")
-        final_model = env_model or active_model_name or "openai/gpt-4o-mini"
-        # Derive provider/model (entry-level provider overrides bare names)
-        if "/" in final_model:
-            self.provider = active_provider or final_model.split("/")[0] or "openai"
-            self.model_name = final_model
-        else:
-            # Derive provider from entry-level provider, or infer from name prefix
-            _name = final_model or active_model_name
-            prov_candidates = [active_provider] if active_provider else []
-            # Try provider from entry dict explicitly
-            if isinstance(raw_models, list) and active_model_name:
-                for entry in raw_models:
-                    if isinstance(entry, dict) and entry.get("name") == active_model_name:
-                        prov_candidates.insert(0, entry.get("provider", ""))
-                        break
-            # Infer known prefixes
-            for prefix in ("gemini", "anthropic", "openai", "groq", "mistral", "openrouter", "ollama"):
-                if _name.startswith(prefix) or f"/{prefix}" in _name or f"{prefix}/" in _name:
-                    prov_candidates.append(prefix)
-                    break
-            derived_provider = next((p for p in prov_candidates if p), "openai")
-            self.provider = derived_provider
-            self.model_name = f"{derived_provider}/{_name}" if not ("/" in _name) else f"{derived_provider}/{_name}"
-        # API key loaded from .env (not YAML) — see setup instructions
-        self.api_key_env = (self.raw.get("model", {}) or {}).get("api_key_env", self.provider.upper() + "_API_KEY")
+            active_entry = next((e for e in raw_models if isinstance(e, dict) and e.get("active") is True), {})
+        legacy = _block(self.raw, "model")
+        self._yaml_model_name = str(active_entry.get("name") or legacy.get("name") or "")
+        self._yaml_provider = str(active_entry.get("provider") or legacy.get("provider") or "")
+        # API key: explicit `api_key_env` (models entry or model block) is read at call time
+        self.api_key_env_explicit = str(active_entry.get("api_key_env") or legacy.get("api_key_env") or "")
+        # Set by /model for the rest of the process; wins over env MODEL and YAML
+        self._session_model: dict[str, str] | None = None
         # Tracing config (env vars override config.yaml)
-        t = self.raw.get("tracing", {}) or {}
+        t = _block(self.raw, "tracing")
         self.tracing_enabled = (
             os.environ.get("OTEL_ENABLED", str(t.get("enabled", False))).lower() in ("1", "true", "yes")
         )
@@ -75,22 +69,89 @@ class Config:
             "OTEL_SERVICE_NAME",
             t.get("service_name", "dostuff"),
         )
-        loop_cfg = self.raw.get("loop", {}) if isinstance(self.raw, dict) else {}
-        self.max_iterations = int(loop_cfg.get("max_iterations", MAX_ITERATIONS)) if loop_cfg.get("max_iterations") is not None else MAX_ITERATIONS
+        # Span attributes carrying user input / tool args / tool output are redacted unless enabled
+        self.tracing_capture_content = bool(t.get("capture_content", False))
         self.tracing_exporter = os.environ.get(
             "OTEL_EXPORTER",
             t.get("exporter", "otlp"),  # otlp | none
         )
+        loop_cfg = _block(self.raw, "loop")
+        self.max_iterations = int(loop_cfg.get("max_iterations") or MAX_ITERATIONS)
+        self.subagent_max_iterations = int(loop_cfg.get("subagent_max_iterations") or SUBAGENT_MAX_ITERATIONS)
+        # Overrides litellm's model info; useful for models litellm doesn't know
+        self.context_window = int(loop_cfg.get("context_window") or 0)
+        self.max_tool_output_chars = int(loop_cfg.get("max_tool_output_chars") or MAX_TOOL_OUTPUT_CHARS)
+        # Model-call retries on rate limits / timeouts / 5xx: exponential backoff (or Retry-After), capped per wait
+        retries = loop_cfg.get("max_retries")
+        self.max_retries = max(int(retries), 0) if retries is not None else MAX_RETRIES
+        self.retry_max_delay = float(loop_cfg.get("retry_max_delay") or RETRY_MAX_DELAY_S)
+        # Cache breakpoints on Claude models (see lib/model.uses_explicit_prompt_caching)
+        self.prompt_caching = str(loop_cfg.get("prompt_caching", True)).lower() not in ("0", "false", "no")
+        mem = _block(self.raw, "memory")
+        scope = str(mem.get("episodic_scope") or "project").lower()
+        self.episodic_scope = scope if scope in ("project", "user") else "project"
+        # Permission layer (dostuff/agent/permissions.py): mode ask | allowlist | auto
+        perms = _block(self.raw, "permissions")
+        mode = str(perms.get("mode", "ask")).lower()
+        self.permission_mode = mode if mode in ("ask", "allowlist", "auto") else "ask"
+        self.permission_allow = [str(p) for p in (perms.get("allow") or [])]
+
+    def configured_models(self) -> list[dict[str, Any]]:
+        """The `models:` entries from config.yaml (name, provider, active, api_key_env)."""
+        raw_models = self.raw.get("models") or []
+        if not isinstance(raw_models, list):
+            return []
+        return [
+            {"name": str(e["name"]), "provider": str(e.get("provider") or ""), "active": e.get("active") is True,
+             "api_key_env": str(e.get("api_key_env") or "")}
+            for e in raw_models if isinstance(e, dict) and e.get("name")
+        ]
+
+    def use_model(self, name: str, provider: str = "", api_key_env: str = "") -> None:
+        """Switch the model for the rest of this process (/model); config.yaml is not changed."""
+        self._session_model = {"name": name, "provider": provider}
+        self.api_key_env_explicit = api_key_env
+
+    def _raw_model_name(self) -> str:
+        if self._session_model:
+            return self._session_model["name"]
+        return os.environ.get("MODEL") or self._yaml_model_name
+
+    @property
+    def model_name(self) -> str:
+        """Active litellm model ("provider/model"): /model, else env MODEL, else YAML. Read at call time."""
+        name = self._raw_model_name() or "openai/gpt-4o-mini"
+        if "/" in name:
+            return name
+        return f"{self.provider}/{name}"
+
+    @property
+    def provider(self) -> str:
+        """Provider: env MODEL_PROVIDER, the entry's `provider`, the model prefix, or a known name prefix."""
+        if self._session_model and self._session_model["provider"]:
+            return self._session_model["provider"]
+        explicit = None if self._session_model else (os.environ.get("MODEL_PROVIDER") or self._yaml_provider)
+        if explicit:
+            return explicit
+        name = self._raw_model_name()
+        if "/" in name:
+            return name.split("/")[0] or "openai"
+        return next((p for p in KNOWN_PROVIDERS if name.startswith(p)), "openai")
+
+    @property
+    def api_key_env(self) -> str:
+        return self.api_key_env_explicit or self.provider.upper() + "_API_KEY"
+
+    def api_key(self) -> str | None:
+        """The key from `api_key_env` when one is configured explicitly; else let litellm find it."""
+        if not self.api_key_env_explicit:
+            return None
+        return os.environ.get(self.api_key_env_explicit) or None
 
     def load(self):
-        # Lazy .env loading — supports session resume from different cwd
-        _dostuff_home = Path.home() / ".dostuff"
-        for _env_path in [_dostuff_home / ".env", Path.cwd() / ".dostuff" / ".env"]:
-            if _env_path.exists():
-                load_dotenv(_env_path)
-                break
+        load_env_files()
         if self.path.exists():
-            with open(self.path) as f:
+            with open(self.path, encoding="utf-8") as f:
                 self.raw = yaml.safe_load(f)
                 if not isinstance(self.raw, dict):
                     self.raw = {}
@@ -100,7 +161,7 @@ class Config:
         cwd = Path.cwd()
         proj = cwd / ".dostuff" / "config.yaml"
         if proj.exists():
-            with open(proj) as f:
+            with open(proj, encoding="utf-8") as f:
                 proj_raw = yaml.safe_load(f)
                 if not isinstance(proj_raw, dict):
                     proj_raw = {}
@@ -128,3 +189,20 @@ class Config:
         dir_path = Path.home() / ".dostuff" / "data"
         dir_path.mkdir(parents=True, exist_ok=True)
         return dir_path
+
+
+_config: Config | None = None
+
+
+def get_config() -> Config:
+    """Lazily created process-wide Config (read after cli.py has switched cwd)."""
+    global _config
+    if _config is None:
+        _config = Config()
+    return _config
+
+
+def reset_config() -> None:
+    """Drop the cached Config (tests, or after a cwd change)."""
+    global _config
+    _config = None

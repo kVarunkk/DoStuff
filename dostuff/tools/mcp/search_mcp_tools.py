@@ -1,54 +1,60 @@
-from dostuff.lib.mcp.mcp_client import MCPClient
 import json
+import re
 
-async def search_mcp_tools(query: str) -> str:
-    """Search available MCP tools by keyword across connected MCP servers.
-    
-    Args:
-        query: Keywords or description to search for matching tools.
-        
-    Returns:
-        String of matching tools with tool name and short description only.
-    """
-    return ""
+from dostuff.lib.mcp.mcp_client import MCPClient, tool_key
+
+_MAX_RESULTS = 5
+
+
+def _tokens(text: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", text.lower()) if len(t) > 1}
+
+
+def keyword_search(query: str, mcp_client: MCPClient, top_k: int = _MAX_RESULTS) -> list[dict]:
+    """Rank connected tools by how many query tokens appear in their name/description."""
+    query_tokens = _tokens(query)
+    if not query_tokens:
+        return []
+    scored = []
+    for key, info in mcp_client.mcp_tools.items():
+        desc = info["schema"].get("description") or ""
+        haystack = _tokens(f"{info['tool_name']} {desc}")
+        overlap = len(query_tokens & haystack)
+        if overlap:
+            scored.append((overlap, key, desc, info["server_name"]))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [{"name": key, "description": desc, "server": server} for _, key, desc, server in scored[:top_k]]
+
 
 async def _impl_search_mcp_tools(query: str, mcp_client: MCPClient) -> str:
-    """Discovers relevant MCP tools using semantic vector search in ChromaDB,
-    falling back to substring search if vector search returns no results.
+    """Search tools of the connected MCP servers by keyword or description.
+
+    Args:
+        query: Keywords or description to search for matching tools.
+
+    Returns:
+        JSON list of matching tools (name, description, server). Pass `name` to
+        get_mcp_tool_details and call_mcp_tool.
     """
     if not query.strip():
         return "Query cannot be empty."
 
+    connected = list(mcp_client.servers)
     results = []
 
-    # Primary: Semantic Vector Search via ChromaDB
-    if hasattr(mcp_client, "tool_registry") and mcp_client.tool_registry:
+    # Primary: semantic search in the tool index, limited to servers connected right now
+    if getattr(mcp_client, "tool_registry", None) is not None and connected:
         try:
-            matched_tools = await mcp_client.tool_registry.search_tools(
-                user_intent=query, 
-                top_k=5
-            )
-            for tool in matched_tools:
-                results.append({
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "server": tool["server_name"],
-                })
-        except Exception as e:
-            pass
-            # print(f"[ToolRegistry] Semantic search failed ({e}), falling back to memory search.")
+            for tool in await mcp_client.tool_registry.search_tools(user_intent=query, top_k=_MAX_RESULTS, server_names=connected):
+                key = tool_key(tool["server_name"], tool["name"])
+                if key in mcp_client.mcp_tools:
+                    results.append({"name": key, "description": tool["description"], "server": tool["server_name"]})
+        except Exception:
+            results = []
 
-    # Fallback: In-memory keyword search if vector search fails or yields no results
-    if not results and hasattr(mcp_client, "mcp_tools"):
-        query_lower = query.lower()
-        for tool_name, tool_info in mcp_client.mcp_tools.items():
-            desc = tool_info["schema"].get("description", "")
-            if query_lower in tool_name.lower() or query_lower in desc.lower():
-                results.append({
-                    "name": tool_name,
-                    "description": desc,
-                    "server": tool_info["server_name"],
-                })
+    # Fallback: token-overlap search over the in-memory tool list
+    if not results:
+        results = keyword_search(query, mcp_client)
 
     if not results:
         return f"No MCP tools found matching query: '{query}'."

@@ -1,4 +1,4 @@
-from pathlib import Path
+from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path
 
 def list_files(directory: str = ".") -> str:
     """Lists files and subdirectories inside a given directory.
@@ -7,17 +7,18 @@ def list_files(directory: str = ".") -> str:
     whether a specific file is present before creating/overwriting it.
 
     Args:
-        directory: Path relative to current directory or absolute. Defaults to ".".
+        directory: Path relative to the project root. Defaults to ".".
 
     Returns:
         A newline-separated list of entries, with directories marked by a trailing '/'.
         Returns "(empty directory)" if there are no entries.
 
     Raises:
+        PathOutsideProject: If the path resolves outside the project root.
         NotADirectoryError: If the given path exists but is not a directory.
         FileNotFoundError: If the given directory does not exist.
     """
-    safe_path = Path(directory).resolve()
+    safe_path = resolve_safe_path(directory, for_read=True)
 
     if not safe_path.exists():
         raise FileNotFoundError(f"Directory not found: {directory}")

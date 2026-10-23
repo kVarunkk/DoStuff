@@ -1,6 +1,7 @@
 tracing:
-  enabled: true # default OFF
+  enabled: false # default OFF
   exporter: "otlp" # otlp | none
+  capture_content: false # when false, user input / tool args / tool output are redacted from spans
 
 # Multi-model selection: active marks the selected model
 models:
@@ -10,6 +11,27 @@ models:
   - name: "gemini/gemini-3.1-flash-lite"
     provider: "gemini"
     active: false
+    # api_key_env: "MY_GEMINI_KEY"  # optional: read the key from this env var instead of GEMINI_API_KEY
 
 loop:
   max_iterations: 100  # max agent turns before forced exit; ESC cancels anytime
+  subagent_max_iterations: 25  # iteration cap for delegate_to_subagent
+  prompt_caching: true  # Claude models: cache the system prompt and history between calls (cheaper, faster)
+  # context_window: 128000     # override the model's context window (tokens) if litellm doesn't know it
+  max_tool_output_chars: 30000 # longer tool results keep head + tail with a truncation marker
+  max_retries: 6               # retries on rate limits, timeouts and 5xx (0 = fail at once)
+  retry_max_delay: 60          # longest wait between retries, seconds (backoff doubles from 1s; Retry-After is honored)
+
+memory:
+  episodic_scope: project   # project: recall past episodes from this directory only | user: from anywhere
+
+permissions:
+  # ask       — every write / delete / shell / MCP call asks, except read-only shell commands
+  # allowlist — as ask, plus the `allow` patterns below are auto-approved
+  # auto      — nothing asks (not recommended)
+  mode: ask
+  allow: []
+  #   - "npm test"       # shell command prefix
+  #   - "git commit"
+  #   - "write_file"     # a tool name
+  #   - "call_mcp_tool:github__create_issue"  # one MCP tool (server__tool)

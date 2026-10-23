@@ -1,129 +1,121 @@
-
+import uuid
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 
-async def consume_stream(stream_iter, adapter, emit_fn):
-    """Consume a litellm stream iterator; accumulate text + tool_call chunks.
-    Returns a SimpleNamespace response with .choices[0].message ."""
-    content_parts = []
-    tool_call_chunks = {}  # id -> {name, args_parts}
-    chunk_count = 0
-    last_chunk = None
+@dataclass
+class StreamProgress:
+    """What a stream has shown the user so far; lets the loop mark an interrupted stream."""
+    emitted_text: bool = False
+
+
+def _emit(adapter: Any, event_type: str, data: Any) -> None:
+    if adapter is not None and hasattr(adapter, "emit"):
+        try:
+            adapter.emit(event_type, data)
+        except Exception:
+            pass
+
+
+def _is_cancelled(adapter: Any) -> bool:
+    event = getattr(adapter, "_cancel_event", None)
+    return bool(getattr(adapter, "_cancelled", False) or (event is not None and event.is_set()))
+
+
+async def consume_stream(stream_iter, adapter, emit_fn=None, progress: StreamProgress | None = None):
+    """Consume a litellm stream; accumulate text, reasoning and tool-call chunks.
+
+    Emits cumulative `partial` (answer) and `partial_thought` (reasoning) text, then
+    `stream_end`. Returns a SimpleNamespace shaped like a non-streaming response, keeping
+    the provider's tool-call ids and finish_reason.
+    """
+    progress = progress if progress is not None else StreamProgress()
+    content_parts: list[str] = []
+    thought_parts: list[str] = []
+    tool_call_chunks: dict[str, dict[str, str]] = {}  # stream key -> {id, name, args_text}
+    finish_reason: str | None = None
     stream_usage = None
-    # Track usage if final chunk provides it
-    # For simplicity: accumulate all delta.content; build message at end
-    async for chunk in stream_iter:
-        chunk_count += 1
-        last_chunk = chunk
-        
-        if adapter and hasattr(adapter, "_cancel_event") and (adapter._cancel_event.is_set() or adapter._cancelled):
-            break
-        # Capture usage-only chunk (empty choices, real usage) BEFORE skipping
-        u = getattr(chunk, "usage", None)
-        if u is not None:
-            stream_usage = u
-        # If no delta, skip content/tool accumulation (usage-only or null chunk)
-        delta = None
-        try:
-            delta = chunk.choices[0].delta
-        except Exception:
-            pass
-        if delta is None:
-            continue
-        # Reasoning / thought process chunks (OpenAI o1/o3, Gemini thinking, Anthropic extended)
-        reasoning_chunk = getattr(delta, "reasoning_content", None) or getattr(delta, "thinking", None) or ""
-        if reasoning_chunk and adapter and hasattr(adapter, "emit"):
+    try:
+        async for chunk in stream_iter:
+            if _is_cancelled(adapter):
+                break
+            # Usage-only chunks have empty choices
+            u = getattr(chunk, "usage", None)
+            if u is not None:
+                stream_usage = u
             try:
-                adapter.emit("partial_thought", reasoning_chunk)
-            except Exception:
-                pass
-        # Content chunks
-        text_chunk = getattr(delta, "content", None) or ""
-        if text_chunk:
-            content_parts.append(text_chunk)
-        # Tool call chunks (streamed in partial chunks by id/index)
-        raw_tool_calls = getattr(delta, "tool_calls", None)
-        if raw_tool_calls:
-            for tc_chunk in (raw_tool_calls if isinstance(raw_tool_calls, list) else [raw_tool_calls]):
-                try:
+                choice = chunk.choices[0]
+            except (AttributeError, IndexError, TypeError):
+                continue
+            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            # Reasoning chunks (OpenAI o-series, Gemini thinking, Anthropic extended thinking)
+            reasoning_chunk = getattr(delta, "reasoning_content", None) or getattr(delta, "thinking", None) or ""
+            if isinstance(reasoning_chunk, str) and reasoning_chunk:
+                thought_parts.append(reasoning_chunk)
+                _emit(adapter, "partial_thought", "".join(thought_parts))
+            text_chunk = getattr(delta, "content", None) or ""
+            if text_chunk:
+                content_parts.append(text_chunk)
+                progress.emitted_text = True
+                _emit(adapter, "partial", "".join(content_parts))
+            raw_tool_calls = getattr(delta, "tool_calls", None)
+            if raw_tool_calls:
+                for tc_chunk in (raw_tool_calls if isinstance(raw_tool_calls, list) else [raw_tool_calls]):
                     fn = getattr(tc_chunk, "function", None)
-                    if fn:
-                        # Track by index (primary) or id (fallback)
-                        idx = getattr(tc_chunk, "index", None)
-                        tc_key = f"idx_{idx}" if idx is not None else (getattr(tc_chunk, "id", None) or "unknown")
-                        fn_name = getattr(fn, "name", None) or ""
-                        args_text = getattr(fn, "arguments", None) or ""
-                        if args_text or fn_name:
-                            if tc_key not in tool_call_chunks:
-                                tool_call_chunks[tc_key] = {"name": fn_name, "args_text": ""}
-                            # Update name if this chunk provides it (first chunk usually has it)
-                            if fn_name:
-                                tool_call_chunks[tc_key]["name"] = fn_name
-                            if args_text:
-                                tool_call_chunks[tc_key]["args_text"] += args_text
-                except Exception:
-                    pass
-        # Emit partial text to adapter (streaming display — cumulative text)
-        accumulated = "".join(content_parts)
-        try:
-            if adapter and hasattr(adapter, "emit") and accumulated:
-                adapter.emit("partial", accumulated)
-        except Exception:
-            pass
-    # Debug: report what we got
-    # if adapter and hasattr(adapter, "emit"):
-    #     adapter.emit("system", f"[stream] {chunk_count} chunks, content_len={len(''.join(content_parts))}, tool_calls={list(tool_call_chunks.keys())}")
-    # Assemble final message
-    full_content = "".join(content_parts)
-    # Build message object
-    msg = SimpleNamespace(
-        content=full_content,
-        role="assistant",
-        tool_calls=None,
-    )
-    if tool_call_chunks:
-        msg.tool_calls = None
-        tc_list = []
-        for tc_key, info in tool_call_chunks.items():
-            # Convert idx_X key to a real id
-            real_id = tc_key[4:] if tc_key.startswith("idx_") else tc_key
-            tc_ns = SimpleNamespace(
-                id=real_id,
-                type="function",
-                function=SimpleNamespace(
-                    name=info["name"],
-                    arguments=info["args_text"],
-                ),
-            )
-            tc_ns.model_dump = lambda tc=tc_ns: {
-                "id": tc.id,
-                "type": tc.type,
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-            }
-            tc_list.append(tc_ns)
+                    idx = getattr(tc_chunk, "index", None)
+                    chunk_id = getattr(tc_chunk, "id", None)
+                    # Chunks of one call share an index; only the first usually carries the id
+                    key = f"idx_{idx}" if idx is not None else (chunk_id or f"anon_{len(tool_call_chunks)}")
+                    entry = tool_call_chunks.setdefault(key, {"id": "", "name": "", "args_text": ""})
+                    if chunk_id and not entry["id"]:
+                        entry["id"] = chunk_id
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            entry["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            entry["args_text"] += fn.arguments
+    finally:
+        _emit(adapter, "stream_end", None)
+
+    msg = SimpleNamespace(content="".join(content_parts), role="assistant", tool_calls=None)
+    tc_list = []
+    for info in tool_call_chunks.values():
+        if not info["name"]:
+            continue
+        tc_ns = SimpleNamespace(
+            id=info["id"] or f"call_{uuid.uuid4().hex[:24]}",
+            type="function",
+            function=SimpleNamespace(name=info["name"], arguments=info["args_text"]),
+        )
+        tc_ns.model_dump = lambda tc=tc_ns: {
+            "id": tc.id,
+            "type": tc.type,
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+        }
+        tc_list.append(tc_ns)
+    if tc_list:
         msg.tool_calls = tc_list
-    # Real response wrapper using stdlib SimpleNamespace
-    choice = SimpleNamespace(
+
+    usage = None
+    if stream_usage is not None:
+        p = getattr(stream_usage, "prompt_tokens", 0) or 0
+        c = getattr(stream_usage, "completion_tokens", 0) or 0
+        t = getattr(stream_usage, "total_tokens", 0) or (p + c)
+        usage = SimpleNamespace(prompt_tokens=p, completion_tokens=c, total_tokens=t)
+    choice_ns = SimpleNamespace(
         message=msg,
         index=0,
-        finish_reason="stop",
+        finish_reason=finish_reason or ("tool_calls" if tc_list else "stop"),
     )
-    # Build real usage from stream if available
-    usage = stream_usage
-    if usage is not None:
-        try:
-            p = getattr(usage, "prompt_tokens", 0) or 0
-            c = getattr(usage, "completion_tokens", 0) or 0
-            t = getattr(usage, "total_tokens", 0) or (p + c)
-            usage = SimpleNamespace(prompt_tokens=p, completion_tokens=c, total_tokens=t)
-        except Exception:
-            pass
-    response = SimpleNamespace(
-        choices=[choice],
+    return SimpleNamespace(
+        choices=[choice_ns],
         usage=usage,
         id="stream",
         model="streamed",
         object="chat.completion",
         created=0,
     )
-    return response

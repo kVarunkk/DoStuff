@@ -1,18 +1,33 @@
 import json
-from litellm import acompletion, ModelResponse
-from dostuff.lib.model import MODEL
+from typing import Any, Literal
 
-async def resolve_memory_operation(user_id: str, new_fact: dict, memory_store) -> None:
+from litellm import acompletion, ModelResponse
+from dostuff.lib.model import completion_kwargs
+
+
+def _parse_decision(raw: str) -> dict[str, Any]:
+    cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
+    try:
+        decision = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        return {"operation": "ADD"}
+    return decision if isinstance(decision, dict) else {"operation": "ADD"}
+
+
+async def resolve_memory_operation(
+    user_id: str, new_fact: dict, memory_store
+) -> tuple[Literal["ADD", "UPDATE", "NOOP"], str]:
+    """Decide ADD / UPDATE / NOOP for one new fact against similar stored ones, then apply it.
+
+    Returns the operation applied and the key it touched (the existing key for UPDATE / NOOP).
+    """
     similar = await memory_store.query(user_id, new_fact["value"], top_k=3)
 
     if not similar:
         await memory_store.upsert_fact(user_id, new_fact)
-        k = new_fact.get('key') or 'unknown'
-        v = new_fact.get('value', '')
-        # print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: SIMILAR NOT FOUND, KEY: {k}, VALUE: {v}")
-        return
+        return "ADD", new_fact["key"]
 
-    v_prompt = new_fact.get('value', '')
+    existing = [{"key": m["key"], "value": m["value"]} for m in similar]
     decision_prompt = f"""You manage a user's long-term memory. Given a NEW fact and
 EXISTING related memories, decide ONE operation:
 - ADD: new fact is genuinely new information, unrelated to existing ones
@@ -21,36 +36,30 @@ EXISTING related memories, decide ONE operation:
 
 Return JSON: {{"operation": "ADD"|"UPDATE"|"NOOP", "replace_key": "<existing key or null>"}}
 
-NEW FACT: {v_prompt}
+NEW FACT: {new_fact.get('value', '')}
 
 EXISTING MEMORIES:
-{json.dumps(similar, indent=2)}
+{json.dumps(existing, indent=2)}
 """
-    response = await acompletion(
-        model=MODEL,
-        messages=[
-            {"role": "user", "content": decision_prompt}
-        ],
-    )
-    
-    if isinstance(response, ModelResponse):
-        raw_json_string = response.choices[0].message.content or ""
-    else:
+    try:
+        response = await acompletion(
+            **completion_kwargs(),
+            messages=[{"role": "user", "content": decision_prompt}],
+        )
+        raw_json_string = (response.choices[0].message.content or "") if isinstance(response, ModelResponse) else ""
+    except Exception:
         raw_json_string = ""
+    decision = _parse_decision(raw_json_string)
+    operation = str(decision.get("operation", "ADD")).upper()
 
-    cleaned = raw_json_string.strip().removeprefix("```json").removesuffix("```").strip()
-    decision = json.loads(cleaned)
-    
-    if decision["operation"] == "NOOP":
-        return
-    elif decision["operation"] == "UPDATE":
-        key_to_replace = decision.get("replace_key") or new_fact["key"]
-        await memory_store.upsert_fact(user_id, {"key": key_to_replace, "value": new_fact["value"]})
-        k_to = key_to_replace or new_fact.get('key') or 'unknown'
-        v_to = new_fact.get('value', '')
-        # print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: UPDATE, KEY: {k_to}, VALUE: {v_to}")
-    else:  # ADD
-        await memory_store.upsert_fact(user_id, new_fact)
-        k_add = new_fact.get('key') or 'unknown'
-        v_add = new_fact.get('value', '')
-        # print(f"FACT SAVED IN LONG TERM MEMORY-> OPERATION: ADD, KEY: {k_add}, VALUE: {v_add}")
+    if operation == "NOOP":
+        noop_key = decision.get("replace_key")
+        return "NOOP", noop_key if isinstance(noop_key, str) and noop_key else similar[0]["key"]
+    if operation == "UPDATE":
+        replace_key = decision.get("replace_key")
+        # An UPDATE must target a key that actually exists; otherwise it is an ADD
+        if isinstance(replace_key, str) and replace_key in {m["key"] for m in existing}:
+            await memory_store.upsert_fact(user_id, {**new_fact, "key": replace_key})
+            return "UPDATE", replace_key
+    await memory_store.upsert_fact(user_id, new_fact)
+    return "ADD", new_fact["key"]

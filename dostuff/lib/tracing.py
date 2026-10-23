@@ -7,11 +7,10 @@ from __future__ import annotations
 import os
 import atexit
 
-from dostuff.config import Config
+from dostuff.config import get_config
 
-_config = Config()
-_service = (_config.tracing_service or "dostuff")
-
+# Tracing is configured once, on first import (after cli.py has switched cwd).
+_config = get_config()
 _enabled = _config.tracing_enabled
 _endpoint = _config.tracing_endpoint
 _service = _config.tracing_service
@@ -24,6 +23,13 @@ import contextvars
 
 session_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("session_id", default="")
 turn_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("turn_id", default="")
+
+
+def content_attr(value: object, limit: int = 2000) -> str:
+    """Span attribute for user input / tool args / tool output — redacted unless tracing.capture_content."""
+    if not get_config().tracing_capture_content:
+        return "[redacted]"
+    return str(value)[:limit]
 
 
 def traced(span_name: str):

@@ -1,11 +1,14 @@
 import http.server
 import re
+import secrets
+import time
 import urllib.parse
 import webbrowser
 import httpx
 import pkce
 import asyncio
 import json
+from typing import Any
 
 from dostuff.lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
 
@@ -13,55 +16,72 @@ CLIENT_ID = "mcp-generic-client"
 REDIRECT_PORT = 8085
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/callback"
 CLIENT_ID_METADATA_DOCUMENT="https://d1b7jdanqdrk6e.cloudfront.net/DoStuff/client-metadata.json"
+CALLBACK_TIMEOUT_S = 120.0
+
+# The loopback callback port is shared, so only one browser flow may run at a time
+_oauth_lock = asyncio.Lock()
+
+
+class OAuthError(Exception):
+    """The authorization flow failed (denied, timed out, state mismatch, ...)."""
+
+
+class _CallbackServer(http.server.HTTPServer):
+    """Loopback server that records the first OAuth callback it receives."""
+    result: dict[str, str] | None = None
 
 
 class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
-    auth_code = None
+    server: _CallbackServer
 
     def do_GET(self):
         self._handle_callback()
 
     def do_POST(self):
         self._handle_callback()
-    
+
     def _handle_callback(self):
         parsed_url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed_url.query)
-    
+
         if self.command == "POST":
             content_length = int(self.headers.get("Content-Length", 0))
             if content_length:
                 body = self.rfile.read(content_length).decode("utf-8")
-                # print(f"RAW POST BODY: {body}")
-    
                 content_type = self.headers.get("Content-Type", "")
-                if "application/json" in content_type:
-                    body_params = {k: [v] for k, v in json.loads(body).items()}
-                else:
-                    body_params = urllib.parse.parse_qs(body)
-    
+                try:
+                    if "application/json" in content_type:
+                        body_params = {k: [str(v)] for k, v in json.loads(body).items()}
+                    else:
+                        body_params = urllib.parse.parse_qs(body)
+                except (json.JSONDecodeError, AttributeError):
+                    body_params = {}
                 for key, value in body_params.items():
-                    query.setdefault(key, value)  
-    
-        if "code" in query:
-            OAuthCallbackHandler.auth_code = query["code"][0]
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
+                    query.setdefault(key, value)
+
+        if "code" not in query and "error" not in query:
+            # e.g. a favicon request; keep waiting for the real callback
+            self.send_response(404)
             self.end_headers()
-            self.wfile.write(
-                b"<h1>Authentication Successful!</h1><p>You may close this window and return to your terminal/agent.</p>"
-            )
+            return
+
+        self.server.result = {k: v[0] for k, v in query.items() if v}
+        ok = "code" in query
+        self.send_response(200 if ok else 400)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        if ok:
+            self.wfile.write(b"<h1>Authentication Successful!</h1><p>You may close this window and return to your terminal/agent.</p>")
         else:
-            self.send_response(400)
-            self.end_headers()
+            self.wfile.write(b"<h1>Authentication failed</h1><p>You may close this window.</p>")
 
     def log_message(self, format, *args):
         return
 
 
-def parse_www_authenticate(header_value: str) -> dict:
+def parse_www_authenticate(header_value: str) -> dict[str, str]:
     """Extracts parameters from a WWW-Authenticate header (resource_metadata, scope, realm, etc.)."""
-    params = {}
+    params: dict[str, str] = {}
     if not header_value:
         return params
 
@@ -71,12 +91,19 @@ def parse_www_authenticate(header_value: str) -> dict:
     return params
 
 
+def canonical_resource(mcp_server_url: str) -> str:
+    """RFC 8707 resource indicator: the server URL without query or fragment."""
+    parsed = urllib.parse.urlparse(mcp_server_url)
+    return urllib.parse.urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", "", ""))
+
+
 async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) -> tuple[str, str, str, str, bool]:
     """Vendor-agnostic OAuth discovery, per RFC 9728 (protected resource metadata)
     and RFC 8414 (authorization server metadata), with an OIDC discovery fallback.
 
     Returns:
-        (authorization_endpoint, token_endpoint, requested_scope, registration_endpoint)
+        (authorization_endpoint, token_endpoint, requested_scope, registration_endpoint,
+        client_id_metadata_document_supported)
     """
     www_auth_params = parse_www_authenticate(www_auth_header)
     requested_scope = www_auth_params.get("scope", "openid")
@@ -128,11 +155,20 @@ async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) ->
         return auth_endpoint, token_endpoint, requested_scope, registration_endpoint, client_id_metadata_document_supported
 
 
+def _wait_for_callback(server: _CallbackServer, timeout_s: float) -> dict[str, str] | None:
+    """Serve requests until the callback arrives or the timeout passes (blocking)."""
+    deadline = time.monotonic() + timeout_s
+    server.timeout = 1.0  # handle_request() returns after this many idle seconds
+    while server.result is None and time.monotonic() < deadline:
+        server.handle_request()
+    return server.result
+
+
 async def authenticate_via_oauth(mcp_server_url: str, www_auth_header: str, registration_store: MCPClientRegistrationStore, server_name: str) -> dict:
     """Discovers OAuth provider details, runs the PKCE authorization-code flow via a
-    local browser + loopback listener, and returns an access token.
+    local browser + loopback listener, and returns the token response plus
+    `token_endpoint`, `client_id` and `resource` (needed for refresh).
     """
-
     auth_endpoint, token_endpoint, scope, registration_endpoint, client_id_metadata_document_supported = await discover_oauth_endpoints(mcp_server_url, www_auth_header)
 
     existing_registration = await registration_store.get(server_name)
@@ -158,43 +194,56 @@ async def authenticate_via_oauth(mcp_server_url: str, www_auth_header: str, regi
             },
         )
 
+    resource = canonical_resource(mcp_server_url)
     code_verifier, code_challenge = pkce.generate_pkce_pair()
+    state = secrets.token_urlsafe(32)
 
-    params = {
+    params: dict[str, str] = {
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": REDIRECT_URI,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
+        "state": state,
+        "resource": resource,
     }
     if scope:
         params["scope"] = scope
 
     auth_url = f"{auth_endpoint}?{urllib.parse.urlencode(params)}"
 
-    # print(f"\nOpening browser for OAuth authentication ({mcp_server_url})...")
-    webbrowser.open(auth_url)
+    async with _oauth_lock:
+        server = _CallbackServer(("localhost", REDIRECT_PORT), OAuthCallbackHandler)
+        try:
+            webbrowser.open(auth_url)
+            callback = await asyncio.to_thread(_wait_for_callback, server, CALLBACK_TIMEOUT_S)
+        finally:
+            server.server_close()  # always release the port
 
-    server = http.server.HTTPServer(("localhost", REDIRECT_PORT), OAuthCallbackHandler)
-    OAuthCallbackHandler.auth_code = None
-
-    await asyncio.to_thread(lambda: _wait_for_callback(server))
-
-    code = OAuthCallbackHandler.auth_code
+    if callback is None:
+        raise OAuthError(f"OAuth for '{server_name}' timed out after {CALLBACK_TIMEOUT_S:.0f}s waiting for the browser callback.")
+    if "error" in callback:
+        detail = callback.get("error_description") or callback["error"]
+        raise OAuthError(f"OAuth for '{server_name}' failed: {detail}")
+    if not secrets.compare_digest(callback.get("state", ""), state):
+        raise OAuthError(f"OAuth for '{server_name}' failed: state mismatch (possible CSRF); try again.")
 
     async with httpx.AsyncClient() as client:
         token_payload = {
             "grant_type": "authorization_code",
             "client_id": client_id,
-            "code": code,
+            "code": callback["code"],
             "redirect_uri": REDIRECT_URI,
             "code_verifier": code_verifier,
+            "resource": resource,
         }
         res = await client.post(token_endpoint, data=token_payload)
         res.raise_for_status()
 
-        token_data = res.json()
+        token_data: dict[str, Any] = res.json()
         token_data["token_endpoint"] = token_endpoint
+        token_data["client_id"] = client_id
+        token_data["resource"] = resource
         return token_data
 
 
@@ -213,17 +262,17 @@ async def register_oauth_client(registration_endpoint: str, redirect_uri: str) -
         res.raise_for_status()
         return res.json()
 
-async def refresh_access_token(token_endpoint: str, refresh_token: str) -> dict:
+
+async def refresh_access_token(token_endpoint: str, refresh_token: str, client_id: str | None = None, resource: str | None = None) -> dict:
+    """Refresh with the client_id the token was issued to (falls back to the generic id)."""
     async with httpx.AsyncClient() as client:
         payload = {
             "grant_type": "refresh_token",
-            "client_id": CLIENT_ID,
+            "client_id": client_id or CLIENT_ID,
             "refresh_token": refresh_token,
         }
+        if resource:
+            payload["resource"] = resource
         res = await client.post(token_endpoint, data=payload)
         res.raise_for_status()
         return res.json()
-
-def _wait_for_callback(server: http.server.HTTPServer):
-    while OAuthCallbackHandler.auth_code is None:
-        server.handle_request()   

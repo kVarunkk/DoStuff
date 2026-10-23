@@ -1,15 +1,32 @@
 from pathlib import Path
-from dostuff.helpers.agent.constants import PROJECT_ROOT
+from dostuff.lib.exceptions import PathAccessDenied, PathOutsideProject
 
-def resolve_safe_path(path: str) -> Path:
-    base_root = Path(PROJECT_ROOT).resolve()
-    clean_path_str = path.replace("\\", "/").strip().lstrip("/")
 
-    target_path = (base_root / clean_path_str).resolve()
+def is_denied_for_read(path: Path) -> bool:
+    """`~/.dostuff/**` and any `.env*` file are never readable by file tools."""
+    dostuff_home = (Path.home() / ".dostuff").resolve()
+    if path == dostuff_home or dostuff_home in path.parents:
+        return True
+    return path.name.startswith(".env")
 
-    try:
-        target_path.relative_to(base_root)
-    except ValueError:
-        raise ValueError(f"Access denied: Path '{path}' resolves outside the allowed project root.")
 
-    return target_path
+def resolve_safe_path(path: str, root: str | Path | None = None, *, for_read: bool = False) -> Path:
+    """Resolve `path` inside the project root (the session working dir, i.e. the cwd).
+
+    Relative paths are joined to the root; absolute or `..` paths that escape it are
+    rejected — never silently re-rooted. With `for_read=True`, secrets and harness data
+    are rejected as well.
+    """
+    base_root = Path(root if root is not None else Path.cwd()).resolve()
+    target = Path(path.strip()).expanduser()
+    if not target.is_absolute():
+        target = base_root / target
+    target = target.resolve()
+
+    if target != base_root and base_root not in target.parents:
+        raise PathOutsideProject(
+            f"Access denied: path '{path}' resolves outside the project root ({base_root})."
+        )
+    if for_read and is_denied_for_read(target):
+        raise PathAccessDenied(f"Access denied: '{path}' may contain secrets and cannot be read by file tools.")
+    return target
