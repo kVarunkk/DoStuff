@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-23
+
+Fixes from the v0.1.6 package review (`plan/2026-10-23-package-review-fixes/`).
+
+### Security
+- **Permission layer** (`agent/permissions.py`): approval is decided before dispatch, never by the model. `_confirmed` / `overwrite` are gone from tool signatures and dropped if a model sends them. Modes `permissions.mode: ask | allowlist | auto`; prompt accepts `y` (once), `a` (always this session), anything else denies; a denial is returned to the model as the tool result.
+- **Shell allow-list** replaces the bypassable `DANGEROUS_PATTERNS` denylist: a command runs without asking only if every segment is read-only and it has no redirection/substitution.
+- **File sandbox**: every file tool rejects paths outside the project root (no more silent re-rooting of `/etc/passwd`); `.env*` and `~/.dostuff/` can't be read.
+- **Tracing** defaults to off in `config.example.yaml`; span content is redacted unless `tracing.capture_content: true`.
+- **Memory provenance**: facts carry `source` (`user_message` / `assistant`); the agent is instructed never to save facts seen only in tool output. `/memories` lists saved facts.
+- **MCP OAuth**: random `state` verified, RFC 8707 `resource` sent, 120 s callback timeout, `?error=` handled, port 8085 always released, refresh uses the registered `client_id`. Optional keyring token storage (`dostuff[keyring]`).
+
+### Added
+- **Memory tools** `save_memory` (key/value fact; overlapping facts are updated via the ADD/UPDATE/NOOP resolver) and `save_episode` (DECISION / PREFERENCE / CORRECTION / EVENT / LEARNING): the agent saves memories during the session instead of an LLM extraction pass at exit. Saves don't ask for approval, are shown in the TUI, and aren't available to subagents.
+- Tools: `edit_file` (exact replacement, unique-match check, `replace_all`), `grep`, `glob` (pure Python, skip `.git`/venvs/`node_modules`/`build`/`dist`); `read_file` gains `offset`/`limit` and line numbers.
+- `<environment>` block in the system prompt every turn (cwd, OS, shell, date, git branch/status); restored tool-usage guidance.
+- Config keys: `loop.context_window`, `loop.max_tool_output_chars` (default 30 000), `memory.episodic_scope` (`project`), `models[].api_key_env`; MCP server `connect_timeout`.
+- `dostuff init --force`; `--session <unknown id>` asks before starting a new session.
+- Tests for schemas, permissions, subagents, file/search tools, loop robustness, DB migration, config, memory, MCP end-to-end and a headless TUI smoke test; GitHub Actions CI (pytest + mypy).
+
+### Changed
+- **TUI runs turns, `/compact`, `/clear` and exit cleanup as async workers** on Textual's loop (no threads); the timer uses `set_interval`. Reasoning text streams into one widget per model call; streamed answers aren't duplicated; all tool calls of a resumed step are rendered.
+- **Agent loop**: compaction is checked after every model call; retries only rate-limit/timeout/5xx/connection errors with 1/2/4 s backoff (context overflow compacts then retries once; auth/bad-request fail fast); an interrupted stream is marked in the UI; an empty response gets one nudge; malformed tool-call JSON becomes a tool error; read-only tool calls run in parallel, mutating ones in order; tool output over the cap keeps head + tail; on ESC, finished tool results are kept.
+- `consume_stream` keeps provider tool-call ids and `finish_reason`. `call_agent` uses `drop_params=True` and sends `stream_options` / Gemini thinking params only when they apply.
+- Compaction summarises in chunks (each request < 50 % of the window) and always makes progress. Unknown models default to a 128k window with a one-time warning.
+- **Session DB**: working history is stored as rows in `working_steps` (one INSERT per step; compaction flags rows). Existing DBs are migrated on first open (`PRAGMA user_version` 1); the old column is emptied, not dropped. One connection per store.
+- **Memory**: episodic recall is per user (and per project directory by default) instead of per session; per-fact JSON guards; UPDATE with an unknown key becomes ADD; tz-aware timestamps; one shared Chroma client; Chroma calls run in threads.
+- **MCP**: tools are keyed `server__tool`; servers connect concurrently with per-server timeouts; each connection lives in its own task (clean shutdown, no cross-task errors); `search_mcp_tools` only returns connected servers' tools and falls back to token-overlap search; tool calls re-authenticate once on HTTP 401.
+- **Config**: `.env` read from `~/.dostuff/.env` then `./.dostuff/.env` (project overrides user; real env wins), loaded once; `get_config()` singleton; model read at call time; `model.api_key_env` honoured.
+- Version comes from package metadata (`importlib.metadata`), used by the banner and `dostuff doctor`.
+- Default identity is neutral ("DoStuff, a coding agent").
+- Packaging: `mcp>=2.0`, `httpx2` declared, `setuptools>=77`; extras `keyring`, `dev`.
+
+### Fixed
+- Subagents: keyword call into `loop`, `tool_names` enforced, `delete_file`/`delegate_to_subagent` never granted, valid seed message, parent adapter/cancel state passed through, `loop.subagent_max_iterations`.
+- Tool schemas generated with pydantic from the real signatures (`dict` → `object`, arrays have `items`, nullable unions).
+- `/clear` now also resets working history, compaction notes and token counters (memory + DB).
+- Exit no longer waits on memory extraction.
+
+### Removed
+- `learn_from_session.py` (dead, referenced a non-existent tool), `extract_text.py`, exit-time memory extraction (`save_memories_and_exit.py`, `extract_semantic_memories.py`, `extract_episodic_memory.py`, `format_transcript.py`) and `memory.exit_timeout_s`, `InMemorySessionStore`, `SQLiteSessionStore.save()`, `WORKSPACE_ROOT` / `SKILLS_ROOT` / `system_prompt_removed`, `random_file.txt`, `build/`, `dostuff_test.egg-info/`.
+
 ## [0.1.6] - 2026-09-21
 
 ### Added
