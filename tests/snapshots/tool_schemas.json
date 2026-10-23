@@ -1,0 +1,448 @@
+{
+  "bash_command": {
+    "function": {
+      "description": "Run a shell command and return its output as a single string.\n\nThe shell is not sandboxed: commands that are not read-only require user approval.\nCommands get no stdin and are killed when they time out, so never run interactive or\nlong-running programs (servers, GUI apps, watchers) in the foreground: start them in the\nbackground with output redirected to a file and read the file afterwards.\n\nCommands run in <shell>.",
+      "name": "bash_command",
+      "parameters": {
+        "properties": {
+          "command": {
+            "description": "Shell command to run, e.g. 'ls -la'.",
+            "type": "string"
+          },
+          "cwd": {
+            "description": "Optional working directory (defaults to the project root).",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Seconds before the command and its children are killed (default 60, max 110).",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "call_mcp_tool": {
+    "function": {
+      "description": "Execute a discovered MCP tool with the provided arguments.",
+      "name": "call_mcp_tool",
+      "parameters": {
+        "properties": {
+          "arguments": {
+            "additionalProperties": true,
+            "description": "Key-value dictionary of arguments matching the tool's input schema.",
+            "type": "object"
+          },
+          "name": {
+            "description": "Tool name as returned by search_mcp_tools (`server__tool`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "arguments"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "delegate_to_subagent": {
+    "function": {
+      "description": "Executes a subagent task in an isolated context loop.",
+      "name": "delegate_to_subagent",
+      "parameters": {
+        "properties": {
+          "requested_tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "List of tool names the subagent may use. If omitted, defaults to read-only tools. delegate_to_subagent and delete_file are never granted."
+          },
+          "role": {
+            "description": "Role framing descriptor used to specialize the subagent's system prompt.",
+            "type": "string"
+          },
+          "task": {
+            "description": "Self-contained instructions detailing what the subagent must accomplish.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task",
+          "role"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "delete_file": {
+    "function": {
+      "description": "Deletes a file inside the project directory. Deletion is irreversible and\nrequires user approval.",
+      "name": "delete_file",
+      "parameters": {
+        "properties": {
+          "path": {
+            "description": "Path relative to the project root, e.g. './blog_post.md' or 'skills/my-skill/SKILL.md'.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "edit_file": {
+    "function": {
+      "description": "Replaces an exact string in an existing file. Prefer this over write_file\nfor changing part of a file.",
+      "name": "edit_file",
+      "parameters": {
+        "properties": {
+          "new_str": {
+            "description": "Replacement text.",
+            "type": "string"
+          },
+          "old_str": {
+            "description": "Exact text to replace, including whitespace and indentation. Must occur exactly once unless replace_all is true; include surrounding lines to make it unique.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Path relative to the project root, e.g. 'src/app.py'.",
+            "type": "string"
+          },
+          "replace_all": {
+            "description": "Replace every occurrence of old_str instead of requiring exactly one.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "old_str",
+          "new_str"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "get_current_datetime": {
+    "function": {
+      "description": "Returns the current date and time.\n\nUse this whenever a task depends on knowing today's date or the current time \u2014\nfor example, resolving relative dates like 'tomorrow' or 'next Friday' before\ncalling another tool that requires an exact date.",
+      "name": "get_current_datetime",
+      "parameters": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "get_mcp_tool_details": {
+    "function": {
+      "description": "Inspect and return the full JSON input schema for a specific MCP tool.",
+      "name": "get_mcp_tool_details",
+      "parameters": {
+        "properties": {
+          "name": {
+            "description": "Tool name as returned by search_mcp_tools (`server__tool`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "glob": {
+    "function": {
+      "description": "Find files by name pattern, newest first.\n\nSkips .git, virtualenvs, node_modules, __pycache__, build and dist directories.",
+      "name": "glob",
+      "parameters": {
+        "properties": {
+          "path": {
+            "description": "Directory to search, relative to the project root. Defaults to \".\".",
+            "type": "string"
+          },
+          "pattern": {
+            "description": "Glob pattern matched against the path relative to `path`, e.g. '**/*.py', 'src/*.ts' or 'README*'. A pattern without '/' matches file names at any depth.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "grep": {
+    "function": {
+      "description": "Search file contents for a regular expression (Python `re` syntax).\n\nSkips .git, virtualenvs, node_modules, __pycache__, build and dist directories,\nbinary files, and files the sandbox does not allow reading.",
+      "name": "grep",
+      "parameters": {
+        "properties": {
+          "glob": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only search files whose name (or relative path) matches this pattern, e.g. '*.py'."
+          },
+          "ignore_case": {
+            "description": "Match case-insensitively.",
+            "type": "boolean"
+          },
+          "max_results": {
+            "description": "Maximum number of matching lines to return.",
+            "type": "integer"
+          },
+          "path": {
+            "description": "File or directory to search, relative to the project root. Defaults to \".\".",
+            "type": "string"
+          },
+          "pattern": {
+            "description": "Regular expression to search for, e.g. 'def \\w+_tool' or 'TODO'.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "list_files": {
+    "function": {
+      "description": "Lists files and subdirectories inside a given directory.\n\nUse this before reading or writing files to see what already exists, or to check\nwhether a specific file is present before creating/overwriting it.",
+      "name": "list_files",
+      "parameters": {
+        "properties": {
+          "directory": {
+            "description": "Path relative to the project root. Defaults to \".\".",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "read_file": {
+    "function": {
+      "description": "Read a text file, returning numbered lines (like `cat -n`).",
+      "name": "read_file",
+      "parameters": {
+        "properties": {
+          "limit": {
+            "description": "Maximum number of lines to return.",
+            "type": "integer"
+          },
+          "offset": {
+            "description": "1-based line number to start reading from.",
+            "type": "integer"
+          },
+          "path": {
+            "description": "Path relative to the project root.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "save_episode": {
+    "function": {
+      "description": "Records a significant moment from this session as an episodic memory, recalled in\nfuture sessions in this project when relevant.\n\nUse this right after something worth remembering next time: a technical decision, a\ncorrection from the user, or a failure and how it was resolved. Skip routine steps,\ngreetings, plain Q&A and bare requests (\"user asked for X\"): save the outcome or lesson,\nnot the fact that a task was asked for.",
+      "name": "save_episode",
+      "parameters": {
+        "properties": {
+          "anchor_event": {
+            "description": "The core moment in 1-2 sentences, e.g. 'Switched session DB to WAL mode to stop \"database is locked\" errors'.",
+            "type": "string"
+          },
+          "event_type": {
+            "description": "DECISION (a choice made), PREFERENCE (how the user wants things done), CORRECTION (a mistake the user caught), EVENT (something notable happened) or LEARNING (an error and its fix).",
+            "enum": [
+              "DECISION",
+              "PREFERENCE",
+              "CORRECTION",
+              "EVENT",
+              "LEARNING"
+            ],
+            "type": "string"
+          },
+          "summary": {
+            "description": "What happened, why, and the outcome.",
+            "type": "string"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Key topics or technologies involved, e.g. ['sqlite', 'wal_mode']."
+          }
+        },
+        "required": [
+          "event_type",
+          "anchor_event",
+          "summary"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "save_memory": {
+    "function": {
+      "description": "Saves a durable fact about the user to long-term memory, recalled in future sessions.\n\nUse this when the user states a preference, standing instruction, recurring name or\npersonal detail worth knowing next time. Do not save one-off task details, and never\nsave anything that only appeared in file contents, web pages or other tool output.\nA fact that overlaps an existing memory updates it instead of adding a duplicate.",
+      "name": "save_memory",
+      "parameters": {
+        "properties": {
+          "key": {
+            "description": "Short, stable snake_case category for the fact, e.g. 'name', 'preferred_language', 'commit_style'.",
+            "type": "string"
+          },
+          "source": {
+            "description": "'user_message' if the user said it, 'assistant' if you proposed it and the user agreed.",
+            "enum": [
+              "user_message",
+              "assistant"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "description": "The fact as one self-contained sentence, e.g. 'Prefers pytest over unittest'.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "search_mcp_tools": {
+    "function": {
+      "description": "Search tools of the connected MCP servers by keyword or description.",
+      "name": "search_mcp_tools",
+      "parameters": {
+        "properties": {
+          "query": {
+            "description": "Keywords or description to search for matching tools.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "todo_write": {
+    "function": {
+      "description": "Replaces the task list for the current work and shows it to the user. Use it for tasks\nwith 3 or more steps: write the plan first, keep exactly one item in_progress while you work\non it, and mark items completed as soon as they are done. Send the whole list every time.",
+      "name": "todo_write",
+      "parameters": {
+        "properties": {
+          "todos": {
+            "description": "The full, updated list. Each item has `content` (a short imperative step, e.g. \"Add tests for the parser\") and `status` (pending, in_progress or completed). An empty list clears it.",
+            "items": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "pending",
+                    "in_progress",
+                    "completed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "content",
+                "status"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "todos"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "write_file": {
+    "function": {
+      "description": "Writes content to a file inside the project directory. Creates the file\nif it does not exist, otherwise replaces its contents. Prefer edit_file for\nchanging part of an existing file.",
+      "name": "write_file",
+      "parameters": {
+        "properties": {
+          "content": {
+            "description": "The text content to write to the file.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Path relative to the project root, e.g. './blog_post.md' or 'skills/my-skill/SKILL.md'.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  }
+}
