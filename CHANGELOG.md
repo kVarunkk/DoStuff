@@ -23,11 +23,21 @@ Fixes from the v0.1.6 package review (`plan/2026-10-23-package-review-fixes/`).
 - `<environment>` block in the system prompt every turn (cwd, OS, shell, date, git branch/status); restored tool-usage guidance.
 - Config keys: `loop.context_window`, `loop.max_tool_output_chars` (default 30 000), `memory.episodic_scope` (`project`), `models[].api_key_env`; MCP server `connect_timeout`.
 - `dostuff init --force`; `--session <unknown id>` asks before starting a new session.
-- Tests for schemas, permissions, subagents, file/search tools, loop robustness, DB migration, config, memory, MCP end-to-end and a headless TUI smoke test; GitHub Actions CI (pytest + mypy).
+- **First-run setup**: launching `dostuff` with no global config and no `MODEL` asks for provider, model and API key (hidden; saved to `~/.dostuff/.env`), writes `~/.dostuff/config.yaml` and offers a test request. `dostuff setup` re-runs it (old config kept as `config.yaml.bak`). No TTY → one-line hint only.
+- **Headless mode** `dostuff -p "<prompt>"`: one turn, answer on stdout, tool activity on stderr (`-q` quiets). `--json`, piped stdin appended (`-p -` reads the prompt from stdin), `--session`, `--permission-mode`. Approvals asked on a TTY, else denied. Ctrl+C exits 130.
+- **Sessions**: `dostuff resume [<id>]` (latest session in this directory), `dostuff sessions [--all] [-n N]`, `sessions rename`, `sessions rm`, `sessions prune [--older-than 30d] [--dry-run]`; ids accept a unique prefix. Session titles (schema v2). `dostuff export [<id>] [-o file|-]` / `/export` write Markdown.
+- **Models**: `/model` picker (saved models, then each provider's catalogue, filterable); picking an unsaved model adds it to the global config. `/model <name> [--active]`; `dostuff models add <provider/model> [--active] [--project] [--api-key-env VAR]` and `dostuff models list`. Model lists come from litellm's catalogue, OpenRouter's public API and the local Ollama server; config edits keep comments.
+- **TUI commands**: `/` command menu (filter, Tab completes, Enter runs); `/resume` picker; `/rename`; `/status`; `/permissions [mode]` (session-only, shown in the status bar); `/undo [force]` restores files from per-turn checkpoints of `write_file` / `edit_file` / `delete_file` (incl. subagents; not shell changes).
+- **`!command`** runs a shell command directly from the input (no approval); command and output are saved so the model sees them next turn.
+- **`todo_write` tool**: visible task list for multi-step work, rendered as a checklist.
+- **Prompt caching** for Claude models (anthropic, and Claude on bedrock / vertex_ai / openrouter); cached tokens shown in the status bar. `loop.prompt_caching: false` turns it off.
+- `dostuff mcp list / add / remove` (stdio or `--url`; `--project` writes the project file).
+- `bash_command` `timeout` parameter (default 60 s, max 110 s). Config keys `loop.max_retries` (default 6) and `loop.retry_max_delay` (default 60 s).
+- Tests for schemas, permissions, subagents, file/search tools, loop robustness, DB migration, config, memory, MCP end-to-end, CLI commands and the TUI; GitHub Actions CI (pytest + mypy).
 
 ### Changed
 - **TUI runs turns, `/compact`, `/clear` and exit cleanup as async workers** on Textual's loop (no threads); the timer uses `set_interval`. Reasoning text streams into one widget per model call; streamed answers aren't duplicated; all tool calls of a resumed step are rendered.
-- **Agent loop**: compaction is checked after every model call; retries only rate-limit/timeout/5xx/connection errors with 1/2/4 s backoff (context overflow compacts then retries once; auth/bad-request fail fast); an interrupted stream is marked in the UI; an empty response gets one nudge; malformed tool-call JSON becomes a tool error; read-only tool calls run in parallel, mutating ones in order; tool output over the cap keeps head + tail; on ESC, finished tool results are kept.
+- **Agent loop**: compaction is checked after every model call; retries only rate-limit/timeout/5xx/connection errors, with jittered exponential backoff that honours `Retry-After` (context overflow compacts then retries once; auth/bad-request fail fast); an interrupted stream is marked in the UI; an empty response gets one nudge; malformed tool-call JSON becomes a tool error; read-only tool calls run in parallel, mutating ones in order; tool output over the cap keeps head + tail; on ESC, finished tool results are kept.
 - `consume_stream` keeps provider tool-call ids and `finish_reason`. `call_agent` uses `drop_params=True` and sends `stream_options` / Gemini thinking params only when they apply.
 - Compaction summarises in chunks (each request < 50 % of the window) and always makes progress. Unknown models default to a 128k window with a one-time warning.
 - **Session DB**: working history is stored as rows in `working_steps` (one INSERT per step; compaction flags rows). Existing DBs are migrated on first open (`PRAGMA user_version` 1); the old column is emptied, not dropped. One connection per store.
@@ -36,12 +46,20 @@ Fixes from the v0.1.6 package review (`plan/2026-10-23-package-review-fixes/`).
 - **Config**: `.env` read from `~/.dostuff/.env` then `./.dostuff/.env` (project overrides user; real env wins), loaded once; `get_config()` singleton; model read at call time; `model.api_key_env` honoured.
 - Version comes from package metadata (`importlib.metadata`), used by the banner and `dostuff doctor`.
 - Default identity is neutral ("DoStuff, a coding agent").
-- Packaging: `mcp>=2.0`, `httpx2` declared, `setuptools>=77`; extras `keyring`, `dev`.
+- Packaging: `mcp>=2.0`, `httpx2` declared, `setuptools>=77`; extras `keyring`, `dev`. Templates ship in the package (`dostuff/templates/`).
+- **`/clear` starts a new session**; the old one stays resumable. Sessions are only created with their first step (no empty sessions per launch).
+- **Approval prompts are a selector** (arrows / number / `y` `a` `n`); several calls in one response are approved together ("allow all", "review each", "no to all"). Denying takes an optional note that is passed to the model.
+- **TUI look**: no message backgrounds, Claude Code-style prefixes (`>`, `●`, `⎿`), grey band on user messages, terminal background shows through, auto-scroll follows streaming output, Gemini reasoning rendered as formatted text.
+- Project MCP config is merged over the global one per server; `mcp.config_path` is honoured; a broken JSON file is skipped with a message.
+- `dostuff doctor` shows ✓/✗ checks with fixes and exits 1 on failure; `config` / `doctor` no longer create files.
+- README quick start is `pip install dostuff` → `dostuff`.
 
 ### Fixed
 - Subagents: keyword call into `loop`, `tool_names` enforced, `delete_file`/`delegate_to_subagent` never granted, valid seed message, parent adapter/cancel state passed through, `loop.subagent_max_iterations`.
 - Tool schemas generated with pydantic from the real signatures (`dict` → `object`, arrays have `items`, nullable unions).
-- `/clear` now also resets working history, compaction notes and token counters (memory + DB).
+- Subagents are no longer killed by the 120 s tool timeout, and return partial results (a wrap-up or a step digest) when they stop early.
+- Long-running shell commands froze the TUI on Windows: commands now run detached with no stdin, and the whole process tree is killed on timeout or ESC.
+- Unrelated past episodes were recalled in every session; recall now needs a minimum similarity.
 - Exit no longer waits on memory extraction.
 
 ### Removed
