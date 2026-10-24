@@ -1,4 +1,7 @@
-from typing import Literal, TypedDict
+from typing import Literal
+
+# pydantic on Python < 3.12 rejects typing.TypedDict when building tool schemas
+from typing_extensions import TypedDict
 
 TodoStatus = Literal["pending", "in_progress", "completed"]
 _MARKS: dict[str, str] = {"pending": "☐", "in_progress": "◐", "completed": "☑"}
