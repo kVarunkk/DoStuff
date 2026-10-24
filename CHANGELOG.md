@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`web_fetch` tool**: GET a URL; HTML becomes Markdown-ish text (headings, lists, links, `<pre>`; scripts/styles dropped), JSON/XML/text as-is, binary refused; `max_chars` (default 20 000), downloads stop at 5 MB. 4xx/5xx HTML pages return only the header and a note.
+- **`web_search` tool**, no API key: SearXNG if `search.searxng_url` is set, else the `ddgs` package (`dostuff[search]`), else DuckDuckGo's HTML page. Title / URL / snippet per result, `max_results` 1-20.
+- New permission kind `network` for `web_fetch` / `web_search`: asks in `ask` / `allowlist`; "always" and `permissions.allow` work per domain (`web_fetch:docs.python.org`) or for every search (`web_search`). Both are in the subagents' default tools.
+- **Settings tools** (`tools/settings.py`): `read_settings`, `edit_config` (exact-text edit of `config.yaml`, keeps comments, refuses invalid YAML, warns on unknown keys), `set_mcp_server` / `remove_mcp_server`; `scope` is `user` or `project`. Changes apply live (`Config.reload()`, status bar, iteration cap, MCP servers reconnected). New permission kind `settings` asks in every mode with no "always"; writes inside a `.dostuff` folder are treated the same. Not available to subagents.
+- **`@path` mentions**: `@src/app.py` attaches the file, `@src` a folder listing (`@"a b.txt"` for spaces); non-paths stay plain text, `.env*` and binaries skipped. `@` opens a completion menu in the TUI; also works in `dostuff -p`.
+- **Cost per turn and per session**, priced with litellm's table (cached tokens included); stored in `sessions.cost_usd` (schema v3), shown in the status bar, `/status` and at the end of each turn; `cost_usd` in `dostuff -p --json`.
+- **TUI**: Shift+Enter (also Ctrl+Enter, Alt+Enter, Ctrl+J, `\` + Enter) inserts a newline; Up/Down prompt history saved per directory; Ctrl+O expands/collapses truncated tool results (click toggles one); select text to copy (OSC 52, plus `clip.exe` on Windows) while the input keeps focus.
+- **Memory commands** `/episodes` and `/forget <key or id>`.
+- **Configurable status bar** (`ui.status_bar`): it fits the terminal by shortening the cwd/model and dropping the least important items, and redraws on resize.
+- `dostuff --version` (`-V`); `python -m dostuff` (and `python -m dostuff.cli`) runs the CLI.
+
+### Changed
+- **chromadb is optional** (`pip install "dostuff[memory]"`, included in `full`). Without it the memory tools aren't offered, recall is skipped, and `search_mcp_tools` uses keyword search.
+- **Faster startup** (~9 s → under 1 s to the first frame): litellm, chromadb and mcp load in a thread after the first frame.
+- Chroma's embedding model downloads at startup with a message instead of silently during the first turn; `dostuff doctor` reports it.
+- **Project instructions are combined**: global `~/.dostuff/AGENTS.md` (or CLAUDE.md), then one file per folder from the outermost parent down to the cwd.
+- Memory recall leaves out facts below 0.25 similarity; the memory resolver skips the model call when nothing related exists; `save_episode` skips near-duplicates (≥ 0.85). The unused `context_window` episode field is gone.
+- System prompt: a "The web" section (search before guessing URLs / packages / config values, never present placeholders as real) and guidance for adding MCP servers.
+- Tool result previews are capped by characters (8 × 200) as well as lines.
+- `pyproject.toml` Homepage points at the repo root; CI also tests Python 3.14 and installs `.[dev,memory]`.
+
+### Fixed
+- **MCP OAuth with confidential clients** (Supabase 422 at the token endpoint): the registration's `client_secret` and auth method are saved and sent (`client_secret_post` or HTTP Basic); cached registrations missing a needed secret are redone. Scope follows the MCP spec (`WWW-Authenticate`, else the resource's `scopes_supported`). OAuth errors include the server's message.
+- `python -m dostuff.cli ...` exited 0 with no output.
+
 ## [0.2.0] - 2026-10-23
 
 Fixes from the v0.1.6 package review (`plan/2026-10-23-package-review-fixes/`).

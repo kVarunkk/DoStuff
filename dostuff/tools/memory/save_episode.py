@@ -6,6 +6,7 @@ from pathlib import Path
 
 from dostuff.config import get_config
 from dostuff.helpers.ui.emit import emit
+from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
 from dostuff.lib.memory.stores import get_episodic_store
 from dostuff.lib.memory.types import EpisodeType
 
@@ -35,29 +36,37 @@ async def save_episode(
         tags: Key topics or technologies involved, e.g. ['sqlite', 'wal_mode'].
 
     Returns:
-        A confirmation with the episode id.
+        A confirmation with the episode id, or the id of the same moment already saved.
     """
     anchor_event, summary = anchor_event.strip(), summary.strip()
     if not anchor_event or not summary:
         raise ValueError("Both anchor_event and summary must be non-empty.")
+    store = get_episodic_store()
+    if store is None:
+        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}).")
+    user_id = get_config().get_user_id()
+    working_dir = str(Path.cwd().resolve())
+    vector_text = f"- EVENT TYPE: {event_type}\n  - ANCHOR EVENT: {anchor_event}\n  - SUMMARY: {summary}"
+    duplicate_id = await store.find_duplicate(user_id, vector_text, working_dir)
+    if duplicate_id:
+        return f"Already recorded as {duplicate_id}; nothing saved."
     now_epoch = int(time.time())
     episode_id = f"ep_{session_id}_{uuid.uuid4().hex[:8]}"
     episode = {
         "id": episode_id,
-        "vector_text": f"- EVENT TYPE: {event_type}\n  - ANCHOR EVENT: {anchor_event}\n  - SUMMARY: {summary}",
+        "vector_text": vector_text,
         "metadata": {
-            "user_id": get_config().get_user_id(),
+            "user_id": user_id,
             "session_id": session_id,
-            "working_dir": str(Path.cwd().resolve()),
+            "working_dir": working_dir,
             "created_at_epoch": now_epoch,
             "created_at_iso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "event_type": event_type,
             "anchor_event": anchor_event,
             "summary": summary,
             "tags": json.dumps([str(t) for t in tags or []]),
-            "context_window": json.dumps([]),
         },
     }
-    await get_episodic_store().add([episode])
+    await store.add([episode])
     emit(f"Remembered episode [{event_type}]: {anchor_event}", msg_type="system")
     return f"Saved episode {episode_id}."

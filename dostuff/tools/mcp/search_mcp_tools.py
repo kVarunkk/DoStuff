@@ -43,9 +43,10 @@ async def _impl_search_mcp_tools(query: str, mcp_client: MCPClient) -> str:
     results = []
 
     # Primary: semantic search in the tool index, limited to servers connected right now
-    if getattr(mcp_client, "tool_registry", None) is not None and connected:
+    registry = getattr(mcp_client, "tool_registry", None)  # None without chromadb
+    if registry is not None and connected:
         try:
-            for tool in await mcp_client.tool_registry.search_tools(user_intent=query, top_k=_MAX_RESULTS, server_names=connected):
+            for tool in await registry.search_tools(user_intent=query, top_k=_MAX_RESULTS, server_names=connected):
                 key = tool_key(tool["server_name"], tool["name"])
                 if key in mcp_client.mcp_tools:
                     results.append({"name": key, "description": tool["description"], "server": tool["server_name"]})

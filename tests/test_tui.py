@@ -29,6 +29,8 @@ def tui(tmp_path, monkeypatch):
     monkeypatch.setattr(SemanticMemoryStore, "query", no_memories)
     monkeypatch.setattr(EpisodicMemoryStore, "query", no_memories)
     monkeypatch.setattr(cli_tui, "load_mcp_config", lambda: {})
+    from dostuff.lib.memory import chroma
+    monkeypatch.setattr(chroma, "embedding_model_missing", lambda: False)  # no 80 MB download in tests
     monkeypatch.setattr(cli_tui, "get_model_token_limit", lambda: 100_000)
 
     async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
@@ -395,3 +397,379 @@ def test_thought_chunks_typed_out_and_formatted(tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+def test_input_newline_keys():
+    from textual.app import App
+    from dostuff.cli_tui import EnterSubmits
+
+    class InputApp(App):
+        submitted: list[str] = []
+
+        def compose(self):
+            yield EnterSubmits(id="input")
+
+        def on_enter_submits_submitted(self, message):
+            self.submitted.append(message.text)
+
+    async def run():
+        app = InputApp()
+        async with app.run_test() as pilot:
+            box = app.query_one("#input", EnterSubmits)
+            box.focus()
+            await pilot.press("a", "shift+enter", "b", "ctrl+enter", "c", "ctrl+j", "d", "\\", "enter", "e")
+            assert box.text == "a\nb\nc\nd\ne"
+            assert app.submitted == []
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.submitted == ["a\nb\nc\nd\ne"]
+
+    asyncio.run(run())
+
+
+def test_tool_results_expand_and_collapse(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="expand")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            long_output = "\n".join(f"line {i}" for i in range(1, 21))
+            app.adapter.emit("tool_result", f"read_file: {long_output}")
+            app.adapter.emit("tool_result", "write_file: ok")
+            await pilot.pause()
+            long_result, short_result = list(app.query(cli_tui.ToolResult))
+            text = str(long_result.render())
+            assert "line 8" in text and "line 9" not in text
+            assert "… +12 lines (ctrl+o to expand)" in text
+            assert not short_result.collapsible
+
+            await pilot.press("ctrl+o")
+            assert long_result.expanded and "line 20" in str(long_result.render())
+            assert not short_result.expanded
+            # Results added while expanded arrive expanded
+            app.adapter.emit("tool_result", f"grep: {long_output}")
+            await pilot.pause()
+            assert list(app.query(cli_tui.ToolResult))[-1].expanded
+
+            await pilot.press("ctrl+o")
+            assert not any(w.expanded for w in app.query(cli_tui.ToolResult))
+            assert "line 9" not in str(long_result.render())
+
+            # A click toggles just that one
+            long_result.on_click()
+            assert long_result.expanded
+            long_result.on_click()
+            assert not long_result.expanded
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_select_to_copy_and_input_keeps_focus(tui, monkeypatch):
+    cli_tui = tui
+    monkeypatch.setattr(cli_tui.sys, "platform", "linux")  # no clip.exe in tests
+    from textual.selection import Selection
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="select")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            app._append("**bold** answer\n\n- item one", msg_type="agent")
+            await pilot.pause()
+            msg = list(app.query(cli_tui.SelectableStatic))[-1]
+            # Markdown is flattened to Text, so Textual can select it
+            text, _ = msg.get_selection(Selection(None, None))
+            assert "bold answer" in text and "item one" in text and "**" not in text
+
+            # Releasing the mouse over a selection copies it
+            app.screen.selections = {msg: Selection(None, None)}
+            app.post_message(cli_tui.TextSelected())
+            await pilot.pause()
+            assert "bold answer" in app.clipboard
+
+            # Clicking the conversation leaves focus in the input
+            await pilot.click("#messages")
+            await pilot.pause()
+            assert app.focused is inp
+            app.set_focus(None)
+            await pilot.pause()
+            assert app.focused is inp
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_prompt_history_up_down(tui, tmp_path):
+    cli_tui = tui
+    from dostuff.helpers.ui.prompt_history import append_history
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="history")
+        append_history(app._history_path, str(tmp_path / "elsewhere"), "other project")
+        append_history(app._history_path, str(Path.cwd()), "first")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.query_one("#input", cli_tui.EnterSubmits)
+            assert box.prompt_history == ["first"]  # only this directory's prompts
+            app._remember_prompt("/help")
+            app._remember_prompt("line one\nline two")
+            menu = app.query_one("#command-menu", cli_tui.CommandMenu)
+
+            await pilot.press("d", "r", "a", "f", "t")
+            await pilot.press("up")
+            assert box.text == "line one\nline two"
+            await pilot.press("up")  # cursor is on the last line: move up within the prompt
+            assert box.text == "line one\nline two" and box.cursor_location[0] == 0
+            await pilot.press("up")
+            await pilot.pause()
+            assert box.text == "/help" and not menu.display  # a recalled command doesn't open the menu
+            await pilot.press("up", "up")  # stops at the oldest
+            assert box.text == "first"
+            await pilot.press("down", "down")
+            assert box.text == "line one\nline two"
+            await pilot.press("down")
+            assert box.text == "draft"
+            await pilot.press("down")
+            assert box.text == "draft"
+
+            # Saved for the next run in this directory
+            app2_history = cli_tui.load_history(app._history_path, str(Path.cwd()))
+            assert app2_history == ["first", "/help", "line one\nline two"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tui_import_skips_heavy_libraries():
+    """litellm / chromadb / mcp load after the first frame (DostuffTUI._load_backend)."""
+    import subprocess
+    import sys
+    code = "import sys, dostuff.cli, dostuff.cli_tui; print(sorted(m for m in ('litellm', 'chromadb', 'mcp') if m in sys.modules))"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
+                         cwd=Path(__file__).resolve().parents[1])
+    assert out.stdout.strip() == "[]"
+
+
+def test_cost_in_status_bar_and_status(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cost")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            status = app.query_one("#status", cli_tui.Static)
+            assert "$" not in str(status.render())  # nothing priced yet
+            app.adapter.emit("usage", {"prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100, "cost": 0.0123})
+            app.adapter.emit("usage", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": None})
+            await pilot.pause()
+            assert "$0.01" in str(status.render())
+            assert app.adapter._turn_cost == 0.0123
+            await app._show_status()
+            assert any("Cost" in t and "$0.01" in t for t in _texts(app))
+            assert any("Status bar" in t and "ui.status_bar" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_episodes_and_forget_commands(tui):
+    cli_tui = tui
+
+    class FakeFacts:
+        def __init__(self):
+            self.keys = {"editor"}
+
+        async def list_all(self, user_id):
+            return [{"key": k, "value": "Uses VS Code", "source": "user_message"} for k in sorted(self.keys)]
+
+        async def delete(self, user_id, key):
+            if key not in self.keys:
+                return False
+            self.keys.discard(key)
+            return True
+
+    class FakeEpisodes:
+        def __init__(self):
+            self.episodes = [
+                {"id": "ep_s2_bbbb2222", "event_type": "LEARNING", "anchor_event": "Retry 429s", "created_at_iso": "2026-10-20T00:00:00Z"},
+                {"id": "ep_s1_aaaa1111", "event_type": "DECISION", "anchor_event": "Use WAL", "created_at_iso": "2026-10-01T00:00:00Z"},
+            ]
+            self.listed_dirs = []
+
+        async def list_all(self, user_id, working_dir=None):
+            self.listed_dirs.append(working_dir)
+            return list(self.episodes)
+
+        async def delete(self, user_id, episode_id):
+            self.episodes = [ep for ep in self.episodes if ep["id"] != episode_id]
+            return True
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="episodes")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            app.memory_store, app.episodic_store = FakeFacts(), FakeEpisodes()
+            await app._show_episodes()
+            listing = next(t for t in _texts(app) if t.startswith("Saved episodes"))
+            assert "for this directory (2)" in listing and "[LEARNING] Retry 429s  (2026-10-20, bbbb2222)" in listing
+            assert listing.index("Retry 429s") < listing.index("Use WAL")
+            assert app.episodic_store.listed_dirs == [str(Path.cwd().resolve())]  # episodic_scope: project
+
+            await app._forget("aaaa1111")
+            assert "Forgot episode [DECISION] Use WAL" in _texts(app)
+            await app._forget("editor")
+            assert "Forgot memory 'editor'." in _texts(app) and not app.memory_store.keys
+            await app._forget("nope")
+            assert any("No memory key or episode id 'nope'" in t for t in _texts(app))
+
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/forget"))
+            await pilot.pause()
+            assert any(t.startswith("Usage: /forget") for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_embedding_model_download_reported(tui, monkeypatch):
+    cli_tui = tui
+    from dostuff.lib.memory import chroma
+    monkeypatch.setattr(chroma, "embedding_model_missing", lambda: True)
+
+    def offline():
+        raise OSError("no network")
+    monkeypatch.setattr(chroma, "download_embedding_model", offline)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="embed")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            await pilot.pause()
+            texts = _texts(app)
+            assert any("Downloading the memory embedding model" in t for t in texts)
+            assert any("Embedding model download failed: no network" in t for t in texts)
+            assert not app._backend_error  # turns still run, just without recall
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_file_mention_completion_and_attachment(tui, monkeypatch):
+    cli_tui = tui
+    from dostuff.helpers.agent import file_mentions
+    monkeypatch.setattr(file_mentions, "_index", {})
+    Path("src").mkdir()
+    Path("src", "main.py").write_text("print('hi')\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.query_one("#input", cli_tui.EnterSubmits)
+            menu = app.query_one("#command-menu", cli_tui.CommandMenu)
+            await pilot.press(*"fix @ma")
+            await pilot.pause()
+            assert menu.display and menu.mode == "file" and menu.selected_command() == "src/main.py"
+            await pilot.press("enter")  # completes the path, doesn't submit
+            assert box.text == "fix @src/main.py " and not menu.display
+            await pilot.press(*"now")
+            await pilot.pause()
+            assert not menu.display
+
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(box.text))
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if app.adapter.has_pending_confirm():
+                    break
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if not app._turn_in_progress:
+                    break
+            sent = app.steps_history[0]["content"]
+            assert sent.startswith("fix @src/main.py now\n\n<attached_file path=\"src/main.py\">")
+            assert "print('hi')" in sent
+            assert any(t == "Attached src/main.py" for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_status_bar_fits_width_and_follows_config(tui, tmp_path):
+    cli_tui = tui
+    from dostuff import config as config_module
+
+    async def scenario(size):
+        app = cli_tui.DostuffTUI(session_id="narrow-session")
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            app.permissions.mode = "auto"
+            app._update_status(loader=" 1.5s")
+            text = str(app.query_one("#status", cli_tui.Static).render())
+            await app._cleanup_and_save_session()
+            return text, _texts(app)
+
+    wide, _ = asyncio.run(scenario((160, 24)))
+    assert all(s in wide for s in ("/help", "narrow-session", "openai/gpt-4o-mini", "auto mode", "1.5s"))
+
+    # Narrow: the least important items go first; mode and timer stay, nothing past the edge
+    narrow, _ = asyncio.run(scenario((30, 24)))
+    assert "auto mode" in narrow and "1.5s" in narrow
+    assert "/help" not in narrow and "narrow-session" not in narrow
+    assert len(narrow) <= 28
+
+    (tmp_path / "home" / ".dostuff" / "config.yaml").write_text("ui:\n  status_bar: [timer, mode, bogus]\n")
+    config_module.reset_config()
+    picked, texts = asyncio.run(scenario((160, 24)))
+    assert picked.strip() == "1.5s  auto mode"
+    assert any("unknown item(s) bogus" in t for t in texts)
+
+
+def test_settings_changes_apply_without_restart(tui):
+    cli_tui = tui
+    from dostuff.tools import settings
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="live")
+        async with app.run_test(size=(160, 24)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            status = app.query_one("#status", cli_tui.Static)
+            connected = []
+
+            async def fake_connect(server_name, **kwargs):
+                connected.append((server_name, kwargs["command"]))
+                app.mcp_client.servers[server_name] = object()
+            app.mcp_client.connect_to_server = fake_connect
+
+            await asyncio.to_thread(settings.edit_config, "", "ui:\n  status_bar: [mode]", "user", app.adapter)
+            await _until(pilot, lambda: str(status.render()).strip() == "ask mode")
+
+            await asyncio.to_thread(settings.set_mcp_server, "git", ["uvx", "mcp-server-git"], adapter=app.adapter)
+            await _until(pilot, lambda: connected == [("git", "uvx")])
+            # Changing a server reconnects it; removing one disconnects it
+            await asyncio.to_thread(settings.set_mcp_server, "git", ["uvx", "other"], adapter=app.adapter)
+            await _until(pilot, lambda: len(connected) == 2)
+            await asyncio.to_thread(settings.remove_mcp_server, "git", adapter=app.adapter)
+            await _until(pilot, lambda: "git" not in app.mcp_client.servers and app._mcp_configured == [])
+            assert any("MCP: disconnected git" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tool_result_preview_caps_one_long_line():
+    """A one-line result (e.g. a JSON list of 800 tool names) is cut by chars, not shown whole."""
+    from dostuff.cli_tui import PREVIEW_CHARS_PER_LINE, _preview, _preview_clipped
+
+    long_line = "x" * 20_000
+    preview = _preview(long_line, 8)
+    budget = 8 * PREVIEW_CHARS_PER_LINE
+    assert preview.splitlines() == ["x" * budget, f"… +{20_000 - budget} chars (ctrl+o to expand)"]
+    assert _preview_clipped(long_line, 8)
+    assert _preview(long_line, len(long_line)) == long_line  # expanded shows everything
+    assert not _preview_clipped("short\nresult", 8)
+    assert _preview("\n".join(map(str, range(20))), 8).endswith("… +12 lines (ctrl+o to expand)")

@@ -16,6 +16,7 @@ from dostuff.lib.checkpoints import CHECKPOINT_TOOLS, get_checkpoint_store
 from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.tracing import content_attr, traced
 from dostuff.tools.definitions import HARNESS_PARAMS, TOOL_MAP, ToolSpec
+from dostuff.tools.settings import SETTINGS_TOOLS, settings_preview
 
 # Legacy approval flags a model may still try to pass; always dropped before dispatch.
 APPROVAL_KEYS = frozenset({"_confirmed", "overwrite"})
@@ -30,6 +31,8 @@ def _sanitize_args(spec: ToolSpec, fn_args: dict[str, Any]) -> dict[str, Any]:
 
 def _approval_preview(tool: str, args: dict[str, Any]) -> str:
     """A plain diff for file writes/edits so the user sees what they approve."""
+    if tool in SETTINGS_TOOLS:
+        return settings_preview(tool, args)
     if tool not in ("write_file", "edit_file") or not isinstance(args.get("path"), str):
         return ""
     try:

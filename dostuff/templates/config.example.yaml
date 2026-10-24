@@ -25,13 +25,27 @@ loop:
 memory:
   episodic_scope: project   # project: recall past episodes from this directory only | user: from anywhere
 
+ui:
+  # Status bar items, shown in this order (omit one to hide it). When the terminal is too
+  # narrow, the least important are dropped first: help, session, cwd, tokens, cost, model, context, timer, mode.
+  status_bar: [help, cwd, session, model, mode, tokens, cost, context, timer]
+
+search:
+  # web_search is free with no API key: DuckDuckGo by default (the `ddgs` package if installed,
+  # `pip install "dostuff[search]"`). For steadier results, point it at a SearXNG instance with JSON
+  # output on, e.g. `docker run -p 8080:8080 searxng/searxng`.
+  # searxng_url: "http://localhost:8080"
+
 permissions:
-  # ask       — every write / delete / shell / MCP call asks, except read-only shell commands
+  # ask       — every write / delete / shell / MCP / web_fetch / web_search call asks, except read-only shell commands
   # allowlist — as ask, plus the `allow` patterns below are auto-approved
   # auto      — nothing asks (not recommended)
+  # Settings changes by the agent (edit_config, set_mcp_server, remove_mcp_server, edits in .dostuff/) ask in every mode.
   mode: ask
   allow: []
   #   - "npm test"       # shell command prefix
   #   - "git commit"
   #   - "write_file"     # a tool name
   #   - "call_mcp_tool:github__create_issue"  # one MCP tool (server__tool)
+  #   - "web_fetch:docs.python.org"  # web_fetch from one domain
+  #   - "web_search"                 # every web search

@@ -25,7 +25,6 @@ classifiers = [
 dependencies = [
     "typer>=0.9.0",
     "aiosqlite>=0.19.0",
-    "chromadb>=1.5.0",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
@@ -42,7 +41,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kVarunkk/DoStuff/blob/package-structure/README.md"
+Homepage = "https://github.com/kVarunkk/DoStuff"
 Repository = "https://github.com/kVarunkk/DoStuff"
 Issues = "https://github.com/kVarunkk/DoStuff/issues"
 
@@ -50,7 +49,17 @@ Issues = "https://github.com/kVarunkk/DoStuff/issues"
 dostuff = "dostuff.cli:app"
 
 [project.optional-dependencies]
+# Long-term memory (save_memory / save_episode, recall) and semantic MCP tool search.
+# Large install (onnxruntime and friends), so it's opt-in.
+memory = [
+    "chromadb>=1.5.0",
+]
+# Steadier web_search (several engines); without it web_search reads DuckDuckGo's HTML page
+search = [
+    "ddgs>=9.0",
+]
 full = [
+    "dostuff[memory,search]",
     "onnxruntime>=1.16",
     "grpcio>=1.52",
 ]

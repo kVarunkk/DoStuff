@@ -65,8 +65,10 @@ class FakeMemory:
     def __init__(self, similar):
         self.similar = similar
         self.upserts = []
+        self.min_similarity = None
 
-    async def query(self, user_id, text, top_k=3):
+    async def query(self, user_id, text, top_k=3, min_similarity=0.0):
+        self.min_similarity = min_similarity
         return self.similar
 
     async def upsert_fact(self, user_id, fact):
@@ -123,6 +125,9 @@ def test_save_episode_tool_stores_episode(monkeypatch, tmp_path):
     added = []
 
     class FakeEpisodic:
+        async def find_duplicate(self, user_id, vector_text, working_dir):
+            return None
+
         async def add(self, episodes):
             added.extend(episodes)
     monkeypatch.setattr(se, "get_config", lambda: SimpleNamespace(get_user_id=lambda: "u"))
@@ -134,6 +139,88 @@ def test_save_episode_tool_stores_episode(monkeypatch, tmp_path):
     meta = added[0]["metadata"]
     assert meta["user_id"] == "u" and meta["session_id"] == "s1" and meta["event_type"] == "DECISION"
     assert meta["working_dir"] == str(tmp_path.resolve()) and meta["tags"] == '["sqlite"]'
+    assert "context_window" not in meta
+
+
+def test_save_episode_skips_a_duplicate(monkeypatch, tmp_path):
+    from dostuff.tools.memory import save_episode as se
+    added, asked = [], []
+
+    class FakeEpisodic:
+        async def find_duplicate(self, user_id, vector_text, working_dir):
+            asked.append((user_id, working_dir))
+            return "ep_old_1234abcd" if "WAL" in vector_text else None
+
+        async def add(self, episodes):
+            added.extend(episodes)
+    monkeypatch.setattr(se, "get_config", lambda: SimpleNamespace(get_user_id=lambda: "u"))
+    monkeypatch.setattr(se, "get_episodic_store", lambda: FakeEpisodic())
+    monkeypatch.chdir(tmp_path)
+
+    result = asyncio.run(se.save_episode("LEARNING", "WAL mode fixed the locks", "Same as before", session_id="s2"))
+    assert result == "Already recorded as ep_old_1234abcd; nothing saved." and added == []
+    assert asked == [("u", str(tmp_path.resolve()))]
+    asyncio.run(se.save_episode("DECISION", "Use httpx", "Async support", session_id="s2"))
+    assert len(added) == 1
+
+
+class FakeCollection:
+    """Chroma collection stand-in: query returns the given rows with their cosine distances."""
+    def __init__(self, rows):
+        self.rows = rows  # [(id, metadata, distance)]
+        self.deleted = []
+
+    def count(self):
+        return len(self.rows)
+
+    def query(self, query_texts, n_results, where):
+        rows = self.rows[:n_results]
+        return {"ids": [[r[0] for r in rows]], "metadatas": [[r[1] for r in rows]],
+                "distances": [[r[2] for r in rows]], "documents": [["" for _ in rows]]}
+
+    def get(self, ids=None, where=None):
+        rows = [r for r in self.rows if ids is None or r[0] in ids]
+        return {"ids": [r[0] for r in rows], "metadatas": [r[1] for r in rows]}
+
+    def delete(self, ids):
+        self.deleted.extend(ids)
+
+
+def _store(cls, rows):
+    store = cls.__new__(cls)
+    store._collection = FakeCollection(rows)
+    return store
+
+
+def test_fact_recall_floor_and_dedup_floor():
+    from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY, SemanticMemoryStore
+    store = _store(SemanticMemoryStore, [
+        ("u:commit_style", {"key": "commit_style", "value": "Conventional commits", "source": "user_message"}, 0.53),
+        ("u:name", {"key": "name", "value": "Varun", "source": "user_message"}, 0.83),
+    ])
+    assert [f["key"] for f in asyncio.run(store.query("u", "write a commit message", top_k=5))] == ["commit_style", "name"]
+    recalled = asyncio.run(store.query("u", "write a commit message", top_k=5, min_similarity=MIN_FACT_SIMILARITY))
+    assert [f["key"] for f in recalled] == ["commit_style"]  # 0.17 similar: left out
+
+    # Dedup asks with its own (lower) floor, and a fact with nothing similar is added without a model call
+    memory = FakeMemory([])
+    assert asyncio.run(rmo.resolve_memory_operation("u", {"key": "editor", "value": "Uses Neovim"}, memory)) == ("ADD", "editor")
+    assert memory.min_similarity == rmo.DEDUP_MIN_SIMILARITY < MIN_FACT_SIMILARITY
+
+
+def test_episode_find_duplicate_list_and_delete():
+    from dostuff.lib.memory.episodic_memory_store import DUPLICATE_EPISODE_SIMILARITY, EpisodicMemoryStore
+    old = {"event_type": "DECISION", "anchor_event": "Use WAL", "created_at_iso": "2026-10-01T00:00:00Z", "created_at_epoch": 100}
+    new = {"event_type": "LEARNING", "anchor_event": "Retry 429s", "created_at_iso": "2026-10-20T00:00:00Z", "created_at_epoch": 200}
+    store = _store(EpisodicMemoryStore, [("ep_s1_aaaa1111", old, 0.1), ("ep_s2_bbbb2222", new, 0.5)])
+    assert asyncio.run(store.find_duplicate("u", "Use WAL mode", "/proj")) == "ep_s1_aaaa1111"
+    store._collection.rows[0] = ("ep_s1_aaaa1111", old, 1.0 - DUPLICATE_EPISODE_SIMILARITY + 0.05)
+    assert asyncio.run(store.find_duplicate("u", "Use WAL mode", "/proj")) is None
+
+    assert [ep["id"] for ep in asyncio.run(store.list_all("u"))] == ["ep_s2_bbbb2222", "ep_s1_aaaa1111"]
+    assert asyncio.run(store.delete("u", "ep_s1_aaaa1111")) is True
+    assert asyncio.run(store.delete("u", "ep_missing")) is False
+    assert store._collection.deleted == ["ep_s1_aaaa1111"]
 
 
 def test_memory_tools_registered_but_not_for_subagents():

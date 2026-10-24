@@ -28,16 +28,18 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Textual TUI** with per-role colored messages, status bar, and a loading/timer spinner
 - **Multi-provider LLMs** via [litellm](https://docs.litellm.ai/docs/providers) — OpenAI, Anthropic, Gemini, Groq, Mistral, Ollama, OpenRouter
 - **Persistent sessions** in SQLite; resume with `dostuff resume` or `dostuff --session <id>`
-- **Long-term memory** (semantic + episodic) backed by ChromaDB
+- **Long-term memory** (semantic + episodic) backed by ChromaDB — optional, `pip install "dostuff[memory]"`
 - **MCP server support** — stdio (npx, uvx) and HTTP transports
-- **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`
+- **`@file` mentions** — type `@` in the prompt to pick a file or folder; its content (or listing) is sent with the message
+- **Project instructions** — `AGENTS.md` / `CLAUDE.md` from `~/.dostuff/`, the repo root and every folder down to the current one, combined
+- **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
 - **Permission layer** — mutating tool calls ask for approval (`y` once / `a` always this session / `n` deny); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`
 - **File sandbox** — file tools stay inside the project directory and never read `.env*` files or `~/.dostuff/`
 - **Skills loader** — drop a `SKILL.md` in the right folder, restart, done
 - **Subagents** — `delegate_to_subagent` runs a bounded task with a restricted tool set; its approval prompts and ESC go through the same TUI
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
 - **Retries with backoff** for rate limits, timeouts and 5xx errors (6 by default, exponential with jitter, honors `Retry-After`; `loop.max_retries` / `loop.retry_max_delay`); auth / bad-request errors fail fast
-- **Token tracking** — per-turn and cumulative totals displayed live
+- **Token and cost tracking** — per-turn and cumulative totals displayed live; cost in USD from litellm's price table (hidden when the model has no known price)
 - **Long-term memory tools** — the agent saves facts (`save_memory`) and notable moments (`save_episode`) as they come up; both are recalled in later sessions
 - **Graceful exit** — `Ctrl+Q` or `/exit` saves the session, cleans up, and stops background workers
 - **Clean Cancellation** — `Escape` can cancel in-flight agent turns cleanly without corrupting the session
@@ -57,6 +59,16 @@ pip install dostuff
 
 This installs the `dostuff` command on your `PATH`. Done.
 
+Long-term memory (the agent remembers facts and past decisions across sessions) needs ChromaDB,
+a large download, so it's an extra:
+
+```bash
+pip install "dostuff[memory]"
+```
+
+Without it everything else works: the memory tools are hidden from the model and MCP tool search
+matches keywords instead of meaning. `dostuff doctor` shows whether memory is on.
+
 ### Other install methods
 
 For an isolated install with [pipx](https://pypa.github.io/pipx/):
@@ -71,7 +83,8 @@ For development (editable mode, from a clone):
 git clone https://github.com/<you>/dostuff.git
 cd dostuff
 pip install -e .           # core
-pip install -e ".[full]"   # + onnxruntime + grpcio
+pip install -e ".[memory]" # + long-term memory (chromadb)
+pip install -e ".[full]"   # + memory + onnxruntime + grpcio
 pip install -e ".[keyring]" # persist MCP OAuth tokens in the OS keyring
 pip install -e ".[dev]"    # + pytest + mypy
 
@@ -121,6 +134,7 @@ In the TUI:
 | Command                  | Description                                     |
 | ------------------------ | ----------------------------------------------- |
 | `dostuff`                | Launch the interactive TUI                      |
+| `dostuff --version`      | Print the version (`-V`)                        |
 | `dostuff --session <id>` | Resume a prior session (asks before starting a new one if the ID is unknown) |
 | `dostuff init [--force]` | Create `.dostuff/` config/skills in current dir (won't overwrite without `--force`) |
 | `dostuff setup`          | Pick a model, save its API key, write `~/.dostuff/config.yaml` (runs automatically on first launch) |
@@ -146,7 +160,10 @@ In the TUI:
 | Key / command | Action                              |
 | ------------- | ----------------------------------- |
 | `Enter`       | Submit message                      |
-| `Ctrl+J`      | Insert a newline (multi-line input) |
+| `Shift+Enter` | Insert a newline (multi-line input). If your terminal sends it as plain Enter, use `\` then `Enter`, `Ctrl+Enter`, `Alt+Enter` or `Ctrl+J` |
+| `@path`       | Attach a file (numbered lines) or a folder listing to the message. Typing `@` lists matching project paths: `Tab` / `Enter` completes, a folder opens for the next part. `@"a b.txt"` for spaces. Also works with `dostuff -p`. `.env` files and binaries are never attached |
+| `Up` / `Down` | On the first / last line of the input: previous / next prompt typed in this directory (saved in `~/.dostuff/data/prompt_history.jsonl`) |
+| `Ctrl+O`      | Expand / collapse every truncated tool and shell result (click one to toggle just that one) |
 | `/exit`       | Save the session and quit           |
 | `/clear`      | Start a new session; the old one stays resumable |
 | `/resume [<id>]` | Pick another session from this directory (or switch to the given one) |
@@ -157,6 +174,8 @@ In the TUI:
 | `/undo [force]` | Revert the agent's file changes from its last file-editing turn |
 | `/compact`    | Manually trigger context compaction |
 | `/memories`   | List the facts saved about you (and where each came from) |
+| `/episodes`   | List saved episodes (decisions, corrections, fixes) recalled here, newest first |
+| `/forget <key or id>` | Delete a saved fact (by key) or episode (by the id shown in `/episodes`) |
 | `Ctrl+Q`      | Graceful quit with save             |
 | `Escape`      | Cancel in-flight turn (also answers "no" to an open approval prompt) |
 | `/help`       | Show available in-TUI commands      |
@@ -169,7 +188,7 @@ In the TUI:
 - **Confirmations** — yellow background (respond `y` = allow once, `a` = always this session, anything else = deny)
 - **Diffs** — `write_file` / `edit_file` changes shown as a coloured diff
 - **Errors** — red background
-- **Status bar** — `cwd • session-id • active model • prompt/completion token rates • context usage % • processing timer`
+- **Status bar** — `/help • cwd • session-id • model • permission mode • tokens • cost • context usage % • timer`. Choose and order the items with `ui.status_bar` in `config.yaml`; when the terminal is too narrow (or zoomed in), long items are shortened and the least important dropped (help, session, cwd, tokens, cost, model, context, timer, mode) instead of being cut off
 - **Loading** — `Working...` or streamed thoughts displayed live
 
 ---
@@ -182,15 +201,29 @@ In the TUI:
 | `write_file`, `edit_file`, `delete_file` | write | yes (shows a diff) |
 | `bash_command` | shell | yes, unless every part of the command is on the read-only allow-list (`ls`, `cat`, `git status`, `git diff`, …) with no redirection or substitution |
 | `call_mcp_tool` | mcp | yes |
+| `web_fetch` | network | yes; `a` (always) allows that domain for the session |
+| `web_search` | network | yes; `a` (always) allows every search for the session. Free: DuckDuckGo by default, the `ddgs` package if installed (`pip install "dostuff[search]"`), or your own SearXNG via `search.searxng_url` |
 | `delegate_to_subagent` | — | no; the subagent's own calls ask |
+| `read_settings` | read | never (MCP `env` / header values are shown as `<redacted>`) |
+| `edit_config`, `set_mcp_server`, `remove_mcp_server` | settings | **always, in every mode, with no "always" option** (shows the diff or the server's command) |
 
 `permissions.mode` in `config.yaml`:
 
 - `ask` (default) — as in the table above.
-- `allowlist` — as `ask`, plus the patterns in `permissions.allow` run without asking (a shell command prefix such as `npm test`, a tool name such as `write_file`, or `call_mcp_tool:<server>__<tool>`).
+- `allowlist` — as `ask`, plus the patterns in `permissions.allow` run without asking (a shell command prefix such as `npm test`, a tool name such as `write_file`, `call_mcp_tool:<server>__<tool>`, `web_fetch:<domain>`, or `web_search`).
 - `auto` — nothing asks. A red warning is shown at startup.
 
 Answering `a` (always) approves that tool, or for the shell those commands, for the rest of the session.
+
+**Changing settings by asking.** Instead of editing `~/.dostuff/config.yaml` or `mcp_config.json` by hand, ask
+the agent: "hide the session id in the status bar", "set max_iterations to 50 for this project", "add the GitHub
+MCP server". It reads the settings with `read_settings`, changes `config.yaml` with `edit_config` (an exact-text
+edit that keeps your comments, checked to be valid YAML) and adds, updates or removes servers with
+`set_mcp_server` / `remove_mcp_server`, in the user files (`~/.dostuff/`) or the project's (`./.dostuff/`).
+Changes apply at once, without a restart (MCP servers connect or disconnect; tracing changes need a restart).
+Because these files hold the permission rules and an MCP server is a command that runs on your machine, every
+change asks, even in `auto` mode, and so do `write_file` / `edit_file` on anything in a `.dostuff` folder.
+API keys stay in `.env` files, which the agent can't read or change. Subagents don't get these tools.
 
 > [!IMPORTANT]
 > File tools are sandboxed to the project directory (the directory the session runs in): paths that resolve
@@ -358,6 +391,18 @@ rm ~/.dostuff/data/mcp_client_registrations.json
 
 ---
 
+## Project instructions
+
+Standing instructions for the agent go in `AGENTS.md` (or `CLAUDE.md`). Every file that applies is
+added to the system prompt, most general first, so the closest one wins where they disagree:
+
+1. `~/.dostuff/AGENTS.md` — your instructions for every project
+2. one per folder from the top of the path down to the current directory (e.g. the repo root, then a sub-package)
+
+In a folder with both, `AGENTS.md` is used. They're read once at startup.
+
+---
+
 ## Skills
 
 Skills are directories containing a `SKILL.md` (frontmatter with `name` and `description` + instructions body).
@@ -402,12 +447,12 @@ Run `dostuff init` to bootstrap a local `.dostuff/skills/` folder. Restart the a
 - **DB:** `~/.dostuff/data/sessions.db` (SQLite)
 - **Resume:** `dostuff resume` (latest in the current dir), `dostuff resume <id>` or `dostuff --session <id>`
 - **List:** `dostuff sessions` (current dir) / `dostuff sessions --all`
-- **Memory stores:** `~/.dostuff/data/chroma/`
+- **Memory stores:** `~/.dostuff/data/chroma/` (needs `pip install "dostuff[memory]"`; without it, saved memories are kept on disk but not used)
   - Semantic (key/value facts)
   - Episodic (events with summaries and timestamps)
-- **Saved when:** the agent decides — `save_memory` stores a key/value fact (an overlapping fact is updated, not duplicated) and `save_episode` stores a decision, correction or lesson. Each save is shown in the TUI; nothing is extracted at exit. Subagents can't save memories.
+- **Saved when:** the agent decides — `save_memory` stores a key/value fact (an overlapping fact is updated, not duplicated) and `save_episode` stores a decision, correction or lesson (one that rewords an episode already saved in the directory is skipped). Each save is shown in the TUI; nothing is extracted at exit. Subagents can't save memories.
 - **Two step tables** — `session_steps` (full audit, shown on resume) and `working_steps` (what the model sees; compaction flags old rows instead of rewriting them). Each step is one INSERT. DBs from 0.1.6 and earlier are migrated on first open (`PRAGMA user_version`).
-- **Memory recall** — episodic memories come from your past sessions in the same directory (`memory.episodic_scope: user` for all directories). The agent is told never to save facts that only appeared in tool output; list saved facts with `/memories`.
+- **Memory recall** — episodic memories come from your past sessions in the same directory (`memory.episodic_scope: user` for all directories). The agent is told never to save facts that only appeared in tool output; only facts and episodes related to the prompt are recalled (an unrelated prompt like "hi" gets none). List them with `/memories` and `/episodes`, delete one with `/forget`.
 - **Token persistence** — `prompt_tokens` / `completion_tokens` / `total_tokens` / `last_input_tokens` saved to DB; resume restores percent from DB meta
 
 Long-term memory survives `pip install . --upgrade` because it lives in the user's home directory, not in the package.

@@ -4,11 +4,13 @@ from pathlib import Path
 from typing import Any
 
 from dostuff.config import get_config
-from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
+from dostuff.helpers.agent.constants import MEMORY_INSTRUCTIONS, SYSTEM_INSTRUCTIONS
 from dostuff.helpers.agent.environment_context import build_environment_block
 from dostuff.helpers.agent.load_identity import load_identity
 from dostuff.helpers.agent.load_project_instructions import load_project_instructions
 from dostuff.helpers.skills.discover_skills import discover_skills
+from dostuff.helpers.ui.emit import emit
+from dostuff.lib.memory import chroma
 
 
 def build_base_instructions() -> tuple[str, list[dict[str, Any]]]:
@@ -21,6 +23,7 @@ def build_base_instructions() -> tuple[str, list[dict[str, Any]]]:
     instructions = SYSTEM_INSTRUCTIONS.format(
         dostuff_identity=load_identity(),
         skills_summary=skills_summary or "(none available)",
+        memory_section=MEMORY_INSTRUCTIONS if chroma.chroma_available() else "",
     )
     project_instructions = load_project_instructions()
     if project_instructions:
@@ -29,16 +32,29 @@ def build_base_instructions() -> tuple[str, list[dict[str, Any]]]:
 
 
 async def build_turn_instructions(base: str, user_text: str, memory_store: Any, episodic_store: Any, user_id: str) -> str:
-    """Base instructions + the environment block + memories and past episodes relevant to user_text."""
-    memories = await memory_store.query(user_id, query_text=user_text, top_k=5)
-    memory_text = "\n".join(f"- {m['key']}: {m['value']}" for m in memories)
+    """Base instructions + the environment block + memories and past episodes relevant to user_text.
 
-    episodes = await episodic_store.query(
-        user_id=user_id,
-        query_text=user_text,
-        top_k=3,
-        working_dir=str(Path.cwd().resolve()) if get_config().episodic_scope == "project" else None,
-    )
+    The stores are None when long-term memory is off (chromadb not installed): no recall then.
+    """
+    # Recall is extra context: if it fails (e.g. the embedding model could not be downloaded),
+    # say so and run the turn without it
+    memories: list[dict] = []
+    episodes: list[dict] = []
+    if memory_store is not None and episodic_store is not None:
+        # Not at module level: the store module pulls in litellm, which the TUI loads after its first frame
+        from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
+        try:
+            memories = await memory_store.query(user_id, query_text=user_text, top_k=5, min_similarity=MIN_FACT_SIMILARITY)
+            episodes = await episodic_store.query(
+                user_id=user_id,
+                query_text=user_text,
+                top_k=3,
+                working_dir=str(Path.cwd().resolve()) if get_config().episodic_scope == "project" else None,
+            )
+        except Exception as e:
+            emit(f"Memory recall failed, continuing without it: {e}", "error")
+            memories, episodes = [], []
+    memory_text = "\n".join(f"- {m['key']}: {m['value']}" for m in memories)
     episodic_text = "\n".join(
         f"  • [{ep['event_type']}] {ep['anchor_event']}\n"
         f"    Summary: {ep['summary']}\n"

@@ -1,5 +1,7 @@
 from dostuff.helpers.agent.loop_check_cancelled import is_cancelled, loop_check_cancelled
 from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
+from dostuff.helpers.agent.model_cost import call_cost
+from dostuff.lib.model import get_model
 from dostuff.helpers.agent.loop_emit import loop_emit
 from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.tracing import content_attr, tracer
@@ -20,10 +22,10 @@ from typing import Any, Literal
 import json
 import litellm
 from dostuff.helpers.agent.consume_stream import StreamProgress, consume_stream as _consume_stream
+from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, truncate_tool_output
 
 TOOL_TIMEOUT_S = 120.0
 RETRY_BASE_DELAY_S = 1.0
-EMPTY_RESPONSE_NUDGE = "Continue, or say you are done."
 CANCELLED_RESULT = "Cancelled by user"
 CANCELLED_RUNNING_RESULT = "Cancelled by user (may still be running)"
 # Read-only tools that must still run one at a time (a subagent may prompt for approval)
@@ -74,20 +76,6 @@ def retry_delay(attempt: int, err: BaseException, max_delay: float) -> float:
     if retry_after is not None:
         return min(retry_after, max_delay)
     return min(RETRY_BASE_DELAY_S * 2 ** attempt, max_delay) * random.uniform(0.5, 1.0)
-
-
-def truncate_tool_output(text: str, max_chars: int) -> str:
-    """Keep the head (60 %) and tail (40 %) of an over-long tool result (design D5)."""
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-    head = int(max_chars * 0.6)
-    tail = max_chars - head
-    omitted = len(text) - head - tail
-    marker = (
-        f"\n[… {omitted} chars truncated of {len(text)} total; "
-        "use read_file with offset/limit or grep to see more …]\n"
-    )
-    return text[:head] + marker + text[-tail:]
 
 
 @dataclass
@@ -290,6 +278,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         # Prompt tokens read from the provider's prompt cache (0 if none / unsupported)
                         "cached_tokens": getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0) or 0,
                     }
+                    # USD from litellm's price table; None if unknown (the TUI then hides the cost)
+                    usage_dict["cost"] = call_cost(get_model(), usage_dict)
 
                 # close model_span exactly once, here, before any continue/return below
                 if model_span is not None and model_span.is_recording():
@@ -317,6 +307,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     current_context_tokens = usage_dict.get("prompt_tokens", 0)
                     if turn_type == "interactive_loop" and store is not None and hasattr(store, "update_session_tokens"):
                         await store.update_session_tokens(session_id, session_total_tokens, session_prompt_tokens, session_completion_tokens, current_context_tokens)
+                        if usage_dict["cost"] and hasattr(store, "add_session_cost"):
+                            await store.add_session_cost(session_id, usage_dict["cost"])
                     percent = (current_context_tokens / token_limit * 100) if token_limit > 0 else 0
                     await loop_emit("status", {"context_window_percent": f"{percent:.1f}%", "token_limit": token_limit}, adapter=adapter)
 

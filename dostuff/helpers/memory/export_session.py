@@ -2,9 +2,9 @@
 import json
 from typing import Any
 
+from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE
+from dostuff.helpers.agent.file_mentions import attached_paths, strip_attachments
 from dostuff.helpers.memory.shell_step import parse_shell_step
-
-EMPTY_RESPONSE_NUDGE = "Continue, or say you are done."  # loop.EMPTY_RESPONSE_NUDGE; not worth importing litellm for
 
 
 def _fence(text: str, lang: str = "") -> str:
@@ -53,7 +53,10 @@ def session_to_markdown(steps: list[dict[str, Any]], meta: dict[str, Any] | None
             if shell is not None:
                 lines += ["## Shell", "", _fence(f"$ {shell[0]}\n{shell[1]}", "console"), ""]
             else:
-                lines += ["## User", "", content, ""]
+                lines += ["## User", "", strip_attachments(content), ""]
+                attached = attached_paths(content)
+                if attached:
+                    lines += ["_Attached: " + ", ".join(f"`{p}`" for p in attached) + "_", ""]
         elif role == "assistant":
             calls = step.get("tool_calls") or []
             if content or not calls:

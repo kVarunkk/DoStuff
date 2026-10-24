@@ -18,9 +18,14 @@ RESTRICTED_SUBAGENT_TOOLS = {
     "save_episode",
     # The todo list belongs to the parent; a subagent would overwrite it
     "todo_write",
+    # Settings are the user's to change, from the main conversation
+    "read_settings",
+    "edit_config",
+    "set_mcp_server",
+    "remove_mcp_server",
 }
 
-DEFAULT_SUBAGENT_TOOLS = ["read_file", "list_files", "grep", "glob", "get_current_datetime", "search_mcp_tools", "get_mcp_tool_details", "call_mcp_tool"]
+DEFAULT_SUBAGENT_TOOLS = ["read_file", "list_files", "grep", "glob", "get_current_datetime", "web_fetch", "web_search","search_mcp_tools", "get_mcp_tool_details", "call_mcp_tool"]
 
 WRAP_UP_PROMPT = (
     "You have run out of steps. Do not call any more tools. Report what you found so far, "

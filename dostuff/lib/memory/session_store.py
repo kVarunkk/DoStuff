@@ -4,10 +4,11 @@ import datetime
 import json
 import os
 import aiosqlite
+from dostuff.helpers.agent.file_mentions import strip_attachments
 from dostuff.helpers.memory.shell_step import parse_shell_step
 
 # PRAGMA user_version of the newest schema; bump and add a step to _migrate() to change it.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SessionStore(ABC):
@@ -41,6 +42,11 @@ class SessionStore(ABC):
     @abstractmethod
     async def update_session_tokens(self, session_id: str, total_tokens: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0, last_input_tokens: int = 0) -> None:
         """Persist session token count and last-used timestamp."""
+        ...
+
+    @abstractmethod
+    async def add_session_cost(self, session_id: str, cost_usd: float) -> None:
+        """Add the USD cost of one model call to the session's total."""
         ...
 
     @abstractmethod
@@ -96,7 +102,7 @@ class SQLiteSessionStore(SessionStore):
             return
 
         # Every step is idempotent, so one pass takes any older DB to the newest schema.
-        # v0 → v1 covers DBs created by dostuff <= 0.1.6 (no user_version); v2 adds `title`.
+        # v0 → v1 covers DBs created by dostuff <= 0.1.6 (no user_version); v2 adds `title`, v3 `cost_usd`.
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS session_steps (
@@ -128,6 +134,7 @@ class SQLiteSessionStore(SessionStore):
             "last_used TEXT",
             "last_input_tokens INTEGER DEFAULT 0",
             "title TEXT DEFAULT ''",
+            "cost_usd REAL DEFAULT 0",
         ):
             try:
                 await db.execute(f"ALTER TABLE sessions ADD COLUMN {column};")
@@ -230,7 +237,7 @@ class SQLiteSessionStore(SessionStore):
         await db.execute("DELETE FROM working_steps WHERE session_id = ?", (session_id,))
         await db.execute(
             "UPDATE sessions SET prompt_tokens = 0, completion_tokens = 0, total_tokens = 0, "
-            "last_input_tokens = 0, compaction_notes = '', working_history = '', last_used = ? WHERE session_id = ?",
+            "last_input_tokens = 0, cost_usd = 0, compaction_notes = '', working_history = '', last_used = ? WHERE session_id = ?",
             (_now(), session_id),
         )
         await db.commit()
@@ -247,12 +254,18 @@ class SQLiteSessionStore(SessionStore):
     async def get_session_meta(self, session_id: str) -> dict | None:
         db = await self._conn()
         async with db.execute(
-            "SELECT session_id, working_dir, prompt_tokens, completion_tokens, total_tokens, last_input_tokens, last_used, compaction_notes, title FROM sessions WHERE session_id = ?", (session_id,),
+            "SELECT session_id, working_dir, prompt_tokens, completion_tokens, total_tokens, last_input_tokens, last_used, compaction_notes, title, cost_usd FROM sessions WHERE session_id = ?", (session_id,),
         ) as cursor:
             row = await cursor.fetchone()
         if row:
-            return {"session_id": row[0], "working_dir": row[1], "prompt_tokens": row[2] or 0, "completion_tokens": row[3] or 0, "total_tokens": row[4] or 0, "last_input_tokens": row[5] or 0, "last_used": row[6], "compaction_notes": row[7] or "", "title": row[8] or ""}
+            return {"session_id": row[0], "working_dir": row[1], "prompt_tokens": row[2] or 0, "completion_tokens": row[3] or 0, "total_tokens": row[4] or 0, "last_input_tokens": row[5] or 0, "last_used": row[6], "compaction_notes": row[7] or "", "title": row[8] or "", "cost_usd": row[9] or 0.0}
         return None
+
+    async def add_session_cost(self, session_id: str, cost_usd: float) -> None:
+        db = await self._conn()
+        await self._ensure_session_row(db, session_id)
+        await db.execute("UPDATE sessions SET cost_usd = COALESCE(cost_usd, 0) + ? WHERE session_id = ?", (cost_usd, session_id))
+        await db.commit()
 
     async def update_session_tokens(self, session_id: str, total_tokens: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0, last_input_tokens: int = 0) -> None:
         db = await self._conn()
@@ -339,4 +352,4 @@ def _session_title(step_json: str | None) -> str:
     shell = parse_shell_step(content)
     if shell is not None:
         content = "!" + shell[0]
-    return " ".join(content.split())
+    return " ".join(strip_attachments(content).split())

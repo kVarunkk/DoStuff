@@ -47,7 +47,7 @@ class _ServerConnection:
 
 
 class MCPClient:
-    def __init__(self, registration_store: MCPClientRegistrationStore, tool_registry_store: MCPToolRegistryStore):
+    def __init__(self, registration_store: MCPClientRegistrationStore, tool_registry_store: MCPToolRegistryStore | None):
         self.servers: dict[str, ClientSession] = {}
         # server__tool -> {"server_name", "tool_name", "schema"}
         self.mcp_tools: dict[str, dict[str, Any]] = {}
@@ -113,7 +113,8 @@ class MCPClient:
 
         self.servers[server_name] = session
         tools_response = await session.list_tools()
-        await self.tool_registry.register_tools(server_name, tools_response.tools)
+        if self.tool_registry is not None:  # None without chromadb: search falls back to keywords
+            await self.tool_registry.register_tools(server_name, tools_response.tools)
         for key in [k for k, v in self.mcp_tools.items() if v["server_name"] == server_name]:
             del self.mcp_tools[key]
         for tool in tools_response.tools:
@@ -167,6 +168,13 @@ class MCPClient:
                 if not ready.cancelled() and ready.exception() is None and self.servers.get(server_name) is ready.result():
                     self.servers.pop(server_name, None)
 
+    async def disconnect(self, server_name: str) -> None:
+        """Close a server and forget its tools (it was removed from the config)."""
+        await self._disconnect(server_name)
+        self.server_meta.pop(server_name, None)
+        for key in [k for k, v in self.mcp_tools.items() if v["server_name"] == server_name]:
+            del self.mcp_tools[key]
+
     async def _disconnect(self, server_name: str, timeout_s: float = 3.0) -> None:
         conn = self._connections.pop(server_name, None)
         self.servers.pop(server_name, None)
@@ -208,10 +216,15 @@ class MCPClient:
                 self._tokens[server_name] = cached
                 return cached["access_token"]
             if cached.get("refresh_token"):
+                # A confidential client (e.g. Supabase) refreshes with the secret from its registration
+                registration = await self.registration_store.get(server_name) or {}
+                same_client = registration.get("client_id") == cached.get("client_id")
                 try:
                     token_data = await refresh_access_token(
                         cached["token_endpoint"], cached["refresh_token"],
                         client_id=cached.get("client_id"), resource=cached.get("resource"),
+                        client_secret=registration.get("client_secret") if same_client else None,
+                        auth_method=registration.get("token_endpoint_auth_method") if same_client else None,
                     )
                     token_data.setdefault("refresh_token", cached["refresh_token"])
                     token_data["client_id"] = cached.get("client_id")

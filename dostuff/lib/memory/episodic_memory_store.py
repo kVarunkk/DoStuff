@@ -11,6 +11,11 @@ from dostuff.lib.memory.chroma import get_chroma_client
 # are recalled even for an unrelated prompt like "hi" (unrelated prompts score ~0.0-0.2)
 MIN_EPISODE_SIMILARITY = 0.3
 
+# An episode at least this similar to one already saved in the same directory is the same moment
+# saved twice. Rewordings of one moment score ~0.75-0.9 (even under another event type); a related
+# but different moment ~0.6
+DUPLICATE_EPISODE_SIMILARITY = 0.85
+
 
 class EpisodicStore(ABC):
     @abstractmethod
@@ -99,16 +104,12 @@ class EpisodicMemoryStore(EpisodicStore):
             raw_tags = meta.get("tags")
             tags = json.loads(raw_tags) if isinstance(raw_tags, str) else []
 
-            raw_context = meta.get("context_window")
-            context_window = json.loads(raw_context) if isinstance(raw_context, str) else []
-
             scored_episodes.append({
                 "score": hybrid_score,
                 "event_type": meta.get("event_type"),
                 "anchor_event": meta.get("anchor_event"),
                 "summary": meta.get("summary"),
                 "tags": tags,
-                "context_window": context_window,
                 "created_at_iso": meta.get("created_at_iso"),
                 "session_id": meta.get("session_id"),
             })
@@ -116,3 +117,48 @@ class EpisodicMemoryStore(EpisodicStore):
         # Sort by hybrid score descending and pick top_k
         scored_episodes.sort(key=lambda x: float(x["score"]), reverse=True)
         return scored_episodes[:top_k]
+
+    async def find_duplicate(
+        self, user_id: str, vector_text: str, working_dir: str, min_similarity: float = DUPLICATE_EPISODE_SIMILARITY
+    ) -> str | None:
+        """Id of an episode from `working_dir` at least `min_similarity` similar to `vector_text`, if any."""
+        where = {"$and": [{"user_id": user_id}, {"working_dir": working_dir}]}
+
+        def _query() -> Any:
+            if self._collection.count() <= 0:
+                return {}
+            return self._collection.query(query_texts=[vector_text], n_results=1, where=where)
+
+        results = await asyncio.to_thread(_query)
+        ids = (results.get("ids") or [[]])[0] or []
+        dists = (results.get("distances") or [[]])[0] or []
+        if ids and dists and 1.0 - dists[0] >= min_similarity:
+            return str(ids[0])
+        return None
+
+    async def list_all(self, user_id: str, working_dir: str | None = None) -> list[dict]:
+        """Every saved episode for this user (only from `working_dir` when given), newest first (for /episodes)."""
+        where: dict[str, Any] = {"user_id": user_id}
+        if working_dir:
+            where = {"$and": [{"user_id": user_id}, {"working_dir": working_dir}]}
+        results = await asyncio.to_thread(self._collection.get, where=where)
+        episodes = [
+            {
+                "id": episode_id,
+                "event_type": str(meta.get("event_type") or ""),
+                "anchor_event": str(meta.get("anchor_event") or ""),
+                "created_at_iso": str(meta.get("created_at_iso") or ""),
+                "created_at_epoch": meta.get("created_at_epoch") if isinstance(meta.get("created_at_epoch"), (int, float)) else 0,
+            }
+            for episode_id, meta in zip(results.get("ids") or [], results.get("metadatas") or [])
+            if meta
+        ]
+        return sorted(episodes, key=lambda ep: ep["created_at_epoch"], reverse=True)
+
+    async def delete(self, user_id: str, episode_id: str) -> bool:
+        """Forget one episode of this user by id; False if there was none."""
+        found = await asyncio.to_thread(self._collection.get, ids=[episode_id], where={"user_id": user_id})
+        if not found.get("ids"):
+            return False
+        await asyncio.to_thread(self._collection.delete, ids=[episode_id])
+        return True

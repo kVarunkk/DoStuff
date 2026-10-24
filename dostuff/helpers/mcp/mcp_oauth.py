@@ -8,6 +8,7 @@ import httpx
 import pkce
 import asyncio
 import json
+from dataclasses import dataclass, field
 from typing import Any
 
 from dostuff.lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
@@ -97,16 +98,57 @@ def canonical_resource(mcp_server_url: str) -> str:
     return urllib.parse.urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", "", ""))
 
 
-async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) -> tuple[str, str, str, str, bool]:
+@dataclass
+class OAuthServerInfo:
+    authorization_endpoint: str
+    token_endpoint: str
+    scope: str
+    registration_endpoint: str | None
+    client_id_metadata_document_supported: bool
+    # token_endpoint_auth_methods_supported; empty when the server doesn't say
+    token_auth_methods: list[str] = field(default_factory=list)
+
+    @property
+    def needs_client_secret(self) -> bool:
+        """The token endpoint takes no public clients (Supabase: client_secret_basic / _post only)."""
+        return bool(self.token_auth_methods) and "none" not in self.token_auth_methods
+
+
+def pick_secret_auth_method(methods: list[str]) -> str:
+    """client_secret_post when offered, else client_secret_basic (the RFC 6749 default)."""
+    return "client_secret_post" if "client_secret_post" in methods else "client_secret_basic"
+
+
+def with_client_auth(
+    payload: dict[str, str], client_secret: str | None, auth_method: str | None
+) -> tuple[dict[str, str], httpx.Auth]:
+    """The token request body and HTTP auth for a client: public (client_id only), secret in
+    the body (client_secret_post), or HTTP Basic (client_secret_basic)."""
+    if not client_secret:
+        return payload, httpx.Auth()  # no-op: public client
+    if auth_method == "client_secret_basic":
+        body = {k: v for k, v in payload.items() if k != "client_id"}
+        # RFC 6749 §2.3.1: id and secret are form-urlencoded before Basic encoding
+        quote = urllib.parse.quote_plus
+        return body, httpx.BasicAuth(quote(payload["client_id"]), quote(client_secret))
+    return {**payload, "client_secret": client_secret}, httpx.Auth()
+
+
+def _http_error(what: str, res: httpx.Response) -> OAuthError:
+    """The server's own message (e.g. "Required parameter: client_secret"), not just the status."""
+    detail = " ".join(res.text.split())[:300] or res.reason_phrase
+    return OAuthError(f"{what} failed (HTTP {res.status_code} from {res.request.url}): {detail}")
+
+
+async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) -> OAuthServerInfo:
     """Vendor-agnostic OAuth discovery, per RFC 9728 (protected resource metadata)
     and RFC 8414 (authorization server metadata), with an OIDC discovery fallback.
 
-    Returns:
-        (authorization_endpoint, token_endpoint, requested_scope, registration_endpoint,
-        client_id_metadata_document_supported)
+    Scope, as the MCP spec says: the WWW-Authenticate `scope`, else the protected resource's
+    `scopes_supported`, else OIDC-style scopes from the authorization server metadata.
     """
     www_auth_params = parse_www_authenticate(www_auth_header)
-    requested_scope = www_auth_params.get("scope", "openid")
+    requested_scope = www_auth_params.get("scope", "")
 
     resource_metadata_url = www_auth_params.get("resource_metadata") or (
         f"{mcp_server_url.rstrip('/')}/.well-known/oauth-protected-resource"
@@ -117,6 +159,8 @@ async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) ->
         res.raise_for_status()
         res_meta = res.json()
 
+        if not requested_scope and res_meta.get("scopes_supported"):
+            requested_scope = " ".join(res_meta["scopes_supported"])
         auth_servers = res_meta.get("authorization_servers", [])
         if not auth_servers:
             raise ValueError(f"No 'authorization_servers' array found in {resource_metadata_url}")
@@ -148,11 +192,18 @@ async def discover_oauth_endpoints(mcp_server_url: str, www_auth_header: str) ->
         if not auth_endpoint or not token_endpoint:
             raise ValueError("Discovered metadata is missing 'authorization_endpoint' or 'token_endpoint'")
 
-        if "scope" not in www_auth_params and "scopes_supported" in meta_data:
+        if not requested_scope and meta_data.get("scopes_supported"):
             supported = meta_data["scopes_supported"]
             requested_scope = " ".join([s for s in supported if s in ["openid", "profile", "email"]] or supported[:2])
 
-        return auth_endpoint, token_endpoint, requested_scope, registration_endpoint, client_id_metadata_document_supported
+        return OAuthServerInfo(
+            authorization_endpoint=auth_endpoint,
+            token_endpoint=token_endpoint,
+            scope=requested_scope or "openid",
+            registration_endpoint=registration_endpoint,
+            client_id_metadata_document_supported=client_id_metadata_document_supported,
+            token_auth_methods=[str(m) for m in meta_data.get("token_endpoint_auth_methods_supported") or []],
+        )
 
 
 def _wait_for_callback(server: _CallbackServer, timeout_s: float) -> dict[str, str] | None:
@@ -169,30 +220,42 @@ async def authenticate_via_oauth(mcp_server_url: str, www_auth_header: str, regi
     local browser + loopback listener, and returns the token response plus
     `token_endpoint`, `client_id` and `resource` (needed for refresh).
     """
-    auth_endpoint, token_endpoint, scope, registration_endpoint, client_id_metadata_document_supported = await discover_oauth_endpoints(mcp_server_url, www_auth_header)
+    info = await discover_oauth_endpoints(mcp_server_url, www_auth_header)
 
-    existing_registration = await registration_store.get(server_name)
+    existing_registration = await registration_store.get(server_name) or {}
+    client_secret: str | None = existing_registration.get("client_secret")
+    auth_method: str | None = existing_registration.get("token_endpoint_auth_method")
+    # A registration saved without its secret (before dostuff kept it) can't get a token from a
+    # server that requires one, so register again
+    reusable = bool(existing_registration.get("client_id")) and (client_secret or not info.needs_client_secret)
 
-    if existing_registration and existing_registration.get("client_id"):
+    if reusable:
         client_id = existing_registration["client_id"]
-    elif client_id_metadata_document_supported:
+    elif info.client_id_metadata_document_supported and not info.needs_client_secret:
         client_id = CLIENT_ID_METADATA_DOCUMENT
     else:
-        if not registration_endpoint:
+        if not info.registration_endpoint:
             raise ValueError(
                 f"No cached client_id for '{server_name}' and server does not "
                 "support dynamic client registration."
             )
-        client_info = await register_oauth_client(registration_endpoint, REDIRECT_URI)
+        requested_method = pick_secret_auth_method(info.token_auth_methods) if info.needs_client_secret else "none"
+        client_info = await register_oauth_client(info.registration_endpoint, REDIRECT_URI, requested_method)
         client_id = client_info["client_id"]
-        await registration_store.save(
-            server_name,
-            {
-                "client_id": client_id,
-                "redirect_uri": REDIRECT_URI,
-                "registration_endpoint": registration_endpoint,
-            },
-        )
+        # Servers may issue a secret whatever was asked for (Supabase always does); it must be sent back
+        client_secret = client_info.get("client_secret") or None
+        auth_method = client_info.get("token_endpoint_auth_method") or requested_method
+        if client_secret and auth_method == "none":
+            auth_method = pick_secret_auth_method(info.token_auth_methods)
+        registration = {
+            "client_id": client_id,
+            "redirect_uri": REDIRECT_URI,
+            "registration_endpoint": info.registration_endpoint,
+            "token_endpoint_auth_method": auth_method,
+        }
+        if client_secret:
+            registration["client_secret"] = client_secret
+        await registration_store.save(server_name, registration)
 
     resource = canonical_resource(mcp_server_url)
     code_verifier, code_challenge = pkce.generate_pkce_pair()
@@ -207,10 +270,10 @@ async def authenticate_via_oauth(mcp_server_url: str, www_auth_header: str, regi
         "state": state,
         "resource": resource,
     }
-    if scope:
-        params["scope"] = scope
+    if info.scope:
+        params["scope"] = info.scope
 
-    auth_url = f"{auth_endpoint}?{urllib.parse.urlencode(params)}"
+    auth_url = f"{info.authorization_endpoint}?{urllib.parse.urlencode(params)}"
 
     async with _oauth_lock:
         server = _CallbackServer(("localhost", REDIRECT_PORT), OAuthCallbackHandler)
@@ -237,34 +300,46 @@ async def authenticate_via_oauth(mcp_server_url: str, www_auth_header: str, regi
             "code_verifier": code_verifier,
             "resource": resource,
         }
-        res = await client.post(token_endpoint, data=token_payload)
-        res.raise_for_status()
+        body, basic_auth = with_client_auth(token_payload, client_secret, auth_method)
+        res = await client.post(info.token_endpoint, data=body, auth=basic_auth)
+        if res.is_error:
+            raise _http_error(f"OAuth for '{server_name}': token exchange", res)
 
         token_data: dict[str, Any] = res.json()
-        token_data["token_endpoint"] = token_endpoint
+        token_data["token_endpoint"] = info.token_endpoint
         token_data["client_id"] = client_id
         token_data["resource"] = resource
         return token_data
 
 
-async def register_oauth_client(registration_endpoint: str, redirect_uri: str) -> dict:
+async def register_oauth_client(registration_endpoint: str, redirect_uri: str, auth_method: str = "none") -> dict:
+    """RFC 7591 dynamic registration. The reply may hold a `client_secret` even when "none" was asked for."""
     async with httpx.AsyncClient() as client:
         res = await client.post(
             registration_endpoint,
             json={
                 "client_name": "DoStuff Agent",
                 "redirect_uris": [redirect_uri],
-                "token_endpoint_auth_method": "none",
+                "token_endpoint_auth_method": auth_method,
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"]
             },
         )
-        res.raise_for_status()
+        if res.is_error:
+            raise _http_error("OAuth client registration", res)
         return res.json()
 
 
-async def refresh_access_token(token_endpoint: str, refresh_token: str, client_id: str | None = None, resource: str | None = None) -> dict:
-    """Refresh with the client_id the token was issued to (falls back to the generic id)."""
+async def refresh_access_token(
+    token_endpoint: str,
+    refresh_token: str,
+    client_id: str | None = None,
+    resource: str | None = None,
+    client_secret: str | None = None,
+    auth_method: str | None = None,
+) -> dict:
+    """Refresh with the client the token was issued to (falls back to the generic id), and its
+    secret when the registration has one."""
     async with httpx.AsyncClient() as client:
         payload = {
             "grant_type": "refresh_token",
@@ -273,6 +348,7 @@ async def refresh_access_token(token_endpoint: str, refresh_token: str, client_i
         }
         if resource:
             payload["resource"] = resource
-        res = await client.post(token_endpoint, data=payload)
+        body, basic_auth = with_client_auth(payload, client_secret, auth_method)
+        res = await client.post(token_endpoint, data=body, auth=basic_auth)
         res.raise_for_status()
         return res.json()

@@ -105,7 +105,9 @@ async def consume_stream(stream_iter, adapter, emit_fn=None, progress: StreamPro
         p = getattr(stream_usage, "prompt_tokens", 0) or 0
         c = getattr(stream_usage, "completion_tokens", 0) or 0
         t = getattr(stream_usage, "total_tokens", 0) or (p + c)
-        usage = SimpleNamespace(prompt_tokens=p, completion_tokens=c, total_tokens=t)
+        # prompt_tokens_details carries cached_tokens (cheaper; used for the cost)
+        usage = SimpleNamespace(prompt_tokens=p, completion_tokens=c, total_tokens=t,
+                                prompt_tokens_details=getattr(stream_usage, "prompt_tokens_details", None))
     choice_ns = SimpleNamespace(
         message=msg,
         index=0,

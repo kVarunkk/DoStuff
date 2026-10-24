@@ -24,6 +24,13 @@ def _lookup_session_dir(session_id: str) -> tuple[bool, str | None]:
 PERMISSION_MODES = ("ask", "allowlist", "auto")
 
 
+def _print_version(value: bool) -> None:
+    if value:
+        from dostuff import __version__
+        typer.echo(f"dostuff {__version__}")
+        raise typer.Exit()
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -32,6 +39,7 @@ def main(
     output_json: bool = typer.Option(False, "--json", help="With -p: print a JSON object (result, session_id, usage)"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="With -p: no progress on stderr, only the answer"),
     permission_mode: str = typer.Option(None, "--permission-mode", help="With -p: ask | allowlist | auto (default: config)"),
+    version: bool = typer.Option(False, "--version", "-V", callback=_print_version, is_eager=True, help="Print the version and exit"),
 ):
     if ctx.invoked_subcommand is not None:
         return  # subcommand (init/setup/config/doctor/resume/sessions/...) — don't start agent
@@ -213,6 +221,12 @@ def doctor():
             check(False, f"MCP config could not be read: {source}: {e}", "fix the JSON in that file")
     info(f"MCP servers: {len(servers)} (`dostuff mcp list`)" if servers else "MCP servers: none configured (optional; `dostuff mcp add`)")
     info(f"Data dir: {cfg.data_dir}" + ("" if cfg.data_dir.exists() else " (created on first run)"))
+    from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT, chroma_available, embedding_model_missing
+    if not chroma_available():
+        info(f"Long-term memory: off, chromadb not installed (optional; `{MEMORY_INSTALL_HINT}`)")
+    else:
+        info("Memory embedding model: " + ("not downloaded yet (~80 MB; the TUI fetches it on first start)"
+                                           if embedding_model_missing() else "downloaded"))
     info(f"Permission mode: {cfg.permission_mode}")
     if problems:
         typer.echo(f"\n{problems} problem(s) found.")
@@ -493,24 +507,15 @@ def mcp_add(
 ):
     """Add a server, e.g. `dostuff mcp add github -e GITHUB_TOKEN=... -- uvx mcp-server-github`."""
     from dostuff.helpers.mcp.load_mcp_config import read_mcp_file, write_mcp_file
-    if bool(url) == bool(command):
-        raise typer.BadParameter("give either a command (stdio) or --url (http), not both")
-    transport = (transport or ("http" if url else "stdio")).lower()
-    if transport not in ("stdio", "http", "sse", "streamable-http"):
-        raise typer.BadParameter("transport must be stdio, http or sse")
-    if url and transport == "stdio":
-        raise typer.BadParameter("--url needs --transport http or sse")
-    if command and transport != "stdio":
-        raise typer.BadParameter("a command needs --transport stdio")
-    cfg: dict = {"transport": transport}
-    if command:
-        cfg.update(command=command[0], args=command[1:])
-        if env:
-            cfg["env"] = _parse_pairs(env, "=", "--env")
-    else:
-        cfg["url"] = url
-        if header:
-            cfg["headers"] = _parse_pairs(header, ":", "--header")
+    from dostuff.helpers.mcp.server_config import build_server_config
+    try:
+        cfg = build_server_config(
+            command=command, url=url, transport=transport,
+            env=_parse_pairs(env, "=", "--env") if env else None,
+            headers=_parse_pairs(header, ":", "--header") if header else None,
+        )
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
     path = _mcp_file(project)
     servers = read_mcp_file(path)
     if name in servers and not force:
@@ -632,3 +637,8 @@ def models_add(
     missing = ([api_key_env] if not os.environ.get(api_key_env) else []) if api_key_env else missing_api_keys(name)
     if missing:
         typer.echo(f"Its API key isn't set: add {missing[0]}=... to {global_path.parent / '.env'}.")
+
+
+# `python -m dostuff.cli ...`: without this it defines the app and exits silently with status 0
+if __name__ == "__main__":
+    app()

@@ -5,6 +5,10 @@ from typing import Any
 from dostuff.helpers.memory.resolve_memory_operation import resolve_memory_operation
 from dostuff.lib.memory.chroma import get_chroma_client
 
+# Facts less similar than this to the prompt aren't recalled: unrelated prompts like "hi" score
+# ~0.0-0.2 against stored facts, relevant ones ~0.3-0.5 (Chroma's default MiniLM embeddings)
+MIN_FACT_SIMILARITY = 0.25
+
 
 class MemoryStore(ABC):
     @abstractmethod
@@ -36,8 +40,8 @@ class SemanticMemoryStore(MemoryStore):
             metadatas=[{"user_id": user_id, "key": key, "value": value, "source": str(fact.get("source") or "user_message")}],
         )
 
-    async def query(self, user_id: str, query_text: str, top_k: int = 3) -> list[dict]:
-        """Similar memories as structured {key, value, source} dicts."""
+    async def query(self, user_id: str, query_text: str, top_k: int = 3, min_similarity: float = 0.0) -> list[dict]:
+        """Memories at least `min_similarity` similar to `query_text`, as {key, value, source} dicts."""
         def _query() -> Any:
             # n_results larger than the collection makes Chroma warn; cap it
             n = min(top_k, self._collection.count())
@@ -47,14 +51,25 @@ class SemanticMemoryStore(MemoryStore):
 
         results = await asyncio.to_thread(_query)
         raw_metas = results.get("metadatas") or [[]]
+        raw_dists = results.get("distances") or [[]]
         metadatas = raw_metas[0] if raw_metas and raw_metas[0] is not None else []
-        return [_as_fact(meta) for meta in metadatas if meta]
+        distances = raw_dists[0] if raw_dists and raw_dists[0] is not None else []
+        return [_as_fact(meta) for meta, dist in zip(metadatas, distances) if meta and 1.0 - dist >= min_similarity]
 
     async def list_all(self, user_id: str) -> list[dict]:
         """Every saved fact for this user (for /memories)."""
         results = await asyncio.to_thread(self._collection.get, where={"user_id": user_id})
         facts = [_as_fact(meta) for meta in (results.get("metadatas") or []) if meta]
         return sorted(facts, key=lambda f: f["key"])
+
+    async def delete(self, user_id: str, key: str) -> bool:
+        """Forget one fact by key; False if there was none."""
+        fact_id = f"{user_id}:{key}"
+        found = await asyncio.to_thread(self._collection.get, ids=[fact_id])
+        if not found.get("ids"):
+            return False
+        await asyncio.to_thread(self._collection.delete, ids=[fact_id])
+        return True
 
 
 def _as_fact(meta: Any) -> dict:

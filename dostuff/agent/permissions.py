@@ -11,16 +11,21 @@ Modes (`permissions.mode` in config, overridable per session):
   ask       — every mutating call asks, except read-only shell commands (allow-list below)
   allowlist — as `ask`, plus `permissions.allow` patterns from config are auto-approved
   auto      — nothing asks (explicit opt-in)
+
+Settings changes (kind "settings": config.yaml, MCP servers) ask in every mode and have no
+"always": they can change these rules or add a command that runs on the user's machine.
 """
 from __future__ import annotations
 
 import re
 import shlex
 from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 PermissionMode = Literal["ask", "allowlist", "auto"]
-ToolKind = Literal["read", "write", "shell", "mcp"]
+ToolKind = Literal["read", "write", "shell", "mcp", "network", "settings"]
 Action = Literal["allow", "ask", "deny"]
 
 PERMISSION_MODES: tuple[str, ...] = ("ask", "allowlist", "auto")
@@ -184,9 +189,26 @@ def _describe_call(tool: str, args: dict[str, Any]) -> str:
         return f"Run shell command:\n  {args.get('command', '')}"
     if tool == "call_mcp_tool":
         return f"Call MCP tool '{args.get('name', '')}' with arguments:\n  {str(args.get('arguments', {}))[:500]}"
+    if tool == "web_fetch":
+        return f"Fetch URL:\n  {str(args.get('url', ''))[:500]}"
+    if tool == "web_search":
+        return f"Search the web:\n  {str(args.get('query', ''))[:500]}"
+    if tool == "edit_config":
+        return f"Change dostuff settings ({args.get('scope') or 'user'} config.yaml)"
+    if tool == "set_mcp_server":
+        return f"Add or replace MCP server '{args.get('name', '')}' ({args.get('scope') or 'user'} mcp_config.json)"
+    if tool == "remove_mcp_server":
+        return f"Remove MCP server '{args.get('name', '')}' ({args.get('scope') or 'user'} mcp_config.json)"
     if "path" in args:
         return f"{tool} on '{args['path']}'"
     return f"{tool}({str(args)[:500]})"
+
+
+def url_host(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
 
 
 def check(
@@ -199,11 +221,14 @@ def check(
 ) -> PermissionDecision:
     """Decide whether `tool(args)` may run. Pure function — no I/O, no prompting."""
     mode = (session.mode if session and session.mode else cfg.mode)
-    if kind == "read" or mode == "auto":
-        return PermissionDecision("allow")
-
     description = _describe_call(tool, args)
     prompt = f"{description}\n{preview}".rstrip()
+    if kind == "write" and ".dostuff" in PurePath(str(args.get("path") or "")).parts:
+        kind = "settings"  # write_file / edit_file on ./.dostuff/config.yaml, mcp_config.json, .env …
+    if kind == "settings":  # every mode, and no "always" (no approval keys)
+        return PermissionDecision("ask", prompt=prompt, reason=description)
+    if kind == "read" or mode == "auto":
+        return PermissionDecision("allow")
 
     if kind == "shell":
         command = str(args.get("command", ""))
@@ -222,7 +247,12 @@ def check(
                 return PermissionDecision("allow")
         return PermissionDecision("ask", prompt=prompt, reason=command, approval_keys=keys)
 
-    pattern = f"{tool}:{args.get('name', '')}" if kind == "mcp" else tool
+    if kind == "mcp":
+        pattern = f"{tool}:{args.get('name', '')}"
+    elif kind == "network" and "url" in args:  # "always" and permissions.allow work per domain ("web_fetch:docs.python.org")
+        pattern = f"{tool}:{url_host(str(args.get('url', '')))}"
+    else:
+        pattern = tool
     if session and session.is_approved(tool, pattern):
         return PermissionDecision("allow")
     if mode == "allowlist" and (_config_allows(tool, None, cfg) or _config_allows(pattern, None, cfg)):
@@ -266,6 +296,10 @@ def describe_approval_keys(keys: list[tuple[str, str]]) -> str:
             name = f"`{pattern}` commands"
         elif tool == "call_mcp_tool":
             name = f"MCP tool {pattern.partition(':')[2] or pattern}"
+        elif tool == "web_fetch":
+            name = f"fetches from {pattern.partition(':')[2] or 'this site'}"
+        elif tool == "web_search":
+            name = "web searches"
         else:
             name = _ALWAYS_NAMES.get(tool, tool)
         if name not in names:

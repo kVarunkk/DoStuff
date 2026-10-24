@@ -120,5 +120,30 @@ def test_v1_db_gets_title_column_and_session_listing(tmp_path, monkeypatch):
 
     asyncio.run(scenario())
     conn = sqlite3.connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
     conn.close()
+
+
+def test_session_cost_adds_up_and_clears(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    async def scenario():
+        store = SQLiteSessionStore(db_path=str(tmp_path / "sessions.db"))
+        await store.add_session_cost("s", 0.25)
+        await store.add_session_cost("s", 0.5)
+        assert (await store.get_session_meta("s"))["cost_usd"] == 0.75
+        await store.clear_session("s")
+        assert (await store.get_session_meta("s"))["cost_usd"] == 0
+        await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_call_cost_known_and_unknown_models():
+    from dostuff.helpers.agent.model_cost import call_cost, format_cost
+    usage = {"prompt_tokens": 1000, "completion_tokens": 100, "cached_tokens": 500}
+    cost = call_cost("openai/gpt-4o-mini", usage)
+    assert cost is not None and 0 < cost < call_cost("openai/gpt-4o-mini", {**usage, "cached_tokens": 0})
+    assert call_cost("ollama/llama3", usage) is None  # free / unpriced: hidden
+    assert call_cost("nobody/no-such-model", usage) is None
+    assert format_cost(1.234) == "$1.23" and format_cost(0.0042) == "$0.0042"

@@ -10,6 +10,7 @@ MAX_TOOL_OUTPUT_CHARS = 30_000
 MAX_RETRIES = 6
 RETRY_MAX_DELAY_S = 60.0
 KNOWN_PROVIDERS = ("gemini", "anthropic", "openai", "groq", "mistral", "openrouter", "ollama")
+STATUS_BAR_ITEMS = ("help", "cwd", "session", "model", "mode", "tokens", "cost", "context", "timer")
 
 
 def _block(raw: dict[str, Any], key: str) -> dict[str, Any]:
@@ -95,6 +96,20 @@ class Config:
         mode = str(perms.get("mode", "ask")).lower()
         self.permission_mode = mode if mode in ("ask", "allowlist", "auto") else "ask"
         self.permission_allow = [str(p) for p in (perms.get("allow") or [])]
+        # web_search backend: a SearXNG instance if set, else ddgs / DuckDuckGo (tools/web_search.py)
+        self.searxng_url = str(_block(self.raw, "search").get("searxng_url") or "").strip()
+        # TUI status bar: which items show, in this order; unknown names are reported once at startup
+        items = _block(self.raw, "ui").get("status_bar")
+        names = [str(i).strip().lower() for i in items] if isinstance(items, list) else list(STATUS_BAR_ITEMS)
+        self.status_bar_items = [n for n in names if n in STATUS_BAR_ITEMS]
+        self.status_bar_unknown = [n for n in names if n not in STATUS_BAR_ITEMS]
+
+    def reload(self) -> None:
+        """Re-read config.yaml in place (after a settings change); a /model choice for this session stays."""
+        session_model, key_env = self._session_model, self.api_key_env_explicit
+        self.__init__(self.path)  # type: ignore[misc]
+        if session_model:
+            self._session_model, self.api_key_env_explicit = session_model, key_env
 
     def configured_models(self) -> list[dict[str, Any]]:
         """The `models:` entries from config.yaml (name, provider, active, api_key_env)."""

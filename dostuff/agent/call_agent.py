@@ -2,7 +2,7 @@ from typing import Any
 
 import litellm
 from litellm import acompletion
-from dostuff.tools.definitions import TOOL_SCHEMAS
+from dostuff.tools.definitions import TOOL_SCHEMAS, default_tool_names
 from dostuff.lib.model import completion_kwargs, get_provider, uses_explicit_prompt_caching
 from dostuff.lib.tracing import content_attr, tracer
 from opentelemetry.trace import Status, StatusCode
@@ -41,7 +41,7 @@ def build_request_kwargs(stream: bool) -> dict[str, Any]:
 
 async def call_agent(steps_history: list, system_instruction: str, tool_names: list[str] | None = None, stream: bool = False):
     if tool_names is None:
-        tool_names = list(TOOL_SCHEMAS.keys())
+        tool_names = default_tool_names()
     active_schemas = [TOOL_SCHEMAS[name] for name in tool_names if name in TOOL_SCHEMAS]
     messages = [{"role": "system", "content": system_instruction}] + steps_history
     request = build_request_kwargs(stream)

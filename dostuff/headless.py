@@ -31,6 +31,7 @@ class HeadlessAdapter:
         self._cancel_event = asyncio.Event()
         self._pending_text = ""  # streamed text; shown on stderr if a tool call follows it
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.cost_usd: float | None = None  # None while no call had a known price
         self.denied_without_terminal = 0
 
     def _progress(self, text: str) -> None:
@@ -41,6 +42,8 @@ class HeadlessAdapter:
         if event_type == "usage" and isinstance(data, dict):
             for k in self.usage:
                 self.usage[k] += data.get(k) or 0
+            if data.get("cost"):
+                self.cost_usd = (self.cost_usd or 0.0) + data["cost"]
         elif event_type == "partial":
             self._pending_text = str(data)
         elif event_type == "tool_call":
@@ -101,13 +104,13 @@ async def run_headless(
     from dostuff.agent.loop import loop as agent_loop
     from dostuff.config import get_config
     from dostuff.helpers.agent.append_step import append_step
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
     from dostuff.helpers.mcp.load_mcp_config import load_mcp_config
     from dostuff.helpers.ui.emit import set_adapter
     from dostuff.lib.mcp.mcp_client import MCPClient
     from dostuff.lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
-    from dostuff.lib.mcp.mcp_tool_registry_store import MCPToolRegistryStore
     from dostuff.lib.memory.session_store import SQLiteSessionStore
-    from dostuff.lib.memory.stores import get_episodic_store, get_semantic_store
+    from dostuff.lib.memory.stores import get_episodic_store, get_semantic_store, make_tool_registry_store
     from dostuff.lib.tracing import session_id_var, turn_id_var
 
     config = get_config()
@@ -121,7 +124,7 @@ async def run_headless(
     store = SQLiteSessionStore(db_path=str(data_dir / "sessions.db"))
     mcp_client = MCPClient(
         registration_store=MCPClientRegistrationStore(path=str(data_dir / "mcp_client_registrations.json")),
-        tool_registry_store=MCPToolRegistryStore(persist_path=str(data_dir / "chroma")),
+        tool_registry_store=make_tool_registry_store(),
     )
     started = time.time()
     result = ""
@@ -135,7 +138,12 @@ async def run_headless(
         steps_history = await store.load(session_id)
         working_history = await store.load_working_history(session_id)
         current_session_history: list = []
-        await append_step({"role": "user", "content": prompt}, steps_history, working_history,
+        expansion = await asyncio.to_thread(expand_file_mentions, prompt, config.max_tool_output_chars)
+        if expansion.attached:
+            adapter._progress("Attached " + ", ".join(expansion.attached))
+        if expansion.skipped:
+            adapter.emit("error", "Not attached: " + "; ".join(expansion.skipped))
+        await append_step({"role": "user", "content": expansion.content}, steps_history, working_history,
                           current_session_history, session_id, store, "interactive_loop")
         instructions = await build_turn_instructions(base, prompt, get_semantic_store(), get_episodic_store(), config.get_user_id())
         result = await agent_loop(
@@ -171,6 +179,7 @@ async def run_headless(
             "is_error": code != 0,
             "duration_s": round(time.time() - started, 2),
             "usage": adapter.usage,
+            "cost_usd": round(adapter.cost_usd, 6) if adapter.cost_usd is not None else None,
         }, ensure_ascii=False))
     elif result:
         print(result)

@@ -1,32 +1,38 @@
-import os
 from pathlib import Path
 
+INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")  # first one found in a directory wins
 
-def load_project_instructions() -> str:
-    """Load AGENTS.md / CLAUDE.md from project (Pi-style cascade).
-    
-    Searches CWD and parent directories for AGENTS.md (or CLAUDE.md fallback),
-    then checks global ~/.dostuff/ as final fallback. Returns content or empty string.
+
+def instruction_files(cwd: Path | None = None, home: Path | None = None) -> list[Path]:
+    """Instruction files that apply in `cwd`, most general first.
+
+    The global one (~/.dostuff/AGENTS.md or CLAUDE.md), then one per directory from the
+    outermost parent of `cwd` down to `cwd` itself, so the closest file is read last and
+    takes precedence where they disagree.
     """
-    # Cascade: walk up from CWD looking for AGENTS.md, then CLAUDE.md
-    cwd = Path.cwd()
-    for directory in [cwd] + list(cwd.parents):
-        agents_path = directory / "AGENTS.md"
-        if agents_path.exists():
-            return _read_md(agents_path)
-        claude_path = directory / "CLAUDE.md"
-        if claude_path.exists():
-            return _read_md(claude_path)
-    
-    # Global fallback in ~/.dostuff/
-    global_agents = Path.home() / ".dostuff" / "AGENTS.md"
-    if global_agents.exists():
-        return _read_md(global_agents)
-    global_claude = Path.home() / ".dostuff" / "CLAUDE.md"
-    if global_claude.exists():
-        return _read_md(global_claude)
-    
-    return ""
+    cwd = (cwd or Path.cwd()).resolve()
+    home = home or Path.home()
+    found: list[Path] = []
+    for directory in [home / ".dostuff"] + list(reversed(cwd.parents)) + [cwd]:
+        for name in INSTRUCTION_FILES:
+            path = directory / name
+            if path.is_file():
+                if path.resolve() not in {p.resolve() for p in found}:
+                    found.append(path)
+                break
+    return found
+
+
+def load_project_instructions(cwd: Path | None = None, home: Path | None = None) -> str:
+    """Every applicable AGENTS.md / CLAUDE.md, each under a heading with its path.
+
+    With a single file its content is returned as-is.
+    """
+    sections = [(path, _read_md(path)) for path in instruction_files(cwd, home)]
+    sections = [(path, text) for path, text in sections if text]
+    if len(sections) == 1:
+        return sections[0][1]
+    return "\n\n".join(f"### From {path}\n{text}" for path, text in sections)
 
 
 def _read_md(path: Path) -> str:

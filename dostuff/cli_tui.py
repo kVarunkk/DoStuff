@@ -7,14 +7,17 @@ which hops back to the UI thread when needed.
 """
 import asyncio
 import os
+import subprocess
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from textual.app import App, ComposeResult
 from textual.message import Message
 from textual.timer import Timer
+from textual.widget import Widget
 from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 from textual.containers import Vertical, VerticalScroll
@@ -22,9 +25,9 @@ from textual.binding import Binding
 from textual.worker import Worker, WorkerState
 from rich.text import Text
 from rich.markdown import Markdown as RichMarkdown
-from textual.events import Key
+from textual.events import Key, TextSelected
 from dostuff import __version__
-from dostuff.config import get_config
+from dostuff.config import STATUS_BAR_ITEMS, get_config
 from dostuff.agent.permissions import PERMISSION_MODES, ApprovalReply, SessionPermissions, parse_answer
 from dostuff.agent.instructions import build_base_instructions, build_turn_instructions
 from dostuff.helpers.agent.constants import COMMAND_DESCRIPTIONS
@@ -32,27 +35,31 @@ from dostuff.helpers.memory.export_session import session_to_markdown
 from dostuff.helpers.memory.shell_step import format_shell_step as _format_shell_step, parse_shell_step as _parse_shell_step
 from dostuff.tools.bash.bash_command import run_shell
 from dostuff.lib.memory.session_store import SQLiteSessionStore
-from dostuff.lib.memory.stores import get_episodic_store, get_semantic_store
-from dostuff.lib.mcp.mcp_client import MCPClient
-from dostuff.lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
-from dostuff.lib.mcp.mcp_tool_registry_store import MCPToolRegistryStore
 from dostuff.lib.checkpoints import UndoResult, get_checkpoint_store
 from dostuff.lib.model import get_model
 from dostuff.lib.tracing import session_id_var, turn_id_var
-from dostuff.agent.loop import EMPTY_RESPONSE_NUDGE, loop as agent_loop, truncate_tool_output
 from dostuff.helpers.agent.append_step import append_step
-from dostuff.helpers.mcp.load_mcp_config import load_mcp_config
+from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_paths, expand_file_mentions,
+                                                 format_mention, mention_candidates, strip_attachments)
+from dostuff.helpers.agent.model_cost import format_cost
+from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, truncate_tool_output
+from dostuff.helpers.mcp.load_mcp_config import load_mcp_config, mcp_config_sources, read_mcp_file
 from dostuff.setup_wizard import PROVIDERS, missing_api_keys, read_template
 from dostuff.helpers.models.add_model_entry import ModelConfigError, add_model_entry
 from dostuff.helpers.models.list_models import ModelListError, provider_models
-from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
-from dostuff.helpers.agent.manage_context import compact_context
 from dostuff.helpers.ui.emit import set_adapter
+from dostuff.helpers.ui.prompt_history import append_history, load_history
+
+if TYPE_CHECKING:
+    from dostuff.lib.mcp.mcp_client import MCPClient
+    from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+    from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
 
 MCP_CONNECT_TIMEOUT_S = 150.0  # covers the 120 s OAuth browser callback
 SHELL_TIMEOUT_S = 110.0  # `!command` typed by the user
 TOOL_RESULT_PREVIEW_LINES = 8  # tool output shown in the conversation; the model gets all of it
 SHELL_PREVIEW_LINES = 40
+PREVIEW_CHARS_PER_LINE = 200  # preview char budget = lines * this, so one giant line can't flood the screen
 PICKER_MAX_SESSIONS = 9  # /resume picker: number keys reach every option
 PICKER_MAX_VISIBLE = 10  # longer option lists scroll with the cursor
 TODO_RESULT_PREFIX = "todo_write: "  # loop() emits results as "<tool>: <result>"
@@ -62,18 +69,151 @@ THOUGHT_REVEAL_INTERVAL_S = 0.03
 THOUGHT_REVEAL_TICKS = 25
 
 
+# litellm, chromadb and mcp take several seconds to import, so the TUI draws its first frame
+# without them and loads them in a thread (DostuffTUI._load_backend). These wrappers import on
+# first use; tests patch them by name.
+
+def _import_backend() -> None:
+    import dostuff.agent.loop  # noqa: F401  (litellm)
+    import dostuff.helpers.agent.manage_context  # noqa: F401
+    import dostuff.lib.mcp.mcp_client  # noqa: F401  (mcp)
+    from dostuff.lib.memory.chroma import chroma_available
+    if chroma_available():
+        import chromadb  # noqa: F401  (optional: the `memory` extra)
+
+
+async def agent_loop(*args: Any, **kwargs: Any) -> Any:
+    from dostuff.agent.loop import loop
+    return await loop(*args, **kwargs)
+
+
+def get_model_token_limit() -> int:
+    from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit as limit
+    return limit()
+
+
+async def compact_context(*args: Any, **kwargs: Any) -> Any:
+    from dostuff.helpers.agent.manage_context import compact_context as compact
+    return await compact(*args, **kwargs)
+
+
+def _preview_clipped(text: str, max_lines: int) -> bool:
+    """Whether _preview hides anything: too many lines, or too many chars (one huge JSON line)."""
+    lines = text.rstrip("\n").splitlines()
+    return len(lines) > max_lines or sum(map(len, lines)) > max_lines * PREVIEW_CHARS_PER_LINE
+
+
 def _preview(text: str, max_lines: int) -> str:
-    """First max_lines lines, with a '… +N lines' marker for the rest."""
+    """First max_lines lines and at most max_lines * PREVIEW_CHARS_PER_LINE chars, with a marker for the rest."""
     lines = text.rstrip("\n").splitlines() or [""]
+    budget = max_lines * PREVIEW_CHARS_PER_LINE
+    shown: list[str] = []
+    for line in lines[:max_lines]:
+        if len(line) > budget:  # a long line (minified JSON, base64…) would wrap over the whole screen
+            shown.append(line[:budget])
+            hidden = len(line) - budget + sum(map(len, lines[len(shown):]))
+            return "\n".join(shown + [f"… +{hidden} chars (ctrl+o to expand)"])
+        shown.append(line)
+        budget -= len(line)
     extra = len(lines) - max_lines
     if extra > 0:
-        lines = lines[:max_lines] + [f"… +{extra} lines"]
-    return "\n".join(lines)
+        shown.append(f"… +{extra} lines (ctrl+o to expand)")
+    return "\n".join(shown)
 
 
 def _tool_result_line(text: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES) -> str:
     """Tool output under its call, Claude Code style: '  ⎿  first line' + indented rest."""
     return "  ⎿  " + _preview(text, max_lines).replace("\n", "\n     ")
+
+
+class SelectableStatic(Static):
+    """Static whose Rich renderables (Markdown) are flattened to Text at the current width.
+
+    Textual can only select Text / Content, so a plain Static holding RichMarkdown can't be
+    selected with the mouse; this keeps the Markdown look and makes it selectable.
+    """
+
+    _flat_cache: tuple[object, int, Text] | None = None
+
+    def _flat(self, width: int) -> Text | None:
+        content = self.content
+        if not isinstance(content, RichMarkdown) or width <= 0:
+            return None
+        cached = self._flat_cache
+        if cached is not None and cached[0] is content and cached[1] == width:
+            return cached[2]
+        console = self.app.console
+        rows = []
+        for line in console.render_lines(content, console.options.update_width(width), pad=False):
+            row = Text()
+            for seg in line:
+                if not seg.control:
+                    row.append(seg.text, seg.style)
+            row.rstrip()  # trailing padding: Textual would re-wrap lines that already fit
+            rows.append(row)
+        text = Text("\n").join(rows)
+        self._flat_cache = (content, width, text)
+        return text
+
+    def render(self) -> Any:
+        flat = self._flat(self.content_size.width)
+        return flat if flat is not None else super().render()
+
+    def get_content_height(self, container: Any, viewport: Any, width: int) -> int:
+        flat = self._flat(width)
+        if flat is not None:
+            return len(flat.plain.split("\n"))
+        return super().get_content_height(container, viewport, width)
+
+
+def _copy_to_clipboard(app: App, text: str) -> None:
+    """OSC 52 (Textual) plus clip.exe on Windows, for consoles that ignore OSC 52."""
+    app.copy_to_clipboard(text)
+    if sys.platform != "win32":
+        return
+
+    def run_clip() -> None:
+        try:
+            subprocess.run(["clip"], input=text.encode("utf-16"), timeout=5,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    threading.Thread(target=run_clip, daemon=True).start()
+
+
+class ToolResult(Static):
+    """A tool or shell result: its first max_lines lines, or all of it once expanded.
+
+    A click toggles this one; Ctrl+O toggles every result (DostuffTUI.action_toggle_tool_results).
+    """
+
+    def __init__(self, text: str, max_lines: int, expanded: bool = False, **kwargs: Any) -> None:
+        self.full_text = text
+        self.max_lines = max_lines
+        self.expanded = expanded and self.collapsible
+        super().__init__(self._content(), markup=False, **kwargs)
+
+    @property
+    def collapsible(self) -> bool:
+        return _preview_clipped(self.full_text, self.max_lines)
+
+    def _content(self) -> Text | str:
+        if self.expanded:
+            line = _tool_result_line(self.full_text, max_lines=len(self.full_text)) + "\n     (ctrl+o to collapse)"
+        else:
+            line = _tool_result_line(self.full_text, self.max_lines)
+        return Text.from_ansi(line) if "\033[" in line else line
+
+    def set_expanded(self, expanded: bool) -> None:
+        expanded = expanded and self.collapsible
+        if expanded != self.expanded:
+            self.expanded = expanded
+            self.update(self._content())
+
+    def on_click(self) -> None:
+        if self.screen.get_selected_text():
+            return  # the end of a mouse selection, not a click
+        self.set_expanded(not self.expanded)
 
 
 def _thought_text(text: str) -> Text:
@@ -127,12 +267,15 @@ def _fmt_time(iso: str) -> str:
 
 
 class CommandMenu(OptionList):
-    """Slash-command suggestions shown above the input while it starts with '/'."""
+    """Suggestions shown above the input: slash commands while it starts with '/', project paths
+    while an `@mention` is typed at the cursor (mode "file")."""
 
     can_focus = False
+    mode = "command"
 
     def show_matches(self, prefix: str) -> bool:
         """List commands starting with prefix; returns False (and hides) if none match."""
+        self.mode = "command"
         matches = [c for c in COMMAND_DESCRIPTIONS if c.startswith(prefix.lower())]
         self.clear_options()
         if not matches:
@@ -143,6 +286,18 @@ class CommandMenu(OptionList):
             Option(Text.assemble((c.ljust(width), "bold"), (COMMAND_DESCRIPTIONS[c], "dim")), id=c)
             for c in matches
         )
+        self.highlighted = 0
+        self.display = True
+        return True
+
+    def show_paths(self, paths: list[str]) -> bool:
+        """List project paths for an @mention; returns False (and hides) if there are none."""
+        self.mode = "file"
+        self.clear_options()
+        if not paths:
+            self.display = False
+            return False
+        self.add_options(Option(Text(path, style="bold" if path.endswith("/") else ""), id=path) for path in paths)
         self.highlighted = 0
         self.display = True
         return True
@@ -284,11 +439,20 @@ class PermissionPrompt(Static, can_focus=True):
         event.prevent_default()
 
 
+# Shift+Enter needs a terminal that reports it (kitty keyboard protocol, e.g. kitty, WezTerm,
+# Ghostty); elsewhere it arrives as plain Enter, so the others stay as fallbacks.
+NEWLINE_KEYS = {"shift+enter", "ctrl+enter", "alt+enter", "ctrl+j"}
+
+
 class EnterSubmits(TextArea):
-    """TextArea where Enter submits and Ctrl+J inserts a newline.
+    """TextArea where Enter submits and Shift+Enter inserts a newline.
+
+    Ctrl+Enter, Alt+Enter, Ctrl+J and a trailing "\\" before Enter also insert a newline, for
+    terminals that send Shift+Enter as a plain Enter.
 
     While the "/" menu is open, Up/Down move through it, Tab completes and Enter runs the
-    highlighted command.
+    highlighted command. Otherwise Up on the first line recalls the previous prompt and Down on
+    the last line goes forward again, back to the draft that was being typed.
     """
 
     class Submitted(Message):
@@ -296,6 +460,58 @@ class EnterSubmits(TextArea):
         def __init__(self, text: str) -> None:
             super().__init__()
             self.text = text
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.prompt_history: list[str] = []  # oldest first
+        self._history_index: int | None = None  # None = editing the draft
+        self._draft = ""
+        self.recalled_text: str | None = None  # last text put in by recall (keeps the "/" menu shut)
+
+    def add_history(self, text: str) -> None:
+        if not self.prompt_history or self.prompt_history[-1] != text:
+            self.prompt_history.append(text)
+        self._history_index = None
+        self._draft = ""
+
+    def _recall(self, step: int) -> bool:
+        """Move through history (-1 older, +1 newer); False if there's nowhere to go."""
+        if self._history_index is None:
+            if step > 0 or not self.prompt_history:
+                return False
+            self._draft = self.text
+            index = len(self.prompt_history) - 1
+        else:
+            index = self._history_index + step
+            if index < 0:
+                return False
+        if index >= len(self.prompt_history):
+            self._history_index = None
+            text = self._draft
+        else:
+            self._history_index = index
+            text = self.prompt_history[index]
+        self.recalled_text = text
+        self.text = text
+        self.move_cursor(self.document.end)
+        return True
+
+    def partial_mention(self) -> str | None:
+        """The `@...` being typed right before the cursor (with the "@"), or None."""
+        row, col = self.cursor_location
+        match = PARTIAL_MENTION_RE.search(self.document.get_line(row)[:col])
+        return match.group(1) if match else None
+
+    def _complete_mention(self, path: str) -> None:
+        """Replace the @mention at the cursor with `path`; a folder stays open for the next part."""
+        partial = self.partial_mention()
+        if partial is None:
+            return
+        row, col = self.cursor_location
+        mention = format_mention(path)
+        if path.endswith("/") and mention.endswith('"'):
+            mention = mention[:-1]  # @"my dir/ : keep typing inside the quotes
+        self.replace(mention + ("" if path.endswith("/") else " "), (row, col - len(partial)), (row, col))
 
     def _menu(self) -> CommandMenu | None:
         try:
@@ -313,6 +529,11 @@ class EnterSubmits(TextArea):
                 menu.action_cursor_up()
             elif event.key == "down":
                 menu.action_cursor_down()
+            elif menu.mode == "file":
+                path = menu.selected_command()
+                menu.display = False
+                if path:
+                    self._complete_mention(path)
             else:
                 command = menu.selected_command()
                 menu.display = False
@@ -322,14 +543,25 @@ class EnterSubmits(TextArea):
                 elif command:
                     self.post_message(self.Submitted(command))
             return
-        if event.key == "ctrl+j":
+        if event.key in NEWLINE_KEYS:
             event.stop()
             event.prevent_default()
             self.insert("\n")
             return
+        row = self.cursor_location[0]
+        if (event.key == "up" and row == 0 and self._recall(-1)) or (
+                event.key == "down" and row == self.document.line_count - 1 and self._recall(1)):
+            event.stop()
+            event.prevent_default()
+            return
         if event.key == "enter":
             event.stop()
             event.prevent_default()
+            row, col = self.cursor_location
+            if col and self.document.get_line(row)[col - 1] == "\\":
+                # "\" + Enter: swap the backslash for a newline instead of submitting
+                self.replace("\n", (row, col - 1), (row, col))
+                return
             self.post_message(self.Submitted(self.text))
             return
         await super()._on_key(event)
@@ -363,10 +595,14 @@ class TuiAdapter:
         self._cancel_event: asyncio.Event = asyncio.Event()
         self._last_context_window_percent = ""
         self._token_display = ""
+        self._session_cost = 0.0  # USD of calls with a known price (0 = none, or unknown model)
+        self._turn_cost = 0.0
 
     def reset_usage(self) -> None:
         self._last_turn_usage = {}
         self._session_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self._session_cost = 0.0
+        self._turn_cost = 0.0
         self._token_display = " ↑0 ↓0"
         self._last_context_window_percent = ""
 
@@ -382,6 +618,9 @@ class TuiAdapter:
             self._last_turn_usage = data
             for k in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens"):
                 self._session_usage[k] = self._session_usage.get(k, 0) + (data.get(k) or 0)
+            if data.get("cost"):
+                self._session_cost += data["cost"]
+                self._turn_cost += data["cost"]
             su = self._session_usage
             if su.get("prompt_tokens", 0) or su.get("completion_tokens", 0):
                 cached = f" ({app._fmt_tokens(su['cached_tokens'])} cached)" if su.get("cached_tokens") else ""
@@ -416,12 +655,15 @@ class TuiAdapter:
         if event_type == "tool_result":
             text = str(data)
             if text.startswith(TODO_RESULT_PREFIX):  # the plan is short and worth seeing in full
-                app._append(_tool_result_line(text.removeprefix(TODO_RESULT_PREFIX), max_lines=100), msg_type="tool-result")
+                app._append_tool_result(text.removeprefix(TODO_RESULT_PREFIX), max_lines=100)
                 return
-            app._append(_tool_result_line(text), msg_type="tool-result")
+            app._append_tool_result(text)
             return
         if event_type in ("confirm", "system", "error"):
             app._append(str(data), msg_type=event_type)
+            return
+        if event_type == "settings_changed":  # the settings tools changed config.yaml or the MCP servers
+            app._apply_settings(mcp=data == "mcp")
             return
         label = event_type.upper().replace("_", " ")
         app._append(f"[{label}] {data}", msg_type="agent")
@@ -539,6 +781,7 @@ class DostuffTUI(App):
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("ctrl+o", "toggle_tool_results", "Expand tool output", priority=True),
     ]
 
     # ── Setup ──────────────────────────────────────────────────────────────────
@@ -548,7 +791,6 @@ class DostuffTUI(App):
         session_id: str,
         **kwargs,
     ):
-        print(" Loading session...", flush=True)
         # ansi_color + an ANSI theme make "transparent" mean the terminal's own background;
         # without them Textual paints the theme's RGB background (black) behind everything.
         kwargs.setdefault("ansi_color", True)
@@ -559,27 +801,18 @@ class DostuffTUI(App):
         set_adapter(self.adapter)
 
         # Cwd already switched in cli.py before TUI launched; Config now reads from correct cwd
-        print(" Loading config...", flush=True)
         self.config = get_config()
-        print(" Initializing session store...", flush=True)
         self.store = SQLiteSessionStore(
             db_path=str(self.config.get_data_dir() / "sessions.db")
         )
-
-        persist_path = str(self.config.get_data_dir() / "chroma")
-        print(" Initializing memory stores...", flush=True)
-        # Same instances the save_memory / save_episode tools write to
-        self.memory_store = get_semantic_store()
-        self.episodic_store = get_episodic_store()
-        print(" Initializing MCP client...", flush=True)
-        self.reg_store = MCPClientRegistrationStore(
-            path=str(self.config.get_data_dir() / "mcp_client_registrations.json")
-        )
-        self.tool_store = MCPToolRegistryStore(persist_path=persist_path)
-        self.mcp_client = MCPClient(
-            registration_store=self.reg_store,
-            tool_registry_store=self.tool_store,
-        )
+        # Memory stores and the MCP client need litellm / chromadb / mcp; _load_backend sets them
+        # after the first frame, then sets _backend_ready
+        self.memory_store: "SemanticMemoryStore | None" = None
+        self.episodic_store: "EpisodicMemoryStore | None" = None
+        self.mcp_client: "MCPClient | None" = None
+        self._backend_ready = asyncio.Event()
+        self._backend_error = ""
+        self._context_tokens = 0  # last_input_tokens; the context % needs litellm's model table
 
         # Session state
         self.user_id = ""
@@ -599,6 +832,7 @@ class DostuffTUI(App):
         self._turn_in_progress: bool = False
         self._turn_start_time: float | None = None
         self._timer: Timer | None = None
+        self._status_loader = ""  # timer / "Queued" / "Compacting" text; kept so a resize can redraw it
         self._quitting = False
         self.max_iterations = self.config.max_iterations
         # Session-scoped approvals ("always") — reset when the app restarts
@@ -606,11 +840,15 @@ class DostuffTUI(App):
         self._draft_before_feedback = ""  # input text set aside while it takes denial feedback
         self._picker_callback: Callable[[str], Awaitable[None]] | None = None
         self._mcp_configured: list[str] = []
+        self._mcp_server_configs: dict[str, dict] = {}  # as connected; diffed when the settings change
+        self._tool_results_expanded = False  # Ctrl+O; new results follow it
+        self._history_path = self.config.get_data_dir() / "prompt_history.jsonl"
 
     # ── Compose UI ─────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="messages"):
+        # Not focusable: clicking the conversation keeps focus in the input (see _keep_input_focus)
+        with VerticalScroll(id="messages", can_focus=False):
             yield Vertical(id="msg-container")
         yield CommandMenu(id="command-menu")
         yield EnterSubmits(id="input", language="")
@@ -625,6 +863,31 @@ class DostuffTUI(App):
             self.call_from_thread(fn)
         except RuntimeError:
             pass  # app is not running (shutting down)
+
+    def _keep_input_focus(self, focused: Widget | None) -> None:
+        """Focus always goes back to the input (or the selector shown in its place)."""
+        if not isinstance(focused, (EnterSubmits, PermissionPrompt)):
+            self.call_after_refresh(self._refocus_input)
+
+    def _refocus_input(self) -> None:
+        if isinstance(self.screen.focused, (EnterSubmits, PermissionPrompt)):
+            return
+        try:
+            for widget in self.query(PermissionPrompt):
+                widget.focus()
+                return
+            inp = self.query_one("#input", EnterSubmits)
+        except Exception:
+            return  # shutting down
+        if inp.display:
+            inp.focus()
+
+    def on_text_selected(self, event: TextSelected) -> None:
+        """Select to copy, like Claude Code: releasing the mouse copies the selection."""
+        text = self.screen.get_selected_text()
+        if text:
+            _copy_to_clipboard(self, text)
+            self.notify(f"Copied {len(text)} characters", timeout=2)
 
     def _start_worker(self, work, name: str) -> Worker:
         worker = self.run_worker(work, name=name, exit_on_error=False)
@@ -645,7 +908,10 @@ class DostuffTUI(App):
         # Anchored: the compositor keeps the view at the bottom in the same layout pass
         # (no flicker); scrolling up releases it, scrolling back to the bottom restores it.
         self.query_one("#messages", VerticalScroll).anchor()
-        self.query_one("#input", EnterSubmits).focus()
+        inp = self.query_one("#input", EnterSubmits)
+        inp.focus()
+        self.watch(self.screen, "focused", self._keep_input_focus, init=False)
+        inp.prompt_history = load_history(self._history_path, os.getcwd())
 
         self._system_instructions, skills = build_base_instructions()
         self.user_id = self.config.get_user_id()
@@ -679,23 +945,94 @@ class DostuffTUI(App):
 
         if self.config.permission_mode == "auto":
             self._append(
-                "⚠ permissions.mode is 'auto': every tool call (shell, writes, deletes, MCP) runs WITHOUT asking.",
+                "⚠ permissions.mode is 'auto': every tool call (shell, writes, deletes, MCP, web fetches) runs WITHOUT asking.",
                 msg_type="error",
             )
 
-        self._warn_if_model_unconfigured()
-        self._update_status()
+        if self.config.status_bar_unknown:
+            self._append(
+                f"ui.status_bar: unknown item(s) {', '.join(self.config.status_bar_unknown)} ignored. "
+                f"Known: {', '.join(STATUS_BAR_ITEMS)}.",
+                msg_type="error",
+            )
 
-        # MCP servers connect in the background so the TUI renders immediately
+        self._update_status()
+        self._append("Type a message or /help for commands.")
+        self._start_worker(self._load_backend(), name="load_backend")
+
+    async def _load_backend(self) -> None:
+        """After the first frame: import litellm / chromadb / mcp in a thread, create the memory
+        stores and MCP client, then connect MCP servers in the background."""
+        try:
+            await asyncio.to_thread(_import_backend)
+            from dostuff.lib.mcp.mcp_client import MCPClient
+            from dostuff.lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
+            from dostuff.lib.memory.stores import get_episodic_store, get_semantic_store, make_tool_registry_store
+
+            data_dir = self.config.get_data_dir()
+            # Same instances the save_memory / save_episode tools write to (None without chromadb)
+            self.memory_store, self.episodic_store, tool_store = await asyncio.to_thread(
+                lambda: (get_semantic_store(), get_episodic_store(), make_tool_registry_store()))
+            self.mcp_client = MCPClient(
+                registration_store=MCPClientRegistrationStore(path=str(data_dir / "mcp_client_registrations.json")),
+                tool_registry_store=tool_store,
+            )
+            if self.memory_store is None:
+                self._note_memory_off()
+            else:
+                await self._ensure_embedding_model()
+        except Exception as e:
+            self._backend_error = str(e)
+            self._append(f"Startup failed: {e}", msg_type="error")
+            return
+        finally:
+            self._backend_ready.set()
+        self._refresh_context_status(self._context_tokens)
+        self._warn_if_model_unconfigured()
+
         mcp_servers = load_mcp_config()
         self._mcp_configured = list(mcp_servers)
+        self._mcp_server_configs = dict(mcp_servers)
         if mcp_servers:
             self._append(f"Connecting to {len(mcp_servers)} MCP server(s)...", msg_type="system")
             self._start_worker(self._connect_mcp_servers(mcp_servers), name="mcp_connect")
         else:
             self._append("Running with local tools only.", msg_type="system")
 
-        self._append("Type a message or /help for commands.")
+    def _note_memory_off(self) -> None:
+        """Without chromadb, say so once if memories were saved before (e.g. an upgrade from 0.1)."""
+        if (self.config.get_data_dir() / "chroma").exists():
+            from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
+            self._append(f"Long-term memory is off: chromadb isn't installed. Your saved memories are kept; "
+                         f"run `{MEMORY_INSTALL_HINT}` to turn it back on.", msg_type="system")
+
+    async def _ensure_embedding_model(self) -> None:
+        """First run: download Chroma's embedding model with a message, before the first turn
+        (otherwise the first memory lookup downloads it silently and the turn seems to hang)."""
+        from dostuff.lib.memory.chroma import download_embedding_model, embedding_model_missing
+        if not await asyncio.to_thread(embedding_model_missing):
+            return
+        self._append("Downloading the memory embedding model (~80 MB, first run only)...", msg_type="system")
+        try:
+            await asyncio.to_thread(download_embedding_model)
+        except Exception as e:
+            self._append(f"Embedding model download failed: {e}\n"
+                         "Memory recall is off until it succeeds (it retries on the next start).", msg_type="error")
+            return
+        self._append("Embedding model ready.", msg_type="system")
+
+    async def _wait_for_backend(self) -> bool:
+        """Wait for _load_backend (with a loader if it's still running); False if it failed."""
+        if not self._backend_ready.is_set():
+            loader_widget = self._show_loader("Loading model libraries...")
+            try:
+                await self._backend_ready.wait()
+            finally:
+                self._stop_loader(loader_widget)
+        if self._backend_error:
+            self._append(f"Not available: startup failed ({self._backend_error}). Restart dostuff.", msg_type="error")
+            return False
+        return True
 
     async def _load_session(self, session_id: str) -> dict | None:
         """Make session_id current: load its steps and token counters; returns its meta (None if new).
@@ -726,10 +1063,14 @@ class DostuffTUI(App):
         self.adapter._session_usage["completion_tokens"] = meta_c
         self.adapter._session_usage["total_tokens"] = meta.get("total_tokens") or 0
         self.adapter._token_display = f" ↑{self._fmt_tokens(meta_p)} ↓{self._fmt_tokens(meta_c)}"
+        self.adapter._session_cost = float(meta.get("cost_usd") or 0.0)
         self._refresh_context_status(meta.get("last_input_tokens") or 0)
         return existing_meta
 
     def _refresh_context_status(self, last_input_tokens: int) -> None:
+        self._context_tokens = last_input_tokens
+        if not self._backend_ready.is_set() or self._backend_error:
+            return  # _load_backend calls this again once litellm is loaded
         token_limit = get_model_token_limit()
         percent = (last_input_tokens / token_limit * 100) if token_limit > 0 else 0
         limit_str = self._fmt_tokens(token_limit) if token_limit else ""
@@ -740,6 +1081,8 @@ class DostuffTUI(App):
             self._render_history_step(step)
 
     def _warn_if_model_unconfigured(self) -> None:
+        if not self._backend_ready.is_set():
+            return  # needs litellm; _load_backend calls this once it's loaded
         model = get_model()
         missing = missing_api_keys(model)
         if not missing:
@@ -757,15 +1100,18 @@ class DostuffTUI(App):
         role = step.get("role", "?")
         content = step.get("content") or ""
         if role == "tool":
-            self._append(_tool_result_line(f"{step.get('name', '')}: {content}"), msg_type="tool-result")
+            self._append_tool_result(f"{step.get('name', '')}: {content}")
             return
         if role == "user":
             shell = _parse_shell_step(content)
             if shell is not None:
                 self._append(f"! {shell[0]}", msg_type="shell")
-                self._append(_tool_result_line(shell[1], SHELL_PREVIEW_LINES), msg_type="shell-output")
+                self._append_tool_result(shell[1], SHELL_PREVIEW_LINES, msg_type="shell-output")
             elif content and content != EMPTY_RESPONSE_NUDGE:
-                self._append(content, msg_type="user")
+                self._append(strip_attachments(content), msg_type="user")
+                attached = attached_paths(content)
+                if attached:
+                    self._append("Attached " + ", ".join(attached), msg_type="system")
             return
         if content:
             self._append(content, msg_type="agent")
@@ -776,6 +1122,8 @@ class DostuffTUI(App):
     # ── Commands ──────────────────────────────────────────────────────────────
 
     async def _compact_session(self) -> None:
+        if not await self._wait_for_backend():
+            return
         loader_widget = self._show_loader("Compacting...")
         self._update_status(loader="Compacting")
         try:
@@ -813,8 +1161,7 @@ class DostuffTUI(App):
         self.current_session_history = []
         self.adapter.reset_usage()
         await self.query_one("#msg-container", Vertical).remove_children()
-        token_limit = get_model_token_limit()
-        self._update_status(context_window_percent=f"0.0%/{self._fmt_tokens(token_limit)}" if token_limit else "0.0%")
+        self._refresh_context_status(0)
         self._append(
             f" New session '{new_session_id}'. Previous session saved; /resume or `dostuff resume {old_session_id}` brings it back.",
             msg_type="system",
@@ -1030,7 +1377,7 @@ class DostuffTUI(App):
         self._refresh_context_status(meta.get("last_input_tokens") or 0)
 
     _PERMISSION_MODE_LABELS = {
-        "ask": "ask        every write / delete / shell / MCP call asks",
+        "ask": "ask        every write / delete / shell / MCP / web fetch call asks",
         "allowlist": "allowlist  as ask, plus config's permissions.allow patterns run without asking",
         "auto": "auto       nothing asks (not recommended)",
     }
@@ -1056,11 +1403,13 @@ class DostuffTUI(App):
             msg_type="system",
         )
         if mode == "auto":
-            self._append("⚠ Every tool call (shell, writes, deletes, MCP) now runs WITHOUT asking.", msg_type="error")
+            self._append("⚠ Every tool call (shell, writes, deletes, MCP, web fetches) now runs WITHOUT asking.", msg_type="error")
         elif mode == "allowlist" and not self.config.permission_allow:
             self._append("permissions.allow in config.yaml is empty, so allowlist behaves like ask.", msg_type="system")
 
     async def _show_status(self) -> None:
+        if not await self._wait_for_backend() or self.mcp_client is None:
+            return
         meta = await self.store.get_session_meta(self.session_id) or {}
         usage = self.adapter._session_usage
         token_limit = get_model_token_limit()
@@ -1076,9 +1425,12 @@ class DostuffTUI(App):
             ("Permissions", mode + (f"  ({len(self.permissions.approved)} 'always' approval(s) this session)" if self.permissions.approved else "")),
             ("Tokens", f"↑{self._fmt_tokens(usage.get('prompt_tokens', 0))} ↓{self._fmt_tokens(usage.get('completion_tokens', 0))}"
                        + (f"  ({self._fmt_tokens(usage['cached_tokens'])} cached)" if usage.get("cached_tokens") else "")),
+            ("Cost", format_cost(self.adapter._session_cost) if self.adapter._session_cost
+                     else "n/a (nothing priced yet, or litellm has no price for this model)"),
             ("Context", f"{self._fmt_tokens(last_input)} / {self._fmt_tokens(token_limit)}{percent}"),
             ("Steps", str(len(self.steps_history))),
             ("MCP", f"{len(connected)}/{len(self._mcp_configured)} connected" + (f": {', '.join(connected)}" if connected else "")),
+            ("Status bar", (", ".join(self.config.status_bar_items) or "(empty)") + "  (ui.status_bar in config.yaml)"),
             ("Version", __version__),
         ]
         width = max(len(k) for k, _ in rows) + 2
@@ -1107,7 +1459,20 @@ class DostuffTUI(App):
             return
         self._append(f"Exported {len(steps)} step(s) to {_rel_path(str(path))}", msg_type="system")
 
+    async def _memory_ready(self) -> bool:
+        """Wait for the stores; False (after saying so) when long-term memory is off."""
+        if not await self._wait_for_backend():
+            return False
+        if self.memory_store is None or self.episodic_store is None:
+            from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
+            self._append(f"Long-term memory is off (chromadb isn't installed). Turn it on with `{MEMORY_INSTALL_HINT}`.", msg_type="system")
+            return False
+        return True
+
     async def _show_memories(self) -> None:
+        if not await self._memory_ready():
+            return
+        assert self.memory_store is not None
         try:
             facts = await self.memory_store.list_all(self.user_id)
         except Exception as e:
@@ -1117,7 +1482,53 @@ class DostuffTUI(App):
             self._append("No saved memories.", msg_type="system")
             return
         lines = [f"- {f['key']}: {f['value']}  ({f['source']})" for f in facts]
-        self._append(f"Saved memories ({len(facts)}):\n" + "\n".join(lines), msg_type="system")
+        self._append(f"Saved memories ({len(facts)}):\n" + "\n".join(lines) + "\n\nForget one with /forget <key>.", msg_type="system")
+
+    def _episodes_dir(self) -> str | None:
+        """The directory episodes are recalled from (None = all), as `memory.episodic_scope` says."""
+        return str(Path.cwd().resolve()) if self.config.episodic_scope == "project" else None
+
+    async def _show_episodes(self) -> None:
+        if not await self._memory_ready():
+            return
+        assert self.episodic_store is not None
+        working_dir = self._episodes_dir()
+        try:
+            episodes = await self.episodic_store.list_all(self.user_id, working_dir=working_dir)
+        except Exception as e:
+            self._append(f"Could not load episodes: {e}", msg_type="error")
+            return
+        where = "for this directory" if working_dir else "in any directory"
+        if not episodes:
+            self._append(f"No saved episodes {where}.", msg_type="system")
+            return
+        # The id's random tail is enough for /forget
+        lines = [f"- [{ep['event_type']}] {ep['anchor_event']}  ({ep['created_at_iso'][:10]}, {ep['id'].rsplit('_', 1)[-1]})"
+                 for ep in episodes]
+        self._append(f"Saved episodes {where} ({len(episodes)}), newest first:\n" + "\n".join(lines)
+                     + "\n\nForget one with /forget <id>.", msg_type="system")
+
+    async def _forget(self, target: str) -> None:
+        """Delete the fact with this key, else the episode with this id (or its last part)."""
+        if not await self._memory_ready():
+            return
+        assert self.memory_store is not None and self.episodic_store is not None
+        try:
+            if await self.memory_store.delete(self.user_id, target):
+                self._append(f"Forgot memory '{target}'.", msg_type="system")
+                return
+            episodes = await self.episodic_store.list_all(self.user_id)
+            matches = [ep for ep in episodes if ep["id"] == target or ep["id"].endswith(f"_{target}")]
+            if len(matches) > 1:
+                self._append(f"'{target}' matches {len(matches)} episodes; use the full id.", msg_type="error")
+                return
+            if matches and await self.episodic_store.delete(self.user_id, matches[0]["id"]):
+                self._append(f"Forgot episode [{matches[0]['event_type']}] {matches[0]['anchor_event']}", msg_type="system")
+                return
+        except Exception as e:
+            self._append(f"Could not forget '{target}': {e}", msg_type="error")
+            return
+        self._append(f"No memory key or episode id '{target}' (see /memories and /episodes).", msg_type="error")
 
     def on_enter_submits_submitted(self, event: EnterSubmits.Submitted) -> None:
         text = event.text
@@ -1130,6 +1541,7 @@ class DostuffTUI(App):
             return
 
         self._clear_input()
+        self._remember_prompt(text)
         cmd = text.strip().lower()
 
         if text.lstrip().startswith("!"):
@@ -1182,6 +1594,15 @@ class DostuffTUI(App):
         if name == "/export":
             self._start_worker(self._export_session(arg), name="export")
             return
+        if name == "/episodes" and not arg:
+            self._start_worker(self._show_episodes(), name="episodes")
+            return
+        if name == "/forget":
+            if not arg:
+                self._append("Usage: /forget <memory key or episode id>", msg_type="error")
+            else:
+                self._start_worker(self._forget(arg), name="forget")
+            return
         if cmd.split()[:1] == ["/undo"]:
             args = cmd.split()[1:]
             if args not in ([], ["force"]):
@@ -1197,7 +1618,8 @@ class DostuffTUI(App):
             self._append(
                 f"Commands:\n{commands}\n\n"
                 "  !<command>   Run a shell command directly; its output is added to the conversation\n\n"
-                "Shortcuts: ESC cancel turn · Ctrl+Q quit · Ctrl+J newline · / command menu",
+                "Shortcuts: ESC cancel turn · Ctrl+Q quit · Shift+Enter (or \\ then Enter) newline · "
+                "Ctrl+O expand/collapse tool output (or click one) · / command menu",
                 msg_type="system",
             )
             return
@@ -1306,8 +1728,12 @@ class DostuffTUI(App):
         """Open the "/" menu while typing a command; tint the input border in "!" shell mode."""
         text = event.text_area.text
         menu = self.query_one("#command-menu", CommandMenu)
-        if text.startswith("/") and " " not in text and "\n" not in text:
+        recalled = isinstance(event.text_area, EnterSubmits) and text == event.text_area.recalled_text
+        partial = event.text_area.partial_mention() if isinstance(event.text_area, EnterSubmits) and not recalled else None
+        if text.startswith("/") and " " not in text and "\n" not in text and not recalled:
             menu.show_matches(text)
+        elif partial is not None and not text.lstrip().startswith("!"):
+            menu.show_paths(mention_candidates(partial[1:]))
         else:
             menu.display = False
         event.text_area.set_class(text.lstrip().startswith("!"), "shell-mode")
@@ -1349,7 +1775,7 @@ class DostuffTUI(App):
             if note:
                 output += f"\n({note})"
             output = output.strip("\n") or "(no output)"
-            self._append(_tool_result_line(output, SHELL_PREVIEW_LINES), msg_type="shell-output")
+            self._append_tool_result(output, SHELL_PREVIEW_LINES, msg_type="shell-output")
 
             content = _format_shell_step(command, truncate_tool_output(output, self.config.max_tool_output_chars))
             working_history = await self.store.load_working_history(self.session_id)
@@ -1381,6 +1807,8 @@ class DostuffTUI(App):
     async def _run_turn(self, user_text: str) -> None:
         loader_widget: Static | None = None
         try:
+            if not await self._wait_for_backend():
+                return
             turn_id = uuid.uuid4().hex
             turn_id_var.set(turn_id)
             session_id_var.set(self.session_id)  # /clear may have switched sessions since on_mount
@@ -1388,8 +1816,13 @@ class DostuffTUI(App):
             meta = await self.store.get_session_meta(self.session_id) or {}
             working_history = await self.store.load_working_history(self.session_id)
 
+            expansion = await asyncio.to_thread(expand_file_mentions, user_text, self.config.max_tool_output_chars)
+            if expansion.attached:
+                self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
+            if expansion.skipped:
+                self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
             await append_step(
-                {"role": "user", "content": user_text},
+                {"role": "user", "content": expansion.content},
                 self.steps_history,
                 working_history,
                 self.current_session_history,
@@ -1406,6 +1839,7 @@ class DostuffTUI(App):
             # Reset cancel state for new turn
             self.adapter._cancelled = False
             self.adapter._cancel_event.clear()
+            self.adapter._turn_cost = 0.0
             self._last_streamed_answer = ""
 
             result = await agent_loop(
@@ -1444,7 +1878,8 @@ class DostuffTUI(App):
             self._turn_in_progress = False
             self._finish_stream_widgets()
             self._stop_loader(loader_widget)
-            self._update_status(loader=f" {final_elapsed:.1f}s" if final_elapsed > 0 else "")
+            turn_cost = f" · {format_cost(self.adapter._turn_cost)}" if self.adapter._turn_cost else ""
+            self._update_status(loader=f" {final_elapsed:.1f}s{turn_cost}" if final_elapsed > 0 else "")
             self._process_prompt_queue()
 
     def _process_prompt_queue(self) -> None:
@@ -1501,7 +1936,7 @@ class DostuffTUI(App):
         widget = self._stream_widgets.get(kind)
         if widget is None or widget.parent is None:
             css = "msg msg-thought" if kind == "thought" else "msg msg-agent"
-            widget = Static("" if kind == "thought" else text, classes=css, markup=False)
+            widget = SelectableStatic("" if kind == "thought" else text, classes=css, markup=False)
             self._stream_widgets[kind] = widget
             if kind == "thought":
                 self._thought_shown = 0
@@ -1598,14 +2033,15 @@ class DostuffTUI(App):
             await asyncio.sleep(0.2)
         # 2. MCP sessions (same loop they were opened on)
         try:
-            await asyncio.wait_for(self.mcp_client.cleanup(), timeout=5.0)
+            if self.mcp_client is not None:
+                await asyncio.wait_for(self.mcp_client.cleanup(), timeout=5.0)
         except asyncio.TimeoutError:
             self._append("MCP shutdown timed out.", msg_type="error")
         # 3. Session DB
         await self.store.close()
         # 4. Force-stop any lingering litellm logging workers (background threads)
         try:
-            import litellm
+            litellm = sys.modules.get("litellm")  # don't import it just to stop it
             worker = getattr(litellm, "logging_worker", None)
             if worker is not None and hasattr(worker, "stop"):
                 worker.stop()
@@ -1634,15 +2070,29 @@ class DostuffTUI(App):
         if msg_type == "user":
             msg = Static(Text("> " + line.replace("\n", "\n  ")), classes=css_class, markup=False)
         elif msg_type == "agent" and line:
-            msg = Static(RichMarkdown(line), classes=css_class, markup=False)
+            msg = SelectableStatic(RichMarkdown(line), classes=css_class, markup=False)
         elif "\033[" in line:
             msg = Static(Text.from_ansi(line), classes=css_class, markup=False)
         else:
             msg = Static(line, classes=css_class, markup=False)
         self._mount_message(msg)
 
+    def _append_tool_result(self, text: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES,
+                            msg_type: str = "tool-result") -> None:
+        """A collapsible result (Ctrl+O / click); capped at the size the model sees."""
+        text = truncate_tool_output(text, self.config.max_tool_output_chars)
+        self._mount_message(ToolResult(text, max_lines, expanded=self._tool_results_expanded,
+                                       classes=f"msg msg-{msg_type}"))
+
+    def action_toggle_tool_results(self) -> None:
+        """Ctrl+O: expand every truncated tool / shell result, or collapse them all again."""
+        self._tool_results_expanded = not self._tool_results_expanded
+        for widget in self.query(ToolResult):
+            widget.set_expanded(self._tool_results_expanded)
+
     async def _connect_one_mcp_server(self, name: str, cfg: dict) -> None:
         timeout = float(cfg.get("connect_timeout") or MCP_CONNECT_TIMEOUT_S)
+        assert self.mcp_client is not None  # connections start from _load_backend
         try:
             await asyncio.wait_for(
                 self.mcp_client.connect_to_server(
@@ -1665,24 +2115,94 @@ class DostuffTUI(App):
     async def _connect_mcp_servers(self, mcp_servers: dict) -> None:
         """Connect every configured server concurrently, each with its own timeout."""
         await asyncio.gather(*(self._connect_one_mcp_server(name, cfg) for name, cfg in mcp_servers.items()))
-        self._append(f"MCP ready ({len(self.mcp_client.servers)} server(s)).", msg_type="system")
+        servers = self.mcp_client.servers if self.mcp_client is not None else {}
+        self._append(f"MCP ready ({len(servers)} server(s)).", msg_type="system")
+
+    def _apply_settings(self, mcp: bool) -> None:
+        """Pick up a settings change (Config is already reloaded) without a restart."""
+        self.max_iterations = self.config.max_iterations
+        self._render_status()
+        if mcp:
+            self._start_worker(self._sync_mcp_servers(), name="mcp_sync")
+
+    async def _sync_mcp_servers(self) -> None:
+        """Connect added or changed MCP servers and disconnect removed ones."""
+        if not await self._wait_for_backend() or self.mcp_client is None:
+            return
+        servers: dict[str, dict] = {}
+        for source in mcp_config_sources():
+            try:
+                servers.update(read_mcp_file(source))
+            except Exception as e:
+                self._append(f"Could not read {source}: {e}", msg_type="error")
+                return
+        old = self._mcp_server_configs
+        gone = [n for n in old if n not in servers]
+        changed = [n for n, cfg in servers.items() if old.get(n) != cfg]
+        self._mcp_server_configs, self._mcp_configured = dict(servers), list(servers)
+        for name in gone:
+            await self.mcp_client.disconnect(name)
+            self._append(f"MCP: disconnected {name}", msg_type="system")
+        if changed:
+            await asyncio.gather(*(self._connect_one_mcp_server(n, servers[n]) for n in changed))
+
+    # Least important first: dropped in this order when the status bar doesn't fit
+    _STATUS_DROP_ORDER = ("help", "session", "cwd", "tokens", "cost", "model", "context", "timer", "mode")
 
     def _update_status(self, loader: str = "", context_window_percent: str = "") -> None:
         """Status bar: cwd, session, model, permission mode, session tokens, context %, timer/queue."""
-        queue_text = f" {len(self._prompt_queue)} queued" if self._prompt_queue else ""
-        loader = f"{loader}  {queue_text}" if loader and queue_text else (loader or queue_text)
-        cwd_display = os.getcwd().replace(str(Path.home()), "~")
-        cwd_display = cwd_display if len(cwd_display) < 36 else "..." + cwd_display[-33:]
-        token_str = self.adapter._token_display or " ↑0 ↓0"
+        self._status_loader = loader
         if context_window_percent:
             self.adapter._last_context_window_percent = context_window_percent
-        display_percent = self.adapter._last_context_window_percent
+        self._render_status()
+
+    def on_resize(self) -> None:
+        self._render_status()
+
+    def _status_items(self) -> dict[str, list[Text]]:
+        """Each item's renderings, longest first; the bar uses the first one that fits."""
+        queue_text = f" {len(self._prompt_queue)} queued" if self._prompt_queue else ""
+        loader = self._status_loader
+        loader = f"{loader}  {queue_text}" if loader and queue_text else (loader or queue_text)
+        cwd = os.getcwd()
+        cwd_display = cwd.replace(str(Path.home()), "~")
+        cwd_display = cwd_display if len(cwd_display) < 36 else "..." + cwd_display[-33:]
         mode = self.permissions.mode or self.config.permission_mode
-        status = Text(f"/help {cwd_display}  {self.session_id}  {get_model()}  ")
-        status.append(f"{mode} mode", style="bold #e06c75" if mode == "auto" else "")
-        status.append(f"  {token_str}  {display_percent}  {loader or '0.0s'} ")
+        cost = self.adapter._session_cost
+        items: dict[str, list[Text]] = {
+            "help": [Text("/help")],
+            "cwd": [Text(cwd_display), Text(Path(cwd).name or cwd_display)],
+            "session": [Text(self.session_id)],
+            "model": [Text(get_model()), Text(get_model().split("/")[-1])],
+            "mode": [Text(f"{mode} mode", style="bold #e06c75" if mode == "auto" else "")],
+            "tokens": [Text((self.adapter._token_display or " ↑0 ↓0").strip())],
+            "cost": [Text(format_cost(cost))] if cost else [],
+            "context": [Text(p)] if (p := self.adapter._last_context_window_percent) else [],
+            "timer": [Text((loader or "0.0s").strip())],
+        }
+        return {name: items[name] for name in self.config.status_bar_items if items.get(name)}
+
+    def _render_status(self) -> None:
+        """Fit the bar to the terminal: shorten items, then drop the least important ones."""
+        items = self._status_items()
+        choice = {name: 0 for name in items}
+        width = max(self.size.width - 2, 1)  # #status has 1 cell of padding each side
+
+        def line() -> Text:
+            return Text("  ").join(items[name][choice[name]] for name in items)
+
+        drop = [name for name in self._STATUS_DROP_ORDER if name in items]
+        while line().cell_len > width:
+            shorter = next((n for n in drop if choice[n] + 1 < len(items[n])), None)
+            if shorter is not None:
+                choice[shorter] += 1
+            elif len(drop) > 1:
+                name = drop.pop(0)
+                del items[name], choice[name]
+            else:
+                break  # one item left: Static crops it
         try:
-            self.query_one("#status", Static).update(status)
+            self.query_one("#status", Static).update(line())
         except Exception:
             pass  # not mounted yet / shutting down
 
@@ -1692,6 +2212,13 @@ class DostuffTUI(App):
         if n < 1_000_000:
             return f"{n/1000:.1f}k"
         return f"{n/1_000_000:.1f}M"
+
+    def _remember_prompt(self, text: str) -> None:
+        """Up/Down history: this run's list, and the project's history file."""
+        inp = self.query_one("#input", EnterSubmits)
+        if text.strip() and (not inp.prompt_history or inp.prompt_history[-1] != text):
+            append_history(self._history_path, os.getcwd(), text)
+        inp.add_history(text)
 
     def _clear_input(self) -> None:
         try:

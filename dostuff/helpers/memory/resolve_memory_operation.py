@@ -4,6 +4,10 @@ from typing import Any, Literal
 from litellm import acompletion, ModelResponse
 from dostuff.lib.model import completion_kwargs
 
+# Lower than the recall floor: a fact that should replace an old one can score low against it
+# ('Uses Neovim' vs 'Uses VS Code' is ~0.28), and the model decides on what is shown anyway
+DEDUP_MIN_SIMILARITY = 0.2
+
 
 def _parse_decision(raw: str) -> dict[str, Any]:
     cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
@@ -21,7 +25,7 @@ async def resolve_memory_operation(
 
     Returns the operation applied and the key it touched (the existing key for UPDATE / NOOP).
     """
-    similar = await memory_store.query(user_id, new_fact["value"], top_k=3)
+    similar = await memory_store.query(user_id, new_fact["value"], top_k=3, min_similarity=DEDUP_MIN_SIMILARITY)
 
     if not similar:
         await memory_store.upsert_fact(user_id, new_fact)
