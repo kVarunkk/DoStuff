@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **MCP OAuth with confidential clients** (Supabase 422 at the token endpoint): the registration's `client_secret` and auth method are saved and sent (`client_secret_post` or HTTP Basic); cached registrations missing a needed secret are redone. Scope follows the MCP spec (`WWW-Authenticate`, else the resource's `scopes_supported`). OAuth errors include the server's message.
 - `python -m dostuff.cli ...` exited 0 with no output.
+- Importing the tool definitions failed on Python < 3.12: `todo_write`'s schema now uses `typing_extensions.TypedDict`.
+- TUI: the input could stay unfocused after focus was cleared on slow machines (Windows CI); it is now refocused one message later instead of after a repaint.
 
 ## [0.2.0] - 2026-10-23
 

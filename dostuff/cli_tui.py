@@ -867,20 +867,22 @@ class DostuffTUI(App):
     def _keep_input_focus(self, focused: Widget | None) -> None:
         """Focus always goes back to the input (or the selector shown in its place)."""
         if not isinstance(focused, (EnterSubmits, PermissionPrompt)):
-            self.call_after_refresh(self._refocus_input)
+            # call_later, not call_after_refresh: waiting on a repaint is slow on Windows
+            self.call_later(self._refocus_input)
 
     def _refocus_input(self) -> None:
         if isinstance(self.screen.focused, (EnterSubmits, PermissionPrompt)):
             return
         try:
             for widget in self.query(PermissionPrompt):
-                widget.focus()
+                self.screen.set_focus(widget)
                 return
             inp = self.query_one("#input", EnterSubmits)
         except Exception:
             return  # shutting down
         if inp.display:
-            inp.focus()
+            # Set directly; widget.focus() would defer one more message hop
+            self.screen.set_focus(inp)
 
     def on_text_selected(self, event: TextSelected) -> None:
         """Select to copy, like Claude Code: releasing the mouse copies the selection."""
