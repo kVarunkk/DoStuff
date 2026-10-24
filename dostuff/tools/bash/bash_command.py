@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from dostuff.helpers.tools.project_root import project_root
+
 DEFAULT_TIMEOUT_S = 60
 MAX_TIMEOUT_S = 110  # stays under the loop's per-tool timeout (TOOL_TIMEOUT_S)
 _DRAIN_GRACE_S = 2.0  # how long to keep reading after the shell exits (background jobs may hold the pipes)
@@ -100,7 +102,7 @@ async def run_shell(command: str, cwd: str = "", timeout: float = DEFAULT_TIMEOU
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=cwd or str(Path.cwd()),
+        cwd=str(project_root() / cwd),  # an absolute cwd replaces the root
         **_detach_kwargs(),
     )
     out, err = bytearray(), bytearray()

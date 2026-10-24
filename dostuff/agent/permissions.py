@@ -24,6 +24,8 @@ from pathlib import PurePath
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from dostuff.helpers.tools.project_root import project_root
+
 PermissionMode = Literal["ask", "allowlist", "auto"]
 ToolKind = Literal["read", "write", "shell", "mcp", "network", "settings"]
 Action = Literal["allow", "ask", "deny"]
@@ -61,6 +63,8 @@ _FORBIDDEN_FLAGS = re.compile(
     re.IGNORECASE,
 )
 _ENV_EXPANSION = re.compile(r"\$[A-Za-z_]")
+# Git worktrees live in .dostuff/worktrees/: reviewing one is not touching dostuff's settings
+_WORKTREES_PREFIX = re.compile(r"\.dostuff[/\\]worktrees[/\\]")
 _SEPARATORS = {"&&", "||", ";", "|", "&", "|&", ";;"}
 
 
@@ -115,6 +119,8 @@ def _segment_is_read_only(tokens: list[str]) -> bool:
 def has_unsafe_constructs(command: str) -> bool:
     """Redirection, substitution, env expansion, or destructive flags anywhere in the string."""
     lowered = command.lower()
+    if ".." not in lowered:  # `.dostuff/worktrees/../config.yaml` stays forbidden
+        lowered = _WORKTREES_PREFIX.sub("", lowered)
     return (
         any(s in lowered for s in _FORBIDDEN_SUBSTRINGS)
         or bool(_FORBIDDEN_FLAGS.search(command))
@@ -211,6 +217,17 @@ def url_host(url: str) -> str:
         return ""
 
 
+def _is_settings_path(path: str) -> bool:
+    """A `.dostuff` dir in the path below the cwd; the cwd itself may be inside one (a git worktree)."""
+    pure = PurePath(path)
+    if pure.is_absolute():
+        try:
+            pure = pure.relative_to(project_root())
+        except ValueError:
+            pass
+    return ".dostuff" in pure.parts
+
+
 def check(
     tool: str,
     kind: ToolKind,
@@ -223,7 +240,7 @@ def check(
     mode = (session.mode if session and session.mode else cfg.mode)
     description = _describe_call(tool, args)
     prompt = f"{description}\n{preview}".rstrip()
-    if kind == "write" and ".dostuff" in PurePath(str(args.get("path") or "")).parts:
+    if kind == "write" and _is_settings_path(str(args.get("path") or "")):
         kind = "settings"  # write_file / edit_file on ./.dostuff/config.yaml, mcp_config.json, .env …
     if kind == "settings":  # every mode, and no "always" (no approval keys)
         return PermissionDecision("ask", prompt=prompt, reason=description)

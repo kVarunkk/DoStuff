@@ -36,6 +36,7 @@ from dostuff.helpers.memory.shell_step import format_shell_step as _format_shell
 from dostuff.tools.bash.bash_command import run_shell
 from dostuff.lib.memory.session_store import SQLiteSessionStore
 from dostuff.lib.checkpoints import UndoResult, get_checkpoint_store
+from dostuff.lib.worktree import Worktree, WorktreeError, create_worktree, detect_worktree, has_changes, remove_worktree, worktree_changes
 from dostuff.lib.model import get_model
 from dostuff.lib.tracing import session_id_var, turn_id_var
 from dostuff.helpers.agent.append_step import append_step
@@ -843,6 +844,8 @@ class DostuffTUI(App):
         self._mcp_server_configs: dict[str, dict] = {}  # as connected; diffed when the settings change
         self._tool_results_expanded = False  # Ctrl+O; new results follow it
         self._history_path = self.config.get_data_dir() / "prompt_history.jsonl"
+        self.worktree: Worktree | None = None  # set while the cwd is a dostuff git worktree
+        self.exit_note = ""  # printed by cli.py after the TUI closes (e.g. a kept worktree)
 
     # ── Compose UI ─────────────────────────────────────────────────────────────
 
@@ -932,6 +935,12 @@ class DostuffTUI(App):
             + f"{'v' + __version__:>42}\n",
             msg_type="system",
         )
+        self.worktree = await asyncio.to_thread(detect_worktree)
+        if self.worktree:
+            self._append(
+                f" Working in worktree '{self.worktree.name}' (branch {self.worktree.branch}). /worktree exit leaves it.",
+                msg_type="system",
+            )
 
         if existing_meta:
             self._append(f" Resumed session '{self.session_id}' ({len(self.steps_history)} step(s)).")
@@ -1255,6 +1264,149 @@ class DostuffTUI(App):
         if had_steps:
             self._append(f" Previous session '{old_session_id}' saved; /resume brings it back.", msg_type="system")
 
+    async def _fork_session(self, arg: str) -> None:
+        """/fork [--worktree] [title]: copy this session into a new one and switch to it; the original stays as it was.
+
+        Files on disk are shared unless --worktree also gives the fork its own git worktree.
+        The fork starts with no undo checkpoints or todos.
+        """
+        words = arg.split()
+        in_worktree = "--worktree" in words
+        title = " ".join(w for w in words if w != "--worktree")
+        if in_worktree and self.worktree:
+            self._append(f"Already in worktree '{self.worktree.name}'; /worktree exit first.", msg_type="error")
+            return
+        if not self.steps_history:
+            self._append("Nothing to fork yet: this session has no messages.", msg_type="system")
+            return
+        old_session_id = self.session_id
+        new_session_id = uuid.uuid4().hex[:16]
+        try:
+            await self.store.fork_session(old_session_id, new_session_id, title or None)
+            await self._load_session(new_session_id)
+        except Exception as e:
+            self._append(f"Fork failed: {e}", msg_type="error")
+            return
+        await self.query_one("#msg-container", Vertical).remove_children()
+        self._render_history()
+        self._append(
+            f" Forked '{old_session_id}' into '{new_session_id}'. You're in the fork now; "
+            f"/resume {old_session_id} goes back to the original.",
+            msg_type="system",
+        )
+        if in_worktree:
+            await self._enter_worktree(f"fork-{new_session_id[:8]}")
+
+    # ── Worktrees ──────────────────────────────────────────────────────────────
+
+    async def _worktree_command(self, arg: str) -> None:
+        """/worktree [name]: move this session into a new git worktree; /worktree exit leaves it."""
+        if arg.lower() == "exit":
+            await self._exit_worktree()
+        elif self.worktree:
+            self._append(
+                f"Already in worktree '{self.worktree.name}' ({self.worktree.path}); /worktree exit first.",
+                msg_type="error",
+            )
+        else:
+            await self._enter_worktree(arg or None)
+
+    async def _enter_worktree(self, name: str | None) -> None:
+        try:
+            wt = await asyncio.to_thread(create_worktree, name)
+        except WorktreeError as e:
+            self._append(f"Worktree failed: {e}", msg_type="error")
+            return
+        await self._move_to(wt.path)
+        self.worktree = wt
+        self._append(
+            f" Created worktree '{wt.name}' at {wt.path} on branch {wt.branch}, from HEAD (uncommitted changes in "
+            f"{wt.repo_root} are not carried over). This session works there now; /worktree exit leaves it.",
+            msg_type="system",
+        )
+
+    async def _exit_worktree(self) -> None:
+        """Back to the main checkout; an unchanged worktree is removed, a changed one asks keep/remove."""
+        wt = self.worktree
+        if wt is None:
+            self._append("Not in a worktree. /worktree [name] creates one.", msg_type="error")
+            return
+        try:
+            dirty, commits = await asyncio.to_thread(worktree_changes, wt)
+        except WorktreeError as e:
+            self._append(f"Could not check the worktree for changes: {e}", msg_type="error")
+            return
+        if not dirty and not commits:
+            await self._leave_worktree(wt, remove=True)
+            return
+        summary = " and ".join(part for part in (
+            f"{len(dirty)} uncommitted file(s)" if dirty else "",
+            f"{commits} commit(s)" if commits else "",
+        ) if part)
+
+        async def choose(value: str) -> None:
+            await self._leave_worktree(wt, remove=value == "remove")
+
+        self._show_picker(
+            f"Worktree '{wt.name}' has {summary}. Keep it?",
+            [("keep", f"Keep it (branch {wt.branch} stays at {wt.path})"),
+             ("remove", "Remove it and its branch, discarding the changes")],
+            choose,
+        )
+
+    async def _leave_worktree(self, wt: Worktree, remove: bool) -> None:
+        await self._move_to(wt.repo_root)  # first: Windows can't delete the cwd
+        self.worktree = None
+        if not remove:
+            self._append(f" Left worktree '{wt.name}'; kept at {wt.path} on branch {wt.branch}.", msg_type="system")
+            return
+        try:
+            await asyncio.to_thread(remove_worktree, wt)
+        except WorktreeError as e:
+            self._append(f"Back in {wt.repo_root}, but removing the worktree failed: {e}", msg_type="error")
+            return
+        self._append(f" Left and removed worktree '{wt.name}'. Back in {wt.repo_root}.", msg_type="system")
+
+    async def _move_to(self, path: Path) -> None:
+        """chdir the session to path; tools, the status bar and the system prompt follow the cwd."""
+        os.chdir(path)
+        self._system_instructions, _ = await asyncio.to_thread(build_base_instructions)
+        meta = await self.store.get_session_meta(self.session_id)
+        if meta:
+            await self.store.save_session_meta(
+                self.session_id,
+                working_dir=str(path),
+                prompt_tokens=meta.get("prompt_tokens") or 0,
+                completion_tokens=meta.get("completion_tokens") or 0,
+                total_tokens=meta.get("total_tokens") or 0,
+                compaction_notes=meta.get("compaction_notes") or "",
+                last_input_tokens=meta.get("last_input_tokens") or 0,
+            )
+        self._render_status()
+
+    async def _close_worktree_on_exit(self) -> None:
+        """On quit: remove an unchanged worktree; keep a changed one and say where it is."""
+        wt = self.worktree
+        if wt is None:
+            return
+        try:
+            changed = await asyncio.to_thread(has_changes, wt)
+        except WorktreeError as e:
+            self.exit_note = f"Kept worktree {wt.path} (branch {wt.branch}); could not check it for changes: {e}"
+            return
+        if changed:
+            self.exit_note = (
+                f"Kept worktree {wt.path} (branch {wt.branch}): it has changes. "
+                f"`dostuff resume {self.session_id}` reopens it; `git worktree remove` deletes it."
+            )
+            return
+        try:
+            await self._move_to(wt.repo_root)
+            await asyncio.to_thread(remove_worktree, wt)
+            self.exit_note = f"Removed worktree '{wt.name}' (no changes)."
+        except (OSError, WorktreeError) as e:
+            self.exit_note = f"Could not remove worktree {wt.path}: {e}"
+
     _BROWSE_PREFIX = "browse:"  # picker value for "pick a model from this provider's list"
 
     def _model_command(self, arg: str) -> None:
@@ -1423,6 +1575,8 @@ class DostuffTUI(App):
         rows = [
             ("Session", self.session_id + (f'  "{meta["title"]}"' if meta.get("title") else "") + ("" if meta else "  (not saved until the first message)")),
             ("Directory", os.getcwd()),
+            *([("Worktree", f"{self.worktree.name}  (branch {self.worktree.branch}, from {self.worktree.repo_root})")]
+              if self.worktree else []),
             ("Model", get_model() + (f"  ⚠ missing {', '.join(missing)}" if missing else "")),
             ("Permissions", mode + (f"  ({len(self.permissions.approved)} 'always' approval(s) this session)" if self.permissions.approved else "")),
             ("Tokens", f"↑{self._fmt_tokens(usage.get('prompt_tokens', 0))} ↓{self._fmt_tokens(usage.get('completion_tokens', 0))}"
@@ -1572,11 +1726,17 @@ class DostuffTUI(App):
             return
         name, _, arg = text.strip().partition(" ")
         name, arg = name.lower(), arg.strip()
-        if name in ("/resume", "/model") and self._turn_in_progress:
+        if name in ("/resume", "/model", "/fork", "/worktree") and self._turn_in_progress:
             self._append(f"Can't run {name} while a turn is running (press ESC to cancel it first).", msg_type="error")
             return
         if name == "/resume":
             self._start_worker(self._resume_command(arg), name="resume")
+            return
+        if name == "/fork":
+            self._start_worker(self._fork_session(arg), name="fork")
+            return
+        if name == "/worktree":
+            self._start_worker(self._worktree_command(arg), name="worktree")
             return
         if name == "/model":
             self._model_command(arg)
@@ -2039,9 +2199,14 @@ class DostuffTUI(App):
                 await asyncio.wait_for(self.mcp_client.cleanup(), timeout=5.0)
         except asyncio.TimeoutError:
             self._append("MCP shutdown timed out.", msg_type="error")
-        # 3. Session DB
+        # 3. Worktree (before the DB closes: removing it points the session back at the main checkout)
+        try:
+            await asyncio.wait_for(self._close_worktree_on_exit(), timeout=30.0)
+        except asyncio.TimeoutError:
+            self.exit_note = f"Timed out cleaning up worktree {self.worktree.path if self.worktree else ''}."
+        # 4. Session DB
         await self.store.close()
-        # 4. Force-stop any lingering litellm logging workers (background threads)
+        # 5. Force-stop any lingering litellm logging workers (background threads)
         try:
             litellm = sys.modules.get("litellm")  # don't import it just to stop it
             worker = getattr(litellm, "logging_worker", None)

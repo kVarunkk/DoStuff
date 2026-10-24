@@ -2,6 +2,7 @@ import fnmatch
 import re
 from pathlib import Path
 
+from dostuff.helpers.tools.project_root import project_root
 from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path
 from dostuff.tools.search.walk import display_path, iter_files
 
@@ -37,7 +38,7 @@ def grep(pattern: str, path: str = ".", glob: str | None = None, ignore_case: bo
         regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as e:
         raise ValueError(f"Invalid regular expression {pattern!r}: {e}") from e
-    project_root = Path.cwd().resolve()
+    root_dir = project_root().resolve()
     root = resolve_safe_path(path, for_read=True)
     if not root.exists():
         raise FileNotFoundError(f"Path not found: {path}")
@@ -47,7 +48,7 @@ def grep(pattern: str, path: str = ".", glob: str | None = None, ignore_case: bo
     files_with_matches = 0
     truncated = False
     for file_path in iter_files(root):
-        rel = display_path(file_path, project_root)
+        rel = display_path(file_path, root_dir)
         if glob and not (fnmatch.fnmatch(file_path.name, glob) or fnmatch.fnmatch(rel, glob)):
             continue
         try:

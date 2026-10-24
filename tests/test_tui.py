@@ -773,3 +773,54 @@ def test_tool_result_preview_caps_one_long_line():
     assert _preview(long_line, len(long_line)) == long_line  # expanded shows everything
     assert not _preview_clipped("short\nresult", 8)
     assert _preview("\n".join(map(str, range(20))), 8).endswith("… +12 lines (ctrl+o to expand)")
+
+
+def test_worktree_enter_exit_and_quit(tui, tmp_path):
+    import subprocess
+    cli_tui = tui
+    proj = Path.cwd()
+
+    def git(*args, cwd=proj):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (proj / "a.txt").write_text("a\n")
+    git("add", ".")
+    git("commit", "-qm", "init")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="wt")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+            submit("/worktree exit")
+            await _until(pilot, lambda: any("Not in a worktree" in t for t in _texts(app)))
+
+            # Unchanged: /worktree exit removes it
+            submit("/worktree one")
+            await _until(pilot, lambda: app.worktree is not None)
+            wt_path = proj.resolve() / ".dostuff" / "worktrees" / "one"
+            assert Path.cwd().resolve() == wt_path
+            submit("/worktree exit")
+            await _until(pilot, lambda: app.worktree is None and any("removed worktree 'one'" in t for t in _texts(app)))
+            assert Path.cwd().resolve() == proj.resolve() and not wt_path.exists()
+
+            # Changed: asks keep/remove
+            submit("/worktree two")
+            await _until(pilot, lambda: app.worktree is not None)
+            (Path.cwd() / "a.txt").write_text("changed\n")
+            submit("/worktree exit")
+            await _until(pilot, app._picker_open)
+            await app._picker_callback("keep")
+            assert app.worktree is None and (proj / ".dostuff" / "worktrees" / "two" / "a.txt").exists()
+
+            # Quitting from an unchanged worktree removes it
+            submit("/worktree three")
+            await _until(pilot, lambda: app.worktree is not None)
+            await app._cleanup_and_save_session()
+            assert "Removed worktree 'three'" in app.exit_note
+            assert not (proj / ".dostuff" / "worktrees" / "three").exists()
+            assert Path.cwd().resolve() == proj.resolve()
+
+    asyncio.run(scenario())

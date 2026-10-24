@@ -57,6 +57,10 @@
       "name": "delegate_to_subagent",
       "parameters": {
         "properties": {
+          "isolation": {
+            "description": "\"worktree\" runs the subagent in a new git worktree (a separate checkout of HEAD on its own branch), so its file changes don't touch the working tree. Use it for subagents that write files. It does not see uncommitted changes. If it changes nothing the worktree is removed; otherwise the result says where the changes are. Leave empty to work in the project directory.",
+            "type": "string"
+          },
           "requested_tools": {
             "anyOf": [
               {

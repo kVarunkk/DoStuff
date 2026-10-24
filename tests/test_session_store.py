@@ -147,3 +147,33 @@ def test_call_cost_known_and_unknown_models():
     assert call_cost("ollama/llama3", usage) is None  # free / unpriced: hidden
     assert call_cost("nobody/no-such-model", usage) is None
     assert format_cost(1.234) == "$1.23" and format_cost(0.0042) == "$0.0042"
+
+
+def test_fork_copies_session_and_leaves_original(tmp_path):
+    db = str(tmp_path / "sessions.db")
+
+    async def scenario():
+        store = SQLiteSessionStore(db)
+        try:
+            for step in ({"role": "user", "content": "first"}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "second"}):
+                await store.append("src", step)
+            await store.compact_working_history("src", 1, "notes")
+            await store.update_session_tokens("src", total_tokens=10, prompt_tokens=7, completion_tokens=3, last_input_tokens=5)
+            await store.add_session_cost("src", 0.5)
+
+            await store.fork_session("src", "fork")
+            assert await store.load("fork") == await store.load("src")
+            assert await store.load_working_history("fork") == [{"role": "user", "content": "second"}]
+            meta = await store.get_session_meta("fork")
+            assert meta["compaction_notes"] == "notes" and meta["total_tokens"] == 10 and meta["cost_usd"] == 0.5
+            assert meta["title"] == "first (fork)"
+
+            await store.append("fork", {"role": "assistant", "content": "only in fork"})
+            assert len(await store.load("src")) == 3 and len(await store.load("fork")) == 4
+
+            await store.fork_session("src", "named", "try plan B")
+            assert (await store.get_session_meta("named"))["title"] == "try plan B"
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())

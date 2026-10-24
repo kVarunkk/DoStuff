@@ -77,7 +77,7 @@ def test_sessions_lists_this_directory(env):
 def test_resume_picks_latest_here_or_by_prefix(env, monkeypatch):
     from dostuff import cli
     launched = []
-    monkeypatch.setattr(cli, "_launch", lambda sid: launched.append(sid))
+    monkeypatch.setattr(cli, "_launch", lambda sid, worktree=None: launched.append(sid))
     assert runner.invoke(env["app"], ["resume"]).exit_code == 0
     assert runner.invoke(env["app"], ["resume", "bbb"]).exit_code == 0
     assert launched == ["aab222", "bbb333"]

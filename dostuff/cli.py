@@ -39,6 +39,8 @@ def main(
     output_json: bool = typer.Option(False, "--json", help="With -p: print a JSON object (result, session_id, usage)"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="With -p: no progress on stderr, only the answer"),
     permission_mode: str = typer.Option(None, "--permission-mode", help="With -p: ask | allowlist | auto (default: config)"),
+    worktree: bool = typer.Option(False, "--worktree", "-w", help="Run the session in a new git worktree (.dostuff/worktrees/<name>, branch dostuff/<name>)"),
+    worktree_name: str = typer.Option(None, "--worktree-name", help="Name for --worktree (implies it; default: a random one)"),
     version: bool = typer.Option(False, "--version", "-V", callback=_print_version, is_eager=True, help="Print the version and exit"),
 ):
     if ctx.invoked_subcommand is not None:
@@ -47,9 +49,12 @@ def main(
         typer.echo("--json, --quiet and --permission-mode only apply with -p/--print.", err=True)
         raise typer.Exit(code=2)
     if prompt is not None:
+        if worktree or worktree_name:
+            typer.echo("--worktree only applies to the TUI.", err=True)
+            raise typer.Exit(code=2)
         _run_print_mode(session, prompt, output_json, quiet, permission_mode)
         return
-    _launch(session)
+    _launch(session, worktree=worktree_name or ("" if worktree else None))
 
 
 def _enter_session_dir(session: str, interactive: bool) -> None:
@@ -96,14 +101,34 @@ def _run_print_mode(session: str | None, prompt: str, output_json: bool, quiet: 
     raise typer.Exit(code=code)
 
 
-def _launch(session: str | None) -> None:
-    """Start the TUI: resume `session` if given, else a new session."""
+def _enter_new_worktree(name: str) -> None:
+    """Create a git worktree (random name if empty) and chdir into it, before Config loads."""
+    import os
+    from dostuff.lib.worktree import WorktreeError, create_worktree, detect_worktree
+    current = detect_worktree()
+    if current:
+        typer.echo(f"Already in worktree '{current.name}' ({current.path}).", err=True)
+        raise typer.Exit(code=1)
+    try:
+        wt = create_worktree(name or None)
+    except WorktreeError as e:
+        typer.echo(f"Worktree failed: {e}", err=True)
+        raise typer.Exit(code=1)
+    os.chdir(wt.path)
+    typer.echo(f"Created worktree {wt.path} on branch {wt.branch}.")
+
+
+def _launch(session: str | None, worktree: str | None = None) -> None:
+    """Start the TUI: resume `session` if given, else a new session; `worktree` (a name, or "" for a
+    random one) runs it in a new git worktree."""
     import uuid
     from dostuff.setup_wizard import can_prompt, needs_setup, run_setup
     session_id = session or uuid.uuid4().hex[:16]
 
     if session:
         _enter_session_dir(session, interactive=True)
+    if worktree is not None:
+        _enter_new_worktree(worktree)
 
     if needs_setup():
         if can_prompt():
@@ -115,6 +140,8 @@ def _launch(session: str | None) -> None:
     from dostuff.cli_tui import DostuffTUI
     tui_app = DostuffTUI(session_id=session_id)
     tui_app.run()
+    if tui_app.exit_note:
+        typer.echo(tui_app.exit_note)
 
 
 @app.command()
@@ -289,9 +316,20 @@ def _latest_here() -> dict:
 
 
 @app.command()
-def resume(session_id: str = typer.Argument(None, help="Session ID or unique prefix (default: the latest one in this directory)")):
+def resume(
+    session_id: str = typer.Argument(None, help="Session ID or unique prefix (default: the latest one in this directory)"),
+    fork: bool = typer.Option(False, "--fork", help="Resume a copy of the session; the original is left unchanged"),
+    worktree: bool = typer.Option(False, "--worktree", "-w", help="Move the session into a new git worktree (with --fork: give the fork its own checkout)"),
+):
     """Resume the most recent session started in the current directory."""
-    _launch(_resolve_session(session_id)["session_id"] if session_id else _latest_here()["session_id"])
+    target = _resolve_session(session_id)["session_id"] if session_id else _latest_here()["session_id"]
+    if fork:
+        import uuid
+        forked = uuid.uuid4().hex[:16]
+        _with_store(lambda store: store.fork_session(target, forked))
+        typer.echo(f"Forked {target} into {forked}.")
+        target = forked
+    _launch(target, worktree="" if worktree else None)
 
 
 sessions_app = typer.Typer(help="List, rename and delete past sessions.")

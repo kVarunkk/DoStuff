@@ -320,6 +320,46 @@ class SQLiteSessionStore(SessionStore):
         await db.execute("UPDATE sessions SET title = ? WHERE session_id = ?", (title.strip(), session_id))
         await db.commit()
 
+    async def fork_session(self, source_id: str, new_id: str, title: str | None = None) -> None:
+        """Copy a session (steps, working history, notes, token counters, cost) into new_id.
+
+        Without a title the fork is named "<source title or first prompt> (fork)". Undo
+        checkpoints and todos are keyed by session id and are not copied.
+        """
+        db = await self._conn()
+        async with db.execute("SELECT title FROM sessions WHERE session_id = ?", (source_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise ValueError(f"No session '{source_id}'")
+        if title is None:
+            async with db.execute(
+                "SELECT step_data FROM session_steps WHERE session_id = ? AND step_data LIKE '{\"role\": \"user\"%' "
+                "ORDER BY step_order ASC LIMIT 1",
+                (source_id,),
+            ) as cur:
+                first_user = await cur.fetchone()
+            base = row[0] or _session_title(first_user[0] if first_user else None)
+            title = f"{base} (fork)" if base else "(fork)"
+        now = _now()
+        await db.execute(
+            "INSERT INTO sessions (session_id, working_dir, created_at, last_used, prompt_tokens, completion_tokens, "
+            "total_tokens, last_input_tokens, compaction_notes, working_history, title, cost_usd) "
+            "SELECT ?, working_dir, ?, ?, prompt_tokens, completion_tokens, total_tokens, last_input_tokens, "
+            "compaction_notes, '', ?, cost_usd FROM sessions WHERE session_id = ?",
+            (new_id, now, now, title.strip(), source_id),
+        )
+        await db.execute(
+            "INSERT INTO session_steps (session_id, step_order, step_data) "
+            "SELECT ?, step_order, step_data FROM session_steps WHERE session_id = ?",
+            (new_id, source_id),
+        )
+        await db.execute(
+            "INSERT INTO working_steps (session_id, seq, step_json, compacted) "
+            "SELECT ?, seq, step_json, compacted FROM working_steps WHERE session_id = ?",
+            (new_id, source_id),
+        )
+        await db.commit()
+
     async def delete_session(self, session_id: str) -> None:
         """Remove a session's steps, working history and meta row."""
         db = await self._conn()

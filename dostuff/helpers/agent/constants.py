@@ -3,6 +3,8 @@ COMMAND_DESCRIPTIONS = {
     "/help": "Show commands and shortcuts",
     "/clear": "Start a new session (the old one stays resumable with /resume)",
     "/resume": "Switch to another session from this directory (/resume <id> for a specific one)",
+    "/fork": "Copy this session into a new one and switch to it (/fork [--worktree] [title]); the original stays resumable",
+    "/worktree": "Move this session into its own git worktree and branch (/worktree [name]); /worktree exit leaves it",
     "/model": "Switch or add a model: saved ones and each provider's list (/model <provider/model> [--active] to pick directly)",
     "/permissions": "Switch permission mode for this session: ask, allowlist or auto (/permissions <mode>)",
     "/status": "Show session, model, tokens, context use, permissions and MCP servers",
@@ -69,6 +71,8 @@ You can help with a wide range of tasks using the tools and skills available to 
   isolated loop and returns its report. Do not delegate single tool calls or questions for the user.
 - The subagent cannot see this conversation: put every path, constraint and goal in `task`, and
   request only the tools it needs. Subagents cannot delegate further.
+- For a subagent that writes files, pass `isolation="worktree"` (git repos only) so it works in its
+  own checkout of HEAD; then review its changes and bring over what the user wants.
 
 ## Responding
 - Be concise and direct. Ask a clarifying question only when guessing would likely be wrong.

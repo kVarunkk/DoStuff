@@ -1,6 +1,6 @@
 import fnmatch
-from pathlib import Path
 
+from dostuff.helpers.tools.project_root import project_root
 from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path
 from dostuff.tools.search.walk import display_path, iter_files
 
@@ -20,7 +20,7 @@ def glob(pattern: str, path: str = ".") -> str:
     Returns:
         Matching file paths relative to the project root, one per line.
     """
-    project_root = Path.cwd().resolve()
+    root_dir = project_root().resolve()
     root = resolve_safe_path(path, for_read=True)
     if not root.is_dir():
         raise NotADirectoryError(f"Not a directory: {path}")
@@ -37,7 +37,7 @@ def glob(pattern: str, path: str = ".") -> str:
                 mtime = file_path.stat().st_mtime
             except OSError:
                 continue
-            found.append((mtime, display_path(file_path, project_root)))
+            found.append((mtime, display_path(file_path, root_dir)))
 
     if not found:
         return f"No files matching {pattern!r} in {path}."

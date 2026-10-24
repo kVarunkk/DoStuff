@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Memory commands** `/episodes` and `/forget <key or id>`.
 - **Configurable status bar** (`ui.status_bar`): it fits the terminal by shortening the cwd/model and dropping the least important items, and redraws on resize.
 - `dostuff --version` (`-V`); `python -m dostuff` (and `python -m dostuff.cli`) runs the CLI.
+- **`/fork [title]`** copies the current session into a new session ID and switches to it (the original is unchanged; `/resume <old id>` returns to it); `dostuff resume [id] --fork` from the shell. Copies steps, working steps and the session row (notes, tokens, cost); not undo checkpoints or todos.
+- **Git worktrees** (`dostuff/lib/worktree.py`): `/worktree [name]` moves the session into `.dostuff/worktrees/<name>` on branch `dostuff/<name>`; `/worktree exit` removes it when unchanged, otherwise offers keep/remove. On quit an unchanged worktree is removed and a changed one is kept (path and branch printed). `/fork --worktree`, `dostuff --worktree` / `-w` / `--worktree-name`, `dostuff resume --worktree`; `/status` shows the worktree. Untracked local config (`.env`, `.dostuff/config.yaml`, ...) is copied in and doesn't count as a change.
+- **Subagent isolation**: `delegate_to_subagent(isolation="worktree")` runs the subagent in its own worktree; unchanged → removed, changed → kept with the path, changed files and review/merge/remove commands. Tools resolve paths against a per-task project root (`helpers/tools/project_root.py`) instead of chdir-ing. The system prompt recommends it for write-capable subagents.
 
 ### Changed
 - **chromadb is optional** (`pip install "dostuff[memory]"`, included in `full`). Without it the memory tools aren't offered, recall is skipped, and `search_mcp_tools` uses keyword search.
@@ -27,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Memory recall leaves out facts below 0.25 similarity; the memory resolver skips the model call when nothing related exists; `save_episode` skips near-duplicates (≥ 0.85). The unused `context_window` episode field is gone.
 - System prompt: a "The web" section (search before guessing URLs / packages / config values, never present placeholders as real) and guidance for adding MCP servers.
 - Tool result previews are capped by characters (8 × 200) as well as lines.
+- grep/glob skip `.dostuff/worktrees/`. Permissions: the "`.dostuff` in a write path → settings" rule only looks below the project root, and `.dostuff/worktrees/` in a shell command no longer counts as touching settings (`..`, nested `.dostuff` / `.env` still forbidden).
 - `pyproject.toml` Homepage points at the repo root; CI also tests Python 3.14 and installs `.[dev,memory]`.
 
 ### Fixed

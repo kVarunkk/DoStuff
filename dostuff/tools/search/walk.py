@@ -22,7 +22,9 @@ def iter_files(root: Path) -> Iterator[Path]:
             yield root
         return
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not is_excluded_dir(d))
+        in_dostuff = os.path.basename(dirpath) == ".dostuff"
+        # .dostuff/worktrees holds whole checkouts of the repo (git worktrees): every hit twice
+        dirnames[:] = sorted(d for d in dirnames if not is_excluded_dir(d) and not (in_dostuff and d == "worktrees"))
         for filename in sorted(filenames):
             path = Path(dirpath) / filename
             if not is_denied_for_read(path):
