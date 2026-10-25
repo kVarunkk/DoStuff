@@ -15,7 +15,7 @@ from dostuff.config import STATUS_BAR_ITEMS, get_config
 from dostuff.helpers.mcp.load_mcp_config import (global_mcp_config_path, project_mcp_config_path, read_mcp_file,
                                                  write_mcp_file)
 from dostuff.helpers.mcp.server_config import build_server_config
-from dostuff.helpers.tools.diff import plain_diff, report_change, unified_diff
+from dostuff.helpers.tools.diff import diff_stats, plain_diff, report_change, unified_diff
 
 Scope = Literal["user", "project"]
 REDACTED = "<redacted>"
@@ -60,6 +60,11 @@ def _display(path: Path) -> str:
     return str(path).replace(str(Path.home()), "~")
 
 
+def _has_crlf(path: Path) -> bool:
+    """Whether the file uses Windows line endings (read_text turns them into plain newlines)."""
+    return path.is_file() and _CRLF.encode() in path.read_bytes()
+
+
 def _apply(adapter: Any, what: str) -> None:
     """Re-read the config and tell the UI, so the change shows without a restart."""
     get_config().reload()
@@ -101,7 +106,7 @@ def _config_warnings(data: dict[str, Any]) -> list[str]:
     ui = data.get("ui")
     items = ui.get("status_bar") if isinstance(ui, dict) else None
     if isinstance(items, list):
-        warnings += [f"unknown ui.status_bar item '{i}'" for i in items if str(i).strip().lower() not in STATUS_BAR_ITEMS]
+        warnings += [f"unknown ui.status_bar item '{i}'" for i in items if str(i).strip().lower() not in (*STATUS_BAR_ITEMS, "timer")]
     perms = data.get("permissions")
     mode = perms.get("mode") if isinstance(perms, dict) else None
     if mode is not None and str(mode).lower() not in ("ask", "allowlist", "auto"):
@@ -126,7 +131,7 @@ def edit_config(old_str: str, new_str: str, scope: Scope = "user", adapter: Any 
     """
     path, content, updated, data = _edited_config(old_str, new_str, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
-    crlf = path.is_file() and _CRLF in path.read_text(encoding="utf-8")
+    crlf = _has_crlf(path)
     path.write_text(updated.replace(_LF, _CRLF) if crlf else updated, encoding="utf-8", newline="")
     result = report_change("Settings changed", _display(path), content, updated)
     _apply(adapter, "config")
@@ -156,6 +161,73 @@ def _edited_config(old_str: str, new_str: str, scope: str) -> tuple[Path, str, s
     if data is not None and not isinstance(data, dict):
         raise ValueError("config.yaml must be a mapping of sections; nothing was written.")
     return path, content, updated, data or {}
+
+
+# ── /config: the user edits a whole settings file in the TUI ──────────────────
+
+SettingsKind = Literal["config", "mcp"]
+
+
+def settings_file(kind: SettingsKind, scope: Scope) -> Path:
+    return config_path(scope) if kind == "config" else mcp_path(scope)
+
+
+def new_settings_text(kind: SettingsKind, scope: Scope) -> str:
+    """What the editor starts with for a file that doesn't exist yet."""
+    if kind == "mcp":
+        return '{\n  "mcpServers": {}\n}\n'
+    from dostuff.setup_wizard import read_template
+    where = "this project only; overrides the user config key by key" if scope == "project" else "all projects"
+    reference = "\n".join(f"# {line}".rstrip() for line in read_template("config.example.yaml").splitlines())
+    return f"# dostuff config ({where}). Every option, commented out:\n#\n{reference}\n"
+
+
+def check_settings_text(kind: SettingsKind, text: str) -> list[str]:
+    """Warnings for an edited settings file; raises ValueError when it can't be saved."""
+    if kind == "config":
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML: {e}") from e
+        if data is not None and not isinstance(data, dict):
+            raise ValueError("config.yaml must be a mapping of sections.")
+        return _config_warnings(data or {})
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError('The MCP config must be a JSON object like {"mcpServers": {...}}.')
+    servers = data.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise ValueError('"mcpServers" must be an object of name → server.')
+    warnings = []
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            raise ValueError(f"MCP server '{name}' must be an object.")
+        if "__" in name:
+            warnings.append(f"server name '{name}' contains '__', which breaks its tool names")
+        if not cfg.get("command") and not cfg.get("url"):
+            warnings.append(f"server '{name}' has neither a command nor a url, so it can't connect")
+    return warnings
+
+
+def save_settings_file(kind: SettingsKind, scope: Scope, text: str, adapter: Any = None) -> str:
+    """Validate and write an edited settings file, then apply it. Returns a one-line summary
+    (no diff: an MCP file usually holds tokens). Raises ValueError and writes nothing if invalid."""
+    warnings = check_settings_text(kind, text)
+    path = settings_file(kind, scope)
+    old = path.read_text(encoding="utf-8") if path.is_file() else ""
+    text = text.replace(_CRLF, _LF)
+    if not text.endswith(_LF):
+        text += _LF
+    path.parent.mkdir(parents=True, exist_ok=True)
+    crlf = _has_crlf(path)
+    path.write_text(text.replace(_LF, _CRLF) if crlf else text, encoding="utf-8", newline="")
+    added, removed = diff_stats(unified_diff(old, text, _display(path)))
+    _apply(adapter, kind)
+    summary = f"Saved {_display(path)} (+{added} / -{removed} lines)"
+    return summary + ("\nWarnings: " + "; ".join(warnings) if warnings else "")
 
 
 SETTINGS_TOOLS = frozenset({"edit_config", "set_mcp_server", "remove_mcp_server"})

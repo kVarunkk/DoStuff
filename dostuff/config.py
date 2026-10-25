@@ -10,7 +10,11 @@ MAX_TOOL_OUTPUT_CHARS = 30_000
 MAX_RETRIES = 6
 RETRY_MAX_DELAY_S = 60.0
 KNOWN_PROVIDERS = ("gemini", "anthropic", "openai", "groq", "mistral", "openrouter", "ollama")
-STATUS_BAR_ITEMS = ("help", "cwd", "session", "model", "mode", "tokens", "cost", "context", "timer")
+STATUS_BAR_ITEMS = ("help", "cwd", "session", "model", "mode", "tokens", "cost", "context")
+DEFAULT_STATUS_BAR = ("cwd", "model", "mode", "context")
+PASTE_COLLAPSE_LINES = 10
+PASTE_FILE_LINES = 200
+PASTE_RETENTION_DAYS = 7
 
 
 def _block(raw: dict[str, Any], key: str) -> dict[str, Any]:
@@ -82,6 +86,11 @@ class Config:
         # Overrides litellm's model info; useful for models litellm doesn't know
         self.context_window = int(loop_cfg.get("context_window") or 0)
         self.max_tool_output_chars = int(loop_cfg.get("max_tool_output_chars") or MAX_TOOL_OUTPUT_CHARS)
+        # Big TUI pastes go to .dostuff/pastes/ and the model gets a path + preview (helpers/agent/pastes.py)
+        file_lines = loop_cfg.get("paste_file_lines")
+        self.paste_file_lines = max(int(file_lines), 0) if file_lines is not None else PASTE_FILE_LINES
+        days = loop_cfg.get("paste_retention_days")
+        self.paste_retention_days = max(float(days), 0.0) if days is not None else PASTE_RETENTION_DAYS
         # Model-call retries on rate limits / timeouts / 5xx: exponential backoff (or Retry-After), capped per wait
         retries = loop_cfg.get("max_retries")
         self.max_retries = max(int(retries), 0) if retries is not None else MAX_RETRIES
@@ -98,11 +107,14 @@ class Config:
         self.permission_allow = [str(p) for p in (perms.get("allow") or [])]
         # web_search backend: a SearXNG instance if set, else ddgs / DuckDuckGo (tools/web_search.py)
         self.searxng_url = str(_block(self.raw, "search").get("searxng_url") or "").strip()
+        collapse = _block(self.raw, "ui").get("paste_collapse_lines")
+        self.paste_collapse_lines = max(int(collapse), 0) if collapse is not None else PASTE_COLLAPSE_LINES
         # TUI status bar: which items show, in this order; unknown names are reported once at startup
         items = _block(self.raw, "ui").get("status_bar")
-        names = [str(i).strip().lower() for i in items] if isinstance(items, list) else list(STATUS_BAR_ITEMS)
+        names = [str(i).strip().lower() for i in items] if isinstance(items, list) else list(DEFAULT_STATUS_BAR)
         self.status_bar_items = [n for n in names if n in STATUS_BAR_ITEMS]
-        self.status_bar_unknown = [n for n in names if n not in STATUS_BAR_ITEMS]
+        # "timer" moved to the loader message; older configs may still list it
+        self.status_bar_unknown = [n for n in names if n not in STATUS_BAR_ITEMS and n != "timer"]
 
     def reload(self) -> None:
         """Re-read config.yaml in place (after a settings change); a /model choice for this session stays."""

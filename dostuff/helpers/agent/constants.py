@@ -5,8 +5,9 @@ COMMAND_DESCRIPTIONS = {
     "/resume": "Switch to another session from this directory (/resume <id> for a specific one)",
     "/fork": "Copy this session into a new one and switch to it (/fork [--worktree] [title]); the original stays resumable",
     "/worktree": "Move this session into its own git worktree and branch (/worktree [name]); /worktree exit leaves it",
-    "/model": "Switch or add a model: saved ones and each provider's list (/model <provider/model> [--active] to pick directly)",
+    "/model": "Switch model for this session; add --active to also make it the default for new sessions (/model [provider/model] [--active])",
     "/permissions": "Switch permission mode for this session: ask, allowlist or auto (/permissions <mode>)",
+    "/config": "Edit settings here: config.yaml or the MCP servers, user or project (/config [mcp] [project])",
     "/status": "Show session, model, tokens, context use, permissions and MCP servers",
     "/rename": "Name this session (/rename <title>); shown by `dostuff sessions`",
     "/export": "Save this session as Markdown (/export [path])",
@@ -18,6 +19,8 @@ COMMAND_DESCRIPTIONS = {
     "/exit": "Save the session and quit",
 }
 COMMANDS = set(COMMAND_DESCRIPTIONS)
+# A flag each command takes, suggested as ghost text in the input after "<command> "
+COMMAND_FLAGS = {"/model": "--active", "/fork": "--worktree"}
 MAX_ITERATIONS = 100
 DEFAULT_IDENTITY = "You are DoStuff, a coding agent that works in the user's project directory."
 SYSTEM_INSTRUCTIONS = """{dostuff_identity}

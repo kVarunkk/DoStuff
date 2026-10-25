@@ -7,41 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **`web_fetch` tool**: GET a URL; HTML becomes Markdown-ish text (headings, lists, links, `<pre>`; scripts/styles dropped), JSON/XML/text as-is, binary refused; `max_chars` (default 20 000), downloads stop at 5 MB. 4xx/5xx HTML pages return only the header and a note.
-- **`web_search` tool**, no API key: SearXNG if `search.searxng_url` is set, else the `ddgs` package (`dostuff[search]`), else DuckDuckGo's HTML page. Title / URL / snippet per result, `max_results` 1-20.
-- New permission kind `network` for `web_fetch` / `web_search`: asks in `ask` / `allowlist`; "always" and `permissions.allow` work per domain (`web_fetch:docs.python.org`) or for every search (`web_search`). Both are in the subagents' default tools.
-- **Settings tools** (`tools/settings.py`): `read_settings`, `edit_config` (exact-text edit of `config.yaml`, keeps comments, refuses invalid YAML, warns on unknown keys), `set_mcp_server` / `remove_mcp_server`; `scope` is `user` or `project`. Changes apply live (`Config.reload()`, status bar, iteration cap, MCP servers reconnected). New permission kind `settings` asks in every mode with no "always"; writes inside a `.dostuff` folder are treated the same. Not available to subagents.
-- **`@path` mentions**: `@src/app.py` attaches the file, `@src` a folder listing (`@"a b.txt"` for spaces); non-paths stay plain text, `.env*` and binaries skipped. `@` opens a completion menu in the TUI; also works in `dostuff -p`.
-- **Cost per turn and per session**, priced with litellm's table (cached tokens included); stored in `sessions.cost_usd` (schema v3), shown in the status bar, `/status` and at the end of each turn; `cost_usd` in `dostuff -p --json`.
-- **TUI**: Shift+Enter (also Ctrl+Enter, Alt+Enter, Ctrl+J, `\` + Enter) inserts a newline; Up/Down prompt history saved per directory; Ctrl+O expands/collapses truncated tool results (click toggles one); select text to copy (OSC 52, plus `clip.exe` on Windows) while the input keeps focus.
-- **Memory commands** `/episodes` and `/forget <key or id>`.
-- **Configurable status bar** (`ui.status_bar`): it fits the terminal by shortening the cwd/model and dropping the least important items, and redraws on resize.
-- `dostuff --version` (`-V`); `python -m dostuff` (and `python -m dostuff.cli`) runs the CLI.
-- **`/fork [title]`** copies the current session into a new session ID and switches to it (the original is unchanged; `/resume <old id>` returns to it); `dostuff resume [id] --fork` from the shell. Copies steps, working steps and the session row (notes, tokens, cost); not undo checkpoints or todos.
-- **Git worktrees** (`dostuff/lib/worktree.py`): `/worktree [name]` moves the session into `.dostuff/worktrees/<name>` on branch `dostuff/<name>`; `/worktree exit` removes it when unchanged, otherwise offers keep/remove. On quit an unchanged worktree is removed and a changed one is kept (path and branch printed). `/fork --worktree`, `dostuff --worktree` / `-w` / `--worktree-name`, `dostuff resume --worktree`; `/status` shows the worktree. Untracked local config (`.env`, `.dostuff/config.yaml`, ...) is copied in and doesn't count as a change.
-- **Subagent isolation**: `delegate_to_subagent(isolation="worktree")` runs the subagent in its own worktree; unchanged → removed, changed → kept with the path, changed files and review/merge/remove commands. Tools resolve paths against a per-task project root (`helpers/tools/project_root.py`) instead of chdir-ing. The system prompt recommends it for write-capable subagents.
+## [0.2.0] - 2026-10-25
 
-### Changed
-- **chromadb is optional** (`pip install "dostuff[memory]"`, included in `full`). Without it the memory tools aren't offered, recall is skipped, and `search_mcp_tools` uses keyword search.
-- **Faster startup** (~9 s → under 1 s to the first frame): litellm, chromadb and mcp load in a thread after the first frame.
-- Chroma's embedding model downloads at startup with a message instead of silently during the first turn; `dostuff doctor` reports it.
-- **Project instructions are combined**: global `~/.dostuff/AGENTS.md` (or CLAUDE.md), then one file per folder from the outermost parent down to the cwd.
-- Memory recall leaves out facts below 0.25 similarity; the memory resolver skips the model call when nothing related exists; `save_episode` skips near-duplicates (≥ 0.85). The unused `context_window` episode field is gone.
-- System prompt: a "The web" section (search before guessing URLs / packages / config values, never present placeholders as real) and guidance for adding MCP servers.
-- Tool result previews are capped by characters (8 × 200) as well as lines.
-- grep/glob skip `.dostuff/worktrees/`. Permissions: the "`.dostuff` in a write path → settings" rule only looks below the project root, and `.dostuff/worktrees/` in a shell command no longer counts as touching settings (`..`, nested `.dostuff` / `.env` still forbidden).
-- `pyproject.toml` Homepage points at the repo root; CI also tests Python 3.14 and installs `.[dev,memory]`.
-
-### Fixed
-- **MCP OAuth with confidential clients** (Supabase 422 at the token endpoint): the registration's `client_secret` and auth method are saved and sent (`client_secret_post` or HTTP Basic); cached registrations missing a needed secret are redone. Scope follows the MCP spec (`WWW-Authenticate`, else the resource's `scopes_supported`). OAuth errors include the server's message.
-- `python -m dostuff.cli ...` exited 0 with no output.
-- Importing the tool definitions failed on Python < 3.12: `todo_write`'s schema now uses `typing_extensions.TypedDict`.
-- TUI: the input could stay unfocused after focus was cleared on slow machines (Windows CI); it is now refocused one message later instead of after a repaint.
-
-## [0.2.0] - 2026-10-23
-
-Fixes from the v0.1.6 package review (`plan/2026-10-23-package-review-fixes/`).
+The v0.1.6 package review fixes (permissions, sandboxing, agent loop, sessions), plus web tools, settings tools, `@` mentions, cost tracking, session fork, git worktrees, skills as commands and many TUI improvements.
 
 ### Security
 - **Permission layer** (`agent/permissions.py`): approval is decided before dispatch, never by the model. `_confirmed` / `overwrite` are gone from tool signatures and dropped if a model sends them. Modes `permissions.mode: ask | allowlist | auto`; prompt accepts `y` (once), `a` (always this session), anything else denies; a denial is returned to the model as the tool result.
@@ -64,10 +32,29 @@ Fixes from the v0.1.6 package review (`plan/2026-10-23-package-review-fixes/`).
 - **TUI commands**: `/` command menu (filter, Tab completes, Enter runs); `/resume` picker; `/rename`; `/status`; `/permissions [mode]` (session-only, shown in the status bar); `/undo [force]` restores files from per-turn checkpoints of `write_file` / `edit_file` / `delete_file` (incl. subagents; not shell changes).
 - **`!command`** runs a shell command directly from the input (no approval); command and output are saved so the model sees them next turn.
 - **`todo_write` tool**: visible task list for multi-step work, rendered as a checklist.
-- **Prompt caching** for Claude models (anthropic, and Claude on bedrock / vertex_ai / openrouter); cached tokens shown in the status bar. `loop.prompt_caching: false` turns it off.
+- **Prompt caching** for Claude models (anthropic, and Claude on bedrock / vertex_ai / openrouter); cached tokens shown in the `tokens` status-bar item. `loop.prompt_caching: false` turns it off.
 - `dostuff mcp list / add / remove` (stdio or `--url`; `--project` writes the project file).
 - `bash_command` `timeout` parameter (default 60 s, max 110 s). Config keys `loop.max_retries` (default 6) and `loop.retry_max_delay` (default 60 s).
 - Tests for schemas, permissions, subagents, file/search tools, loop robustness, DB migration, config, memory, MCP end-to-end, CLI commands and the TUI; GitHub Actions CI (pytest + mypy).
+- **`web_fetch` tool**: GET a URL; HTML becomes Markdown-ish text (headings, lists, links, `<pre>`; scripts/styles dropped), JSON/XML/text as-is, binary refused; `max_chars` (default 20 000), downloads stop at 5 MB. 4xx/5xx HTML pages return only the header and a note.
+- **`web_search` tool**, no API key: SearXNG if `search.searxng_url` is set, else the `ddgs` package (`dostuff[search]`), else DuckDuckGo's HTML page. Title / URL / snippet per result, `max_results` 1-20.
+- New permission kind `network` for `web_fetch` / `web_search`: asks in `ask` / `allowlist`; "always" and `permissions.allow` work per domain (`web_fetch:docs.python.org`) or for every search (`web_search`). Both are in the subagents' default tools.
+- **Settings tools** (`tools/settings.py`): `read_settings`, `edit_config` (exact-text edit of `config.yaml`, keeps comments, refuses invalid YAML, warns on unknown keys), `set_mcp_server` / `remove_mcp_server`; `scope` is `user` or `project`. Changes apply live (`Config.reload()`, status bar, iteration cap, MCP servers reconnected). New permission kind `settings` asks in every mode with no "always"; writes inside a `.dostuff` folder are treated the same. Not available to subagents.
+- **`@path` mentions**: `@src/app.py` attaches the file, `@src` a folder listing (`@"a b.txt"` for spaces); non-paths stay plain text, `.env*` and binaries skipped. `@` opens a completion menu in the TUI; also works in `dostuff -p`.
+- **Cost per turn and per session**, priced with litellm's table (cached tokens included); stored in `sessions.cost_usd` (schema v3), shown in `/status`, the turn summary and the optional `cost` status-bar item; `cost_usd` in `dostuff -p --json`.
+- **TUI**: Shift+Enter (also Ctrl+Enter, Alt+Enter, Ctrl+J, `\` + Enter) inserts a newline; Up/Down prompt history saved per directory; Ctrl+O expands/collapses truncated tool results (click toggles one); select text to copy (OSC 52, plus `clip.exe` on Windows) while the input keeps focus.
+- **Memory commands** `/episodes` and `/forget <key or id>`.
+- **Configurable status bar** (`ui.status_bar`): it fits the terminal by shortening the cwd/model and dropping the least important items, and redraws on resize.
+- `dostuff --version` (`-V`); `python -m dostuff` (and `python -m dostuff.cli`) runs the CLI.
+- **`/fork [title]`** copies the current session into a new session ID and switches to it (the original is unchanged; `/resume <old id>` returns to it); `dostuff resume [id] --fork` from the shell. Copies steps, working steps and the session row (notes, tokens, cost); not undo checkpoints or todos.
+- **Git worktrees** (`dostuff/lib/worktree.py`): `/worktree [name]` moves the session into `.dostuff/worktrees/<name>` on branch `dostuff/<name>`; `/worktree exit` removes it when unchanged, otherwise offers keep/remove. On quit an unchanged worktree is removed and a changed one is kept (path and branch printed). `/fork --worktree`, `dostuff --worktree` / `-w` / `--worktree-name`, `dostuff resume --worktree`; `/status` shows the worktree. Untracked local config (`.env`, `.dostuff/config.yaml`, ...) is copied in and doesn't count as a change.
+- **Subagent isolation**: `delegate_to_subagent(isolation="worktree")` runs the subagent in its own worktree; unchanged → removed, changed → kept with the path, changed files and review/merge/remove commands. Tools resolve paths against a per-task project root (`helpers/tools/project_root.py`) instead of chdir-ing. The system prompt recommends it for write-capable subagents.
+- **Big pastes collapse**: a paste over `ui.paste_collapse_lines` (default 10) or 2 000 chars shows as `[Pasted text #1 +243 lines]` in the input and the conversation and is expanded on submit. Over `loop.paste_file_lines` (default 200) or `loop.max_tool_output_chars` it is written to `.dostuff/pastes/<session>-<n>.txt` (with its own `.gitignore`) and the model gets a stub with a 20-line preview to page through with `read_file` / `grep`. Files older than `loop.paste_retention_days` (default 7) are removed at startup; 0 removes them on exit. `!` commands and approval notes get the text inline.
+- **`/config [mcp] [project]`**: edit `config.yaml` or the MCP config (user / project) in a full-height editor in the TUI (YAML / JSON highlighting when tree-sitter is installed, line numbers). `Ctrl+S` validates, saves and applies without a restart; an invalid file stays open with the error. `Esc` closes (twice with unsaved changes). A missing `config.yaml` starts as the commented-out template.
+- **Skills as slash commands**: every discovered skill is `/<name> [args]` (in the `/` menu marked `(skill)`, ghost text and `/help`); it runs a turn with the SKILL.md body plus the args. Built-in commands win a clash, and the first skill found wins among skills. Works in `dostuff -p "/<skill> ..."` too.
+- **Slash-command ghost text**: the rest of the command, then its flag (`/model ` → `--active`, `/fork ` → `--worktree`), shown dim after the cursor; `Tab` or `Right` accepts it.
+- **Turn summary** after each turn: `✻ Worked for 1m 5s · $0.01 · done 12:59 PM` (`Cancelled after …` on ESC; cost only when priced).
+- **`↓ Jump to bottom`** bar when the conversation is scrolled up; it hides when you scroll back down or send a message.
 
 ### Changed
 - **TUI runs turns, `/compact`, `/clear` and exit cleanup as async workers** on Textual's loop (no threads); the timer uses `set_interval`. Reasoning text streams into one widget per model call; streamed answers aren't duplicated; all tool calls of a resumed step are rendered.
@@ -87,6 +74,19 @@ Fixes from the v0.1.6 package review (`plan/2026-10-23-package-review-fixes/`).
 - Project MCP config is merged over the global one per server; `mcp.config_path` is honoured; a broken JSON file is skipped with a message.
 - `dostuff doctor` shows ✓/✗ checks with fixes and exits 1 on failure; `config` / `doctor` no longer create files.
 - README quick start is `pip install dostuff` → `dostuff`.
+- **chromadb is optional** (`pip install "dostuff[memory]"`, included in `full`). Without it the memory tools aren't offered, recall is skipped, and `search_mcp_tools` uses keyword search.
+- **Faster startup** (~9 s → under 1 s to the first frame): litellm, chromadb and mcp load in a thread after the first frame.
+- Chroma's embedding model downloads at startup with a message instead of silently during the first turn; `dostuff doctor` reports it.
+- **Project instructions are combined**: global `~/.dostuff/AGENTS.md` (or CLAUDE.md), then one file per folder from the outermost parent down to the cwd.
+- Memory recall leaves out facts below 0.25 similarity; the memory resolver skips the model call when nothing related exists; `save_episode` skips near-duplicates (≥ 0.85). The unused `context_window` episode field is gone.
+- System prompt: a "The web" section (search before guessing URLs / packages / config values, never present placeholders as real) and guidance for adding MCP servers.
+- Tool result previews are capped by characters (8 × 200) as well as lines.
+- grep/glob skip `.dostuff/worktrees/`. Permissions: the "`.dostuff` in a write path → settings" rule only looks below the project root, and `.dostuff/worktrees/` in a shell command no longer counts as touching settings (`..`, nested `.dostuff` / `.env` still forbidden).
+- `pyproject.toml` Homepage points at the repo root; CI also tests Python 3.14 and installs `.[dev,memory]`.
+- Tool-call lines are one line, `name(key=value, …)` (values cut to 60 chars, the line to 200), instead of the full arguments (e.g. a whole `write_file` content).
+- The loader shows the turn's elapsed time (`45s`, `1m 5s`, `1h 2m`, ticking once a second) and the queued-prompt count; ESC shows `Cancelling...`. The `timer` status-bar item is gone (ignored in older configs) and the default `ui.status_bar` is `[cwd, model, mode, context]`; `help`, `session`, `tokens` and `cost` can be added.
+- `/model` says that a plain switch lasts for this session and `--active` makes it the default for new sessions.
+- The `/` and `@` menu is drawn on its own layer over the conversation, so opening or closing it no longer repaints (and flashes) the screen.
 
 ### Fixed
 - Subagents: keyword call into `loop`, `tool_names` enforced, `delete_file`/`delegate_to_subagent` never granted, valid seed message, parent adapter/cancel state passed through, `loop.subagent_max_iterations`.
@@ -95,6 +95,12 @@ Fixes from the v0.1.6 package review (`plan/2026-10-23-package-review-fixes/`).
 - Long-running shell commands froze the TUI on Windows: commands now run detached with no stdin, and the whole process tree is killed on timeout or ESC.
 - Unrelated past episodes were recalled in every session; recall now needs a minimum similarity.
 - Exit no longer waits on memory extraction.
+- **MCP OAuth with confidential clients** (Supabase 422 at the token endpoint): the registration's `client_secret` and auth method are saved and sent (`client_secret_post` or HTTP Basic); cached registrations missing a needed secret are redone. Scope follows the MCP spec (`WWW-Authenticate`, else the resource's `scopes_supported`). OAuth errors include the server's message.
+- `python -m dostuff.cli ...` exited 0 with no output.
+- Importing the tool definitions failed on Python < 3.12: `todo_write`'s schema now uses `typing_extensions.TypedDict`.
+- TUI: the input could stay unfocused after focus was cleared on slow machines (Windows CI); it is now refocused one message later instead of after a repaint.
+- Slash-command ghost text looked like typed text under the `ansi-dark` theme; it is grey now.
+- Settings writes turned a CRLF `config.yaml` into LF.
 
 ### Removed
 - `learn_from_session.py` (dead, referenced a non-existent tool), `extract_text.py`, exit-time memory extraction (`save_memories_and_exit.py`, `extract_semantic_memories.py`, `extract_episodic_memory.py`, `format_transcript.py`) and `memory.exit_timeout_s`, `InMemorySessionStore`, `SQLiteSessionStore.save()`, `WORKSPACE_ROOT` / `SKILLS_ROOT` / `system_prompt_removed`, `random_file.txt`, `build/`, `dostuff_test.egg-info/`.

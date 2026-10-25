@@ -35,11 +35,11 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
 - **Permission layer** — mutating tool calls ask for approval (`y` once / `a` always this session / `n` deny); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`
 - **File sandbox** — file tools stay inside the project directory and never read `.env*` files or `~/.dostuff/`
-- **Skills loader** — drop a `SKILL.md` in the right folder, restart, done
+- **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`
 - **Subagents** — `delegate_to_subagent` runs a bounded task with a restricted tool set; its approval prompts and ESC go through the same TUI
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
 - **Retries with backoff** for rate limits, timeouts and 5xx errors (6 by default, exponential with jitter, honors `Retry-After`; `loop.max_retries` / `loop.retry_max_delay`); auth / bad-request errors fail fast
-- **Token and cost tracking** — per-turn and cumulative totals displayed live; cost in USD from litellm's price table (hidden when the model has no known price)
+- **Token and cost tracking** — per-turn and cumulative totals in `/status` and the line after each turn (`✻ Worked for 1m 5s · $0.01`); cost in USD from litellm's price table (hidden when the model has no known price)
 - **Long-term memory tools** — the agent saves facts (`save_memory`) and notable moments (`save_episode`) as they come up; both are recalled in later sessions
 - **Graceful exit** — `Ctrl+Q` or `/exit` saves the session, cleans up, and stops background workers
 - **Clean Cancellation** — `Escape` can cancel in-flight agent turns cleanly without corrupting the session
@@ -162,13 +162,17 @@ In the TUI:
 | `Enter`       | Submit message                      |
 | `Shift+Enter` | Insert a newline (multi-line input). If your terminal sends it as plain Enter, use `\` then `Enter`, `Ctrl+Enter`, `Alt+Enter` or `Ctrl+J` |
 | `@path`       | Attach a file (numbered lines) or a folder listing to the message. Typing `@` lists matching project paths: `Tab` / `Enter` completes, a folder opens for the next part. `@"a b.txt"` for spaces. Also works with `dostuff -p`. `.env` files and binaries are never attached |
+| `Tab`         | While typing a slash command, accept the dim ghost text after the cursor: the rest of the command name, then its flag (`/model ` → `--active`, `/fork ` → `--worktree`). `Right` accepts it too |
+| Paste        | A paste over 10 lines (`ui.paste_collapse_lines`) or 2,000 chars shows as `[Pasted text #1 +243 lines]` and is expanded when you send it. Over 200 lines (`loop.paste_file_lines`) it's saved to `.dostuff/pastes/` and the model reads it from there, so it doesn't fill the context; files are removed after `loop.paste_retention_days` (7) |
 | `Up` / `Down` | On the first / last line of the input: previous / next prompt typed in this directory (saved in `~/.dostuff/data/prompt_history.jsonl`) |
 | `Ctrl+O`      | Expand / collapse every truncated tool and shell result (click one to toggle just that one) |
 | `/exit`       | Save the session and quit           |
 | `/clear`      | Start a new session; the old one stays resumable |
 | `/resume [<id>]` | Pick another session from this directory (or switch to the given one) |
-| `/model [<provider/model>] [--active]` | Pick a model: your saved ones (`models:` in config.yaml) first, then "More <provider> models…" for each provider's list (type to filter; Enter on no match uses what you typed). A model that isn't saved yet is added to `~/.dostuff/config.yaml`. The switch lasts for this session; `--active` also makes it the default |
+| `/model [<provider/model>] [--active]` | Pick a model: your saved ones (`models:` in config.yaml) first, then "More <provider> models…" for each provider's list (type to filter; Enter on no match uses what you typed). A model that isn't saved yet is added to `~/.dostuff/config.yaml`. A plain `/model` switch lasts only for this session; add `--active` (e.g. `/model --active`, or `/model anthropic/claude-sonnet-5-5 --active`) to make it the default that new sessions start with |
+| `/config [mcp] [project]` | Edit a settings file right in the TUI: pick `config.yaml` or the MCP servers, user (`~/.dostuff`) or project (`./.dostuff`), or name one (`/config mcp project`). `Ctrl+S` checks the file, saves it and applies it without a restart (an invalid file stays open with the error); `Esc` closes, twice if there are unsaved changes. A new file starts with every option commented out. `.env` files aren't offered |
 | `/status`     | Session, directory, model, permission mode, tokens, context use, MCP servers |
+| `/<skill> [args]` | Run a skill: every discovered skill is a command (listed in the `/` menu and `/help`). See [Skills](#skills) |
 | `/rename <title>` | Name this session (shown by `dostuff sessions`) |
 | `/export [<path>]` | Save this session as Markdown (default `dostuff-session-<id>.md`) |
 | `/undo [force]` | Revert the agent's file changes from its last file-editing turn |
@@ -188,8 +192,8 @@ In the TUI:
 - **Confirmations** — yellow background (respond `y` = allow once, `a` = always this session, anything else = deny)
 - **Diffs** — `write_file` / `edit_file` changes shown as a coloured diff
 - **Errors** — red background
-- **Status bar** — `/help • cwd • session-id • model • permission mode • tokens • cost • context usage % • timer`. Choose and order the items with `ui.status_bar` in `config.yaml`; when the terminal is too narrow (or zoomed in), long items are shortened and the least important dropped (help, session, cwd, tokens, cost, model, context, timer, mode) instead of being cut off
-- **Loading** — `Working...` or streamed thoughts displayed live
+- **Status bar** — `cwd • model • permission mode • context usage %` by default; `help`, `session`, `tokens` and `cost` can be added. Choose and order the items with `ui.status_bar` in `config.yaml`; when the terminal is too narrow (or zoomed in), long items are shortened and the least important dropped (help, session, cwd, tokens, cost, model, context, mode) instead of being cut off
+- **Loading** — bold `Working...` with a live elapsed timer and queued-prompt count, or streamed thoughts displayed live
 
 ---
 
@@ -415,7 +419,9 @@ Skills are directories containing a `SKILL.md` (frontmatter with `name` and `des
 4. `~/.agents/skills/`
 5. `<cwd>/skills/`
 
-**Conflict resolution:** No deduplication. If two skills share the same name (from different directories), both are loaded and passed to the model — the agent may see the same skill twice with different `location` paths. To avoid confusion, keep names unique across the search paths.
+**Conflict resolution:** No deduplication in the system prompt. If two skills share the same name (from different directories), both are loaded and passed to the model — the agent may see the same skill twice with different `location` paths. To avoid confusion, keep names unique across the search paths.
+
+**Running a skill:** every skill is also a slash command, `/<name> [args]` (shown in the `/` menu marked `(skill)` and in `/help`). It runs a turn with the skill's `SKILL.md` body plus your arguments; `@mentions` in the arguments are expanded. Also works headless: `dostuff -p "/my-skill fix the tests"`. Built-in commands win a name clash, the first skill found (in the order above) wins between skills, and names with spaces get no command.
 
 **Example structure:**
 
@@ -437,6 +443,8 @@ description: One-line description of what this skill does
 
 Detailed instructions for the agent go here.
 ```
+
+**Running a skill yourself:** each skill is also a slash command, `/<name> [arguments]` (e.g. `/my-skill src/app.py`), in the TUI and with `dostuff -p "/my-skill ..."`. The turn's message is the skill's `SKILL.md` body plus your arguments (which can use `@path` mentions), so the model follows it straight away instead of deciding whether to read it. Built-in commands win a name clash, and names with spaces can't be run this way; the model can still use those skills on its own.
 
 Run `dostuff init` to bootstrap a local `.dostuff/skills/` folder. Restart the agent after adding new skills.
 

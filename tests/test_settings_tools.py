@@ -46,9 +46,9 @@ def test_edit_config_keeps_comments_validates_and_reloads(home):
     assert adapter.events == [("settings_changed", "config")]
 
     # Empty old_str appends a section; unknown status bar items come back as warnings
-    result = settings.edit_config("", "ui:\n  status_bar: [mode, timer, bogus]")
-    assert "unknown ui.status_bar item 'bogus'" in result
-    assert get_config().status_bar_items == ["mode", "timer"]
+    result = settings.edit_config("", "ui:\n  status_bar: [mode, cost, timer, bogus]")
+    assert "unknown ui.status_bar item 'bogus'" in result and "'timer'" not in result
+    assert get_config().status_bar_items == ["mode", "cost"]
 
     with pytest.raises(ValueError, match="invalid YAML"):
         settings.edit_config("loop:", "loop: [")
@@ -121,3 +121,38 @@ def test_settings_tools_are_not_given_to_subagents():
     allowed, dropped = resolve_subagent_tools(["read_file", "edit_config", "set_mcp_server", "read_settings"])
     assert allowed == ["read_file"]
     assert set(dropped) == {"edit_config", "set_mcp_server", "read_settings"}
+
+
+def test_save_settings_file_validates_keeps_crlf_and_applies(home):
+    from dostuff.config import get_config
+    path = home / ".dostuff" / "config.yaml"
+    path.write_bytes(b"loop:\r\n  max_iterations: 5\r\n")
+    recorder = Recorder()
+
+    with pytest.raises(ValueError, match="Invalid YAML"):
+        settings.save_settings_file("config", "user", "loop: [x\n", recorder)
+    with pytest.raises(ValueError, match="mapping"):
+        settings.save_settings_file("config", "user", "- a\n", recorder)
+    assert path.read_bytes() == b"loop:\r\n  max_iterations: 5\r\n" and recorder.events == []
+
+    summary = settings.save_settings_file("config", "user", "loop:\n  max_iterations: 9\nbogus: 1", recorder)
+    assert path.read_bytes() == b"loop:\r\n  max_iterations: 9\r\nbogus: 1\r\n"
+    assert "(+2 / -1 lines)" in summary and "unknown top-level key 'bogus'" in summary
+    assert recorder.events == [("settings_changed", "config")] and get_config().max_iterations == 9
+
+
+def test_save_mcp_settings_file(home):
+    with pytest.raises(ValueError, match="Invalid JSON"):
+        settings.save_settings_file("mcp", "project", "{", None)
+    with pytest.raises(ValueError, match="mcpServers"):
+        settings.save_settings_file("mcp", "project", '{"mcpServers": []}', None)
+    summary = settings.save_settings_file("mcp", "project", '{"mcpServers": {"x": {"env": {"T": "secret"}}}}', None)
+    assert "neither a command nor a url" in summary and "secret" not in summary
+    saved = json.loads((Path.cwd() / ".dostuff" / "mcp_config.json").read_text(encoding="utf-8"))
+    assert saved["mcpServers"]["x"]["env"]["T"] == "secret"
+
+
+def test_new_settings_text_is_valid_and_empty():
+    import yaml
+    assert yaml.safe_load(settings.new_settings_text("config", "user")) is None
+    assert settings.check_settings_text("mcp", settings.new_settings_text("mcp", "user")) == []

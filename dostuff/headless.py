@@ -106,6 +106,7 @@ async def run_headless(
     from dostuff.helpers.agent.append_step import append_step
     from dostuff.helpers.agent.file_mentions import expand_file_mentions
     from dostuff.helpers.mcp.load_mcp_config import load_mcp_config
+    from dostuff.helpers.skills.skill_command import parse_skill_command, skill_commands, skill_prompt
     from dostuff.helpers.ui.emit import set_adapter
     from dostuff.lib.mcp.mcp_client import MCPClient
     from dostuff.lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
@@ -133,17 +134,20 @@ async def run_headless(
         servers = load_mcp_config()
         if servers:
             await _connect_mcp(mcp_client, servers, adapter)
-        base, _ = build_base_instructions()
+        base, skills = build_base_instructions()
         meta = await store.get_session_meta(session_id) or {}
         steps_history = await store.load(session_id)
         working_history = await store.load_working_history(session_id)
         current_session_history: list = []
-        expansion = await asyncio.to_thread(expand_file_mentions, prompt, config.max_tool_output_chars)
+        skill_run = parse_skill_command(prompt, skill_commands(skills))  # `-p "/<skill> args"`
+        expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else prompt,
+                                            config.max_tool_output_chars)
         if expansion.attached:
             adapter._progress("Attached " + ", ".join(expansion.attached))
         if expansion.skipped:
             adapter.emit("error", "Not attached: " + "; ".join(expansion.skipped))
-        await append_step({"role": "user", "content": expansion.content}, steps_history, working_history,
+        content = await asyncio.to_thread(skill_prompt, skill_run[0], expansion.content) if skill_run else expansion.content
+        await append_step({"role": "user", "content": content}, steps_history, working_history,
                           current_session_history, session_id, store, "interactive_loop")
         instructions = await build_turn_instructions(base, prompt, get_semantic_store(), get_episodic_store(), config.get_user_id())
         result = await agent_loop(

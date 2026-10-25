@@ -247,3 +247,15 @@ def test_split_always_makes_progress_and_keeps_tool_pairs():
     assert old and recent
     assert recent[0]["role"] != "tool"
     assert old + recent == history
+
+
+def test_call_label_clips_long_arguments():
+    from dostuff.helpers.agent.tool_output import format_call_label
+    content = "line one\n" + "x" * 5000
+    label = format_call_label("write_file", {"path": "game.py", "content": content})
+    assert label.startswith('write_file(path="game.py", content="line one\\n')
+    assert "\n" not in label and len(label) <= 200 and "…" in label
+    # history stores the raw JSON string; it renders the same way
+    assert format_call_label("write_file", json.dumps({"path": "game.py", "content": content})) == label
+    assert format_call_label("read_file", '{"path": "a"}') == 'read_file(path="a")'
+    assert format_call_label("x", "{bad json") == "x({bad json)"

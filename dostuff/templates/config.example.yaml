@@ -21,14 +21,19 @@ loop:
   max_tool_output_chars: 30000 # longer tool results keep head + tail with a truncation marker
   max_retries: 6               # retries on rate limits, timeouts and 5xx (0 = fail at once)
   retry_max_delay: 60          # longest wait between retries, seconds (backoff doubles from 1s; Retry-After is honored)
+  paste_file_lines: 200        # TUI pastes longer than this (or over max_tool_output_chars) are saved to .dostuff/pastes/;
+                               # the model gets the path + a 20-line preview and reads the rest as needed (0 = always inline)
+  paste_retention_days: 7      # paste files older than this are deleted at startup (0 = delete them when dostuff exits)
 
 memory:
   episodic_scope: project   # project: recall past episodes from this directory only | user: from anywhere
 
 ui:
-  # Status bar items, shown in this order (omit one to hide it). When the terminal is too
-  # narrow, the least important are dropped first: help, session, cwd, tokens, cost, model, context, timer, mode.
-  status_bar: [help, cwd, session, model, mode, tokens, cost, context, timer]
+  # Status bar items, shown in this order. Default: [cwd, model, mode, context].
+  # All items: help, cwd, session, model, mode, tokens, cost, context. When the terminal is too
+  # narrow, the least important are dropped first: help, session, cwd, tokens, cost, model, context, mode.
+  status_bar: [cwd, model, mode, context]
+  paste_collapse_lines: 10  # pastes longer than this show as [Pasted text #1 +N lines] in the input (0 = never)
 
 search:
   # web_search is free with no API key: DuckDuckGo by default (the `ddgs` package if installed,

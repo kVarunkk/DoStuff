@@ -22,7 +22,7 @@ from typing import Any, Literal
 import json
 import litellm
 from dostuff.helpers.agent.consume_stream import StreamProgress, consume_stream as _consume_stream
-from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, truncate_tool_output
+from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
 
 TOOL_TIMEOUT_S = 120.0
 RETRY_BASE_DELAY_S = 1.0
@@ -117,7 +117,7 @@ def _call_label(call: _ToolCall) -> str:
     """How a call is shown in the TUI; the todo list's JSON args would only repeat its result."""
     if call.name == "todo_write":
         return "Update todos"
-    return f"{call.name}({call.args})"
+    return format_call_label(call.name, call.args)
 
 
 def _runs_in_parallel(name: str) -> bool:

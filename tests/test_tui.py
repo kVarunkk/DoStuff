@@ -29,6 +29,8 @@ def tui(tmp_path, monkeypatch):
     monkeypatch.setattr(SemanticMemoryStore, "query", no_memories)
     monkeypatch.setattr(EpisodicMemoryStore, "query", no_memories)
     monkeypatch.setattr(cli_tui, "load_mcp_config", lambda: {})
+    from dostuff.helpers.skills import discover_skills
+    monkeypatch.setattr(discover_skills, "SKILLS_DIRS", [".dostuff/skills"])  # not the real ~/.agents/skills
     from dostuff.lib.memory import chroma
     monkeypatch.setattr(chroma, "embedding_model_missing", lambda: False)  # no 80 MB download in tests
     monkeypatch.setattr(cli_tui, "get_model_token_limit", lambda: 100_000)
@@ -285,16 +287,37 @@ def test_slash_menu_and_shell_command(tui):
         async with app.run_test() as pilot:
             await pilot.pause()
             menu = app.query_one("#command-menu", cli_tui.CommandMenu)
+            messages_region = app.query_one("#messages").region
             await pilot.press("/")
             await pilot.pause()
             assert menu.display and menu.option_count == len(cli_tui.COMMAND_DESCRIPTIONS)
-            await pilot.press("c", "o")
+            # The menu floats over the conversation instead of resizing it (a resize repaints the screen)
+            assert app.query_one("#messages").region == messages_region
+            assert menu.region.height > 0 and menu.region.bottom == messages_region.bottom
+            await pilot.press("c", "o", "m")
             await pilot.pause()
             assert menu.option_count == 1 and menu.selected_command() == "/compact"
             await pilot.press("tab")
             await pilot.pause()
             assert app.query_one("#input", cli_tui.EnterSubmits).text == "/compact"
             await pilot.press("escape")
+            app._clear_input()
+
+            # Ghost text: the rest of the command, then its flag; Tab accepts each
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            inp.focus()
+            await pilot.press("/", "m", "o")
+            await pilot.pause()
+            assert inp.suggestion == "del"
+            # Dimmer than typed text (the ansi theme's $text-muted is the plain foreground)
+            ghost = inp.get_component_rich_style("text-area--suggestion").color
+            assert ghost is not None and ghost.triplet is not None and ghost.triplet.hex == "#6a6a6a"
+            await pilot.press("tab")
+            await pilot.pause()
+            assert inp.text == "/model " and inp.suggestion == "--active"
+            await pilot.press("tab")
+            await pilot.pause()
+            assert inp.text == "/model --active" and inp.suggestion == ""
             app._clear_input()
 
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("!echo shell-ok"))
@@ -552,8 +575,11 @@ def test_tui_import_skips_heavy_libraries():
     assert out.stdout.strip() == "[]"
 
 
-def test_cost_in_status_bar_and_status(tui):
+def test_cost_in_status_bar_and_status(tui, tmp_path):
     cli_tui = tui
+    from dostuff import config as config_module
+    (tmp_path / "home" / ".dostuff" / "config.yaml").write_text("ui:\n  status_bar: [mode, cost]\n")
+    config_module.reset_config()
 
     async def scenario():
         app = cli_tui.DostuffTUI(session_id="cost")
@@ -707,25 +733,35 @@ def test_status_bar_fits_width_and_follows_config(tui, tmp_path):
             await pilot.pause()
             await app._backend_ready.wait()
             app.permissions.mode = "auto"
-            app._update_status(loader=" 1.5s")
+            app._update_status()
             text = str(app.query_one("#status", cli_tui.Static).render())
             await app._cleanup_and_save_session()
             return text, _texts(app)
 
-    wide, _ = asyncio.run(scenario((160, 24)))
-    assert all(s in wide for s in ("/help", "narrow-session", "openai/gpt-4o-mini", "auto mode", "1.5s"))
+    # Lean by default: no help / session id / tokens / timer
+    default, _ = asyncio.run(scenario((160, 24)))
+    assert "openai/gpt-4o-mini" in default and "auto mode" in default
+    assert "/help" not in default and "narrow-session" not in default and "↑" not in default
 
-    # Narrow: the least important items go first; mode and timer stay, nothing past the edge
+    config_path = tmp_path / "home" / ".dostuff" / "config.yaml"
+    config_path.write_text("ui:\n  status_bar: [help, cwd, session, model, mode, tokens, cost, context]\n")
+    config_module.reset_config()
+    wide, _ = asyncio.run(scenario((160, 24)))
+    assert all(s in wide for s in ("/help", "narrow-session", "openai/gpt-4o-mini", "auto mode"))
+
+    # Narrow: the least important items go first; mode stays, nothing past the edge
     narrow, _ = asyncio.run(scenario((30, 24)))
-    assert "auto mode" in narrow and "1.5s" in narrow
+    assert "auto mode" in narrow
     assert "/help" not in narrow and "narrow-session" not in narrow
     assert len(narrow) <= 28
 
-    (tmp_path / "home" / ".dostuff" / "config.yaml").write_text("ui:\n  status_bar: [timer, mode, bogus]\n")
+    # "timer" (now in the loader) is ignored quietly in older configs
+    config_path.write_text("ui:\n  status_bar: [timer, mode, bogus]\n")
     config_module.reset_config()
     picked, texts = asyncio.run(scenario((160, 24)))
-    assert picked.strip() == "1.5s  auto mode"
+    assert picked.strip() == "auto mode"
     assert any("unknown item(s) bogus" in t for t in texts)
+    assert not any("timer" in t for t in texts)
 
 
 def test_settings_changes_apply_without_restart(tui):
@@ -822,5 +858,174 @@ def test_worktree_enter_exit_and_quit(tui, tmp_path):
             assert "Removed worktree 'three'" in app.exit_note
             assert not (proj / ".dostuff" / "worktrees" / "three").exists()
             assert Path.cwd().resolve() == proj.resolve()
+
+    asyncio.run(scenario())
+
+
+def test_turn_summary_timer_format_and_jump_to_bottom(tui):
+    cli_tui = tui
+    assert [cli_tui._fmt_elapsed(s) for s in (0.4, 45, 65, 3725)] == ["0s", "45s", "1m 5s", "1h 2m"]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="summary")
+        async with app.run_test(size=(80, 20)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            app.adapter._turn_cost = 0.0123
+            app._append_turn_summary(65)
+            await pilot.pause()
+            assert any(t.startswith("✻ Worked for 1m 5s · $0.01 · done ") for t in _texts(app))
+
+            # Scrolling up shows the bar; clicking it goes back to the bottom and hides it
+            jump = app.query_one("#jump-bottom", cli_tui.JumpToBottom)
+            for i in range(40):
+                app._append(f"line {i}", msg_type="system")
+            await pilot.pause()
+            messages = app.query_one("#messages", cli_tui.VerticalScroll)
+            assert not jump.display
+            messages.scroll_home(animate=False)
+            await _until(pilot, lambda: jump.display)
+            await pilot.click("#jump-bottom")
+            await _until(pilot, lambda: messages.is_vertical_scroll_end and not jump.display)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_big_paste_collapses_and_spills_to_file(tui):
+    cli_tui = tui
+    from textual.events import Paste
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pastesess")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            body = "\r\n".join(f"log line {i}" for i in range(1, 501))
+            inp.insert("see ")
+            app.post_message(Paste(body))  # the driver sends pastes to the app, which forwards them
+            await pilot.pause()
+            assert inp.text == "see [Pasted text #1 +500 lines]"
+            app.post_message(Paste("short"))
+            await pilot.pause()
+            assert inp.text.endswith("lines]short")  # small pastes go in as text
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(inp.text))
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            user = app.steps_history[0]["content"]
+            assert '<pasted_content file=".dostuff/pastes/pasteses-1.txt" lines="500"' in user
+            assert "log line 20\n" in user and "log line 21" not in user
+            saved = Path(".dostuff/pastes/pasteses-1.txt").read_text(encoding="utf-8")
+            assert saved == body.replace("\r\n", "\n")
+            assert any("[Pasted text #1 +500 lines]" in t for t in _texts(app))  # the screen keeps the placeholder
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_skill_slash_command_runs_skill(tui):
+    cli_tui = tui
+    skill_dir = Path(".dostuff", "skills", "release-notes")
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: release-notes\ndescription: Write release notes from git log\n---\n\nRead git log and summarise.\n",
+        encoding="utf-8")
+    Path("CHANGES.txt").write_text("v1 fixed things\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="skill")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            menu = app.query_one("#command-menu", cli_tui.CommandMenu)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            await pilot.press(*"/rel")
+            await pilot.pause()
+            assert menu.display and menu.selected_command() == "/release-notes"
+            assert inp.suggestion == "ease-notes"
+            app._clear_input()
+
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/help"))
+            assert any("/release-notes" in t and "Skills" in t for t in _texts(app))
+
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/release-notes"))
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            sent = app.steps_history[0]["content"]
+            assert "Read git log and summarise." in sent and "name: release-notes" not in sent
+            assert sent.endswith("(no arguments)")
+            assert not any("Unknown command" in t for t in _texts(app))
+
+            # The arguments keep their @mentions
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/release-notes for @CHANGES.txt"))
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            sent = app.steps_history[2]["content"]
+            assert "Arguments: for @CHANGES.txt" in sent and "v1 fixed things" in sent
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_config_command_edits_settings_file(tui, tmp_path):
+    cli_tui = tui
+    config_path = tmp_path / "home" / ".dostuff" / "config.yaml"
+    config_path.write_text("ui:\n  status_bar: [model]\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="config")
+
+        def status_text():
+            return str(app.query_one("#settings-status", cli_tui.Static).render())
+
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            status = app.query_one("#status", cli_tui.Static)
+
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/config"))
+            await pilot.pause()
+            picker = app.query_one("#picker", cli_tui.PermissionPrompt)
+            assert [v for v, _ in picker._options] == ["config:user", "config:project", "mcp:user", "mcp:project"]
+            await pilot.press("enter")
+            await _until(pilot, app._settings_open)
+            editor = app.query_one("#settings-editor", cli_tui.SettingsEditor)
+            assert app.screen.focused is editor and editor.text == "ui:\n  status_bar: [model]\n"
+            assert not app.query_one("#conversation").display and not app.query_one("#input").display
+
+            # Invalid YAML: nothing written, the editor stays open with the error
+            editor.text = "ui: [unclosed\n"
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            assert app._settings_open() and "Not saved" in status_text()
+            assert config_path.read_text(encoding="utf-8") == "ui:\n  status_bar: [model]\n"
+
+            # Valid: written, applied right away, editor closes
+            editor.text = "ui:\n  status_bar: [mode]\n"
+            await pilot.press("ctrl+s")
+            await _until(pilot, lambda: not app._settings_open())
+            assert config_path.read_text(encoding="utf-8") == "ui:\n  status_bar: [mode]\n"
+            await _until(pilot, lambda: str(status.render()).strip() == "ask mode")
+            assert any("Saved ~" in t and "config.yaml" in t for t in _texts(app))
+            assert app.query_one("#input").display and app.query_one("#conversation").display
+
+            # Unsaved changes: the first ESC warns, the second discards them
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/config mcp project"))
+            await _until(pilot, app._settings_open)
+            editor = app.query_one("#settings-editor", cli_tui.SettingsEditor)
+            assert '"mcpServers"' in editor.text
+            editor.text = "{}"
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._settings_open() and "Unsaved" in status_text()
+            await pilot.press("escape")
+            await _until(pilot, lambda: not app._settings_open())
+            assert not Path(".dostuff", "mcp_config.json").exists()
+
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/config bogus"))
+            assert any("Usage: /config" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
