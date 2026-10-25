@@ -25,15 +25,17 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 
 ## Features
 
-- **Textual TUI** with per-role colored messages, status bar, and a loading/timer spinner
+- **Textual TUI** with a `/` command menu, `@file` completion, `!shell` commands, an in-app config editor, a configurable status bar and a live turn timer
+- **Headless mode** — `dostuff -p "<prompt>"` runs one prompt and prints the answer (`--json` for scripts and CI)
 - **Multi-provider LLMs** via [litellm](https://docs.litellm.ai/docs/providers) — OpenAI, Anthropic, Gemini, Groq, Mistral, Ollama, OpenRouter
-- **Persistent sessions** in SQLite; resume with `dostuff resume` or `dostuff --session <id>`
+- **Persistent sessions** in SQLite; resume with `dostuff resume` or `dostuff --session <id>`, branch one off with `/fork`
+- **Git worktrees** — `/worktree` or `dostuff -w` runs a session on its own branch and checkout; subagents can run in their own worktree too
 - **Long-term memory** (semantic + episodic) backed by ChromaDB — optional, `pip install "dostuff[memory]"`
 - **MCP server support** — stdio (npx, uvx) and HTTP transports
 - **`@file` mentions** — type `@` in the prompt to pick a file or folder; its content (or listing) is sent with the message
 - **Project instructions** — `AGENTS.md` / `CLAUDE.md` from `~/.dostuff/`, the repo root and every folder down to the current one, combined
 - **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
-- **Permission layer** — mutating tool calls ask for approval (`y` once / `a` always this session / `n` deny); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`
+- **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
 - **File sandbox** — file tools stay inside the project directory and never read `.env*` files or `~/.dostuff/`
 - **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`
 - **Subagents** — `delegate_to_subagent` runs a bounded task with a restricted tool set; its approval prompts and ESC go through the same TUI
@@ -80,8 +82,8 @@ pipx install dostuff
 For development (editable mode, from a clone):
 
 ```bash
-git clone https://github.com/<you>/dostuff.git
-cd dostuff
+git clone https://github.com/kVarunkk/DoStuff.git
+cd DoStuff
 pip install -e .           # core
 pip install -e ".[memory]" # + long-term memory (chromadb)
 pip install -e ".[full]"   # + memory + onnxruntime + grpcio
@@ -136,11 +138,12 @@ In the TUI:
 | `dostuff`                | Launch the interactive TUI                      |
 | `dostuff --version`      | Print the version (`-V`)                        |
 | `dostuff --session <id>` | Resume a prior session (asks before starting a new one if the ID is unknown) |
+| `dostuff -w` / `--worktree-name <name>` | Start the session in a new git worktree (`.dostuff/worktrees/<name>`, branch `dostuff/<name>`) |
 | `dostuff init [--force]` | Create `.dostuff/` config/skills in current dir (won't overwrite without `--force`) |
 | `dostuff setup`          | Pick a model, save its API key, write `~/.dostuff/config.yaml` (runs automatically on first launch) |
 | `dostuff config`         | Show resolved config paths and values           |
 | `dostuff doctor`         | Health check: config, API key, MCP, data dir; prints a fix for each problem |
-| `dostuff resume [<id>]`  | Resume the latest session started in the current directory (or the given one; a unique ID prefix is enough) |
+| `dostuff resume [<id>]`  | Resume the latest session started in the current directory (or the given one; a unique ID prefix is enough). `--fork` resumes a copy, `--worktree` moves it into a new worktree |
 | `dostuff sessions [--all] [-n N]` | List sessions in the current directory with their title or first prompt (`--all`: every directory) |
 | `dostuff sessions rename <id> <title>` | Name a session |
 | `dostuff sessions rm <id>... [-y]` | Delete sessions and their `/undo` checkpoints |
@@ -160,6 +163,8 @@ In the TUI:
 | Key / command | Action                              |
 | ------------- | ----------------------------------- |
 | `Enter`       | Submit message                      |
+| `/`           | Open the command menu (type to filter, `Tab` completes, `Enter` runs) |
+| `!<command>`  | Run a shell command directly (no approval); the command and its output are shown to the model on the next turn |
 | `Shift+Enter` | Insert a newline (multi-line input). If your terminal sends it as plain Enter, use `\` then `Enter`, `Ctrl+Enter`, `Alt+Enter` or `Ctrl+J` |
 | `@path`       | Attach a file (numbered lines) or a folder listing to the message. Typing `@` lists matching project paths: `Tab` / `Enter` completes, a folder opens for the next part. `@"a b.txt"` for spaces. Also works with `dostuff -p`. `.env` files and binaries are never attached |
 | `Tab`         | While typing a slash command, accept the dim ghost text after the cursor: the rest of the command name, then its flag (`/model ` → `--active`, `/fork ` → `--worktree`). `Right` accepts it too |
@@ -169,6 +174,9 @@ In the TUI:
 | `/exit`       | Save the session and quit           |
 | `/clear`      | Start a new session; the old one stays resumable |
 | `/resume [<id>]` | Pick another session from this directory (or switch to the given one) |
+| `/fork [title] [--worktree]` | Copy this session into a new one and switch to it; the original is unchanged |
+| `/worktree [name]` / `/worktree exit` | Move the session into a new git worktree on branch `dostuff/<name>` / leave it (removed if unchanged, otherwise keep or remove) |
+| `/permissions [mode]` | Show or change the permission mode for this session |
 | `/model [<provider/model>] [--active]` | Pick a model: your saved ones (`models:` in config.yaml) first, then "More <provider> models…" for each provider's list (type to filter; Enter on no match uses what you typed). A model that isn't saved yet is added to `~/.dostuff/config.yaml`. A plain `/model` switch lasts only for this session; add `--active` (e.g. `/model --active`, or `/model anthropic/claude-sonnet-5-5 --active`) to make it the default that new sessions start with |
 | `/config [mcp] [project]` | Edit a settings file right in the TUI: pick `config.yaml` or the MCP servers, user (`~/.dostuff`) or project (`./.dostuff`), or name one (`/config mcp project`). `Ctrl+S` checks the file, saves it and applies it without a restart (an invalid file stays open with the error); `Esc` closes, twice if there are unsaved changes. A new file starts with every option commented out. `.env` files aren't offered |
 | `/status`     | Session, directory, model, permission mode, tokens, context use, MCP servers |
@@ -186,10 +194,9 @@ In the TUI:
 
 **Visual elements:**
 
-- **User messages** — blue background
-- **Agent messages** — neutral
-- **Tool calls and results** — teal/green background
-- **Confirmations** — yellow background (respond `y` = allow once, `a` = always this session, anything else = deny)
+- **Messages** — `>` for your prompts (on a grey band), `●` for agent replies and tool calls, `⎿` for tool results; the terminal background shows through
+- **Approvals** — a selector (arrows, a number, or `y` = allow once, `a` = always this session, `n` = deny with an optional note); several calls in one response can be approved together
+- **Turn summary** — `✻ Worked for 1m 5s · $0.01 · done 12:59 PM` after each turn
 - **Diffs** — `write_file` / `edit_file` changes shown as a coloured diff
 - **Errors** — red background
 - **Status bar** — `cwd • model • permission mode • context usage %` by default; `help`, `session`, `tokens` and `cost` can be added. Choose and order the items with `ui.status_bar` in `config.yaml`; when the terminal is too narrow (or zoomed in), long items are shortened and the least important dropped (help, session, cwd, tokens, cost, model, context, mode) instead of being cut off
@@ -318,7 +325,7 @@ The model resolution maps model names (using [litellm format](https://docs.litel
 | Provider  | Example Model name                     | API key env         |
 | --------- | -------------------------------------- | ------------------- |
 | OpenAI    | `openai/gpt-4o-mini`                   | `OPENAI_API_KEY`    |
-| Anthropic | `anthropic/claude-3-5-sonnet-20240620` | `ANTHROPIC_API_KEY` |
+| Anthropic | `anthropic/claude-sonnet-5-5`          | `ANTHROPIC_API_KEY` |
 | Gemini    | `gemini/gemini-3.1-flash-lite`         | `GEMINI_API_KEY`    |
 | Groq      | `groq/llama-3.1-70b-versatile`         | `GROQ_API_KEY`      |
 | Ollama    | `ollama/llama3.1`                      | _(none)_            |
@@ -421,8 +428,6 @@ Skills are directories containing a `SKILL.md` (frontmatter with `name` and `des
 
 **Conflict resolution:** No deduplication in the system prompt. If two skills share the same name (from different directories), both are loaded and passed to the model — the agent may see the same skill twice with different `location` paths. To avoid confusion, keep names unique across the search paths.
 
-**Running a skill:** every skill is also a slash command, `/<name> [args]` (shown in the `/` menu marked `(skill)` and in `/help`). It runs a turn with the skill's `SKILL.md` body plus your arguments; `@mentions` in the arguments are expanded. Also works headless: `dostuff -p "/my-skill fix the tests"`. Built-in commands win a name clash, the first skill found (in the order above) wins between skills, and names with spaces get no command.
-
 **Example structure:**
 
 ```text
@@ -444,7 +449,7 @@ description: One-line description of what this skill does
 Detailed instructions for the agent go here.
 ```
 
-**Running a skill yourself:** each skill is also a slash command, `/<name> [arguments]` (e.g. `/my-skill src/app.py`), in the TUI and with `dostuff -p "/my-skill ..."`. The turn's message is the skill's `SKILL.md` body plus your arguments (which can use `@path` mentions), so the model follows it straight away instead of deciding whether to read it. Built-in commands win a name clash, and names with spaces can't be run this way; the model can still use those skills on its own.
+**Running a skill yourself:** each skill is also a slash command, `/<name> [arguments]` (e.g. `/my-skill src/app.py`), in the TUI and with `dostuff -p "/my-skill ..."`. The turn's message is the skill's `SKILL.md` body plus your arguments (which can use `@path` mentions), so the model follows it straight away instead of deciding whether to read it. The command shows in the `/` menu marked `(skill)` and in `/help`. Built-in commands win a name clash, the first skill found (in the order above) wins between skills, and names with spaces can't be run this way; the model can still use those skills on its own.
 
 Run `dostuff init` to bootstrap a local `.dostuff/skills/` folder. Restart the agent after adding new skills.
 
@@ -550,23 +555,31 @@ dostuff/
 ├── helpers/                # sub-modules for agent, mcp, memory, skills, tools, ui
 │   ├── agent/              # state, exit handlers, system prompts, token limit utilities
 │   ├── mcp/                # config loading, oauth
-│   ├── memory/             # transcript formatting and memory extractors
+│   ├── memory/             # memory resolver, session export, shell steps
 │   ├── skills/             # skill discovery logic
 │   ├── tools/              # schemas and path resolution
 │   └── ui/                 # event emission shims
 ├── lib/                    # core logic
+│   ├── checkpoints.py      # per-turn file checkpoints for /undo
 │   ├── exceptions.py       # validation, confirmation, and workflow exceptions
 │   ├── mcp/                # mcp transport client & local registrations
 │   ├── memory/             # semantic, episodic, and session stores
 │   ├── model.py            # model and provider resolution
-│   └── tracing.py          # opentelemetry tracing bootstrap
+│   ├── tracing.py          # opentelemetry tracing bootstrap
+│   └── worktree.py         # git worktree create / exit / cleanup
 ├── memory/                 # DB management
 │   └── __init__.py         # DB initiation exports
 ├── tools/                  # defined tools
 │   ├── bash/               # terminal command execution tools
 │   ├── files/              # read, write, edit, delete, list
 │   ├── search/             # grep and glob (pure Python, default excludes)
-│   └── mcp/                # mcp tool search, detail, and execution wrappers
+│   ├── mcp/                # mcp tool search, detail, and execution wrappers
+│   ├── memory/             # save_memory / save_episode
+│   ├── settings.py         # read_settings, edit_config, set/remove_mcp_server
+│   ├── web_fetch.py        # read a URL as text
+│   ├── web_search.py       # free web search (SearXNG / ddgs / DuckDuckGo)
+│   ├── todo_write.py       # visible task list
+│   └── delegate_to_subagent.py # bounded subagents (optionally in a worktree)
 ├── cli.py                  # CLI typer entrypoints and doctor checkup utilities
 ├── cli_tui.py              # Textual TUI Application and adapter translates state
 ├── config.py               # layered config loader supporting project/global yaml and multi-model configuration
@@ -582,3 +595,5 @@ dostuff/
 - **Author:** [varun](mailto:varunkumawatleap2@gmail.com)
 - **Repository:** https://github.com/kVarunkk/DoStuff
 - **Issues:** https://github.com/kVarunkk/DoStuff/issues
+- **Changelog:** [CHANGELOG.md](CHANGELOG.md)
+- **PyPI:** https://pypi.org/project/dostuff/
