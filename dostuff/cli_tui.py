@@ -868,6 +868,8 @@ class DostuffTUI(App):
         background: transparent; border: round #4a4a4a; padding: 0 1;
     }
     #input:focus { border: round #7a7a7a; }
+    /* "Copied N characters" hint, shown in the input's top border instead of a toast */
+    #input { border-title-align: right; border-title-color: #8a8a8a; }
     #input.shell-mode { border: round #d7769f; }
     #input.feedback-mode { border: round #e5c07b; }
     #input > .text-area--cursor-line { background: transparent; }
@@ -938,6 +940,7 @@ class DostuffTUI(App):
         self._last_streamed_answer: str = ""
         self._prompt_queue: list = []
         self._pending_workers: list[Worker] = []
+        self._copy_hint_timer: Timer | None = None
         self._turn_in_progress: bool = False
         self._turn_start_time: float | None = None
         self._timer: Timer | None = None
@@ -1010,7 +1013,11 @@ class DostuffTUI(App):
         text = self.screen.get_selected_text()
         if text:
             _copy_to_clipboard(self, text)
-            self.notify(f"Copied {len(text)} characters", timeout=2)
+            inp = self.query_one("#input", EnterSubmits)
+            inp.border_title = f"copied {len(text)} characters"
+            if self._copy_hint_timer is not None:
+                self._copy_hint_timer.stop()
+            self._copy_hint_timer = self.set_timer(2, lambda: setattr(inp, "border_title", None))
 
     def _start_worker(self, work, name: str) -> Worker:
         worker = self.run_worker(work, name=name, exit_on_error=False)

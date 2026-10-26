@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `dostuff sessions` also lists sessions running in this repo's git worktrees (`.dostuff/worktrees/`), tagged `[worktree <name>]`, so a session forked into a worktree no longer disappears from the list. `dostuff resume` with no ID still picks the latest session in the current directory only.
+- TUI: select-to-copy no longer pops a large toast; a dim "copied N characters" label shows on the right of the input box's top border for 2 s.
 
 ### Documentation
 - README: fixed the clone URL and documented the 0.2.0 commands.
