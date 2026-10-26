@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- `dostuff sessions` also lists sessions running in this repo's git worktrees (`.dostuff/worktrees/`), tagged `[worktree <name>]`, so a session forked into a worktree no longer disappears from the list. `dostuff resume` with no ID still picks the latest session in the current directory only.
+
+### Documentation
+- README: fixed the clone URL and documented the 0.2.0 commands.
+- Added `DEMO.md`, a step-by-step demo script covering the 0.2.0 features.
+
 ## [0.2.0] - 2026-10-25
 
 The v0.1.6 package review fixes (permissions, sandboxing, agent loop, sessions), plus web tools, settings tools, `@` mentions, cost tracking, session fork, git worktrees, skills as commands and many TUI improvements.

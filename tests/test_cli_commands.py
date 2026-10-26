@@ -74,6 +74,19 @@ def test_sessions_lists_this_directory(env):
     assert "No sessions in" in result.output
 
 
+def test_sessions_include_this_repos_worktrees(env):
+    db = env["home"] / ".dostuff" / "data" / "sessions.db"
+    conn = sqlite3.connect(db)
+    wt = env["proj"] / ".dostuff" / "worktrees" / "fork-bbb3"
+    conn.execute("UPDATE sessions SET working_dir = ? WHERE session_id = 'bbb333'", (str(wt),))
+    conn.commit()
+    conn.close()
+    result = runner.invoke(env["app"], ["sessions"])
+    assert result.exit_code == 0, result.output
+    assert _ids(result.output) == ["aab222", "aaa111", "bbb333"]
+    assert "[worktree fork-bbb3] elsewhere" in result.output
+
+
 def test_resume_picks_latest_here_or_by_prefix(env, monkeypatch):
     from dostuff import cli
     launched = []

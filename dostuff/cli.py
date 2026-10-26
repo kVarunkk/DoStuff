@@ -336,10 +336,36 @@ sessions_app = typer.Typer(help="List, rename and delete past sessions.")
 app.add_typer(sessions_app, name="sessions")
 
 
+def _worktree_of(working_dir: str, repo_dir: str) -> str | None:
+    """Name of the worktree under repo_dir/.dostuff/worktrees that working_dir is in, if any."""
+    from pathlib import Path
+    from dostuff.lib.memory.session_store import _norm_dir
+    from dostuff.lib.worktree import WORKTREES_DIR
+    if not working_dir:
+        return None
+    try:
+        rel = Path(_norm_dir(working_dir)).relative_to(_norm_dir(str(Path(repo_dir) / WORKTREES_DIR)))
+    except ValueError:
+        return None
+    return rel.parts[0] if rel.parts else None
+
+
+def _sessions_here(cwd: str) -> list[dict]:
+    """Sessions in cwd plus those in its worktrees (tagged with `worktree`), newest first."""
+    from dostuff.lib.memory.session_store import _norm_dir
+    rows = []
+    for row in _list_sessions(None):
+        if _norm_dir(row["working_dir"]) == _norm_dir(cwd):
+            rows.append(row)
+        elif (name := _worktree_of(row["working_dir"], cwd)) is not None:
+            rows.append({**row, "worktree": name})
+    return rows
+
+
 def _print_sessions(all_dirs: bool, limit: int) -> None:
     import os
     import shutil
-    rows = _list_sessions(None if all_dirs else os.getcwd())
+    rows = _list_sessions(None) if all_dirs else _sessions_here(os.getcwd())
     if not rows:
         typer.echo("No past sessions." if all_dirs else f"No sessions in {os.getcwd()}. `dostuff sessions --all` lists every directory.")
         return
@@ -352,6 +378,8 @@ def _print_sessions(all_dirs: bool, limit: int) -> None:
     typer.echo(header + ("DIRECTORY / TITLE" if all_dirs else "TITLE"))
     for row in shown:
         title = row["title"] or "(no prompt)"
+        if row.get("worktree"):
+            title = f"[worktree {row['worktree']}] {title}"
         if len(title) > title_width:
             title = title[: title_width - 3] + "..."
         typer.echo(f"{row['session_id']:<16}  {_fmt_last_used(row['last_used']):<16}  {row['steps']:>5}  " + (row["working_dir"] if all_dirs else title))
