@@ -2,8 +2,12 @@
 import os
 import re
 
+from dostuff.helpers.models.opencode import OPENCODE_PROVIDERS, chat_model_ids, models_url
+
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"  # public, no key needed
 FETCH_TIMEOUT_S = 5.0
+# Providers whose list is fetched over the network (the pickers say "Fetching...")
+FETCHED_PROVIDERS = ("ollama", "openrouter", *OPENCODE_PROVIDERS)
 # litellm lists these with mode "chat", but they aren't models to talk to
 _NOT_CHAT = ("guard", "moderation", "embed", "tts", "transcribe", "whisper", "realtime", "audio",
              "image", "computer-use", "search-preview", "container")
@@ -12,7 +16,7 @@ _DATED = re.compile(r"-(?:\d{4}-\d{2}-\d{2}|\d{8}|\d{4}|\d{2}-\d{4})$")
 
 
 class ModelListError(Exception):
-    """The list couldn't be fetched (Ollama not running, offline for OpenRouter)."""
+    """The list couldn't be fetched (Ollama not running, offline for OpenRouter / OpenCode)."""
 
 
 def provider_models(provider: str) -> list[str]:
@@ -21,6 +25,8 @@ def provider_models(provider: str) -> list[str]:
         return _ollama_models()
     if provider == "openrouter":
         return _openrouter_models()
+    if provider in OPENCODE_PROVIDERS:
+        return _opencode_models(provider)
     return _litellm_models(provider)
 
 
@@ -62,3 +68,9 @@ def _openrouter_models() -> list[str]:
         if isinstance(m, dict) and m.get("id")
         and "text" in ((m.get("architecture") or {}).get("output_modalities") or ["text"])
     )
+
+
+def _opencode_models(provider: str) -> list[str]:
+    """OpenCode Zen's or Go's catalog (public, no key needed)."""
+    data = _get_json(models_url(provider), f"the {provider} model list")
+    return sorted(f"{provider}/{m}" for m in chat_model_ids(data))

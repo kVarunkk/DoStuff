@@ -72,6 +72,8 @@ def _decide(fn_name: str, fn_args: dict[str, Any], permissions: SessionPermissio
 
 
 def _denial(decision: PermissionDecision, reply: ApprovalReply | None = None) -> str:
+    if decision.action == "deny":  # a rule (plan mode), not the user: the reason is the whole message
+        return decision.reason
     text = f"User denied: {decision.reason}"
     if reply is not None and reply.feedback.strip():
         text += f"\nThe user said: {reply.feedback.strip()}"

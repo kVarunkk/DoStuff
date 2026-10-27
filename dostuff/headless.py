@@ -1,7 +1,7 @@
 """`dostuff -p "prompt"`: run one turn without the TUI, for scripts and CI.
 
-The final answer goes to stdout (or a JSON object with --json); progress (tool calls, results,
-errors) goes to stderr unless --quiet. Approvals are asked on the terminal when there is one;
+The final answer goes to stdout (or a JSON object with --output-format json, or one JSON event
+per line with stream-json); progress (tool calls, results, errors) goes to stderr unless --quiet. Approvals are asked on the terminal when there is one;
 without a terminal, calls that need approval are denied unless the permission mode allows them.
 """
 import asyncio
@@ -9,12 +9,16 @@ import json
 import sys
 import time
 import uuid
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable, Literal
 
 from dostuff.agent.permissions import ApprovalReply, PermissionMode, SessionPermissions, parse_answer
 
 PREVIEW_LINES = 4
 MCP_CONNECT_TIMEOUT_S = 150.0
+OutputFormat = Literal["text", "json", "stream-json"]
+OUTPUT_FORMATS: tuple[str, ...] = ("text", "json", "stream-json")
+MAX_ITERATIONS_PREFIX = "Reached maximum iterations"  # loop()'s answer when it hits the cap
 
 
 def _err(text: str) -> None:
@@ -24,9 +28,10 @@ def _err(text: str) -> None:
 class HeadlessAdapter:
     """Prints loop() events to stderr and asks for approval on the terminal (if any)."""
 
-    def __init__(self, interactive: bool, quiet: bool) -> None:
+    def __init__(self, interactive: bool, quiet: bool, stream: Callable[[dict[str, Any]], None] | None = None) -> None:
         self._interactive = interactive
         self._quiet = quiet
+        self._stream = stream  # stream-json: gets each event as a dict
         self._cancelled = False
         self._cancel_event = asyncio.Event()
         self._pending_text = ""  # streamed text; shown on stderr if a tool call follows it
@@ -38,7 +43,23 @@ class HeadlessAdapter:
         if not self._quiet:
             _err(text)
 
+    def _stream_event(self, event_type: str, data: Any) -> None:
+        if self._stream is None:
+            return
+        if event_type == "tool_call":
+            if self._pending_text.strip():
+                self._stream({"type": "assistant", "text": self._pending_text.strip()})
+            self._stream({"type": "tool_call", "call": str(data)})
+        elif event_type == "tool_result":
+            name, _, result = str(data).partition(": ")
+            self._stream({"type": "tool_result", "tool": name, "result": result})
+        elif event_type == "usage" and isinstance(data, dict):
+            self._stream({"type": "usage", **{k: data.get(k) for k in ("prompt_tokens", "completion_tokens", "cached_tokens", "cost")}})
+        elif event_type in ("error", "system"):
+            self._stream({"type": event_type, "message": str(data)})
+
     def emit(self, event_type: str, data: Any) -> None:
+        self._stream_event(event_type, data)
         if event_type == "usage" and isinstance(data, dict):
             for k in self.usage:
                 self.usage[k] += data.get(k) or 0
@@ -94,11 +115,17 @@ async def run_headless(
     prompt: str,
     session_id: str | None = None,
     permission_mode: PermissionMode | None = None,
-    output_json: bool = False,
+    output_format: OutputFormat = "text",
     quiet: bool = False,
     interactive: bool = True,
+    max_turns: int | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> int:
-    """Run one turn and print the answer; returns the process exit code."""
+    """Run one turn and print the answer; returns the process exit code.
+
+    max_turns caps the model calls (loop.max_iterations otherwise); allowed_tools are patterns
+    that run without asking in any mode (see SessionPermissions.allow).
+    """
     # Heavy imports here so `dostuff --help` stays fast
     from dostuff.agent.instructions import build_base_instructions, build_turn_instructions
     from dostuff.agent.loop import loop as agent_loop
@@ -106,6 +133,7 @@ async def run_headless(
     from dostuff.helpers.agent.append_step import append_step
     from dostuff.helpers.agent.file_mentions import expand_file_mentions
     from dostuff.helpers.mcp.load_mcp_config import load_mcp_config
+    from dostuff.helpers.skills.custom_commands import discover_commands
     from dostuff.helpers.skills.skill_command import parse_skill_command, skill_commands, skill_prompt
     from dostuff.helpers.ui.emit import set_adapter
     from dostuff.lib.mcp.mcp_client import MCPClient
@@ -115,7 +143,12 @@ async def run_headless(
     from dostuff.lib.tracing import session_id_var, turn_id_var
 
     config = get_config()
-    adapter = HeadlessAdapter(interactive=interactive, quiet=quiet)
+
+    def stream(event: dict[str, Any]) -> None:
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+
+    adapter = HeadlessAdapter(interactive=interactive, quiet=quiet,
+                              stream=stream if output_format == "stream-json" else None)
     set_adapter(None)  # loader chatter ("[MCP] Loaded config ...") isn't useful here; errors come via adapter
     session_id = session_id or uuid.uuid4().hex[:16]
     turn_id = uuid.uuid4().hex
@@ -131,6 +164,10 @@ async def run_headless(
     result = ""
     code = 0
     try:
+        if output_format == "stream-json":
+            from dostuff.lib.model import get_model
+            stream({"type": "init", "session_id": session_id, "model": get_model(), "cwd": str(Path.cwd()),
+                    "permission_mode": permission_mode or config.permission_mode})
         servers = load_mcp_config()
         if servers:
             await _connect_mcp(mcp_client, servers, adapter)
@@ -139,7 +176,7 @@ async def run_headless(
         steps_history = await store.load(session_id)
         working_history = await store.load_working_history(session_id)
         current_session_history: list = []
-        skill_run = parse_skill_command(prompt, skill_commands(skills))  # `-p "/<skill> args"`
+        skill_run = parse_skill_command(prompt, skill_commands(skills, discover_commands()))  # `-p "/<name> args"`
         expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else prompt,
                                             config.max_tool_output_chars)
         if expansion.attached:
@@ -160,9 +197,11 @@ async def run_headless(
             session_total_tokens=meta.get("total_tokens") or 0,
             last_input_tokens=meta.get("last_input_tokens") or 0,
             stream=True,
-            max_iterations=config.max_iterations,
-            permissions=SessionPermissions(mode=permission_mode),
+            max_iterations=max_turns or config.max_iterations,
+            permissions=SessionPermissions(mode=permission_mode, allow=list(allowed_tools or [])),
         )
+        if result.startswith(MAX_ITERATIONS_PREFIX):
+            code = 1
     except Exception as e:
         _err(f"Error: {e}")
         code = 1
@@ -176,15 +215,19 @@ async def run_headless(
     if adapter.denied_without_terminal:
         _err(f"{adapter.denied_without_terminal} call(s) needed approval and were denied. "
              "Allow them with --permission-mode allowlist (+ permissions.allow) or auto.")
-    if output_json:
-        print(json.dumps({
+    if output_format != "text":
+        summary = {
             "session_id": session_id,
             "result": result,
             "is_error": code != 0,
             "duration_s": round(time.time() - started, 2),
             "usage": adapter.usage,
             "cost_usd": round(adapter.cost_usd, 6) if adapter.cost_usd is not None else None,
-        }, ensure_ascii=False))
+        }
+        if output_format == "stream-json":
+            stream({"type": "result", **summary})
+        else:
+            print(json.dumps(summary, ensure_ascii=False))
     elif result:
         print(result)
     if not quiet:

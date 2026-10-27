@@ -21,7 +21,7 @@ def _lookup_session_dir(session_id: str) -> tuple[bool, str | None]:
     return (row is not None), (row[0] if row else None)
 
 
-PERMISSION_MODES = ("ask", "allowlist", "auto")
+PERMISSION_MODES = ("ask", "allowlist", "auto", "plan")
 
 
 def _print_version(value: bool) -> None:
@@ -35,24 +35,38 @@ def _print_version(value: bool) -> None:
 def main(
     ctx: typer.Context,
     session: str = typer.Option(None, "--session", help="Resume a session by ID (default: start a new one)"),
+    continue_: bool = typer.Option(False, "--continue", "-c", help="Resume the latest session in this directory (same as `dostuff resume`)"),
     prompt: str = typer.Option(None, "--print", "-p", help="Run this prompt without the TUI, print the answer and exit ('-' reads it from stdin)"),
-    output_json: bool = typer.Option(False, "--json", help="With -p: print a JSON object (result, session_id, usage)"),
+    output_json: bool = typer.Option(False, "--json", help="With -p: same as --output-format json"),
+    output_format: str = typer.Option(None, "--output-format", help="With -p: text (the answer), json (one object: result, session_id, usage) or stream-json (one JSON event per line)"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="With -p: no progress on stderr, only the answer"),
-    permission_mode: str = typer.Option(None, "--permission-mode", help="With -p: ask | allowlist | auto (default: config)"),
+    permission_mode: str = typer.Option(None, "--permission-mode", help="With -p: ask | allowlist | auto | plan (default: config)"),
+    max_turns: int = typer.Option(None, "--max-turns", min=1, help="With -p: stop after this many model calls (default: loop.max_iterations)"),
+    allowed_tools: list[str] = typer.Option(None, "--allowed-tools", help="With -p: run these without asking, in any mode; comma-separated or repeated. A tool name (write_file), a shell command prefix (\"npm test\") or tool:target (web_fetch:docs.python.org)"),
     worktree: bool = typer.Option(False, "--worktree", "-w", help="Run the session in a new git worktree (.dostuff/worktrees/<name>, branch dostuff/<name>)"),
     worktree_name: str = typer.Option(None, "--worktree-name", help="Name for --worktree (implies it; default: a random one)"),
     version: bool = typer.Option(False, "--version", "-V", callback=_print_version, is_eager=True, help="Print the version and exit"),
 ):
     if ctx.invoked_subcommand is not None:
         return  # subcommand (init/setup/config/doctor/resume/sessions/...) — don't start agent
-    if prompt is None and (output_json or quiet or permission_mode):
-        typer.echo("--json, --quiet and --permission-mode only apply with -p/--print.", err=True)
+    if continue_:
+        if session:
+            typer.echo("--continue and --session can't be used together.", err=True)
+            raise typer.Exit(code=2)
+        session = _latest_here()["session_id"]
+    if prompt is None and (output_json or output_format or quiet or permission_mode or max_turns or allowed_tools):
+        typer.echo("--json, --output-format, --quiet, --permission-mode, --max-turns and --allowed-tools "
+                   "only apply with -p/--print.", err=True)
         raise typer.Exit(code=2)
     if prompt is not None:
         if worktree or worktree_name:
             typer.echo("--worktree only applies to the TUI.", err=True)
             raise typer.Exit(code=2)
-        _run_print_mode(session, prompt, output_json, quiet, permission_mode)
+        if output_json and output_format not in (None, "json"):
+            typer.echo("--json is --output-format json; give only one of them.", err=True)
+            raise typer.Exit(code=2)
+        _run_print_mode(session, prompt, output_format or ("json" if output_json else "text"), quiet, permission_mode,
+                        max_turns, [t.strip() for item in allowed_tools or [] for t in item.split(",") if t.strip()])
         return
     _launch(session, worktree=worktree_name or ("" if worktree else None))
 
@@ -69,12 +83,17 @@ def _enter_session_dir(session: str, interactive: bool) -> None:
         os.chdir(working_dir)
 
 
-def _run_print_mode(session: str | None, prompt: str, output_json: bool, quiet: bool, permission_mode: str | None) -> None:
+def _run_print_mode(session: str | None, prompt: str, output_format: str, quiet: bool, permission_mode: str | None,
+                    max_turns: int | None = None, allowed_tools: list[str] | None = None) -> None:
     """`dostuff -p`: one headless turn. Text piped to stdin is appended to the prompt."""
     import asyncio
     import sys
+    from dostuff.headless import OUTPUT_FORMATS
     if permission_mode is not None and permission_mode not in PERMISSION_MODES:
         typer.echo(f"--permission-mode must be one of: {', '.join(PERMISSION_MODES)}", err=True)
+        raise typer.Exit(code=2)
+    if output_format not in OUTPUT_FORMATS:
+        typer.echo(f"--output-format must be one of: {', '.join(OUTPUT_FORMATS)}", err=True)
         raise typer.Exit(code=2)
     stdin_is_tty = sys.stdin is not None and sys.stdin.isatty()
     piped = "" if stdin_is_tty or sys.stdin is None else sys.stdin.read()
@@ -91,7 +110,8 @@ def _run_print_mode(session: str | None, prompt: str, output_json: bool, quiet: 
     try:
         code = asyncio.run(run_headless(
             prompt, session_id=session, permission_mode=permission_mode,  # type: ignore[arg-type]
-            output_json=output_json, quiet=quiet,
+            output_format=output_format, quiet=quiet,  # type: ignore[arg-type]
+            max_turns=max_turns, allowed_tools=allowed_tools,
             # Approval prompts need a terminal on both ends; piped stdin is already consumed
             interactive=stdin_is_tty and sys.stderr.isatty(),
         ))
@@ -171,7 +191,7 @@ def init(force: bool = typer.Option(False, "--force", help="Overwrite an existin
 #     active: false
 
 # permissions:
-#   mode: "ask"        # ask | allowlist | auto
+#   mode: "ask"        # ask | allowlist | auto | plan
 #   allow: []          # shell patterns auto-approved in allowlist mode, e.g. "npm test"
 
 # tracing:
@@ -210,51 +230,21 @@ def config():
 @app.command()
 def doctor():
     """Check config, API key, MCP and data dir; print a fix for each problem."""
-    from pathlib import Path
     from dostuff import __version__
-    from dostuff.config import get_config
-    from dostuff.helpers.mcp.load_mcp_config import mcp_config_sources, read_mcp_file
-    from dostuff.setup_wizard import mark, missing_api_keys
-
-    cfg = get_config()
-    problems = 0
-
-    def check(ok: bool, label: str, fix: str = "") -> None:
-        nonlocal problems
-        typer.secho(f"  {mark(ok)} {label}", fg=typer.colors.GREEN if ok else typer.colors.RED)
-        if not ok:
-            problems += 1
-            if fix:
-                typer.echo(f"      -> {fix}")
-
-    def info(label: str) -> None:
-        typer.echo(f"  - {label}")
+    from dostuff.helpers.ui.doctor import doctor_checks
+    from dostuff.setup_wizard import mark
 
     typer.echo(f"dostuff {__version__}")
-    check(cfg.global_path.exists(), f"Global config: {cfg.global_path}", "run `dostuff setup`")
-    proj = Path.cwd() / ".dostuff" / "config.yaml"
-    info(f"Project config: {proj}" + ("" if proj.exists() else " (none; `dostuff init` creates one)"))
-    for env_path in (cfg.global_path.parent / ".env", Path.cwd() / ".dostuff" / ".env"):
-        info(f".env: {env_path}" + ("" if env_path.exists() else " (none)"))
-    model = cfg.model_name
-    missing = missing_api_keys(model)
-    check(not missing, f"Model: {model}" + (f" (missing {', '.join(missing)})" if missing else ""),
-          f"run `dostuff setup`, or add {missing[0]}=... to {cfg.global_path.parent / '.env'}" if missing else "")
-    servers: dict = {}
-    for source in mcp_config_sources():
-        try:
-            servers.update(read_mcp_file(source))
-        except Exception as e:
-            check(False, f"MCP config could not be read: {source}: {e}", "fix the JSON in that file")
-    info(f"MCP servers: {len(servers)} (`dostuff mcp list`)" if servers else "MCP servers: none configured (optional; `dostuff mcp add`)")
-    info(f"Data dir: {cfg.data_dir}" + ("" if cfg.data_dir.exists() else " (created on first run)"))
-    from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT, chroma_available, embedding_model_missing
-    if not chroma_available():
-        info(f"Long-term memory: off, chromadb not installed (optional; `{MEMORY_INSTALL_HINT}`)")
-    else:
-        info("Memory embedding model: " + ("not downloaded yet (~80 MB; the TUI fetches it on first start)"
-                                           if embedding_model_missing() else "downloaded"))
-    info(f"Permission mode: {cfg.permission_mode}")
+    problems = 0
+    for check in doctor_checks():
+        if check.ok is None:
+            typer.echo(f"  - {check.label}")
+            continue
+        typer.secho(f"  {mark(check.ok)} {check.label}", fg=typer.colors.GREEN if check.ok else typer.colors.RED)
+        if not check.ok:
+            problems += 1
+            if check.fix:
+                typer.echo(f"      -> {check.fix}")
     if problems:
         typer.echo(f"\n{problems} problem(s) found.")
         raise typer.Exit(code=1)

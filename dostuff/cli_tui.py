@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Literal
 from textual.app import App, ComposeResult
 from textual.message import Message
 from textual.timer import Timer
@@ -27,8 +27,8 @@ from rich.text import Text
 from rich.markdown import Markdown as RichMarkdown
 from textual.events import Key, Paste, TextSelected
 from dostuff import __version__
-from dostuff.config import STATUS_BAR_ITEMS, get_config
-from dostuff.agent.permissions import PERMISSION_MODES, ApprovalReply, SessionPermissions, parse_answer
+from dostuff.config import NOTIFY_KINDS, STATUS_BAR_ITEMS, get_config, parse_compact_threshold
+from dostuff.agent.permissions import PERMISSION_MODES, ApprovalReply, SessionPermissions, next_mode, parse_answer
 from dostuff.agent.instructions import build_base_instructions, build_turn_instructions
 from dostuff.helpers.agent.constants import COMMAND_DESCRIPTIONS, COMMAND_FLAGS
 from dostuff.helpers.memory.export_session import session_to_markdown
@@ -44,15 +44,22 @@ from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_pa
                                                  format_mention, mention_candidates, strip_attachments)
 from dostuff.helpers.agent.model_cost import format_cost
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
+from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
+from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
+from dostuff.helpers.ui.doctor import doctor_checks
 from dostuff.helpers.agent.slash_suggestion import slash_suggestion
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
 from dostuff.helpers.mcp.load_mcp_config import load_mcp_config, mcp_config_sources, read_mcp_file
+from dostuff.helpers.skills.custom_commands import discover_commands
 from dostuff.helpers.skills.skill_command import parse_skill_command, skill_commands, skill_prompt
 from dostuff.setup_wizard import PROVIDERS, missing_api_keys, read_template
 from dostuff.helpers.models.add_model_entry import ModelConfigError, add_model_entry
-from dostuff.helpers.models.list_models import ModelListError, provider_models
+from dostuff.helpers.models.list_models import FETCHED_PROVIDERS, ModelListError, provider_models
 from dostuff.helpers.ui.emit import set_adapter
 from dostuff.helpers.ui.prompt_history import append_history, load_history
+from dostuff.helpers.ui.terminal_signals import (
+    PUSH_TITLE, TitleState, format_title, notification_sequence, restore_title_sequence, should_notify, title_sequence,
+)
 from dostuff.tools.settings import (Scope, SettingsKind, mcp_path, new_settings_text, save_settings_file,
                                     settings_file)
 
@@ -68,6 +75,8 @@ SHELL_PREVIEW_LINES = 40
 PREVIEW_CHARS_PER_LINE = 200  # preview char budget = lines * this, so one giant line can't flood the screen
 PICKER_MAX_SESSIONS = 9  # /resume picker: number keys reach every option
 PICKER_MAX_VISIBLE = 10  # longer option lists scroll with the cursor
+EDIT_PROMPT_ESC_SECONDS = 1.5  # Esc, then Esc again within this, takes back the last prompt
+HISTORY_SEARCH_MAX = 500  # Ctrl+R: newest prompts offered
 SKILL_MENU_DESCRIPTION_CHARS = 100  # skill descriptions can be paragraphs; the "/" menu shows the start
 TODO_RESULT_PREFIX = "todo_write: "  # loop() emits results as "<tool>: <result>"
 # Gemini sends reasoning as whole summary paragraphs ~1 s apart; each new chunk is typed out
@@ -469,6 +478,9 @@ class PermissionPrompt(Static, can_focus=True):
 # Shift+Enter needs a terminal that reports it (kitty keyboard protocol, e.g. kitty, WezTerm,
 # Ghostty); elsewhere it arrives as plain Enter, so the others stay as fallbacks.
 NEWLINE_KEYS = {"shift+enter", "ctrl+enter", "alt+enter", "ctrl+j"}
+# Windows (VT input) sends Backspace as DEL and Ctrl+Backspace as ^H; Textual names both "backspace".
+# Elsewhere some terminals send ^H for plain Backspace, so it's only remapped on Windows.
+CTRL_H_DELETES_WORD = sys.platform == "win32"
 
 
 class EnterSubmits(TextArea):
@@ -484,6 +496,9 @@ class EnterSubmits(TextArea):
     A slash command being typed shows the rest of it (or its flag, e.g. /model --active) as
     dim ghost text after the cursor; Tab or Right accepts it.
     """
+
+    # Ctrl+W / Ctrl+Backspace / Alt+Backspace delete the previous word (TextArea's own bindings)
+    BINDINGS = [Binding("ctrl+delete", "delete_word_right", "Delete word right", show=False)]
 
     class Submitted(Message):
         """Sent when user presses Enter."""
@@ -610,6 +625,12 @@ class EnterSubmits(TextArea):
             event.prevent_default()
             self.insert("\n")
             return
+        if event.key == "backspace" and event.character == "\x08" and CTRL_H_DELETES_WORD:
+            event.stop()
+            event.prevent_default()
+            if not self.read_only:
+                self.action_delete_word_left()
+            return
         row = self.cursor_location[0]
         if (event.key == "up" and row == 0 and self._recall(-1)) or (
                 event.key == "down" and row == self.document.line_count - 1 and self._recall(1)):
@@ -629,8 +650,11 @@ class EnterSubmits(TextArea):
         await super()._on_key(event)
 
 
+EditorKind = Literal["config", "mcp", "memory"]  # memory: an AGENTS.md (scope "user" = the global one)
+
+
 class SettingsEditor(TextArea):
-    """/config's editor for one whole settings file, shown in place of the conversation and input.
+    """/config's (and /memory's) editor for one whole file, shown in place of the conversation and input.
 
     Ctrl+S saves (an invalid file stays open with the error); ESC is the app's cancel binding,
     which closes it, asking for a second ESC when there are unsaved changes.
@@ -641,10 +665,11 @@ class SettingsEditor(TextArea):
     class Save(Message):
         pass
 
-    def __init__(self, text: str, kind: SettingsKind, scope: Scope, **kwargs: Any) -> None:
-        super().__init__(text, language="yaml" if kind == "config" else "json", soft_wrap=False,
+    def __init__(self, text: str, kind: EditorKind, scope: Scope, **kwargs: Any) -> None:
+        language = {"config": "yaml", "mcp": "json", "memory": "markdown"}[kind]
+        super().__init__(text, language=language, soft_wrap=kind == "memory",
                          tab_behavior="indent", show_line_numbers=True, **kwargs)
-        self.kind: SettingsKind = kind
+        self.kind: EditorKind = kind
         self.scope: Scope = scope
         self.saved_text = text
         self.discard_armed = False  # ESC once with unsaved changes; the next ESC discards them
@@ -786,6 +811,7 @@ class TuiAdapter:
             self._confirm_event = evt
             self._app._mount_message(Static(_confirm_text(details), classes="msg msg-confirm", markup=False))
             self._app._show_permission_prompt(question, options)
+            self._app._approval_waiting(question)
             try:
                 await evt.wait()
             finally:
@@ -793,6 +819,7 @@ class TuiAdapter:
                 self._feedback_mode = False
                 self._confirm_event = None
                 self._app._hide_permission_prompt()
+                self._app._set_title("running")
             reply = self._confirm_reply or ApprovalReply("no")
             self._confirm_reply = None
             return reply
@@ -892,6 +919,8 @@ class DostuffTUI(App):
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("escape", "cancel", "Cancel", priority=True),
         Binding("ctrl+o", "toggle_tool_results", "Expand tool output", priority=True),
+        Binding("shift+tab", "cycle_permission_mode", "Cycle permission mode", priority=True),
+        Binding("ctrl+r", "history_search", "Search prompt history", priority=True),
     ]
 
     # ── Setup ──────────────────────────────────────────────────────────────────
@@ -950,7 +979,8 @@ class DostuffTUI(App):
         self.permissions = SessionPermissions()
         self._draft_before_feedback = ""  # input text set aside while it takes denial feedback
         self._picker_callback: Callable[[str], Awaitable[None]] | None = None
-        self._skill_commands: dict[str, dict[str, Any]] = {}  # "/name" → skill (helpers/skills/skill_command.py)
+        # "/name" → skill or custom command (helpers/skills/skill_command.py)
+        self._skill_commands: dict[str, dict[str, Any]] = {}
         self._mcp_configured: list[str] = []
         self._mcp_server_configs: dict[str, dict] = {}  # as connected; diffed when the settings change
         self._tool_results_expanded = False  # Ctrl+O; new results follow it
@@ -958,6 +988,12 @@ class DostuffTUI(App):
         self._pastes = PasteStore()  # collapsed pastes in the input (helpers/agent/pastes.py)
         self.worktree: Worktree | None = None  # set while the cwd is a dostuff git worktree
         self.exit_note = ""  # printed by cli.py after the TUI closes (e.g. a kept worktree)
+        self._notify_kind = self.config.notifications  # /notifications changes it for the session
+        self._title_state: TitleState = "idle"
+        self._title_pushed = False
+        self._last_escape = 0.0  # time.monotonic() of an Esc with nothing to cancel (Esc Esc edits the last prompt)
+        # (session id, steps_history index) → the prompt as typed, before @mentions / skills expanded it
+        self._sent_prompts: dict[tuple[str, int], str] = {}
 
     # ── Compose UI ─────────────────────────────────────────────────────────────
 
@@ -1013,11 +1049,46 @@ class DostuffTUI(App):
         text = self.screen.get_selected_text()
         if text:
             _copy_to_clipboard(self, text)
-            inp = self.query_one("#input", EnterSubmits)
-            inp.border_title = f"copied {len(text)} characters"
-            if self._copy_hint_timer is not None:
-                self._copy_hint_timer.stop()
-            self._copy_hint_timer = self.set_timer(2, lambda: setattr(inp, "border_title", None))
+            self._flash_input_hint(f"copied {len(text)} characters")
+
+    def _flash_input_hint(self, text: str, seconds: float = 2) -> None:
+        """A dim note on the right of the input's top border, cleared after `seconds`."""
+        inp = self.query_one("#input", EnterSubmits)
+        inp.border_title = text
+        if self._copy_hint_timer is not None:
+            self._copy_hint_timer.stop()
+        self._copy_hint_timer = self.set_timer(seconds, lambda: setattr(inp, "border_title", None))
+
+    # ── Terminal title and notifications ───────────────────────────────────────
+
+    def _write_terminal(self, sequence: str) -> None:
+        if sequence and not self.is_headless and self._driver is not None:
+            self._driver.write(sequence)
+
+    def _set_title(self, state: TitleState) -> None:
+        """Run status in the terminal tab title (ui.terminal_title); the old title is saved first."""
+        self._title_state = state
+        if not self.config.terminal_title:
+            return
+        if not self._title_pushed:
+            self._title_pushed = True
+            self._write_terminal(PUSH_TITLE)
+        self._write_terminal(title_sequence(format_title(state, Path.cwd().name)))
+
+    def _restore_title(self) -> None:
+        if self._title_pushed:
+            self._title_pushed = False
+            self._write_terminal(restore_title_sequence())
+
+    def _notify(self, message: str, elapsed: float) -> None:
+        """Bell / OSC 9 (ui.notifications, /notifications) if the terminal is unfocused or the wait was long."""
+        if should_notify(self._notify_kind, elapsed, self.config.notify_after_seconds, self.app_focus):
+            self._write_terminal(notification_sequence(self._notify_kind, message))
+
+    def _approval_waiting(self, question: str) -> None:
+        self._set_title("waiting")
+        started = self._turn_start_time
+        self._notify(f"dostuff: approval needed: {question}", time.time() - started if started else 0.0)
 
     def _start_worker(self, work, name: str) -> Worker:
         worker = self.run_worker(work, name=name, exit_on_error=False)
@@ -1081,13 +1152,15 @@ class DostuffTUI(App):
         else:
             self._append(f" New session '{self.session_id}'.")
 
-        self._skill_commands = skill_commands(skills)
+        custom = await asyncio.to_thread(discover_commands)
+        self._skill_commands = skill_commands(skills, custom)
         menu_commands = dict(COMMAND_DESCRIPTIONS)
         for command, skill in self._skill_commands.items():
             description = " ".join(str(skill.get("description", "")).split())
             if len(description) > SKILL_MENU_DESCRIPTION_CHARS:
                 description = description[:SKILL_MENU_DESCRIPTION_CHARS - 1] + "…"
-            menu_commands[command] = f"(skill) {description}".rstrip()
+            kind = f"{skill['scope']} command" if skill.get("kind") == "command" else "skill"
+            menu_commands[command] = f"({kind}) {description}".rstrip()
         self.query_one("#command-menu", CommandMenu).commands = menu_commands
         inp.commands = menu_commands
         if skills:
@@ -1095,6 +1168,8 @@ class DostuffTUI(App):
             self._append(f"Skills loaded: {len(skills)} — {skill_names}", msg_type="system")
         else:
             self._append("Skills loaded: 0 (add to .dostuff/skills/ or ~/.agents/skills/)", msg_type="system")
+        if custom:
+            self._append(f"Custom commands: {', '.join('/' + c['name'] for c in custom)}", msg_type="system")
 
         if self.config.permission_mode == "auto":
             self._append(
@@ -1612,7 +1687,7 @@ class DostuffTUI(App):
 
     async def _pick_model_to_add(self, provider: str, active: bool) -> None:
         """Second step of /model: the provider's models, filterable; a typed name is used as given."""
-        if provider in ("ollama", "openrouter"):
+        if provider in FETCHED_PROVIDERS:
             self._append(f"Fetching {provider} models...", msg_type="system")
         try:
             models = await asyncio.to_thread(provider_models, provider)
@@ -1677,7 +1752,21 @@ class DostuffTUI(App):
         "ask": "ask        every write / delete / shell / MCP / web fetch call asks",
         "allowlist": "allowlist  as ask, plus config's permissions.allow patterns run without asking",
         "auto": "auto       nothing asks (not recommended)",
+        "plan": "plan       read-only: the agent investigates and answers with a plan, no changes",
     }
+    _MODE_HINTS = {
+        "ask": "ask mode", "allowlist": "allowlist mode", "auto": "auto mode: nothing asks",
+        "plan": "plan mode: read-only",
+    }
+
+    def action_cycle_permission_mode(self) -> None:
+        """Shift+Tab: next permission mode for this session (ask → auto → plan → allowlist)."""
+        if self._settings_open() or self._picker_open():
+            return
+        mode = next_mode(self.permissions.mode or self.config.permission_mode)
+        self.permissions.mode = mode  # type: ignore[assignment]
+        self._update_status()
+        self._flash_input_hint(self._MODE_HINTS[mode] + " · shift+tab to change", seconds=3)
 
     def _permissions_command(self, arg: str) -> None:
         """/permissions: pick a permission mode; /permissions <mode> switches directly (session only)."""
@@ -1701,8 +1790,60 @@ class DostuffTUI(App):
         )
         if mode == "auto":
             self._append("⚠ Every tool call (shell, writes, deletes, MCP, web fetches) now runs WITHOUT asking.", msg_type="error")
+        elif mode == "plan":
+            self._append("Plan mode: file changes and non-read-only shell commands are denied; the agent answers with a plan.", msg_type="system")
         elif mode == "allowlist" and not self.config.permission_allow:
             self._append("permissions.allow in config.yaml is empty, so allowlist behaves like ask.", msg_type="system")
+
+    def _compact_auto_command(self, arg: str) -> None:
+        """/compact auto <N|off>: the auto-compaction threshold for this session."""
+        if not arg:
+            current = self.config.compact_threshold
+            self._append(f"Auto-compact: {f'at {current}% of the context window' if current else 'off'}. "
+                         "Usage: /compact auto <1-100|off>", msg_type="system")
+            return
+        try:
+            percent = parse_compact_threshold(arg)
+        except ValueError:
+            self._append("Usage: /compact auto <1-100|off>", msg_type="error")
+            return
+        self.config.session_compact_threshold = (percent,)
+        self._append(
+            (f"Auto-compact at {percent}% of the context window" if percent else
+             "Auto-compact off (the context is still compacted if the window overflows; /compact runs it by hand)")
+            + " for this session. Set loop.auto_compact_threshold in config.yaml to change the default.",
+            msg_type="system",
+        )
+
+    def _notifications_command(self, arg: str) -> None:
+        """/notifications [on|off|bell|osc9]: notify when a turn finishes or an approval waits (session only)."""
+        if not arg:
+            self._append(f"Notifications: {self._notify_kind}. Usage: /notifications on|off|bell|osc9 "
+                         "(ui.notifications in config.yaml sets the default).", msg_type="system")
+            return
+        kind = {"on": self.config.notifications if self.config.notifications != "off" else "bell"}.get(arg, arg)
+        if kind not in NOTIFY_KINDS:
+            self._append("Usage: /notifications on|off|bell|osc9", msg_type="error")
+            return
+        self._notify_kind = kind
+        if kind == "off":
+            self._append("Notifications off for this session.", msg_type="system")
+            return
+        how = "terminal bell" if kind == "bell" else "OSC 9 desktop notification"
+        self._append(f"Notifications on ({how}) for this session: when a turn takes over "
+                     f"{self.config.notify_after_seconds:g}s or the terminal is in the background, and when an "
+                     "approval is waiting.", msg_type="system")
+
+    def _copy_last_answer(self) -> None:
+        """/copy: the model's last answer to the clipboard."""
+        answer = next((s.get("content") for s in reversed(self.steps_history)
+                       if isinstance(s, dict) and s.get("role") == "assistant" and not s.get("tool_calls")
+                       and isinstance(s.get("content"), str) and s["content"].strip()), None)
+        if not answer:
+            self._append("No answer to copy yet.", msg_type="error")
+            return
+        _copy_to_clipboard(self, answer)
+        self._flash_input_hint(f"copied last answer ({len(answer)} characters)")
 
     # ── /config: edit a settings file in place ─────────────────────────────────
 
@@ -1734,13 +1875,16 @@ class DostuffTUI(App):
         self._show_picker("Edit which settings file? (API keys stay in .env files)", options, self._open_settings)
 
     async def _open_settings(self, target: str) -> None:
-        """target: "config:user", "mcp:project", … (the /config picker's values)."""
-        kind: SettingsKind = "mcp" if target.startswith("mcp:") else "config"
+        """target: "config:user", "mcp:project", "memory:project", … (the /config and /memory pickers' values)."""
+        name = target.split(":", 1)[0]
+        kind: EditorKind = name if name in ("mcp", "memory") else "config"  # type: ignore[assignment]
         scope: Scope = "project" if target.endswith(":project") else "user"
-        path = settings_file(kind, scope)
+        path = self._editor_path(kind, scope)
         try:
-            text = await asyncio.to_thread(path.read_text, encoding="utf-8") if path.is_file() \
-                else new_settings_text(kind, scope)
+            if path.is_file():
+                text = await asyncio.to_thread(path.read_text, encoding="utf-8")
+            else:
+                text = "" if kind == "memory" else new_settings_text(kind, scope)
         except OSError as e:
             self._append(f"Could not read {path}: {e}", msg_type="error")
             return
@@ -1759,6 +1903,54 @@ class DostuffTUI(App):
         await self.mount(panel, before="#input")
         editor.focus()
 
+    @staticmethod
+    def _editor_path(kind: EditorKind, scope: Scope) -> Path:
+        if kind == "memory":
+            return memory_file("global" if scope == "user" else "project")
+        return settings_file(kind, scope)
+
+    def _reload_instructions(self) -> None:
+        """Rebuild the system prompt, e.g. after an AGENTS.md change, so the next message sees it."""
+        self._system_instructions, _ = build_base_instructions()
+
+    # ── /memory and `# note`: the AGENTS.md instruction files ──────────────────
+
+    def _memory_targets(self) -> list[tuple[str, str]]:
+        options = []
+        for scope, label in (("project", "Project: this directory"), ("global", "Global: all projects")):
+            path = memory_file(scope)  # type: ignore[arg-type]
+            missing = "" if path.is_file() else ", not created yet"
+            options.append((scope, f"{label}  ({str(path).replace(str(Path.home()), '~')}{missing})"))
+        return options
+
+    def _memory_command(self, arg: str) -> None:
+        """/memory: pick the project or global AGENTS.md; /memory project|global opens one in the editor."""
+        scope = {"project": "project", "global": "user", "user": "user"}.get(arg.lower())
+        if arg and scope is None:
+            self._append("Usage: /memory [project|global]", msg_type="error")
+            return
+        if scope:
+            self._start_worker(self._open_settings(f"memory:{scope}"), name="memory")
+            return
+
+        async def choose(value: str) -> None:
+            await self._open_settings(f"memory:{'user' if value == 'global' else 'project'}")
+        self._show_picker("Edit which instructions file?", self._memory_targets(), choose)
+
+    def _quick_memory(self, note: str) -> None:
+        """`# note`: ask project or global, then append the note to that AGENTS.md."""
+        async def save(scope: str) -> None:
+            path = memory_file(scope)  # type: ignore[arg-type]
+            try:
+                await asyncio.to_thread(append_memory, path, note)
+            except OSError as e:
+                self._append(f"Could not save to {path}: {e}", msg_type="error")
+                return
+            self._reload_instructions()
+            self._append(f"Saved to {str(path).replace(str(Path.home()), '~')}: - {note}  (/memory edits it)",
+                         msg_type="system")
+        self._show_picker(f"Save \"{note[:60]}\" to which instructions file?", self._memory_targets(), save)
+
     def _settings_open(self) -> bool:
         return bool(self.query("#settings-panel"))
 
@@ -1773,7 +1965,14 @@ class DostuffTUI(App):
             self._close_settings()
             return
         try:
-            summary = save_settings_file(editor.kind, editor.scope, editor.text, adapter=self.adapter)
+            if editor.kind == "memory":
+                path = self._editor_path("memory", editor.scope)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(editor.text, encoding="utf-8")
+                self._reload_instructions()
+                summary = f"Saved {str(path).replace(str(Path.home()), '~')}; the agent follows it from the next message."
+            else:
+                summary = save_settings_file(editor.kind, editor.scope, editor.text, adapter=self.adapter)
         except (ValueError, OSError) as e:
             self._settings_status(f"Not saved: {e}", error=True)
             return
@@ -1822,6 +2021,10 @@ class DostuffTUI(App):
             ("Cost", format_cost(self.adapter._session_cost) if self.adapter._session_cost
                      else "n/a (nothing priced yet, or litellm has no price for this model)"),
             ("Context", f"{self._fmt_tokens(last_input)} / {self._fmt_tokens(token_limit)}{percent}"),
+            ("Auto-compact", (f"at {t}% of the window" if (t := self.config.compact_threshold) else "off")
+             + ("  (this session; /compact auto)" if self.config.session_compact_threshold else "")),
+            ("Notifications", (f"{self._notify_kind} after {self.config.notify_after_seconds:g}s or in the background"
+                               if self._notify_kind != "off" else "off") + "  (/notifications)"),
             ("Steps", str(len(self.steps_history))),
             ("MCP", f"{len(connected)}/{len(self._mcp_configured)} connected" + (f": {', '.join(connected)}" if connected else "")),
             ("Status bar", (", ".join(self.config.status_bar_items) or "(empty)") + "  (ui.status_bar in config.yaml)"),
@@ -1829,6 +2032,55 @@ class DostuffTUI(App):
         ]
         width = max(len(k) for k, _ in rows) + 2
         self._append("\n".join(f"  {k.ljust(width)}{v}" for k, v in rows), msg_type="system")
+
+    async def _show_context(self) -> None:
+        """/context: estimated tokens per part of the next request (system prompt, tools, messages...)."""
+        if not await self._wait_for_backend():
+            return
+        from dostuff.helpers.agent.environment_context import build_environment_block
+        from dostuff.helpers.agent.load_project_instructions import load_project_instructions
+        from dostuff.lib.model import get_litellm_model
+        from dostuff.tools.definitions import TOOL_SCHEMAS, default_tool_names
+        try:
+            meta = await self.store.get_session_meta(self.session_id) or {}
+            messages = await self.store.load_working_history(self.session_id)
+            model = get_litellm_model()
+
+            def measure() -> list[tuple[str, int]]:
+                return context_parts(
+                    self._system_instructions + "\n\n" + build_environment_block(),
+                    load_project_instructions(),
+                    {name: TOOL_SCHEMAS[name] for name in default_tool_names()},
+                    messages,
+                    meta.get("compaction_notes") or "",
+                    lambda text: count_tokens(text, model),
+                )
+            parts = await asyncio.to_thread(measure)
+            text = render_context(parts, get_model_token_limit(), get_model(), meta.get("last_input_tokens") or 0)
+        except Exception as e:
+            self._append(f"Could not measure the context: {e}", msg_type="error")
+            return
+        self._mount_message(Static(text, classes="msg msg-system", markup=False))
+
+    async def _show_doctor(self) -> None:
+        """/doctor: the `dostuff doctor` checks, ✓ / ✗ with a fix for each problem."""
+        try:
+            checks = await asyncio.to_thread(doctor_checks)
+        except Exception as e:
+            self._append(f"Doctor failed: {e}", msg_type="error")
+            return
+        text = Text(f"dostuff {__version__}\n")
+        for check in checks:
+            if check.ok is None:
+                text.append(f"  - {check.label}\n", style="#8a8a8a")
+                continue
+            text.append(f"  {'✓' if check.ok else '✗'} {check.label}\n", style="#98c379" if check.ok else "#e06c75")
+            if not check.ok and check.fix:
+                text.append(f"      → {check.fix}\n", style="#e5c07b")
+        problems = sum(1 for c in checks if c.ok is False)
+        text.append(f"{problems} problem(s) found." if problems else "All good.",
+                    style="#e06c75" if problems else "#98c379")
+        self._mount_message(Static(text, classes="msg msg-system", markup=False))
 
     async def _rename_session(self, title: str) -> None:
         try:
@@ -1947,10 +2199,15 @@ class DostuffTUI(App):
                 return
             self._start_worker(self._run_shell_command(command), name="shell")
             return
+        note = quick_memory_text(text)
+        if note is not None:
+            self._quick_memory(note)
+            return
         if cmd == "/exit":
             self.run_worker(self.action_quit(), name="exit_worker", exit_on_error=False)
             return
-        if cmd in ("/clear", "/compact") and self._turn_in_progress:
+        if (cmd in ("/clear", "/compact") or (cmd.startswith("/compact ") and cmd.split()[1:2] != ["auto"])) \
+                and self._turn_in_progress:
             self._append(f"Can't run {cmd} while a turn is running (press ESC to cancel it first).", msg_type="error")
             return
         if cmd == "/clear":
@@ -1959,12 +2216,15 @@ class DostuffTUI(App):
         if cmd == "/compact":
             self._start_worker(self._compact_session(), name="compact")
             return
+        if cmd.split()[:2] == ["/compact", "auto"]:
+            self._compact_auto_command(" ".join(cmd.split()[2:]))
+            return
         if cmd == "/memories":
             self._start_worker(self._show_memories(), name="memories")
             return
         name, _, arg = text.strip().partition(" ")
         name, arg = name.lower(), arg.strip()
-        if name in ("/resume", "/model", "/fork", "/worktree", "/config") and self._turn_in_progress:
+        if name in ("/resume", "/model", "/fork", "/worktree", "/config", "/memory") and self._turn_in_progress:
             self._append(f"Can't run {name} while a turn is running (press ESC to cancel it first).", msg_type="error")
             return
         if name == "/resume":
@@ -1982,8 +2242,23 @@ class DostuffTUI(App):
         if name == "/permissions":
             self._permissions_command(arg)
             return
+        if name == "/copy" and not arg:
+            self._copy_last_answer()
+            return
+        if name == "/notifications":
+            self._notifications_command(arg.lower())
+            return
         if name == "/config":
             self._config_command(arg)
+            return
+        if name == "/memory":
+            self._memory_command(arg)
+            return
+        if name == "/context" and not arg:
+            self._start_worker(self._show_context(), name="context")
+            return
+        if name == "/doctor" and not arg:
+            self._start_worker(self._show_doctor(), name="doctor")
             return
         if name == "/status" and not arg:
             self._start_worker(self._show_status(), name="status")
@@ -2018,14 +2293,22 @@ class DostuffTUI(App):
         if cmd == "/help":
             width = max(len(c) for c in COMMAND_DESCRIPTIONS) + 4
             commands = "\n".join(f"  {c.ljust(width)}{desc}" for c, desc in COMMAND_DESCRIPTIONS.items())
-            skills = "".join(f"\n  {c}" for c in self._skill_commands)
+            custom = "".join(f"\n  {c}  ({_rel_path(s['location'])})" for c, s in self._skill_commands.items()
+                             if s.get("kind") == "command")
+            if custom:
+                custom = f"\n\nCustom commands (/<name> [arguments]; $ARGUMENTS in the file is replaced):{custom}"
+            skills = "".join(f"\n  {c}" for c, s in self._skill_commands.items() if s.get("kind") != "command")
             if skills:
                 skills = f"\n\nSkills (/<skill> [arguments] runs one):{skills}"
             self._append(
-                f"Commands:\n{commands}{skills}\n\n"
-                "  !<command>   Run a shell command directly; its output is added to the conversation\n\n"
+                f"Commands:\n{commands}{custom}{skills}\n\n"
+                "  !<command>   Run a shell command directly; its output is added to the conversation\n"
+                "  # <note>     Add a line to AGENTS.md (project or global), which the agent follows\n\n"
                 "Shortcuts: ESC cancel turn · Ctrl+Q quit · Shift+Enter (or \\ then Enter) newline · "
-                "Ctrl+O expand/collapse tool output (or click one) · / command menu",
+                "Shift+Tab cycle permission mode (ask → auto → plan → allowlist) · "
+                "Ctrl+Backspace / Ctrl+W delete word · Ctrl+Delete delete next word · "
+                "Ctrl+O expand/collapse tool output (or click one) · Ctrl+R search prompt history · "
+                "Esc Esc (empty input) edit the previous prompt · / command menu",
                 msg_type="system",
             )
             return
@@ -2157,6 +2440,7 @@ class DostuffTUI(App):
         self._turn_in_progress = True
         self._append(f"! {command}", msg_type="shell")
         loader_widget = self._show_loader("Running... (ESC to cancel)")
+        self._set_title("running")
         self._turn_start_time = time.time()
         self._start_timer()
         self.adapter._cancelled = False
@@ -2204,6 +2488,7 @@ class DostuffTUI(App):
             self._turn_start_time = None
             self._turn_in_progress = False
             self._stop_loader(loader_widget)
+            self._set_title("done")
             self._process_prompt_queue()
 
     # ── One agent turn ─────────────────────────────────────────────────────────
@@ -2238,10 +2523,12 @@ class DostuffTUI(App):
                 try:
                     content = await asyncio.to_thread(skill_prompt, skill_run[0], content)
                 except OSError as e:
-                    self._append(f"Could not read skill /{skill_run[0]['name']}: {e}", msg_type="error")
+                    self._append(f"Could not read /{skill_run[0]['name']}: {e}", msg_type="error")
                     return
-                self._append(f"Running skill {skill_run[0]['name']} ({_rel_path(skill_run[0]['location'])})",
+                what = "command" if skill_run[0].get("kind") == "command" else "skill"
+                self._append(f"Running {what} {skill_run[0]['name']} ({_rel_path(skill_run[0]['location'])})",
                              msg_type="system")
+            self._sent_prompts[(self.session_id, len(self.steps_history))] = user_text
             await append_step(
                 {"role": "user", "content": content},
                 self.steps_history,
@@ -2255,6 +2542,7 @@ class DostuffTUI(App):
             dynamic_instructions = await self._build_instructions(user_text)
 
             loader_widget = self._show_loader("Working... (ESC to cancel)")
+            self._set_title("running")
             self._turn_start_time = time.time()
             self._start_timer()
             # Reset cancel state for new turn
@@ -2300,6 +2588,9 @@ class DostuffTUI(App):
             self._stop_loader(loader_widget)
             if started is not None:
                 self._append_turn_summary(time.time() - started)
+                self._set_title("done")
+                if not self.adapter._cancelled and not self._prompt_queue:
+                    self._notify("dostuff: turn finished", time.time() - started)
             self._render_status()  # session cost changed
             self._process_prompt_queue()
 
@@ -2443,12 +2734,95 @@ class DostuffTUI(App):
             self._close_settings()
             return
         if not self._turn_in_progress and not self.adapter.has_pending_confirm():
-            return  # nothing to cancel; a stale flag would cancel the next turn's first step
+            # Nothing to cancel (a stale flag would cancel the next turn's first step); Esc Esc
+            # with an empty input takes back the last prompt
+            self._escape_when_idle()
+            return
         self.adapter._cancelled = True
         self.adapter._cancel_event.set()
         self.adapter.deny_pending_confirm()
         self._loader_label = "Cancelling..."
         self._render_loader()
+
+    # ── Esc Esc: edit the previous prompt · Ctrl+R: search prompt history ──────
+
+    def _last_prompt_index(self) -> int | None:
+        """Index in steps_history of the last prompt the user sent (not a `!` command or a note)."""
+        for i in range(len(self.steps_history) - 1, -1, -1):
+            step = self.steps_history[i]
+            content = step.get("content") if isinstance(step, dict) else None
+            if (step.get("role") == "user" and isinstance(content, str) and content != EMPTY_RESPONSE_NUDGE
+                    and not content.startswith("[/undo]") and _parse_shell_step(content) is None):
+                return i
+        return None
+
+    def _escape_when_idle(self) -> None:
+        inp = self.query_one("#input", EnterSubmits)
+        if inp.text.strip() or self._last_prompt_index() is None:
+            self._last_escape = 0.0
+            return
+        now = time.monotonic()
+        if now - self._last_escape <= EDIT_PROMPT_ESC_SECONDS:
+            self._last_escape = 0.0
+            self._start_worker(self._edit_previous_prompt(), name="edit_prompt")
+            return
+        self._last_escape = now
+        self._flash_input_hint("Esc again to edit the previous prompt", seconds=EDIT_PROMPT_ESC_SECONDS)
+
+    async def _edit_previous_prompt(self) -> None:
+        """Drop the last prompt and everything after it (answer, tool calls) and put the prompt back
+        in the input. Files the turn changed stay as they are; /undo restores them."""
+        index = self._last_prompt_index()
+        if self._turn_in_progress or index is None:
+            return
+        dropped = self.steps_history[index:]
+        text = self._sent_prompts.get((self.session_id, index)) or strip_attachments(dropped[0]["content"])
+        try:
+            await self.store.drop_last_steps(self.session_id, len(dropped))
+        except Exception as e:
+            self._append(f"Could not remove the last prompt: {e}", msg_type="error")
+            return
+        del self.steps_history[index:]
+        if self.current_session_history:
+            del self.current_session_history[-min(len(dropped), len(self.current_session_history)):]
+        changed_files = any(
+            (tc.get("function") or {}).get("name") in ("write_file", "edit_file", "delete_file")
+            for step in dropped for tc in (step.get("tool_calls") or []) if isinstance(tc, dict)
+        )
+        await self.query_one("#msg-container", Vertical).remove_children()
+        self._render_history()
+        self._append("Took back the last prompt and its answer: edit it and press Enter to send it again."
+                     + (" Files that turn changed are left as they are; /undo restores them." if changed_files else ""),
+                     msg_type="system")
+        inp = self.query_one("#input", EnterSubmits)
+        inp.text = text
+        inp.recalled_text = text  # keep the "/" menu shut for a recalled command
+        inp.move_cursor(inp.document.end)
+
+    def action_history_search(self) -> None:
+        """Ctrl+R: pick a past prompt from this directory's history (type to filter) to put in the input."""
+        if self._settings_open() or self._picker_open() or self.adapter.has_pending_confirm():
+            return
+        inp = self.query_one("#input", EnterSubmits)
+        prompts = list(dict.fromkeys(reversed(inp.prompt_history)))[:HISTORY_SEARCH_MAX]  # newest first, no repeats
+        if not prompts:
+            self._flash_input_hint("no prompt history in this directory yet")
+            return
+
+        def label(prompt: str) -> str:
+            lines = prompt.strip().splitlines() or [""]
+            first = lines[0] if len(lines[0]) <= 100 else lines[0][:99] + "…"
+            return first + (f"  (+{len(lines) - 1} lines)" if len(lines) > 1 else "")
+
+        async def choose(value: str) -> None:
+            index = value[1:] if value.startswith("h") else ""
+            text = prompts[int(index)] if index.isdigit() and int(index) < len(prompts) else value  # else: typed text
+            inp.text = text
+            inp.recalled_text = text
+            inp.move_cursor(inp.document.end)
+
+        self._show_picker("Search prompt history", [(f"h{i}", label(p)) for i, p in enumerate(prompts)], choose,
+                          filterable=True)
 
     # ── Exit ───────────────────────────────────────────────────────────────────
 
@@ -2466,6 +2840,7 @@ class DostuffTUI(App):
         except Exception as e:
             self._append(f"Cleanup error: {e}", msg_type="error")
         finally:
+            self._restore_title()
             self.exit()
 
     async def _cleanup_and_save_session(self) -> None:
@@ -2622,13 +2997,14 @@ class DostuffTUI(App):
         cwd_display = cwd.replace(str(Path.home()), "~")
         cwd_display = cwd_display if len(cwd_display) < 36 else "..." + cwd_display[-33:]
         mode = self.permissions.mode or self.config.permission_mode
+        mode_style = {"auto": "bold #e06c75", "plan": "bold #8ab4f8"}.get(mode, "")
         cost = self.adapter._session_cost
         items: dict[str, list[Text]] = {
             "help": [Text("/help")],
             "cwd": [Text(cwd_display), Text(Path(cwd).name or cwd_display)],
             "session": [Text(self.session_id)],
             "model": [Text(get_model()), Text(get_model().split("/")[-1])],
-            "mode": [Text(f"{mode} mode", style="bold #e06c75" if mode == "auto" else "")],
+            "mode": [Text(f"{mode} mode", style=mode_style)],
             "tokens": [Text((self.adapter._token_display or " ↑0 ↓0").strip())],
             "cost": [Text(format_cost(cost))] if cost else [],
             "context": [Text(p)] if (p := self.adapter._last_context_window_percent) else [],

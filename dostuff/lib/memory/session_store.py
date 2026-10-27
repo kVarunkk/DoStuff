@@ -360,6 +360,20 @@ class SQLiteSessionStore(SessionStore):
         )
         await db.commit()
 
+    async def drop_last_steps(self, session_id: str, count: int) -> None:
+        """Remove the newest `count` steps from the audit trail and the working history (Esc Esc
+        takes back the last prompt). Both got every step appended together, so they end alike."""
+        if count <= 0:
+            return
+        db = await self._conn()
+        for table, order in (("session_steps", "step_order"), ("working_steps", "seq")):
+            await db.execute(
+                f"DELETE FROM {table} WHERE rowid IN "
+                f"(SELECT rowid FROM {table} WHERE session_id = ? ORDER BY {order} DESC LIMIT ?)",
+                (session_id, count),
+            )
+        await db.commit()
+
     async def delete_session(self, session_id: str) -> None:
         """Remove a session's steps, working history and meta row."""
         db = await self._conn()

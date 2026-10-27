@@ -24,6 +24,8 @@ loop:
   paste_file_lines: 200        # TUI pastes longer than this (or over max_tool_output_chars) are saved to .dostuff/pastes/;
                                # the model gets the path + a 20-line preview and reads the rest as needed (0 = always inline)
   paste_retention_days: 7      # paste files older than this are deleted at startup (0 = delete them when dostuff exits)
+  auto_compact_threshold: 50   # summarize older history when the context passes this % of the window (1-100, or off);
+                               # /compact auto <N|off> changes it for a session. Off still compacts if the window overflows.
 
 memory:
   episodic_scope: project   # project: recall past episodes from this directory only | user: from anywhere
@@ -34,6 +36,12 @@ ui:
   # narrow, the least important are dropped first: help, session, cwd, tokens, cost, model, context, mode.
   status_bar: [cwd, model, mode, context]
   paste_collapse_lines: 10  # pastes longer than this show as [Pasted text #1 +N lines] in the input (0 = never)
+  terminal_title: true      # show the run status in the terminal tab title: ⏳ working, ✋ waiting for approval, ✓ done
+  # Notify when a turn finishes or an approval is waiting, if it took longer than notify_after_seconds
+  # or the terminal is in the background. off | bell (terminal bell) | osc9 (desktop notification in
+  # iTerm2, WezTerm, Ghostty, kitty …; Windows Terminal ignores it, use bell). /notifications on|off per session.
+  notifications: off
+  notify_after_seconds: 30
 
 search:
   # web_search is free with no API key: DuckDuckGo by default (the `ddgs` package if installed,
@@ -45,6 +53,9 @@ permissions:
   # ask       — every write / delete / shell / MCP / web_fetch / web_search call asks, except read-only shell commands
   # allowlist — as ask, plus the `allow` patterns below are auto-approved
   # auto      — nothing asks (not recommended)
+  # plan      — read-only: reads and read-only shell commands run; file changes, other shell commands and
+  #             settings changes are denied, so the agent investigates and answers with a plan.
+  # In the TUI, Shift+Tab cycles ask → auto → plan → allowlist for the session.
   # Settings changes by the agent (edit_config, set_mcp_server, remove_mcp_server, edits in .dostuff/) ask in every mode.
   mode: ask
   allow: []

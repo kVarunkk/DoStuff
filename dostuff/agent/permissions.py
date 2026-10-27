@@ -11,6 +11,9 @@ Modes (`permissions.mode` in config, overridable per session):
   ask       — every mutating call asks, except read-only shell commands (allow-list below)
   allowlist — as `ask`, plus `permissions.allow` patterns from config are auto-approved
   auto      — nothing asks (explicit opt-in)
+  plan      — read-only: reads and read-only shell commands run, file writes / other shell
+              commands / settings changes are denied with a "plan only" note; web and MCP
+              calls ask as in `ask`
 
 Settings changes (kind "settings": config.yaml, MCP servers) ask in every mode and have no
 "always": they can change these rules or add a command that runs on the user's machine.
@@ -26,11 +29,26 @@ from urllib.parse import urlparse
 
 from dostuff.helpers.tools.project_root import project_root
 
-PermissionMode = Literal["ask", "allowlist", "auto"]
+PermissionMode = Literal["ask", "allowlist", "auto", "plan"]
 ToolKind = Literal["read", "write", "shell", "mcp", "network", "settings"]
 Action = Literal["allow", "ask", "deny"]
 
-PERMISSION_MODES: tuple[str, ...] = ("ask", "allowlist", "auto")
+PERMISSION_MODES: tuple[str, ...] = ("ask", "allowlist", "auto", "plan")
+# Order of the TUI's Shift+Tab cycle
+MODE_CYCLE: tuple[str, ...] = ("ask", "auto", "plan", "allowlist")
+
+PLAN_MODE_INSTRUCTION = (
+    "## Plan mode\nPlan mode is on: you can read files, search and run read-only commands, but file "
+    "changes, other shell commands and settings changes are denied. Investigate, then reply with a "
+    "concrete step-by-step plan. Don't make the changes until the user leaves plan mode (Shift+Tab or /permissions)."
+)
+
+
+def next_mode(mode: str) -> str:
+    """The mode after `mode` in the Shift+Tab cycle."""
+    i = MODE_CYCLE.index(mode) if mode in MODE_CYCLE else -1
+    return MODE_CYCLE[(i + 1) % len(MODE_CYCLE)]
+
 
 # ── Shell read-only allow-list (design D2) ────────────────────────────────────
 # Value None → any arguments; a set → the first argument must be one of these
@@ -154,9 +172,12 @@ def _shell_pattern_matches(pattern: str, tokens: list[str]) -> bool:
 
 @dataclass
 class SessionPermissions:
-    """Per-session approvals (`a`/`always`) and an optional mode override."""
+    """Per-session approvals (`a`/`always`), an optional mode override, and `allow` patterns
+    (`dostuff -p --allowed-tools`) that apply in every mode: the `permissions.allow` syntax, or a
+    tool name for every call of that tool."""
     mode: PermissionMode | None = None
     approved: set[tuple[str, str]] = field(default_factory=set)
+    allow: list[str] = field(default_factory=list)
 
     def approve(self, keys: list[tuple[str, str]]) -> None:
         self.approved.update(keys)
@@ -181,7 +202,11 @@ class PermissionConfig:
 
 
 def _config_allows(tool: str, tokens: list[str] | None, cfg: PermissionConfig) -> bool:
-    for pattern in cfg.allow:
+    return _patterns_allow(cfg.allow, tool, tokens)
+
+
+def _patterns_allow(patterns: list[str], tool: str, tokens: list[str] | None) -> bool:
+    for pattern in patterns:
         if tokens is None:
             if pattern == tool:
                 return True
@@ -228,6 +253,14 @@ def _is_settings_path(path: str) -> bool:
     return ".dostuff" in pure.parts
 
 
+def _plan_denies(kind: ToolKind, args: dict[str, Any]) -> bool:
+    if kind in ("write", "settings"):
+        return True
+    if kind == "shell":
+        return not (is_read_only_shell(str(args.get("command", ""))) and not has_unsafe_constructs(str(args.get("cwd") or "")))
+    return False
+
+
 def check(
     tool: str,
     kind: ToolKind,
@@ -242,9 +275,16 @@ def check(
     prompt = f"{description}\n{preview}".rstrip()
     if kind == "write" and _is_settings_path(str(args.get("path") or "")):
         kind = "settings"  # write_file / edit_file on ./.dostuff/config.yaml, mcp_config.json, .env …
+    if mode == "plan" and _plan_denies(kind, args):
+        return PermissionDecision("deny", reason=(
+            f"Plan mode: not run ({description.splitlines()[0]}). Only read-only tools run in plan mode; "
+            "put this step in your plan instead."
+        ))
     if kind == "settings":  # every mode, and no "always" (no approval keys)
         return PermissionDecision("ask", prompt=prompt, reason=description)
     if kind == "read" or mode == "auto":
+        return PermissionDecision("allow")
+    if session and tool in session.allow:
         return PermissionDecision("allow")
 
     if kind == "shell":
@@ -259,6 +299,8 @@ def check(
             def segment_ok(seg: list[str]) -> bool:
                 if _segment_is_read_only(seg) or (session and session.is_approved(tool, shell_approval_pattern(seg))):
                     return True
+                if session and _patterns_allow(session.allow, tool, seg):
+                    return True
                 return mode == "allowlist" and _config_allows(tool, seg, cfg)
             if all(segment_ok(seg) for seg in segments):
                 return PermissionDecision("allow")
@@ -270,7 +312,7 @@ def check(
         pattern = f"{tool}:{url_host(str(args.get('url', '')))}"
     else:
         pattern = tool
-    if session and session.is_approved(tool, pattern):
+    if session and (session.is_approved(tool, pattern) or pattern in session.allow):
         return PermissionDecision("allow")
     if mode == "allowlist" and (_config_allows(tool, None, cfg) or _config_allows(pattern, None, cfg)):
         return PermissionDecision("allow")

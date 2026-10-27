@@ -21,6 +21,7 @@ def env(tmp_path, monkeypatch):
     proj.mkdir()
     other.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(tmp_path)  # before the os.chdir calls below, so teardown returns to the original cwd
     monkeypatch.setenv("MODEL", "openai/gpt-4o-mini")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     from dostuff import config as config_module
@@ -99,6 +100,20 @@ def test_resume_picks_latest_here_or_by_prefix(env, monkeypatch):
     assert result.exit_code == 1 and "matches 2 sessions" in result.output
     os.chdir(env["home"])
     result = runner.invoke(env["app"], ["resume"])
+    assert result.exit_code == 1 and "No sessions in" in result.output
+
+
+def test_continue_resumes_latest_here(env, monkeypatch):
+    from dostuff import cli
+    launched = []
+    monkeypatch.setattr(cli, "_launch", lambda sid, worktree=None: launched.append(sid))
+    assert runner.invoke(env["app"], ["-c"]).exit_code == 0
+    assert runner.invoke(env["app"], ["--continue"]).exit_code == 0
+    assert launched == ["aab222", "aab222"]
+    result = runner.invoke(env["app"], ["-c", "--session", "aaa111"])
+    assert result.exit_code == 2 and "can't be used together" in result.output
+    os.chdir(env["home"])
+    result = runner.invoke(env["app"], ["-c"])
     assert result.exit_code == 1 and "No sessions in" in result.output
 
 
@@ -282,7 +297,8 @@ def headless(env, monkeypatch):
 
     async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
                         current_session_history, steps_history, store, adapter=None, permissions=None, **kwargs):
-        calls.append({"text": user_text, "history": list(working_history), "mode": permissions.mode})
+        calls.append({"text": user_text, "history": list(working_history), "mode": permissions.mode,
+                      "allow": permissions.allow, "max_iterations": kwargs.get("max_iterations")})
         reply = await adapter.ask("Allow write_file?")
         adapter.emit("tool_call", "write_file(path=a.txt)")
         adapter.emit("usage", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
@@ -316,3 +332,23 @@ def test_print_mode(env, headless):
     assert runner.invoke(app, ["-p", "x", "--session", "nope"]).exit_code == 1
     assert runner.invoke(app, ["-p", "x", "--permission-mode", "yolo"]).exit_code == 2
     assert runner.invoke(app, ["--json"]).exit_code == 2
+
+
+def test_print_mode_flags(env, headless):
+    """--max-turns, --allowed-tools and --output-format stream-json."""
+    app = env["app"]
+    result = runner.invoke(app, ["-p", "go", "-q", "--max-turns", "3", "--allowed-tools", "write_file,npm test",
+                                 "--allowed-tools", "web_fetch:docs.python.org", "--output-format", "stream-json"])
+    assert result.exit_code == 0, result.output
+    assert headless[-1]["max_iterations"] == 3
+    assert headless[-1]["allow"] == ["write_file", "npm test", "web_fetch:docs.python.org"]
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [e["type"] for e in events] == ["init", "tool_call", "usage", "result"]
+    assert events[0]["session_id"] == events[-1]["session_id"] and events[1]["call"] == "write_file(path=a.txt)"
+    assert events[-1]["result"] == "answer (no)" and events[-1]["is_error"] is False
+
+    result = runner.invoke(app, ["-p", "go", "-q", "--output-format", "json"])
+    assert json.loads(result.stdout)["result"] == "answer (no)"
+    assert runner.invoke(app, ["-p", "go", "--output-format", "xml"]).exit_code == 2
+    assert runner.invoke(app, ["-p", "go", "--json", "--output-format", "text"]).exit_code == 2
+    assert runner.invoke(app, ["--max-turns", "2"]).exit_code == 2

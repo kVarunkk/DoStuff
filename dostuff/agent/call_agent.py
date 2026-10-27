@@ -3,7 +3,7 @@ from typing import Any
 import litellm
 from litellm import acompletion
 from dostuff.tools.definitions import TOOL_SCHEMAS, default_tool_names
-from dostuff.lib.model import completion_kwargs, get_provider, uses_explicit_prompt_caching
+from dostuff.lib.model import completion_kwargs, uses_explicit_prompt_caching
 from dostuff.lib.tracing import content_attr, tracer
 from opentelemetry.trace import Status, StatusCode
 
@@ -30,7 +30,7 @@ def build_request_kwargs(stream: bool) -> dict[str, Any]:
     kwargs["stream"] = stream
     if stream:
         kwargs["stream_options"] = {"include_usage": True}
-    if _supports_reasoning(kwargs["model"]) and get_provider() in ("gemini", "vertex_ai"):
+    if _supports_reasoning(kwargs["model"]) and kwargs["model"].startswith(("gemini/", "vertex_ai/")):
         # Ask Gemini to stream its thoughts (rendered as partial_thought)
         kwargs["thinking_config"] = {"include_thoughts": True}
     if uses_explicit_prompt_caching():

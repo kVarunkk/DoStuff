@@ -1029,3 +1029,169 @@ def test_config_command_edits_settings_file(tui, tmp_path):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+def test_roadmap_021_input_and_commands(tui, monkeypatch):
+    """Shift+Tab mode cycle, Ctrl+Backspace / Ctrl+Delete, /copy, /compact auto, /notifications, title state."""
+    cli_tui = tui
+    copied = []
+    monkeypatch.setattr(cli_tui, "_copy_to_clipboard", lambda app, text: copied.append(text))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="r021")
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+
+            # Shift+Tab: ask → auto → plan → allowlist → ask, shown in the input border
+            modes = []
+            for _ in range(4):
+                await pilot.press("shift+tab")
+                modes.append(app.permissions.mode)
+            assert modes == ["auto", "plan", "allowlist", "ask"]
+            await pilot.press("shift+tab", "shift+tab")
+            assert app.permissions.mode == "plan" and "plan mode" in str(inp.border_title)
+
+            # Ctrl+Backspace as Windows terminals send it (^H) deletes a word; elsewhere ^H stays Backspace.
+            # (Pilot sends "backspace" with the character ^H.)
+            inp.text = "hello big world"
+            inp.move_cursor(inp.document.end)
+            monkeypatch.setattr(cli_tui, "CTRL_H_DELETES_WORD", True)
+            await pilot.press("backspace")
+            assert inp.text == "hello big "
+            monkeypatch.setattr(cli_tui, "CTRL_H_DELETES_WORD", False)
+            await pilot.press("backspace")
+            assert inp.text == "hello big"
+            inp.move_cursor((0, 0))
+            await pilot.press("ctrl+delete")
+            assert inp.text == " big"
+            inp.text = ""
+
+            # /copy before and after an answer; the turn sets the title to done
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/copy"))
+            await pilot.pause()
+            assert copied == [] and any("No answer to copy" in t for t in _texts(app))
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("hi"))
+            await _until(pilot, app.adapter.has_pending_confirm)
+            assert app._title_state == "waiting"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert app._title_state == "done"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/copy"))
+            await pilot.pause()
+            assert copied == ["answer to hi (yes)"]
+
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/compact auto 80"))
+            assert app.config.compact_threshold == 80
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/compact auto off"))
+            assert app.config.compact_threshold is None
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/compact auto 500"))
+            assert app.config.compact_threshold is None
+
+            assert app._notify_kind == "off"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/notifications on"))
+            assert app._notify_kind == "bell"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/notifications osc9"))
+            assert app._notify_kind == "osc9"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/notifications loud"))
+            assert app._notify_kind == "osc9" and any("Usage: /notifications" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_roadmap_021_commands_memory_context_doctor_history(tui, tmp_path, monkeypatch):
+    """Custom commands, `# note`, /memory, /context, /doctor, Esc Esc and Ctrl+R."""
+    cli_tui = tui
+    monkeypatch.setattr(cli_tui, "count_tokens", lambda text, model: len(text) // 4)
+    commands = Path(".dostuff", "commands")
+    commands.mkdir(parents=True)
+    (commands / "review.md").write_text("---\ndescription: Review a file\n---\nReview $ARGUMENTS for bugs.\n",
+                                        encoding="utf-8")
+    user_commands = tmp_path / "home" / ".dostuff" / "commands"
+    user_commands.mkdir(parents=True)
+    (user_commands / "review.md").write_text("User review (hidden by the project one)\n", encoding="utf-8")
+    (user_commands / "standup.md").write_text("Summarise yesterday's commits.\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="r021b")
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            menu = app.query_one("#command-menu", cli_tui.CommandMenu)
+
+            # Custom commands: in the menu, project wins over user, $ARGUMENTS filled in
+            await pilot.press(*"/rev")
+            await pilot.pause()
+            assert menu.display and menu.selected_command() == "/review"
+            assert menu.commands["/review"] == "(project command) Review a file"
+            assert menu.commands["/standup"].startswith("(user command)")
+            app._clear_input()
+            submit("/review src/app.py")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            submit("y")
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert app.steps_history[0]["content"] == "Review src/app.py for bugs."
+            assert any("Running command review" in t for t in _texts(app))
+
+            # Esc Esc with an empty input takes the prompt back as typed and drops the turn
+            await pilot.press("escape")
+            assert "Esc again" in str(inp.border_title)
+            await pilot.press("escape")
+            await _until(pilot, lambda: not app.steps_history)
+            assert inp.text == "/review src/app.py"
+            assert await app.store.load("r021b") == [] and await app.store.load_working_history("r021b") == []
+            app._clear_input()
+
+            # `# note` asks project or global, then appends to that AGENTS.md
+            submit("# always use pytest")
+            await pilot.pause()
+            picker = app.query_one("#picker", cli_tui.PermissionPrompt)
+            assert [v for v, _ in picker._options] == ["project", "global"]
+            await pilot.press("enter")
+            await _until(pilot, lambda: Path("AGENTS.md").exists())
+            assert Path("AGENTS.md").read_text(encoding="utf-8") == "- always use pytest\n"
+            await _until(pilot, lambda: "always use pytest" in app._system_instructions)
+            submit("# second note")
+            await pilot.pause()
+            await pilot.press("down", "enter")
+            global_md = tmp_path / "home" / ".dostuff" / "AGENTS.md"
+            await _until(pilot, global_md.exists)
+            assert global_md.read_text(encoding="utf-8") == "- second note\n"
+
+            # /memory opens AGENTS.md in the editor; Ctrl+S saves it
+            submit("/memory project")
+            await _until(pilot, app._settings_open)
+            editor = app.query_one("#settings-editor", cli_tui.SettingsEditor)
+            assert editor.text == "- always use pytest\n"
+            editor.text = "- always use pytest\n- run ruff\n"
+            await pilot.press("ctrl+s")
+            await _until(pilot, lambda: not app._settings_open())
+            assert Path("AGENTS.md").read_text(encoding="utf-8").endswith("- run ruff\n")
+            assert "run ruff" in app._system_instructions
+            submit("/memory bogus")
+            assert any("Usage: /memory" in t for t in _texts(app))
+
+            # /context and /doctor
+            submit("/context")
+            await _until(pilot, lambda: any("Project instructions" in t for t in _texts(app)))
+            context = next(t for t in _texts(app) if "Project instructions" in t)
+            assert "System prompt" in context and "Tools" in context and "Free" in context
+            submit("/doctor")
+            await _until(pilot, lambda: any("Global config" in t for t in _texts(app)))
+
+            # Ctrl+R: pick a past prompt (type to filter)
+            inp.prompt_history = ["fix the tests", "write docs", "fix the build"]
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            picker = app.query_one("#picker", cli_tui.PermissionPrompt)
+            assert [label for _, label in picker._options] == ["fix the build", "write docs", "fix the tests"]
+            await pilot.press(*"tests")
+            await pilot.press("enter")
+            await _until(pilot, lambda: inp.text == "fix the tests")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

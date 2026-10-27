@@ -9,12 +9,27 @@ SUBAGENT_MAX_ITERATIONS = 25
 MAX_TOOL_OUTPUT_CHARS = 30_000
 MAX_RETRIES = 6
 RETRY_MAX_DELAY_S = 60.0
-KNOWN_PROVIDERS = ("gemini", "anthropic", "openai", "groq", "mistral", "openrouter", "ollama")
+KNOWN_PROVIDERS = ("gemini", "anthropic", "openai", "groq", "mistral", "openrouter", "ollama", "opencode-go", "opencode")
 STATUS_BAR_ITEMS = ("help", "cwd", "session", "model", "mode", "tokens", "cost", "context")
 DEFAULT_STATUS_BAR = ("cwd", "model", "mode", "context")
 PASTE_COLLAPSE_LINES = 10
 PASTE_FILE_LINES = 200
 PASTE_RETENTION_DAYS = 7
+AUTO_COMPACT_THRESHOLD = 50  # percent of the context window
+NOTIFY_KINDS = ("off", "bell", "osc9")
+NOTIFY_AFTER_SECONDS = 30.0
+
+
+def parse_compact_threshold(value: Any) -> int | None:
+    """`loop.auto_compact_threshold`: a percent 1-100, or off/false/0 (None = no auto-compaction).
+    Raises ValueError for anything else."""
+    text = str(value).strip().lower().rstrip("%")
+    if text in ("off", "false", "no", "none", "0"):
+        return None
+    percent = int(float(text))
+    if not 1 <= percent <= 100:
+        raise ValueError(f"auto_compact_threshold must be 1-100 or off, got {value!r}")
+    return percent
 
 
 def _block(raw: dict[str, Any], key: str) -> dict[str, Any]:
@@ -61,6 +76,8 @@ class Config:
         self.api_key_env_explicit = str(active_entry.get("api_key_env") or legacy.get("api_key_env") or "")
         # Set by /model for the rest of the process; wins over env MODEL and YAML
         self._session_model: dict[str, str] | None = None
+        # Set by /compact auto <N|off>: a 1-tuple so "off" (None) differs from "not set"
+        self.session_compact_threshold: tuple[int | None] | None = None
         # Tracing config (env vars override config.yaml)
         t = _block(self.raw, "tracing")
         self.tracing_enabled = (
@@ -95,19 +112,35 @@ class Config:
         retries = loop_cfg.get("max_retries")
         self.max_retries = max(int(retries), 0) if retries is not None else MAX_RETRIES
         self.retry_max_delay = float(loop_cfg.get("retry_max_delay") or RETRY_MAX_DELAY_S)
+        # Auto-compaction when a model call's input passes this percent of the context window (None = off)
+        threshold = loop_cfg.get("auto_compact_threshold")
+        try:
+            self.auto_compact_threshold = AUTO_COMPACT_THRESHOLD if threshold is None else parse_compact_threshold(threshold)
+        except ValueError:
+            self.auto_compact_threshold = AUTO_COMPACT_THRESHOLD
         # Cache breakpoints on Claude models (see lib/model.uses_explicit_prompt_caching)
         self.prompt_caching = str(loop_cfg.get("prompt_caching", True)).lower() not in ("0", "false", "no")
         mem = _block(self.raw, "memory")
         scope = str(mem.get("episodic_scope") or "project").lower()
         self.episodic_scope = scope if scope in ("project", "user") else "project"
-        # Permission layer (dostuff/agent/permissions.py): mode ask | allowlist | auto
+        # Permission layer (dostuff/agent/permissions.py): mode ask | allowlist | auto | plan
         perms = _block(self.raw, "permissions")
         mode = str(perms.get("mode", "ask")).lower()
-        self.permission_mode = mode if mode in ("ask", "allowlist", "auto") else "ask"
+        self.permission_mode = mode if mode in ("ask", "allowlist", "auto", "plan") else "ask"
         self.permission_allow = [str(p) for p in (perms.get("allow") or [])]
         # web_search backend: a SearXNG instance if set, else ddgs / DuckDuckGo (tools/web_search.py)
         self.searxng_url = str(_block(self.raw, "search").get("searxng_url") or "").strip()
-        collapse = _block(self.raw, "ui").get("paste_collapse_lines")
+        ui = _block(self.raw, "ui")
+        # Run status in the terminal tab/window title (helpers/ui/terminal_signals.py)
+        self.terminal_title = str(ui.get("terminal_title", True)).lower() not in ("0", "false", "no", "off")
+        # Bell / OSC 9 when a long turn finishes or an approval waits; off unless the user turns it on
+        raw_notify = ui.get("notifications", "off")
+        # YAML reads on/off as booleans: `notifications: on` means the bell
+        notify = "bell" if raw_notify is True else str(raw_notify).lower()
+        self.notifications = notify if notify in NOTIFY_KINDS else "off"
+        after = ui.get("notify_after_seconds")
+        self.notify_after_seconds = max(float(after), 0.0) if after is not None else NOTIFY_AFTER_SECONDS
+        collapse = ui.get("paste_collapse_lines")
         self.paste_collapse_lines = max(int(collapse), 0) if collapse is not None else PASTE_COLLAPSE_LINES
         # TUI status bar: which items show, in this order; unknown names are reported once at startup
         items = _block(self.raw, "ui").get("status_bar")
@@ -117,11 +150,20 @@ class Config:
         self.status_bar_unknown = [n for n in names if n not in STATUS_BAR_ITEMS and n != "timer"]
 
     def reload(self) -> None:
-        """Re-read config.yaml in place (after a settings change); a /model choice for this session stays."""
+        """Re-read config.yaml in place (after a settings change); /model and /compact auto choices for this session stay."""
         session_model, key_env = self._session_model, self.api_key_env_explicit
+        session_compact = self.session_compact_threshold
         self.__init__(self.path)  # type: ignore[misc]
         if session_model:
             self._session_model, self.api_key_env_explicit = session_model, key_env
+        self.session_compact_threshold = session_compact
+
+    @property
+    def compact_threshold(self) -> int | None:
+        """Auto-compaction threshold in percent (None = off): /compact auto for this session, else config."""
+        if self.session_compact_threshold is not None:
+            return self.session_compact_threshold[0]
+        return self.auto_compact_threshold
 
     def configured_models(self) -> list[dict[str, Any]]:
         """The `models:` entries from config.yaml (name, provider, active, api_key_env)."""
@@ -167,6 +209,8 @@ class Config:
 
     @property
     def api_key_env(self) -> str:
+        if self.provider.startswith("opencode"):
+            return self.api_key_env_explicit or "OPENCODE_API_KEY"  # Zen and Go share one key
         return self.api_key_env_explicit or self.provider.upper() + "_API_KEY"
 
     def api_key(self) -> str | None:

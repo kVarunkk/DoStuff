@@ -1,19 +1,22 @@
-"""Skills as slash commands: `/<skill-name> [args]` runs a turn with the skill's SKILL.md in it."""
+"""Skills and custom commands as slash commands: `/<name> [args]` runs a turn with the skill's
+SKILL.md, or the command's prompt template (helpers/skills/custom_commands.py), in it."""
 import re
 from pathlib import Path
 from typing import Any
 
 from dostuff.helpers.agent.constants import COMMAND_DESCRIPTIONS
+from dostuff.helpers.skills.custom_commands import command_prompt
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 _NAME_RE = re.compile(r"^[\w.-]+$")
 
 
-def skill_commands(skills: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """"/name" → skill for each discovered skill. Built-in commands win a clash, the first
-    skill found wins among skills, and names that can't be typed as one word are left out."""
+def skill_commands(skills: list[dict[str, Any]], custom: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+    """"/name" → custom command or skill. Built-in commands win a clash, then custom commands
+    (project before user), then skills in the order found; names that can't be typed as one
+    word are left out."""
     commands: dict[str, dict[str, Any]] = {}
-    for skill in skills:
+    for skill in [*(custom or []), *skills]:
         name = str(skill.get("name", "")).strip().lower()
         command = "/" + name
         if not _NAME_RE.match(name) or command in COMMAND_DESCRIPTIONS or command in commands:
@@ -31,7 +34,10 @@ def parse_skill_command(text: str, commands: dict[str, dict[str, Any]]) -> tuple
 
 def skill_prompt(skill: dict[str, Any], args: str) -> str:
     """The user message for a skill run: its SKILL.md body (frontmatter dropped), then the args.
-    Raises OSError if the file can't be read."""
+    For a custom command, its template with $ARGUMENTS filled in. Raises OSError if the file
+    can't be read."""
+    if skill.get("kind") == "command":
+        return command_prompt(skill, args)
     location = Path(skill["location"])
     body = _FRONTMATTER_RE.sub("", location.read_text(encoding="utf-8"), count=1).strip()
     return (

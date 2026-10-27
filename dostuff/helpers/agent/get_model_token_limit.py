@@ -1,6 +1,6 @@
 import litellm
 from dostuff.config import get_config
-from dostuff.lib.model import get_model
+from dostuff.lib.model import get_litellm_model
 
 FALLBACK_CONTEXT_WINDOW = 128_000
 _warned_models: set[str] = set()
@@ -11,7 +11,7 @@ def get_model_token_limit() -> int:
     configured = get_config().context_window
     if configured > 0:
         return configured
-    model = get_model()
+    model = get_litellm_model()
     try:
         limit = litellm.get_model_info(model=model).get("max_input_tokens")
         if limit:

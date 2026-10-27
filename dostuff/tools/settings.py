@@ -109,8 +109,8 @@ def _config_warnings(data: dict[str, Any]) -> list[str]:
         warnings += [f"unknown ui.status_bar item '{i}'" for i in items if str(i).strip().lower() not in (*STATUS_BAR_ITEMS, "timer")]
     perms = data.get("permissions")
     mode = perms.get("mode") if isinstance(perms, dict) else None
-    if mode is not None and str(mode).lower() not in ("ask", "allowlist", "auto"):
-        warnings.append(f"permissions.mode '{mode}' isn't ask, allowlist or auto (it falls back to ask)")
+    if mode is not None and str(mode).lower() not in ("ask", "allowlist", "auto", "plan"):
+        warnings.append(f"permissions.mode '{mode}' isn't ask, allowlist, auto or plan (it falls back to ask)")
     return warnings
 
 

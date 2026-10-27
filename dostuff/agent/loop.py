@@ -1,7 +1,7 @@
 from dostuff.helpers.agent.loop_check_cancelled import is_cancelled, loop_check_cancelled
 from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
 from dostuff.helpers.agent.model_cost import call_cost
-from dostuff.lib.model import get_model
+from dostuff.lib.model import current_session_id, get_litellm_model
 from dostuff.helpers.agent.loop_emit import loop_emit
 from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.tracing import content_attr, tracer
@@ -14,9 +14,9 @@ import asyncio
 import inspect
 import random
 from dataclasses import dataclass
-from dostuff.agent.permissions import SessionPermissions
+from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, SessionPermissions
 from dostuff.agent.run_tool import authorize_batch, authorize_tool, dispatch_tool
-from dostuff.config import get_config
+from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
 from dostuff.tools.definitions import TOOL_MAP
 from typing import Any, Literal
 import json
@@ -156,11 +156,13 @@ async def _sleep_or_cancel(seconds: float, adapter: Any) -> bool:
 
 async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction)."""
+    current_session_id.set(session_id)
     iteration = 0
     token_limit = get_model_token_limit()
-    context_token_threshold = int(token_limit * 0.5)
-    keep_recent_token_budget = min(int(token_limit * 0.15), 20000)
     config = get_config()
+    threshold_percent = getattr(config, "compact_threshold", AUTO_COMPACT_THRESHOLD)  # None: auto-compaction off (overflow still compacts)
+    context_token_threshold = int(token_limit * threshold_percent / 100) if threshold_percent else None
+    keep_recent_token_budget = min(int(token_limit * 0.15), 20000)
     max_tool_output_chars = config.max_tool_output_chars
     max_retries = getattr(config, "max_retries", 6)
     retry_max_delay = getattr(config, "retry_max_delay", 60.0)
@@ -193,10 +195,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     async def check_cancelled() -> bool:
         return await loop_check_cancelled(steps_history, working_history, current_session_history, session_id, store, turn_type, adapter=adapter)
 
-    # auto compaction triggers at 50% of the model's token limit and keeps at least 15%/20k tokens
-    # of the most recent steps; the rest is summarised into the system instruction. Checked at turn
-    # start and after every model call.
-    if last_input_tokens > context_token_threshold:
+    # auto compaction triggers at loop.auto_compact_threshold (default 50%) of the model's token limit
+    # and keeps at least 15%/20k tokens of the most recent steps; the rest is summarised into the
+    # system instruction. Checked at turn start and after every model call.
+    if context_token_threshold is not None and last_input_tokens > context_token_threshold:
         await compact("Token threshold exceeded.", keep_recent_token_budget)
 
     with tracer.start_as_current_span("turn") as turn_span:
@@ -224,9 +226,13 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     model_span = None
                     progress = StreamProgress()
                     try:
+                        # Read per call: the mode can change mid-turn (Shift+Tab)
+                        plan_mode = ((permissions.mode if permissions else None) or getattr(config, "permission_mode", "ask")) == "plan"
                         interaction, model_span = await call_agent(
                             steps_history=working_history,
-                            system_instruction=dynamic_system_instruction + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else ""),
+                            system_instruction=dynamic_system_instruction
+                            + (f"\n\n{PLAN_MODE_INSTRUCTION}" if plan_mode else "")
+                            + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else ""),
                             tool_names=tool_names,
                             stream=stream,
                         )
@@ -279,7 +285,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         "cached_tokens": getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0) or 0,
                     }
                     # USD from litellm's price table; None if unknown (the TUI then hides the cost)
-                    usage_dict["cost"] = call_cost(get_model(), usage_dict)
+                    usage_dict["cost"] = call_cost(get_litellm_model(), usage_dict)
 
                 # close model_span exactly once, here, before any continue/return below
                 if model_span is not None and model_span.is_recording():
@@ -419,7 +425,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     await check_cancelled()
                     return "Cancelled by user."
 
-                if current_context_tokens > context_token_threshold:
+                if context_token_threshold is not None and current_context_tokens > context_token_threshold:
                     await compact("Token threshold exceeded.", keep_recent_token_budget)
         else:
             msg = f"Reached maximum iterations ({max_iter}) without receiving a model output. Ending the agent loop."

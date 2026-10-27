@@ -263,3 +263,38 @@ def test_env_files_denied_for_read(tmp_path, name):
     with pytest.raises(PathAccessDenied):
         resolve_safe_path(name, tmp_path, for_read=True)
     assert resolve_safe_path(name, tmp_path) == (tmp_path / name).resolve()  # writes go through approval
+
+
+# ── Plan mode ─────────────────────────────────────────────────────────────────
+
+PLAN = PermissionConfig(mode="plan")
+
+
+def test_plan_mode_runs_reads_and_denies_changes():
+    assert check("read_file", "read", {"path": "a.py"}, None, PLAN).action == "allow"
+    assert shell("git status", cfg=PLAN) == "allow"
+    assert shell("ls -la | grep x", cfg=PLAN) == "allow"
+    for command in ("rm x", "pytest", "echo hi > out.txt"):
+        assert shell(command, cfg=PLAN) == "deny"
+    # an "always" from ask mode doesn't carry into plan mode
+    session = SessionPermissions(approved={("bash_command", "pytest")})
+    assert shell("pytest", session=session, cfg=PLAN) == "deny"
+    write = check("write_file", "write", {"path": "a.py", "content": ""}, None, PLAN)
+    assert write.action == "deny" and write.reason.startswith("Plan mode")
+    assert check("edit_config", "settings", {"old_str": "", "new_str": "x"}, None, PLAN).action == "deny"
+    # web and MCP calls ask, as in ask mode
+    assert check("web_fetch", "network", {"url": "https://example.com"}, None, PLAN).action == "ask"
+    assert check("call_mcp_tool", "mcp", {"name": "gh__list"}, None, PLAN).action == "ask"
+
+
+def test_plan_mode_session_override_and_denial_text():
+    session = SessionPermissions(mode="plan")
+    assert check("delete_file", "write", {"path": "a"}, session, PermissionConfig(mode="auto")).action == "deny"
+    result = asyncio.run(authorize_tool("write_file", {"path": "c", "content": ""}, permissions=session))
+    assert result is not None and result.startswith("Plan mode: not run") and "User denied" not in result
+
+
+def test_mode_cycle():
+    from dostuff.agent.permissions import next_mode
+    assert [next_mode(m) for m in ("ask", "auto", "plan", "allowlist")] == ["auto", "plan", "allowlist", "ask"]
+    assert next_mode("bogus") == "ask"

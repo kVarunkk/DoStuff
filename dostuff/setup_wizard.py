@@ -6,12 +6,15 @@ and on demand as `dostuff setup`.
 import os
 import re
 import sys
+import uuid
 from importlib import resources
 from pathlib import Path
 
 import typer
 
 from dostuff.config import load_env_files, reset_config
+from dostuff import __version__
+from dostuff.helpers.models.opencode import OPENCODE_API_KEY_ENV, OPENCODE_PROVIDERS, opencode_kwargs
 
 # provider -> (default model, API key env var or None when no key is needed)
 PROVIDERS: dict[str, tuple[str, str | None]] = {
@@ -22,6 +25,8 @@ PROVIDERS: dict[str, tuple[str, str | None]] = {
     "mistral": ("mistral/mistral-large-latest", "MISTRAL_API_KEY"),
     "openrouter": ("openrouter/openrouter/free", "OPENROUTER_API_KEY"),
     "ollama": ("ollama/llama3.2", None),
+    "opencode": ("opencode/claude-sonnet-5-5", "OPENCODE_API_KEY"),  # OpenCode Zen, pay as you go
+    "opencode-go": ("opencode-go/kimi-k3", "OPENCODE_API_KEY"),  # OpenCode Go subscription
 }
 CHOOSE_MODEL_PAGE = 15  # models listed at once by choose_model
 
@@ -57,6 +62,8 @@ def mark(ok: bool) -> str:
 
 def missing_api_keys(model: str) -> list[str]:
     """Env vars litellm needs for `model` that are not set; [] when none are missing or unknown."""
+    if model.split("/", 1)[0] in OPENCODE_PROVIDERS:  # not a litellm provider
+        return [] if os.environ.get(OPENCODE_API_KEY_ENV) else [OPENCODE_API_KEY_ENV]
     try:
         import litellm
         env = litellm.validate_environment(model=model)
@@ -99,8 +106,8 @@ def write_private(path: Path, text: str) -> None:
 
 def choose_model(provider: str, default: str) -> str:
     """Numbered list of the provider's models; a number picks, other text filters or is used as typed."""
-    from dostuff.helpers.models.list_models import ModelListError, provider_models
-    if provider in ("ollama", "openrouter"):
+    from dostuff.helpers.models.list_models import FETCHED_PROVIDERS, ModelListError, provider_models
+    if provider in FETCHED_PROVIDERS:
         typer.echo(f"Fetching {provider} models...")
     try:
         models = provider_models(provider)
@@ -149,7 +156,10 @@ def _check_connection(model: str) -> None:
     typer.echo("Checking the model responds...")
     try:
         import litellm
-        litellm.completion(model=model, messages=[{"role": "user", "content": "ping"}], max_tokens=1, timeout=30)
+        provider, _, model_id = model.partition("/")
+        kwargs = (opencode_kwargs(provider, model_id, None, uuid.uuid4().hex, __version__)
+                  if provider in OPENCODE_PROVIDERS else {"model": model})
+        litellm.completion(**kwargs, messages=[{"role": "user", "content": "ping"}], max_tokens=1, timeout=30)
     except Exception as e:
         reason = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
         typer.secho(f"{mark(False)} {reason[:300]}", fg=typer.colors.RED)

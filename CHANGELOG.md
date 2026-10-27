@@ -5,14 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.1] - 2026-10-27
+
+OpenCode Zen / Go models, plan mode, custom commands, `# note` memory, `/context`, `/doctor`, `/copy`, richer headless output and terminal title / notifications.
+
+### Added
+- **OpenCode Zen / Go models** (`opencode/<id>`, `opencode-go/<id>`, key in `OPENCODE_API_KEY`). litellm has no OpenCode provider, so `helpers/models/opencode.py` routes each model to litellm's anthropic (Claude, some Qwen / MiniMax), `openai/responses/` (GPT / Grok / Muse), gemini or openai chat route, with the gateway as `api_base`. Sends `User-Agent: dostuff/<version>` and `x-opencode-session`. In the setup wizard, `dostuff models add` and `/model`, with model lists from `/v1/models`. Context window and cost use the routed model; prompt-cache breakpoints apply to OpenCode Claude models.
+- **Plan mode** (`permissions.mode: plan`, `/permissions plan`, `--permission-mode plan`): reads and read-only shell commands run; file writes, other shell commands and settings changes are denied with a "Plan mode: not run …" result, even if approved with "always" earlier. Web / MCP calls ask as in `ask`. A `## Plan mode` section is added to the system prompt while it's on.
+- **Shift+Tab** cycles the session's permission mode ask → auto → plan → allowlist; the input border flashes the new mode and the status bar shows it.
+- **`dostuff -c` / `--continue`**: resume the latest session in the current directory (also with `-p`).
+- **Headless flags**: `--max-turns N` (model calls; exit 1 when hit), `--allowed-tools` (comma-separated / repeated; `permissions.allow` syntax or a bare tool name), `--output-format text|json|stream-json` (stream-json prints `init`, `assistant`, `tool_call`, `tool_result`, `usage`, `error` / `system`, `result` events, one per line).
+- **Custom commands**: `.dostuff/commands/<name>.md` (project) and `~/.dostuff/commands/<name>.md` (user) become `/<name> [args]`, with `$ARGUMENTS` substitution and an optional `description:` frontmatter. Built-ins win a clash, then project, user commands, then skills. Works with `-p "/<name> ..."`.
+- **`# note`**: a one-line prompt starting with `#` appends `- note` to this project's or the global AGENTS.md (or an existing CLAUDE.md); the system prompt is rebuilt.
+- **`/memory [project|global]`** edits AGENTS.md in the `/config` editor.
+- **`/context`**: estimated tokens per part of the next request with a bar, free space and the size of the last request.
+- **`/doctor`** in the TUI (checks shared with `dostuff doctor`).
+- **`/copy`** copies the model's last answer to the clipboard.
+- **Esc Esc** (empty input, no turn running) takes back the last prompt and every step after it; the prompt goes back in the input.
+- **Ctrl+R**: filterable picker over this directory's prompt history.
+- **Auto-compact threshold**: `loop.auto_compact_threshold` (percent, default 50; `off` disables auto-compaction, overflow still compacts); `/compact auto <N|off>` per session; `/status` shows it.
+- **Terminal title** shows the run status (`⏳` working, `✋` approval waiting, `✓` done) and is restored on exit; `ui.terminal_title: false` turns it off.
+- **Notifications** (opt-in): `ui.notifications: off | bell | osc9` and `ui.notify_after_seconds` (30), when a turn finishes or an approval waits; `/notifications` per session.
 
 ### Changed
+- litellm's bundled model price list is used (`LITELLM_LOCAL_MODEL_COST_MAP=True` unless already set) instead of fetching it from GitHub on import, so there are no "model cost map fetch … timed out" warnings or retry delay on slow networks. Prices for new models update with litellm upgrades.
+- Ctrl+Backspace deletes the previous word on Windows (where it arrives as `^H`); Ctrl+Delete deletes the next word.
+- Gemini thinking depends on the routed model, not the provider name.
 - `dostuff sessions` also lists sessions running in this repo's git worktrees (`.dostuff/worktrees/`), tagged `[worktree <name>]`, so a session forked into a worktree no longer disappears from the list. `dostuff resume` with no ID still picks the latest session in the current directory only.
 - TUI: select-to-copy no longer pops a large toast; a dim "copied N characters" label shows on the right of the input box's top border for 2 s.
 
+### Fixed
+- Tests: the `env` fixture in `tests/test_cli_commands.py` left the cwd in a temp dir, which broke later `python -m dostuff` tests in a full run.
+
 ### Documentation
-- README: fixed the clone URL and documented the 0.2.0 commands.
+- README: fixed the clone URL and documented the 0.2.0 and 0.2.1 commands.
 
 ## [0.2.0] - 2026-10-25
 

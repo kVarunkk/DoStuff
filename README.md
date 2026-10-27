@@ -26,9 +26,9 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 ## Features
 
 - **Textual TUI** with a `/` command menu, `@file` completion, `!shell` commands, an in-app config editor, a configurable status bar and a live turn timer
-- **Headless mode** — `dostuff -p "<prompt>"` runs one prompt and prints the answer (`--json` for scripts and CI)
-- **Multi-provider LLMs** via [litellm](https://docs.litellm.ai/docs/providers) — OpenAI, Anthropic, Gemini, Groq, Mistral, Ollama, OpenRouter
-- **Persistent sessions** in SQLite; resume with `dostuff resume` or `dostuff --session <id>`, branch one off with `/fork`
+- **Headless mode** — `dostuff -p "<prompt>"` runs one prompt and prints the answer (`--output-format json|stream-json`, `--max-turns`, `--allowed-tools` for scripts and CI)
+- **Multi-provider LLMs** via [litellm](https://docs.litellm.ai/docs/providers) — OpenAI, Anthropic, Gemini, Groq, Mistral, Ollama, OpenRouter, OpenCode Zen / Go
+- **Persistent sessions** in SQLite; resume with `dostuff -c`, `dostuff resume` or `dostuff --session <id>`, branch one off with `/fork`
 - **Git worktrees** — `/worktree` or `dostuff -w` runs a session on its own branch and checkout; subagents can run in their own worktree too
 - **Long-term memory** (semantic + episodic) backed by ChromaDB — optional, `pip install "dostuff[memory]"`
 - **MCP server support** — stdio (npx, uvx) and HTTP transports
@@ -41,12 +41,12 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Subagents** — `delegate_to_subagent` runs a bounded task with a restricted tool set; its approval prompts and ESC go through the same TUI
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
 - **Retries with backoff** for rate limits, timeouts and 5xx errors (6 by default, exponential with jitter, honors `Retry-After`; `loop.max_retries` / `loop.retry_max_delay`); auth / bad-request errors fail fast
-- **Token and cost tracking** — per-turn and cumulative totals in `/status` and the line after each turn (`✻ Worked for 1m 5s · $0.01`); cost in USD from litellm's price table (hidden when the model has no known price)
+- **Token and cost tracking** — per-turn and cumulative totals in `/status` and the line after each turn (`✻ Worked for 1m 5s · $0.01`); cost in USD from litellm's price table (hidden when the model has no known price). The table bundled with litellm is used, so startup doesn't wait on a download; set `LITELLM_LOCAL_MODEL_COST_MAP=False` to fetch the latest one from GitHub instead
 - **Long-term memory tools** — the agent saves facts (`save_memory`) and notable moments (`save_episode`) as they come up; both are recalled in later sessions
 - **Graceful exit** — `Ctrl+Q` or `/exit` saves the session, cleans up, and stops background workers
 - **Clean Cancellation** — `Escape` can cancel in-flight agent turns cleanly without corrupting the session
 - **2-state session split** — `session_steps` (full audit) / `working_history` (LLM payload); DB persists both plus `compaction_notes` + `last_input_tokens`
-- **Auto & Manual Compaction** — Manual `/compact` runs compaction and saves it. Auto-compaction triggers automatically during the agent loop if context usage (`last_input_tokens`) exceeds 50% of the model's token limit. It keeps at least 15% or 20k tokens of the most recent steps in the working history, summarizing the rest into `compaction_notes` which are appended to system instructions.
+- **Auto & Manual Compaction** — Manual `/compact` runs compaction and saves it. Auto-compaction triggers automatically during the agent loop if context usage (`last_input_tokens`) exceeds `loop.auto_compact_threshold` (default 50%) of the model's token limit; `off` disables it (an overflowing window is still compacted), and `/compact auto <N|off>` changes it for the session. It keeps at least 15% or 20k tokens of the most recent steps in the working history, summarizing the rest into `compaction_notes` which are appended to system instructions.
 - **Tracing (opt-in)** — OTLP tracing support built into `lib/tracing.py`; prompt and tool content are redacted from spans by default
 
 ---
@@ -138,6 +138,7 @@ In the TUI:
 | `dostuff`                | Launch the interactive TUI                      |
 | `dostuff --version`      | Print the version (`-V`)                        |
 | `dostuff --session <id>` | Resume a prior session (asks before starting a new one if the ID is unknown) |
+| `dostuff -c` / `--continue` | Resume the latest session in the current directory (same as `dostuff resume`; works with `-p` too) |
 | `dostuff -w` / `--worktree-name <name>` | Start the session in a new git worktree (`.dostuff/worktrees/<name>`, branch `dostuff/<name>`) |
 | `dostuff init [--force]` | Create `.dostuff/` config/skills in current dir (won't overwrite without `--force`) |
 | `dostuff setup`          | Pick a model, save its API key, write `~/.dostuff/config.yaml` (runs automatically on first launch) |
@@ -149,7 +150,7 @@ In the TUI:
 | `dostuff sessions rm <id>... [-y]` | Delete sessions and their `/undo` checkpoints |
 | `dostuff sessions prune [--older-than 30d] [--dry-run] [-y]` | Delete empty sessions, and sessions not used for the given time (`45m`, `12h`, `30d`, `2w`) |
 | `dostuff export [<id>] [-o file\|-]` | Save a session (default: latest here) as Markdown: prompts, answers, tool calls and results |
-| `dostuff -p "<prompt>"`  | Headless: run one prompt, print the answer to stdout, exit. Progress goes to stderr. Piped stdin is appended to the prompt (`-p -` reads the prompt from stdin). `--session <id>` continues a session, `--json` prints `{result, session_id, usage, ...}`, `-q` hides progress, `--permission-mode ask\|allowlist\|auto`. Without a terminal, calls that need approval are denied |
+| `dostuff -p "<prompt>"`  | Headless: run one prompt, print the answer to stdout, exit. Progress goes to stderr. Piped stdin is appended to the prompt (`-p -` reads the prompt from stdin). `--session <id>` continues a session, `--output-format json` (or `--json`) prints `{result, session_id, usage, ...}`, `--output-format stream-json` prints one JSON event per line (`init`, `assistant`, `tool_call`, `tool_result`, `usage`, `error`, then `result`), `-q` hides progress, `--permission-mode ask\|allowlist\|auto\|plan`. `--max-turns N` stops after N model calls (exit code 1). `--allowed-tools` (comma-separated or repeated) runs matching calls without asking in any mode, in the `permissions.allow` syntax (`"npm test"`, `web_fetch:docs.python.org`) or a tool name for every call of it (`write_file`, `bash_command`). Without a terminal, other calls that need approval are denied |
 | `dostuff mcp list`       | Show MCP servers and the file each comes from |
 | `dostuff mcp add <name> [-e K=V] -- <command> [args...]` | Add a stdio server; `--url <url> [-H "Name: value"]` for HTTP; `--project` writes `./.dostuff/mcp_config.json` |
 | `dostuff mcp remove <name> [--project]` | Remove a server |
@@ -165,26 +166,37 @@ In the TUI:
 | `Enter`       | Submit message                      |
 | `/`           | Open the command menu (type to filter, `Tab` completes, `Enter` runs) |
 | `!<command>`  | Run a shell command directly (no approval); the command and its output are shown to the model on the next turn |
+| `# <note>`    | Add `- <note>` to `AGENTS.md`: you pick this project's or the global one (`~/.dostuff/AGENTS.md`); the agent follows it from the next message |
 | `Shift+Enter` | Insert a newline (multi-line input). If your terminal sends it as plain Enter, use `\` then `Enter`, `Ctrl+Enter`, `Alt+Enter` or `Ctrl+J` |
 | `@path`       | Attach a file (numbered lines) or a folder listing to the message. Typing `@` lists matching project paths: `Tab` / `Enter` completes, a folder opens for the next part. `@"a b.txt"` for spaces. Also works with `dostuff -p`. `.env` files and binaries are never attached |
 | `Tab`         | While typing a slash command, accept the dim ghost text after the cursor: the rest of the command name, then its flag (`/model ` → `--active`, `/fork ` → `--worktree`). `Right` accepts it too |
 | Paste        | A paste over 10 lines (`ui.paste_collapse_lines`) or 2,000 chars shows as `[Pasted text #1 +243 lines]` and is expanded when you send it. Over 200 lines (`loop.paste_file_lines`) it's saved to `.dostuff/pastes/` and the model reads it from there, so it doesn't fill the context; files are removed after `loop.paste_retention_days` (7) |
 | `Up` / `Down` | On the first / last line of the input: previous / next prompt typed in this directory (saved in `~/.dostuff/data/prompt_history.jsonl`) |
+| `Ctrl+R`      | Search the prompts typed in this directory (type to filter, `Enter` puts the prompt in the input) |
+| `Esc` `Esc`   | With an empty input: take back your last prompt. It and everything after it (answer, tool calls) leave the conversation and the prompt goes back in the input to edit and resend. Files that turn changed stay as they are; `/undo` restores them |
 | `Ctrl+O`      | Expand / collapse every truncated tool and shell result (click one to toggle just that one) |
+| `Shift+Tab`   | Cycle the permission mode for this session: ask → auto → plan → allowlist (shown in the status bar) |
+| `Ctrl+Backspace` / `Ctrl+W` / `Alt+Backspace` | Delete the previous word; `Ctrl+Delete` / `Alt+Delete` the next one |
 | `/exit`       | Save the session and quit           |
 | `/clear`      | Start a new session; the old one stays resumable |
 | `/resume [<id>]` | Pick another session from this directory (or switch to the given one) |
 | `/fork [title] [--worktree]` | Copy this session into a new one and switch to it; the original is unchanged |
 | `/worktree [name]` / `/worktree exit` | Move the session into a new git worktree on branch `dostuff/<name>` / leave it (removed if unchanged, otherwise keep or remove) |
-| `/permissions [mode]` | Show or change the permission mode for this session |
+| `/permissions [mode]` | Show or change the permission mode for this session (`ask`, `allowlist`, `auto`, `plan`) |
+| `/copy`       | Copy the model's last answer to the clipboard |
+| `/notifications [on\|off\|bell\|osc9]` | Turn turn-finished / approval notifications on or off for this session (default from `ui.notifications`) |
 | `/model [<provider/model>] [--active]` | Pick a model: your saved ones (`models:` in config.yaml) first, then "More <provider> models…" for each provider's list (type to filter; Enter on no match uses what you typed). A model that isn't saved yet is added to `~/.dostuff/config.yaml`. A plain `/model` switch lasts only for this session; add `--active` (e.g. `/model --active`, or `/model anthropic/claude-sonnet-5-5 --active`) to make it the default that new sessions start with |
 | `/config [mcp] [project]` | Edit a settings file right in the TUI: pick `config.yaml` or the MCP servers, user (`~/.dostuff`) or project (`./.dostuff`), or name one (`/config mcp project`). `Ctrl+S` checks the file, saves it and applies it without a restart (an invalid file stays open with the error); `Esc` closes, twice if there are unsaved changes. A new file starts with every option commented out. `.env` files aren't offered |
 | `/status`     | Session, directory, model, permission mode, tokens, context use, MCP servers |
+| `/context`    | What fills the context window: system prompt, tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
+| `/memory [project\|global]` | Edit `AGENTS.md` (this project's or `~/.dostuff/AGENTS.md`) in the same editor as `/config`; `Ctrl+S` saves and the agent follows it from the next message |
+| `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory), with a fix for each problem |
 | `/<skill> [args]` | Run a skill: every discovered skill is a command (listed in the `/` menu and `/help`). See [Skills](#skills) |
+| `/<command> [args]` | Run a custom command from `.dostuff/commands/` or `~/.dostuff/commands/`. See [Custom commands](#custom-commands) |
 | `/rename <title>` | Name this session (shown by `dostuff sessions`) |
 | `/export [<path>]` | Save this session as Markdown (default `dostuff-session-<id>.md`) |
 | `/undo [force]` | Revert the agent's file changes from its last file-editing turn |
-| `/compact`    | Manually trigger context compaction |
+| `/compact`    | Manually trigger context compaction; `/compact auto <1-100\|off>` sets the auto-compaction threshold for this session |
 | `/memories`   | List the facts saved about you (and where each came from) |
 | `/episodes`   | List saved episodes (decisions, corrections, fixes) recalled here, newest first |
 | `/forget <key or id>` | Delete a saved fact (by key) or episode (by the id shown in `/episodes`) |
@@ -201,6 +213,8 @@ In the TUI:
 - **Errors** — red background
 - **Status bar** — `cwd • model • permission mode • context usage %` by default; `help`, `session`, `tokens` and `cost` can be added. Choose and order the items with `ui.status_bar` in `config.yaml`; when the terminal is too narrow (or zoomed in), long items are shortened and the least important dropped (help, session, cwd, tokens, cost, model, context, mode) instead of being cut off
 - **Loading** — bold `Working...` with a live elapsed timer and queued-prompt count, or streamed thoughts displayed live
+- **Terminal title** — the tab / window title shows the run status: `⏳ dostuff · <folder>` while working, `✋` while an approval waits, `✓` when done; the old title comes back on exit. `ui.terminal_title: false` turns it off
+- **Notifications** (off by default) — `ui.notifications: bell` (terminal bell) or `osc9` (desktop notification in iTerm2, WezTerm, Ghostty, kitty …) when a turn finishes or an approval is waiting, if it took longer than `ui.notify_after_seconds` (30) or the terminal is in the background. `/notifications` switches it per session
 
 ---
 
@@ -223,6 +237,9 @@ In the TUI:
 - `ask` (default) — as in the table above.
 - `allowlist` — as `ask`, plus the patterns in `permissions.allow` run without asking (a shell command prefix such as `npm test`, a tool name such as `write_file`, `call_mcp_tool:<server>__<tool>`, `web_fetch:<domain>`, or `web_search`).
 - `auto` — nothing asks. A red warning is shown at startup.
+- `plan` — read-only: reads and read-only shell commands run; file changes, other shell commands and settings changes are denied with a "plan mode" note, and the model is told to investigate and answer with a plan. Web and MCP calls ask as in `ask`.
+
+In the TUI, `Shift+Tab` cycles the mode for the session (ask → auto → plan → allowlist); `/permissions <mode>` picks one.
 
 Answering `a` (always) approves that tool, or for the shell those commands, for the rest of the session.
 
@@ -291,7 +308,7 @@ memory:
   episodic_scope: project   # recall past episodes from this directory (project) or anywhere (user)
 
 permissions:
-  mode: ask                 # ask | allowlist | auto
+  mode: ask                 # ask | allowlist | auto | plan
   allow: []
 ```
 
@@ -329,6 +346,8 @@ The model resolution maps model names (using [litellm format](https://docs.litel
 | Gemini    | `gemini/gemini-3.1-flash-lite`         | `GEMINI_API_KEY`    |
 | Groq      | `groq/llama-3.1-70b-versatile`         | `GROQ_API_KEY`      |
 | Ollama    | `ollama/llama3.1`                      | _(none)_            |
+| OpenCode Zen | `opencode/claude-sonnet-5-5`        | `OPENCODE_API_KEY`  |
+| OpenCode Go  | `opencode-go/kimi-k3`               | `OPENCODE_API_KEY`  |
 
 If `name` has no `/`, the provider prefix is dynamically inferred from the model name prefix or configured `provider` fields.
 
@@ -340,7 +359,9 @@ dostuff models add anthropic/claude-sonnet-5-5            # add it (pick it with
 dostuff models add groq/llama-3.3-70b-versatile --active  # add it and make it the default
 ```
 
-or `/model` inside the TUI. Model lists come from litellm's catalog (chat models, without dated snapshots that have an alias), from OpenRouter's public model list, and for Ollama from the models you've pulled (the server must be running). A name that isn't listed still works. Then put the provider's key in `~/.dostuff/.env`. A project's `./.dostuff/config.yaml` with its own `models:` list replaces the global list in that directory.
+or `/model` inside the TUI. Model lists come from litellm's catalog (chat models, without dated snapshots that have an alias), from OpenRouter's and OpenCode's public model lists, and for Ollama from the models you've pulled (the server must be running). A name that isn't listed still works. Then put the provider's key in `~/.dostuff/.env`. A project's `./.dostuff/config.yaml` with its own `models:` list replaces the global list in that directory.
+
+OpenCode models (`opencode/<id>` for Zen, `opencode-go/<id>` for a Go subscription) use the ids from the [OpenCode docs](https://opencode.ai/docs/zen/). litellm has no OpenCode provider, so DoStuff sends each model to the gateway endpoint for its family: Claude models (and a few Qwen / MiniMax models) to the Anthropic Messages endpoint, GPT / Grok / Muse models to the Responses endpoint, Gemini models to the Gemini endpoint, and all other models to chat completions. One console key in `OPENCODE_API_KEY` works for Zen and Go. OpenCode only allows its free models from its own app, so use paid models or Go.
 
 ---
 
@@ -410,7 +431,8 @@ added to the system prompt, most general first, so the closest one wins where th
 1. `~/.dostuff/AGENTS.md` — your instructions for every project
 2. one per folder from the top of the path down to the current directory (e.g. the repo root, then a sub-package)
 
-In a folder with both, `AGENTS.md` is used. They're read once at startup.
+In a folder with both, `AGENTS.md` is used. They're read once at startup, and again after you change
+one from the TUI: `# <note>` adds a line to this project's or the global file, and `/memory` opens one in an editor.
 
 ---
 
@@ -452,6 +474,24 @@ Detailed instructions for the agent go here.
 **Running a skill yourself:** each skill is also a slash command, `/<name> [arguments]` (e.g. `/my-skill src/app.py`), in the TUI and with `dostuff -p "/my-skill ..."`. The turn's message is the skill's `SKILL.md` body plus your arguments (which can use `@path` mentions), so the model follows it straight away instead of deciding whether to read it. The command shows in the `/` menu marked `(skill)` and in `/help`. Built-in commands win a name clash, the first skill found (in the order above) wins between skills, and names with spaces can't be run this way; the model can still use those skills on its own.
 
 Run `dostuff init` to bootstrap a local `.dostuff/skills/` folder. Restart the agent after adding new skills.
+
+### Custom commands
+
+A Markdown file in `.dostuff/commands/` (this project) or `~/.dostuff/commands/` (every project) is a slash
+command named after the file: `.dostuff/commands/review.md` is `/review`. Running `/review src/app.py` sends the
+file's text as your message, with `$ARGUMENTS` replaced by `src/app.py` (with no `$ARGUMENTS` in the file, the
+arguments are added at the end). An optional frontmatter `description:` is shown in the `/` menu, otherwise the
+first line is. Works in the TUI and with `dostuff -p "/review src/app.py"`.
+
+```markdown
+---
+description: Review a file for bugs
+---
+Review $ARGUMENTS for bugs and missing tests. List problems by severity.
+```
+
+Built-in commands win a name clash, then project commands, then user commands, then skills. Restart dostuff
+after adding a command.
 
 ---
 

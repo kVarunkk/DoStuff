@@ -155,7 +155,6 @@ def test_cache_breakpoints_only_for_claude(monkeypatch, provider, model, enabled
     assert model_module.uses_explicit_prompt_caching() is expected
 
     monkeypatch.setattr(call_agent_module, "completion_kwargs", lambda: {"model": model})
-    monkeypatch.setattr(call_agent_module, "get_provider", lambda: provider)
     monkeypatch.setattr(call_agent_module, "_supports_reasoning", lambda m: False)
     kwargs = call_agent_module.build_request_kwargs(stream=False)
     assert ("cache_control_injection_points" in kwargs) is expected
