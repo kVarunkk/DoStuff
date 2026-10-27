@@ -17,7 +17,7 @@ _CHUNK_PREFIX = "chunks:"
 try:
     import keyring as _keyring
 except ImportError:  # a required dependency, but don't crash a broken install
-    _keyring = None
+    _keyring = None  # type: ignore[assignment]
 
 
 def keyring_available() -> bool:
@@ -40,7 +40,8 @@ def load_token(server_url: str) -> dict[str, Any] | None:
         raw = _keyring.get_password(SERVICE, server_url)
         if n := _chunk_count(raw):
             parts = [_keyring.get_password(SERVICE, f"{server_url}#{i}") for i in range(n)]
-            raw = "".join(parts) if all(p is not None for p in parts) else None
+            chunks = [p for p in parts if p is not None]
+            raw = "".join(chunks) if len(chunks) == n else None
         data = json.loads(raw) if raw else None
     except Exception:
         return None
