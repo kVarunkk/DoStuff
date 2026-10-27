@@ -46,12 +46,35 @@ class _ServerConnection:
         self.stop = asyncio.Event()
 
 
+class _OAuthBearer(httpx2.Auth):
+    """Puts a current access token on every request and refreshes it (no browser) when it is
+    about to expire or the server answers 401, so a session outlives its first token."""
+
+    def __init__(self, client: "MCPClient", server_name: str, url: str) -> None:
+        self._client = client
+        self._server_name = server_name
+        self._url = url
+
+    async def async_auth_flow(self, request):
+        token = await self._client._valid_token(self._server_name, self._url)
+        if token:
+            request.headers["Authorization"] = f"Bearer {token}"
+        response = yield request
+        if response.status_code == 401:
+            fresh = await self._client._refresh(self._server_name, self._url, rejected=token)
+            if fresh:
+                request.headers["Authorization"] = f"Bearer {fresh}"
+                yield request
+
+
 class MCPClient:
     def __init__(self, registration_store: MCPClientRegistrationStore, tool_registry_store: MCPToolRegistryStore | None):
         self.servers: dict[str, ClientSession] = {}
         # server__tool -> {"server_name", "tool_name", "schema"}
         self.mcp_tools: dict[str, dict[str, Any]] = {}
         self._tokens: dict[str, dict] = {}
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
+        self._warned_unsaved = False
         self.server_meta: dict[str, dict] = {}
         self._connections: dict[str, _ServerConnection] = {}
         self.registration_store = registration_store
@@ -86,20 +109,19 @@ class MCPClient:
             "args": args,
             "env": env,
         }
+        auth: _OAuthBearer | None = None
         if transport in HTTP_TRANSPORTS or url:
             if not url:
                 raise ValueError(f"Server '{server_name}' requires a 'url' for transport '{transport}'.")
-            if "Authorization" not in req_headers:
-                token = await self._get_or_refresh_token(server_name, url)
-                if token:
-                    req_headers["Authorization"] = f"Bearer {token}"
+            if "Authorization" not in req_headers and await self._get_or_refresh_token(server_name, url):
+                auth = _OAuthBearer(self, server_name, url)
         elif not command:
             raise ValueError(f"Server '{server_name}' requires a 'command' for stdio transport.")
 
         conn = _ServerConnection()
         ready: asyncio.Future[ClientSession] = asyncio.get_running_loop().create_future()
         conn.task = asyncio.create_task(
-            self._serve(server_name, transport, url, req_headers, command, args, env, ready, conn.stop),
+            self._serve(server_name, transport, url, req_headers, auth, command, args, env, ready, conn.stop),
             name=f"mcp:{server_name}",
         )
         self._connections[server_name] = conn
@@ -133,17 +155,17 @@ class MCPClient:
                 },
             }
 
-    async def _serve(self, server_name, transport, url, req_headers, command, args, env, ready: asyncio.Future, stop: asyncio.Event) -> None:
+    async def _serve(self, server_name, transport, url, req_headers, auth, command, args, env, ready: asyncio.Future, stop: asyncio.Event) -> None:
         """Owns one server's transports: opens them, hands back the session, closes on stop."""
         try:
             async with AsyncExitStack() as stack:
                 if transport in HTTP_TRANSPORTS or url:
                     if transport in ("http", "streamable-http"):
-                        http_client = await stack.enter_async_context(httpx2.AsyncClient(headers=req_headers, timeout=timeout, event_hooks={"response": [self._log_response]}))
+                        http_client = await stack.enter_async_context(httpx2.AsyncClient(headers=req_headers, auth=auth, timeout=timeout, event_hooks={"response": [self._log_response]}))
                         self.server_meta[server_name]["http_client"] = http_client
                         read, write, *_ = await stack.enter_async_context(streamable_http_client(url=url, http_client=http_client))
                     else:
-                        read, write = await stack.enter_async_context(sse_client(url=url, headers=req_headers))
+                        read, write = await stack.enter_async_context(sse_client(url=url, headers=req_headers, auth=auth))
                 else:
                     merged_env = os.environ.copy()
                     if env:
@@ -188,12 +210,15 @@ class MCPClient:
             await asyncio.gather(conn.task, return_exceptions=True)
 
     async def reauthenticate(self, server_name: str) -> None:
-        """Drop the cached token and reconnect (runs the OAuth flow again if needed)."""
+        """Reconnect with a new token: refreshed while the refresh token still works, otherwise
+        the cached token is dropped and the OAuth flow runs again."""
         meta = self.server_meta.get(server_name, {})
         url = meta.get("url")
-        self._tokens.pop(server_name, None)
         if url:
-            token_store.delete_token(url)
+            cached = self._cached_token(server_name, url)
+            if await self._refresh(server_name, url, rejected=cached["access_token"] if cached else None) is None:
+                self._tokens.pop(server_name, None)
+                token_store.delete_token(url)
         headers = dict(meta.get("headers") or {})
         headers.pop("Authorization", None)
         await self.connect_to_server(
@@ -209,30 +234,9 @@ class MCPClient:
     async def _get_or_refresh_token(self, server_name: str, url: str) -> str | None:
         """Cached (memory, then keyring) token, refreshed if expired; else probe the server and
         run the OAuth flow when it answers 401."""
-        cached = self._tokens.get(server_name) or token_store.load_token(url)
-
-        if cached:
-            if time.time() < cached["expires_at"] - 60:  # 60s safety margin
-                self._tokens[server_name] = cached
-                return cached["access_token"]
-            if cached.get("refresh_token"):
-                # A confidential client (e.g. Supabase) refreshes with the secret from its registration
-                registration = await self.registration_store.get(server_name) or {}
-                same_client = registration.get("client_id") == cached.get("client_id")
-                try:
-                    token_data = await refresh_access_token(
-                        cached["token_endpoint"], cached["refresh_token"],
-                        client_id=cached.get("client_id"), resource=cached.get("resource"),
-                        client_secret=registration.get("client_secret") if same_client else None,
-                        auth_method=registration.get("token_endpoint_auth_method") if same_client else None,
-                    )
-                    token_data.setdefault("refresh_token", cached["refresh_token"])
-                    token_data["client_id"] = cached.get("client_id")
-                    token_data["resource"] = cached.get("resource")
-                    self._store_token(server_name, url, cached["token_endpoint"], token_data)
-                    return token_data["access_token"]
-                except httpx.HTTPError:
-                    pass  # refresh token expired/revoked: fall through to a fresh flow
+        token = await self._valid_token(server_name, url)
+        if token:
+            return token
 
         try:
             async with httpx.AsyncClient() as probe_client:
@@ -249,6 +253,52 @@ class MCPClient:
             return token_data["access_token"]
         return None
 
+    def _cached_token(self, server_name: str, url: str) -> dict | None:
+        cached = self._tokens.get(server_name) or token_store.load_token(url)
+        if cached:
+            self._tokens[server_name] = cached
+        return cached
+
+    async def _valid_token(self, server_name: str, url: str) -> str | None:
+        """The cached access token, refreshed if it is about to expire. Never opens a browser."""
+        cached = self._cached_token(server_name, url)
+        if cached is None:
+            return None
+        if time.time() < cached["expires_at"] - 60:  # 60s safety margin
+            return cached["access_token"]
+        return await self._refresh(server_name, url, rejected=cached["access_token"])
+
+    async def _refresh(self, server_name: str, url: str, rejected: str | None) -> str | None:
+        """Trade the refresh token for a new access token; None when there is none or the server
+        refuses it. `rejected` is the token that just failed: if a concurrent request already
+        replaced it, the newer one is returned instead of refreshing twice."""
+        async with self._refresh_locks.setdefault(server_name, asyncio.Lock()):
+            cached = self._cached_token(server_name, url)
+            if cached is None:
+                return None
+            if cached["access_token"] != rejected and time.time() < cached["expires_at"] - 60:
+                return cached["access_token"]
+            if not cached.get("refresh_token"):
+                return None
+            # A confidential client (e.g. Supabase) refreshes with the secret from its registration
+            registration = await self.registration_store.get(server_name) or {}
+            same_client = registration.get("client_id") == cached.get("client_id")
+            try:
+                token_data = await refresh_access_token(
+                    cached["token_endpoint"], cached["refresh_token"],
+                    client_id=cached.get("client_id"), resource=cached.get("resource"),
+                    client_secret=registration.get("client_secret") if same_client else None,
+                    auth_method=registration.get("token_endpoint_auth_method") if same_client else None,
+                )
+                access_token = token_data["access_token"]
+            except (httpx.HTTPError, KeyError, ValueError):
+                return None  # refresh token expired/revoked
+            token_data.setdefault("refresh_token", cached["refresh_token"])
+            token_data["client_id"] = cached.get("client_id")
+            token_data["resource"] = cached.get("resource")
+            self._store_token(server_name, url, cached["token_endpoint"], token_data)
+            return access_token
+
     def _store_token(self, server_name: str, url: str, token_endpoint: str, token_data: dict) -> None:
         token = {
             "access_token": token_data["access_token"],
@@ -259,7 +309,11 @@ class MCPClient:
             "resource": token_data.get("resource"),
         }
         self._tokens[server_name] = token
-        token_store.save_token(url, token)
+        if not token_store.save_token(url, token) and not self._warned_unsaved:
+            self._warned_unsaved = True
+            from dostuff.helpers.ui.emit import emit
+            why = "the OS keyring refused it" if token_store.keyring_available() else "`keyring` isn't importable; reinstall dostuff"
+            emit(f"MCP sign-in for '{server_name}' is kept in memory only ({why}); you will sign in again next start.", msg_type="system")
 
     async def cleanup(self) -> None:
         """Close every server connection (each in the task that opened it)."""

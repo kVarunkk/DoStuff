@@ -2,13 +2,17 @@
 import asyncio
 import base64
 import json
+import time
 import urllib.parse
 
 import httpx
+import httpx2
 import pytest
 
-from dostuff.helpers.mcp import mcp_oauth
+from dostuff.helpers.mcp import mcp_oauth, token_store
 from dostuff.helpers.mcp.mcp_oauth import OAuthError, authenticate_via_oauth, refresh_access_token, with_client_auth
+from dostuff.lib.mcp import mcp_client as mcp_client_mod
+from dostuff.lib.mcp.mcp_client import MCPClient, _OAuthBearer
 from dostuff.lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
 
 MCP_URL = "https://mcp.example.com/mcp"
@@ -113,3 +117,108 @@ def test_refresh_sends_the_secret(oauth_env):
 def test_public_client_sends_no_secret():
     body, auth = with_client_auth({"client_id": "c"}, None, None)
     assert body == {"client_id": "c"} and type(auth) is httpx.Auth
+
+
+# --- token persistence and refresh ---------------------------------------------------------
+
+class FakeKeyring:
+    """Like Windows Credential Manager: refuses secrets over 1280 chars."""
+    def __init__(self):
+        self.items: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service, name):
+        return self.items.get((service, name))
+
+    def set_password(self, service, name, value):
+        if len(value) > 1280:
+            raise OSError("The stub received bad data.")
+        self.items[(service, name)] = value
+
+    def delete_password(self, service, name):
+        if (service, name) not in self.items:
+            raise KeyError(name)
+        del self.items[(service, name)]
+
+
+@pytest.fixture
+def fake_keyring(monkeypatch):
+    ring = FakeKeyring()
+    monkeypatch.setattr(token_store, "_keyring", ring)
+    return ring
+
+
+def test_long_token_is_split_across_entries(fake_keyring):
+    token = {"access_token": "a" * 3000, "refresh_token": "r" * 1500}
+    assert token_store.save_token(MCP_URL, token)
+    assert token_store.load_token(MCP_URL) == token
+    assert len(fake_keyring.items) > 1
+    token_store.save_token(MCP_URL, {"access_token": "short"})  # replaces the chunks
+    assert token_store.load_token(MCP_URL) == {"access_token": "short"} and len(fake_keyring.items) == 1
+    token_store.delete_token(MCP_URL)
+    assert fake_keyring.items == {}
+
+
+def make_client(tmp_path, monkeypatch, access_token="old", expires_in=3600, refresh=None):
+    monkeypatch.setattr(token_store, "_keyring", FakeKeyring())
+    client = MCPClient(MCPClientRegistrationStore(path=str(tmp_path / "reg.json")), None)
+    client._tokens["srv"] = {
+        "access_token": access_token, "refresh_token": "ref", "expires_at": time.time() + expires_in,
+        "token_endpoint": f"{AS}/token", "client_id": "c", "resource": None,
+    }
+    calls = []
+
+    async def fake_refresh(endpoint, refresh_token, **kw):
+        calls.append(refresh_token)
+        if refresh is None:
+            return {"access_token": "new", "expires_in": 3600}
+        raise refresh
+
+    async def no_browser(*a, **kw):
+        raise AssertionError("the browser flow ran")
+    monkeypatch.setattr(mcp_client_mod, "refresh_access_token", fake_refresh)
+    monkeypatch.setattr(mcp_client_mod, "authenticate_via_oauth", no_browser)
+    return client, calls
+
+
+def test_expired_token_is_refreshed_without_a_browser(tmp_path, monkeypatch):
+    client, calls = make_client(tmp_path, monkeypatch, expires_in=-10)
+    assert asyncio.run(client._get_or_refresh_token("srv", MCP_URL)) == "new"
+    assert calls == ["ref"] and token_store.load_token(MCP_URL)["refresh_token"] == "ref"
+
+
+def test_401_mid_session_refreshes_and_retries(tmp_path, monkeypatch):
+    client, calls = make_client(tmp_path, monkeypatch)
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["authorization"])
+        return httpx2.Response(200 if request.headers["authorization"] == "Bearer new" else 401)
+
+    async def go():
+        async with httpx2.AsyncClient(auth=_OAuthBearer(client, "srv", MCP_URL), transport=httpx2.MockTransport(handler)) as http:
+            return (await http.post(MCP_URL, json={})).status_code
+    assert asyncio.run(go()) == 200
+    assert seen == ["Bearer old", "Bearer new"] and calls == ["ref"]
+
+
+def test_reauthenticate_refreshes_before_signing_in_again(tmp_path, monkeypatch):
+    client, calls = make_client(tmp_path, monkeypatch)
+    client.server_meta["srv"] = {"url": MCP_URL, "transport": "streamable-http", "headers": {}}
+    reconnects = []
+
+    async def fake_connect(**kw):
+        reconnects.append(kw["server_name"])
+    monkeypatch.setattr(client, "connect_to_server", fake_connect)
+    asyncio.run(client.reauthenticate("srv"))
+    assert calls == ["ref"] and client._tokens["srv"]["access_token"] == "new" and reconnects == ["srv"]
+
+
+def test_reauthenticate_drops_a_dead_refresh_token(tmp_path, monkeypatch):
+    client, calls = make_client(tmp_path, monkeypatch, refresh=httpx.HTTPError("invalid_grant"))
+    client.server_meta["srv"] = {"url": MCP_URL, "transport": "streamable-http", "headers": {}}
+
+    async def fake_connect(**kw):
+        pass
+    monkeypatch.setattr(client, "connect_to_server", fake_connect)
+    asyncio.run(client.reauthenticate("srv"))
+    assert "srv" not in client._tokens

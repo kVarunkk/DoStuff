@@ -87,7 +87,6 @@ cd DoStuff
 pip install -e .           # core
 pip install -e ".[memory]" # + long-term memory (chromadb)
 pip install -e ".[full]"   # + memory + onnxruntime + grpcio
-pip install -e ".[keyring]" # persist MCP OAuth tokens in the OS keyring
 pip install -e ".[dev]"    # + pytest + mypy
 
 python -m pytest -q tests
@@ -413,7 +412,7 @@ MCP servers connect concurrently in the background, so the TUI never blanks duri
 
 MCP tools are named `<server>__<tool>` (e.g. `github__create_issue`), so two servers can expose a tool with the same name. `search_mcp_tools` only returns tools of servers that are connected right now.
 
-**OAuth (HTTP servers):** a browser login opens when the server answers 401. The flow uses PKCE, a random `state` and an RFC 8707 `resource` indicator; the local callback on port 8085 times out after 120 s. Tokens are kept in memory, or in the OS keyring if you install `dostuff[keyring]`, never in a plain file. A tool call that fails with 401 re-authenticates once and retries.
+**OAuth (HTTP servers):** a browser login opens when the server answers 401. The flow uses PKCE, a random `state` and an RFC 8707 `resource` indicator; the local callback on port 8085 times out after 120 s. Tokens are stored in the OS keyring (memory only if no keyring backend is available), never in a plain file. Expired access tokens are refreshed with the refresh token, before a request or after a 401, without opening the browser; you sign in again only when the refresh token itself is rejected.
 
 To force a re-registration, delete:
 

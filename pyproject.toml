@@ -38,6 +38,8 @@ dependencies = [
     "opentelemetry-sdk>=1.20",
     "textual>=0.50.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20",
+    # MCP OAuth tokens persist in the OS keyring; without it every start opens the browser
+    "keyring>=24",
 ]
 
 [project.urls]
@@ -62,10 +64,6 @@ full = [
     "dostuff[memory,search]",
     "onnxruntime>=1.16",
     "grpcio>=1.52",
-]
-# Persist MCP OAuth tokens in the OS keyring (otherwise they live in memory only)
-keyring = [
-    "keyring>=24",
 ]
 dev = [
     "pytest>=8",

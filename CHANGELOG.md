@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- `keyring` is a core dependency; the `dostuff[keyring]` extra is removed. Without a usable keyring backend, tokens are still kept in memory only, never in a plain file.
+
+### Fixed
+- **MCP OAuth no longer signs in on every start.** Tokens over ~1 KB are split across several keyring entries (Windows Credential Manager rejected the whole JSON at its 2560-byte cap, so the save failed silently). HTTP/SSE transports attach the current token per request through an `httpx2.Auth`, refresh it shortly before expiry, and on a 401 refresh once and retry; `reauthenticate()` only opens the browser when the refresh token is rejected. A one-time notice says when a token can only be kept in memory.
+
 ## [0.2.1] - 2026-10-27
 
 OpenCode Zen / Go models, plan mode, custom commands, `# note` memory, `/context`, `/doctor`, `/copy`, richer headless output and terminal title / notifications.
