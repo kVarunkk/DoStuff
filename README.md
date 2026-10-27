@@ -61,15 +61,19 @@ pip install dostuff
 
 This installs the `dostuff` command on your `PATH`. Done.
 
-Long-term memory (the agent remembers facts and past decisions across sessions) needs ChromaDB,
-a large download, so it's an extra:
+Optional features come as extras:
 
-```bash
-pip install "dostuff[memory]"
-```
+| Install | Adds |
+|---|---|
+| `pip install dostuff` | Everything except the extras below, including MCP (with OAuth tokens kept in the OS keyring) |
+| `pip install "dostuff[memory]"` | Long-term memory (facts and past decisions across sessions) and semantic MCP tool search, via ChromaDB. Large download |
+| `pip install "dostuff[search]"` | Steadier `web_search` through the `ddgs` package (several engines) instead of DuckDuckGo's HTML page |
+| `pip install "dostuff[full]"` | `memory` + `search` |
+| `pip install "dostuff[dev]"` | `pytest` and `mypy`, for working on dostuff itself |
 
-Without it everything else works: the memory tools are hidden from the model and MCP tool search
-matches keywords instead of meaning. `dostuff doctor` shows whether memory is on.
+Extras combine, e.g. `pip install "dostuff[memory,search]"`. Without `memory` everything else
+works: the memory tools are hidden from the model and MCP tool search matches keywords instead of
+meaning. `dostuff doctor` shows whether memory is on.
 
 ### Other install methods
 
@@ -77,6 +81,7 @@ For an isolated install with [pipx](https://pypa.github.io/pipx/):
 
 ```bash
 pipx install dostuff
+pipx install "dostuff[full]"   # with extras
 ```
 
 For development (editable mode, from a clone):
@@ -86,7 +91,8 @@ git clone https://github.com/kVarunkk/DoStuff.git
 cd DoStuff
 pip install -e .           # core
 pip install -e ".[memory]" # + long-term memory (chromadb)
-pip install -e ".[full]"   # + memory + onnxruntime + grpcio
+pip install -e ".[search]" # + ddgs web search
+pip install -e ".[full]"   # + memory + search
 pip install -e ".[dev]"    # + pytest + mypy
 
 python -m pytest -q tests
