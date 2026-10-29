@@ -368,6 +368,8 @@ or `/model` inside the TUI. Model lists come from litellm's catalog (chat models
 
 OpenCode models (`opencode/<id>` for Zen, `opencode-go/<id>` for a Go subscription) use the ids from the [OpenCode docs](https://opencode.ai/docs/zen/). litellm has no OpenCode provider, so DoStuff sends each model to the gateway endpoint for its family: Claude models (and a few Qwen / MiniMax models) to the Anthropic Messages endpoint, GPT / Grok / Muse models to the Responses endpoint, Gemini models to the Gemini endpoint, and all other models to chat completions. One console key in `OPENCODE_API_KEY` works for Zen and Go. OpenCode only allows its free models from its own app, so use paid models or Go.
 
+The gateways don't publish a model's context window in `/v1/models`, so `helpers/models/opencode.py` carries one per model, taken from [models.dev](https://models.dev)'s `opencode` and `opencode-go` entries (the same id can differ per gateway: `opencode/minimax-m3` is 512k, `opencode-go/minimax-m3` is 1M). `/context`, the status bar and auto-compaction size themselves from it; set `loop.context_window` to override.
+
 ---
 
 ## MCP servers
