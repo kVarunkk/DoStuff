@@ -304,7 +304,7 @@ models:
 loop:
   max_iterations: 100
   subagent_max_iterations: 25
-  # context_window: 128000       # override when litellm doesn't know the model
+  # context_window: 128000       # override when dostuff/litellm don't know the model
   max_tool_output_chars: 30000   # longer tool results keep head + tail
   max_retries: 6                 # retries on rate limits, timeouts, 5xx (0 = none)
   retry_max_delay: 60            # cap on each wait, seconds; Retry-After is honored

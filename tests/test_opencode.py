@@ -1,6 +1,7 @@
 """OpenCode Zen / Go models: routing through litellm's openai / anthropic / gemini providers."""
 import pytest
 
+import dostuff.helpers.agent.get_model_token_limit as token_limit_module
 from dostuff import config as config_module
 from dostuff.config import reset_config
 from dostuff.helpers.models import list_models
@@ -79,3 +80,45 @@ def test_model_list(monkeypatch):
     assert chat_model_ids(data) == ["kimi-k3", "claude-haiku-5-5"]
     monkeypatch.setattr(list_models, "_get_json", lambda url, what: data if url.endswith("/go/v1/models") else {})
     assert list_models.provider_models("opencode-go") == ["opencode-go/claude-haiku-5-5", "opencode-go/kimi-k3"]
+
+
+def test_context_window_table(model):
+    """OpenCode gateways publish no context limit, so the table in helpers/models/opencode.py is used."""
+    t = token_limit_module
+    for name, window in [
+        ("opencode-go/deepseek-v4.1-flash", 1_000_000),  # the model that used to be assumed 128k
+        ("opencode/deepseek-v4.1-flash", 1_000_000),
+        ("opencode/minimax-m3", 512_000),  # same id, different window per gateway
+        ("opencode-go/minimax-m3", 1_000_000),
+        ("opencode/qwen3.8-max", 262_144),
+        ("opencode-go/qwen3.8-max", 1_000_000),
+    ]:
+        model(name)
+        assert t.get_model_token_limit() == window, name
+
+
+def test_context_window_bare_litellm_fallback(model, monkeypatch):
+    """An id missing from the table still resolves through litellm without the route prefix."""
+    t = token_limit_module
+    monkeypatch.setattr(t, "context_window", lambda provider, model_id: None)
+    model("opencode-go/deepseek-v4-pro")
+    assert t._litellm_limit("openai/deepseek-v4-pro") is None  # the routed name is unknown to litellm
+    assert t._litellm_limit("deepseek-v4-pro") == 1_000_000  # the bare id is not
+    assert t.get_model_token_limit() == 1_000_000
+
+
+def test_context_window_configured_wins(model, monkeypatch):
+    model("opencode-go/deepseek-v4.1-flash")
+    monkeypatch.setattr(token_limit_module.get_config(), "context_window", 32_000)
+    assert token_limit_module.get_model_token_limit() == 32_000
+
+
+def test_context_window_unknown_warns_once(model, monkeypatch):
+    t = token_limit_module
+    emitted = []
+    monkeypatch.setattr("dostuff.helpers.ui.emit.emit", lambda message, msg_type="system": emitted.append(message))
+    monkeypatch.setattr(t, "_warned_models", set())
+    model("opencode-go/not-a-real-model")
+    assert t.get_model_token_limit() == t.FALLBACK_CONTEXT_WINDOW
+    assert t.get_model_token_limit() == t.FALLBACK_CONTEXT_WINDOW
+    assert len(emitted) == 1 and "128,000" in emitted[0]

@@ -17,7 +17,7 @@ loop:
   max_iterations: 100  # max agent turns before forced exit; ESC cancels anytime
   subagent_max_iterations: 25  # iteration cap for delegate_to_subagent
   prompt_caching: true  # Claude models: cache the system prompt and history between calls (cheaper, faster)
-  # context_window: 128000     # override the model's context window (tokens) if litellm doesn't know it
+  # context_window: 128000     # override the model's context window (tokens) if dostuff/litellm can't tell
   max_tool_output_chars: 30000 # longer tool results keep head + tail with a truncation marker
   max_retries: 6               # retries on rate limits, timeouts and 5xx (0 = fail at once)
   retry_max_delay: 60          # longest wait between retries, seconds (backoff doubles from 1s; Retry-After is honored)

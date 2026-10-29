@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **OpenCode models no longer report an assumed 128k context window.** The gateways publish no `context_length` in `/v1/models` and litellm doesn't map their ids, so every OpenCode Zen / Go model fell back to 128k — `opencode-go/deepseek-v4.1-flash` is 1M, `opencode/minimax-m3` is 512k, `opencode/qwen3.8-max` is 262k. `helpers/models/opencode.py` now carries a per-gateway `_CONTEXT_WINDOWS` table taken from models.dev (the same id can have a different window on each gateway) plus a `context_window()` lookup, and `get_model_token_limit()` resolves `loop.context_window` → table → litellm on the routed name → litellm on the bare id → 128k. The "Unknown context window … assuming 128,000 tokens" notice now only appears when all of those miss, once per model. Auto-compaction thresholds, the status-bar percentage, `/context` and `/compact` budgets follow from it, so OpenCode sessions no longer compact at a sixth of their real window.
+
+### Documentation
+- The `loop.context_window` comment in `README.md` and `templates/config.example.yaml` no longer claims litellm is the only source.
+
 ## [0.2.2] - 2026-10-28
 
 MCP OAuth sign-ins now survive restarts, and `keyring` is a core dependency.
