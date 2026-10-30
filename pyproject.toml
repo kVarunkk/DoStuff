@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dostuff"
-version = "0.2.3"
+version = "0.3.0"
 description = "DoStuff - a terminal coding agent for any LLM: TUI and headless mode, permissions, MCP, skills, web tools, sessions and git worktrees"
 readme = "README.md"
 license = "MIT"

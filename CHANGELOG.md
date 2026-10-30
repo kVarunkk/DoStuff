@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-30
+
+Hooks: run your own commands on agent events, with Claude Code's contract.
+
+### Added
+- **Hooks** (`hooks:` in `config.yaml`, user and project): shell commands on `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop` and `SessionStart`. Each hook gets a JSON envelope on stdin plus `DOSTUFF_HOOK_*` env vars and runs through the configured shell in the project root (the worktree for a worktree subagent). Exit 0 stdout is context or a JSON decision (both Claude Code spellings accepted), exit 2 blocks with stderr as the reason, any other code is a non-blocking error. `matcher` fully matches the tool name, `if` searches the shell command. Timeouts are clamped to 1–300 s and run outside the tool timeout; a hook is killed with its process tree on timeout or Esc. A Claude Code PreToolUse script works unchanged once its matcher is renamed.
+- **PreToolUse** can deny, ask, allow or rewrite a call's arguments. Outcomes merge strictest-wins (`deny` > `ask` > `allow`), and a rewrite is re-sanitized and faces the same prompt / plan-mode gate as a model call. Precedence: plan deny > hook deny > settings ask > hook ask > hook allow > permission layer, so a hook can never loosen plan mode or a settings prompt. `fail_closed: true` turns a crashed, timed-out or misconfigured hook into a deny.
+- **PostToolUse** appends each hook's output to the tool result as `<hook name="…">…</hook>`; **UserPromptSubmit** can block a prompt or add context for that turn; **Stop** / **SubagentStop** can keep the agent going (at most `hooks.stop_block_limit` times per turn); **SessionStart** (`startup` / `resume` / `clear` / `compact`) adds session context that is never stored.
+- **Project hook trust**: project hooks run only with `project_trust: allow` (read from the user file), or after a yes to a prompt listing every project command and its file. The answer is stored in `~/.dostuff/trusted_hooks.json`, keyed by project root and a hash of the project entries and `.dostuff/hooks/`; editing either asks again. Headless takes `--trust-project-hooks`, skips untrusted project hooks with a warning, and refuses to start (exit 2) when an untrusted one is `fail_closed`.
+- **`/hooks`** lists every hook per event in run order with its trust mark, matcher, timeout, command and origin file; `/hooks r` reloads. Hook decisions show as `⚓ PreToolUse bash_command → deny (reason)` lines in the TUI, on headless stderr and as `{"type": "hook"}` in stream-json.
+- `dostuff doctor` checks hooks: load warnings, programs missing from PATH, untrusted project hooks, project scripts outside `.dostuff/hooks/`. `read_settings` and `edit_config` know the `hooks` key.
+
+### Security
+- A `bash_command` naming `.dostuff` in its command or `cwd` is a settings change: it asks in every mode, `auto` included, with no "always", and a hook `allow` can't silence it. This closes an auto-mode path that could add a user hook without a prompt. Subagent worktree paths stay exempt.
+
+### Documentation
+- README Hooks section (events, config example with `.dostuff/hooks/` scripts, stdin / env / exit-code / JSON contract, merge rules, trust model, Claude Code name table); `templates/config.example.yaml` documents every event.
+
+### CI
+- macOS added to the test matrix alongside Ubuntu and Windows.
+
 ## [0.2.3] - 2026-10-29
 
 OpenCode models now use their real context window instead of an assumed 128k.
