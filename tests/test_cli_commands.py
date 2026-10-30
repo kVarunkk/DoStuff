@@ -447,4 +447,7 @@ def test_headless_project_hooks(env, headless, hook_cmd, tmp_path, monkeypatch):
     assert "guard" in result.stderr and "--trust-project-hooks" in result.stderr
     assert run("--trust-project-hooks").exit_code == 0 and runs() == 3
 
-    assert "--trust-project-hooks" in runner.invoke(env["app"], ["--help"]).output
+    # CI forces color and a narrow terminal; Rich then splits the option name with escape codes
+    help_text = runner.invoke(env["app"], ["--help"], env={"NO_COLOR": "1", "FORCE_COLOR": None,
+                                                          "TERM": "dumb", "COLUMNS": "200"}).output
+    assert "--trust-project-hooks" in help_text

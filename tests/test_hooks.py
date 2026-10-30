@@ -1573,19 +1573,22 @@ def test_readme_documents_hooks():
     for phrase in ("project_trust", "trusted_hooks.json", "--trust-project-hooks", ".dostuff/hooks/",
                    "unsandboxed", "/hooks", "fail_closed"):
         assert phrase in hooks, phrase
-    # both examples, with their scripts, and the config pasteable byte-for-byte from spec D9
-    spec = (REPO / "plan" / "2026-10-29-hooks" / "spec.md").read_text(encoding="utf-8")
-    d9 = _section(spec, "### D9. Config shape")
+    for script in ("block_main_push.py", "format_file.py"):
+        assert f"# .dostuff/hooks/{script}" in hooks, script
+    assert "**Hooks**" in _section(readme, "## Features")
+    # the config pasteable byte-for-byte from spec D9 (plan/ is gitignored, so this part is local only)
+    spec_path = REPO / "plan" / "2026-10-29-hooks" / "spec.md"
+    if not spec_path.exists():
+        return
+    d9 = _section(spec_path.read_text(encoding="utf-8"), "### D9. Config shape")
     d9_yaml = d9[d9.index("```yaml\n"):d9.index("```\n", d9.index("```yaml\n") + 8) + 4]
     assert d9_yaml in hooks
     inner = d9_yaml.removeprefix("```yaml\n").removesuffix("```\n")
     entries, warnings = load_hooks(yaml.safe_load(inner)["hooks"], source="user", origin="README.md")
     assert warnings == [] and entries
-    for script in ("block_main_push.py", "format_file.py"):
-        assert f"# .dostuff/hooks/{script}" in hooks, script
-    assert "**Hooks**" in _section(readme, "## Features")
 
 
+@pytest.mark.skipif(not (REPO / "plan").is_dir(), reason="plan/ is gitignored, so local only")
 def test_plans_point_at_the_hooks_spec():
     # CHANGELOG.md is written when NOTES.md is folded in at push time, so it isn't checked here
     parity = (REPO / "plan" / "2026-10-28-claude-code-parity" / "plan.md").read_text(encoding="utf-8")
