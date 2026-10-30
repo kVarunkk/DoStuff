@@ -4,6 +4,7 @@ import yaml
 import os
 from dotenv import dotenv_values
 from dostuff.helpers.agent.constants import MAX_ITERATIONS
+from dostuff.helpers.hooks.load_hooks import HookEntry, load_merged_hooks
 
 SUBAGENT_MAX_ITERATIONS = 25
 MAX_TOOL_OUTPUT_CHARS = 30_000
@@ -50,6 +51,11 @@ def load_env_files(cwd: Path | None = None) -> None:
             merged.update({k: v for k, v in dotenv_values(env_path).items() if v is not None})
     for key, value in merged.items():
         os.environ.setdefault(key, value)
+
+
+def project_config_path() -> Path:
+    """`./.dostuff/config.yaml` of the project the session started in (not a subagent's worktree)."""
+    return Path.cwd() / ".dostuff" / "config.yaml"
 
 
 class Config:
@@ -229,8 +235,14 @@ class Config:
         else:
             self.raw = {}
         # Project override
-        cwd = Path.cwd()
-        proj = cwd / ".dostuff" / "config.yaml"
+        proj = project_config_path()
+        # Hooks are loaded per file, not from the merged raw: a project may add hooks but never
+        # replace the user's, and every entry keeps its provenance for the trust gate (hooks spec D10)
+        loaded = load_merged_hooks(self.path, proj)
+        self.hooks: dict[str, list[HookEntry]] = loaded.hooks
+        self.hooks_project_trust = loaded.project_trust
+        self.hooks_stop_block_limit = loaded.stop_block_limit
+        self.hooks_warnings = loaded.warnings
         if proj.exists():
             with open(proj, encoding="utf-8") as f:
                 proj_raw = yaml.safe_load(f)

@@ -12,6 +12,7 @@ COMMAND_DESCRIPTIONS = {
     "/context": "Show what fills the context window: system prompt, tools, project instructions, messages",
     "/memory": "Edit the instructions file (AGENTS.md) the agent follows (/memory [project|global]); `# note` adds a line",
     "/doctor": "Check config, API key, MCP config and memory setup, with a fix for each problem",
+    "/hooks": "List the configured hooks, where each came from and whether it runs (/hooks r reloads config)",
     "/rename": "Name this session (/rename <title>); shown by `dostuff sessions`",
     "/export": "Save this session as Markdown (/export [path])",
     "/compact": "Summarize older history to free up context; /compact auto <1-100|off> sets the auto-compact threshold",

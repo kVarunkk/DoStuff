@@ -50,12 +50,15 @@ class _SubagentAdapter:
 
     def __init__(self, parent: Any, role: str):
         self._parent = parent
+        self._role = role
         self._prefix = f"[subagent: {role}]"
 
     def emit(self, event_type: str, data: Any) -> None:
         if event_type == "status":  # context-window % of the subagent would overwrite the parent's
             return
-        if event_type in ("usage",) or not isinstance(data, str):
+        if event_type == "hook" and isinstance(data, dict):  # hook_line renders the prefix
+            self._parent.emit(event_type, {**data, "subagent": self._role})
+        elif event_type in ("usage",) or not isinstance(data, str):
             self._parent.emit(event_type, data)
         else:
             self._parent.emit(event_type, f"{self._prefix} {data}")

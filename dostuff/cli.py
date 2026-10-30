@@ -43,6 +43,7 @@ def main(
     permission_mode: str = typer.Option(None, "--permission-mode", help="With -p: ask | allowlist | auto | plan (default: config)"),
     max_turns: int = typer.Option(None, "--max-turns", min=1, help="With -p: stop after this many model calls (default: loop.max_iterations)"),
     allowed_tools: list[str] = typer.Option(None, "--allowed-tools", help="With -p: run these without asking, in any mode; comma-separated or repeated. A tool name (write_file), a shell command prefix (\"npm test\") or tool:target (web_fetch:docs.python.org)"),
+    trust_project_hooks: bool = typer.Option(False, "--trust-project-hooks", help="With -p: run this project's hooks (.dostuff/config.yaml) without a trust record from the TUI"),
     worktree: bool = typer.Option(False, "--worktree", "-w", help="Run the session in a new git worktree (.dostuff/worktrees/<name>, branch dostuff/<name>)"),
     worktree_name: str = typer.Option(None, "--worktree-name", help="Name for --worktree (implies it; default: a random one)"),
     version: bool = typer.Option(False, "--version", "-V", callback=_print_version, is_eager=True, help="Print the version and exit"),
@@ -66,7 +67,8 @@ def main(
             typer.echo("--json is --output-format json; give only one of them.", err=True)
             raise typer.Exit(code=2)
         _run_print_mode(session, prompt, output_format or ("json" if output_json else "text"), quiet, permission_mode,
-                        max_turns, [t.strip() for item in allowed_tools or [] for t in item.split(",") if t.strip()])
+                        max_turns, [t.strip() for item in allowed_tools or [] for t in item.split(",") if t.strip()],
+                        trust_project_hooks)
         return
     _launch(session, worktree=worktree_name or ("" if worktree else None))
 
@@ -84,7 +86,8 @@ def _enter_session_dir(session: str, interactive: bool) -> None:
 
 
 def _run_print_mode(session: str | None, prompt: str, output_format: str, quiet: bool, permission_mode: str | None,
-                    max_turns: int | None = None, allowed_tools: list[str] | None = None) -> None:
+                    max_turns: int | None = None, allowed_tools: list[str] | None = None,
+                    trust_project_hooks: bool = False) -> None:
     """`dostuff -p`: one headless turn. Text piped to stdin is appended to the prompt."""
     import asyncio
     import sys
@@ -111,7 +114,7 @@ def _run_print_mode(session: str | None, prompt: str, output_format: str, quiet:
         code = asyncio.run(run_headless(
             prompt, session_id=session, permission_mode=permission_mode,  # type: ignore[arg-type]
             output_format=output_format, quiet=quiet,  # type: ignore[arg-type]
-            max_turns=max_turns, allowed_tools=allowed_tools,
+            max_turns=max_turns, allowed_tools=allowed_tools, trust_project_hooks=trust_project_hooks,
             # Approval prompts need a terminal on both ends; piped stdin is already consumed
             interactive=stdin_is_tty and sys.stderr.isatty(),
         ))

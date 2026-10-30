@@ -78,6 +78,31 @@ def test_shell_cwd_into_secrets_asks():
     assert shell("ls", cwd=str(Path.home() / ".dostuff")) == "ask"
 
 
+AUTO = PermissionConfig(mode="auto")
+
+
+@pytest.mark.parametrize("command, cwd", [
+    ("echo 'hooks: {}' >> ~/.dostuff/config.yaml", ""),
+    ("cat $HOME/.DOSTUFF/config.yaml", ""),
+    (r"Add-Content C:\Users\me\.dostuff\config.yaml 'x'", ""),
+    ("cp evil.yaml config.yaml", str(Path.home() / ".dostuff")),
+    ("cat .dostuff/worktrees/../config.yaml", ""),
+])
+def test_shell_touching_dostuff_asks_in_every_mode(command, cwd):
+    """A shell command naming .dostuff is a settings change: it asks even in auto mode, with no "always"."""
+    decision = check("bash_command", "shell", {"command": command, "cwd": cwd}, None, AUTO)
+    assert decision.action == "ask" and not decision.approval_keys
+    session = SessionPermissions(allow=["bash_command"])
+    assert check("bash_command", "shell", {"command": command, "cwd": cwd}, session, ASK).action == "ask"
+    assert shell(command, cfg=PLAN, cwd=cwd) == "deny"
+
+
+def test_shell_in_subagent_worktree_is_not_settings():
+    command = "git -C .dostuff/worktrees/abc status"
+    assert check("bash_command", "shell", {"command": command}, None, AUTO).action == "allow"
+    assert check("bash_command", "shell", {"command": "pytest -q"}, None, AUTO).action == "allow"
+
+
 def test_read_tools_never_ask_and_write_tools_ask():
     assert check("read_file", "read", {"path": "x"}, None, ASK).action == "allow"
     assert check("write_file", "write", {"path": "x", "content": ""}, None, ASK).action == "ask"

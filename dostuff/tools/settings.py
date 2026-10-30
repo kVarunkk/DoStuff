@@ -12,6 +12,7 @@ from typing import Any, Literal
 import yaml
 
 from dostuff.config import STATUS_BAR_ITEMS, get_config
+from dostuff.helpers.hooks.load_hooks import load_hooks
 from dostuff.helpers.mcp.load_mcp_config import (global_mcp_config_path, project_mcp_config_path, read_mcp_file,
                                                  write_mcp_file)
 from dostuff.helpers.mcp.server_config import build_server_config
@@ -20,7 +21,13 @@ from dostuff.helpers.tools.diff import diff_stats, plain_diff, report_change, un
 Scope = Literal["user", "project"]
 REDACTED = "<redacted>"
 # Top-level keys config.yaml understands (see templates/config.example.yaml)
-CONFIG_KEYS = ("tracing", "models", "model", "loop", "memory", "permissions", "mcp", "ui", "search")
+CONFIG_KEYS = ("tracing", "models", "model", "loop", "memory", "permissions", "mcp", "ui", "search", "hooks")
+HOOKS_NOTE = (
+    "hooks: commands dostuff runs at fixed points (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, "
+    "SubagentStop). They are config, not model output: not permission-checked and not sandboxed — they run with the "
+    "user's privileges. User hooks always run; project hooks are appended after them (never replacing them) and only "
+    "run once the user trusts them (hooks.project_trust, read from the user file only). Keep project hook scripts in "
+    ".dostuff/hooks/, which the trust check covers.")
 _CRLF, _LF = "\r\n", "\n"
 
 
@@ -97,7 +104,7 @@ def read_settings() -> str:
         parts.append(f"## MCP servers — scope '{scope}': {_display(path)}\n{body}")
     parts.append("## Reference: every config.yaml option (the shipped template)\n" + read_template("config.example.yaml").rstrip())
     parts.append("API keys live in ~/.dostuff/.env or ./.dostuff/.env; these tools don't read or change them. "
-                 f"ui.status_bar items: {', '.join(STATUS_BAR_ITEMS)}.")
+                 f"ui.status_bar items: {', '.join(STATUS_BAR_ITEMS)}.\n" + HOOKS_NOTE)
     return "\n\n".join(parts)
 
 
@@ -111,6 +118,8 @@ def _config_warnings(data: dict[str, Any]) -> list[str]:
     mode = perms.get("mode") if isinstance(perms, dict) else None
     if mode is not None and str(mode).lower() not in ("ask", "allowlist", "auto", "plan"):
         warnings.append(f"permissions.mode '{mode}' isn't ask, allowlist, auto or plan (it falls back to ask)")
+    if "hooks" in data:
+        warnings += load_hooks(data["hooks"], source="user", origin="config.yaml")[1]
     return warnings
 
 

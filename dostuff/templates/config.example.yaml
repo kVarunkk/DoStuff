@@ -65,3 +65,43 @@ permissions:
   #   - "call_mcp_tool:github__create_issue"  # one MCP tool (server__tool)
   #   - "web_fetch:docs.python.org"  # web_fetch from one domain
   #   - "web_search"                 # every web search
+
+# Hooks: commands dostuff runs at fixed points of a session, to block a tool call, add context for the
+# model, or keep the agent going until the tests pass. They run with your privileges, unsandboxed, and
+# are not permission-checked: they are your config, not model output.
+# Each hook gets one JSON object on stdin (session_id, hook_event_name, turn_type, plus the event's keys:
+# tool_name / tool_input for tool events, prompt, source, …) and DOSTUFF_HOOK_* env vars. Exit 0: stdout
+# is context for the model, or JSON such as {"decision": "block", "reason": "…"}; exit 2: block, stderr is
+# the reason; any other exit code is an error and the run goes on (unless fail_closed).
+# Hooks in ~/.dostuff/config.yaml always run. Hooks in a project's ./.dostuff/config.yaml are added after
+# them and run only once you trust them (project_trust): the TUI asks once per project, and again when the
+# hooks or a script in .dostuff/hooks/ change; `dostuff -p` needs a trust record or --trust-project-hooks.
+# Keep project hook scripts in .dostuff/hooks/: trust covers that folder, and the model can't change it
+# without asking. /hooks lists what is loaded; /doctor checks the commands.
+# hooks:
+#   project_trust: ask        # ask | allow | deny for project hooks; only read from ~/.dostuff/config.yaml
+#   stop_block_limit: 3       # Stop blocks honoured per turn before the turn may end anyway (1-10)
+#   SessionStart:             # source: startup | resume | clear | compact; stdout joins the system prompt
+#     - matcher: "startup|resume|clear"
+#       hooks:
+#         - { type: command, command: "git status --short" }
+#   UserPromptSubmit:         # exit 2 rejects the prompt; stdout joins that turn's instructions
+#     - hooks:
+#         - { type: command, name: prompt-check, command: "python .dostuff/hooks/check_prompt.py" }
+#   PreToolUse:               # matcher: regex, full match on the tool name; if: searched in bash_command's command
+#     - matcher: "bash_command"
+#       if: '(?i)^\s*git\s+push'   # single quotes: no escaping; inline flags such as (?i) go first
+#       fail_closed: true     # a crashed or timed-out hook denies the call instead of letting it run
+#       timeout: 10           # seconds (1-300, default 30)
+#       hooks:
+#         - { type: command, name: block-main-push, command: "python .dostuff/hooks/block_main_push.py" }
+#   PostToolUse:              # stdout is appended to the tool result the model sees
+#     - matcher: "write_file|edit_file"
+#       hooks:
+#         - { type: command, name: format, command: "python .dostuff/hooks/format_file.py" }
+#   Stop:                     # exit 2 (or "decision": "block") sends the reason back and the agent continues
+#     - hooks:
+#         - { type: command, name: tests, command: "python .dostuff/hooks/run_tests.py" }
+#   SubagentStop:             # the same, for a subagent's final answer
+#     - hooks:
+#         - { type: command, name: subagent-check, command: "python .dostuff/hooks/check_subagent.py" }

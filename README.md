@@ -36,6 +36,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Project instructions** — `AGENTS.md` / `CLAUDE.md` from `~/.dostuff/`, the repo root and every folder down to the current one, combined
 - **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
 - **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
+- **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **File sandbox** — file tools stay inside the project directory and never read `.env*` files or `~/.dostuff/`
 - **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`
 - **Subagents** — `delegate_to_subagent` runs a bounded task with a restricted tool set; its approval prompts and ESC go through the same TUI
@@ -155,7 +156,7 @@ In the TUI:
 | `dostuff sessions rm <id>... [-y]` | Delete sessions and their `/undo` checkpoints |
 | `dostuff sessions prune [--older-than 30d] [--dry-run] [-y]` | Delete empty sessions, and sessions not used for the given time (`45m`, `12h`, `30d`, `2w`) |
 | `dostuff export [<id>] [-o file\|-]` | Save a session (default: latest here) as Markdown: prompts, answers, tool calls and results |
-| `dostuff -p "<prompt>"`  | Headless: run one prompt, print the answer to stdout, exit. Progress goes to stderr. Piped stdin is appended to the prompt (`-p -` reads the prompt from stdin). `--session <id>` continues a session, `--output-format json` (or `--json`) prints `{result, session_id, usage, ...}`, `--output-format stream-json` prints one JSON event per line (`init`, `assistant`, `tool_call`, `tool_result`, `usage`, `error`, then `result`), `-q` hides progress, `--permission-mode ask\|allowlist\|auto\|plan`. `--max-turns N` stops after N model calls (exit code 1). `--allowed-tools` (comma-separated or repeated) runs matching calls without asking in any mode, in the `permissions.allow` syntax (`"npm test"`, `web_fetch:docs.python.org`) or a tool name for every call of it (`write_file`, `bash_command`). Without a terminal, other calls that need approval are denied |
+| `dostuff -p "<prompt>"`  | Headless: run one prompt, print the answer to stdout, exit. Progress goes to stderr. Piped stdin is appended to the prompt (`-p -` reads the prompt from stdin). `--session <id>` continues a session, `--output-format json` (or `--json`) prints `{result, session_id, usage, ...}`, `--output-format stream-json` prints one JSON event per line (`init`, `assistant`, `tool_call`, `tool_result`, `usage`, `error`, then `result`), `-q` hides progress, `--permission-mode ask\|allowlist\|auto\|plan`. `--max-turns N` stops after N model calls (exit code 1). `--allowed-tools` (comma-separated or repeated) runs matching calls without asking in any mode, in the `permissions.allow` syntax (`"npm test"`, `web_fetch:docs.python.org`) or a tool name for every call of it (`write_file`, `bash_command`). Without a terminal, other calls that need approval are denied. `--trust-project-hooks` runs the project's [hooks](#project-hooks-and-trust) without a saved trust answer |
 | `dostuff mcp list`       | Show MCP servers and the file each comes from |
 | `dostuff mcp add <name> [-e K=V] -- <command> [args...]` | Add a stdio server; `--url <url> [-H "Name: value"]` for HTTP; `--project` writes `./.dostuff/mcp_config.json` |
 | `dostuff mcp remove <name> [--project]` | Remove a server |
@@ -195,7 +196,8 @@ In the TUI:
 | `/status`     | Session, directory, model, permission mode, tokens, context use, MCP servers |
 | `/context`    | What fills the context window: system prompt, tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
 | `/memory [project\|global]` | Edit `AGENTS.md` (this project's or `~/.dostuff/AGENTS.md`) in the same editor as `/config`; `Ctrl+S` saves and the agent follows it from the next message |
-| `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory), with a fix for each problem |
+| `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory, hooks), with a fix for each problem |
+| `/hooks [r]`  | List the configured hooks per event: file, matcher, timeout, `fail_closed`, and whether each runs (`user` / `trusted` / `untrusted` / `disabled` / `broken`). `/hooks r` re-reads the config files. See [Hooks](#hooks) |
 | `/<skill> [args]` | Run a skill: every discovered skill is a command (listed in the `/` menu and `/help`). See [Skills](#skills) |
 | `/<command> [args]` | Run a custom command from `.dostuff/commands/` or `~/.dostuff/commands/`. See [Custom commands](#custom-commands) |
 | `/rename <title>` | Name this session (shown by `dostuff sessions`) |
@@ -237,6 +239,11 @@ In the TUI:
 | `read_settings` | read | never (MCP `env` / header values are shown as `<redacted>`) |
 | `edit_config`, `set_mcp_server`, `remove_mcp_server` | settings | **always, in every mode, with no "always" option** (shows the diff or the server's command) |
 
+File tools writing under a `.dostuff` directory, and `bash_command` calls whose command or `cwd` names `.dostuff`, are
+settings changes too, so they always ask. That way auto mode can't quietly add a hook to `~/.dostuff/config.yaml`. Paths
+into subagent worktrees (`.dostuff/worktrees/…`) are exempt. The shell check matches the text `.dostuff`, so a name the
+command builds indirectly is not caught.
+
 `permissions.mode` in `config.yaml`:
 
 - `ask` (default) — as in the table above.
@@ -269,6 +276,193 @@ API keys stay in `.env` files, which the agent can't read or change. Subagents d
 > finished are kept. Tools that run in a worker thread (file tools, `bash_command`) cannot be interrupted
 > mid-call, so one that was still running may finish in the background; its result is recorded as
 > `Cancelled by user (may still be running)`.
+
+---
+
+## Hooks
+
+Hooks are shell commands DoStuff runs at fixed points of a session: block a tool call, feed a formatter's output back
+to the model, keep the turn going until the tests pass. They are configured under `hooks:` in `config.yaml` and use
+Claude Code's I/O contract (stdin JSON, exit codes, JSON output), so an existing Claude Code hook script works once its
+matcher and tool argument names are renamed (see [the table below](#coming-from-claude-code)).
+
+> [!WARNING]
+> Hooks run with your privileges, **unsandboxed**, and are not permission-checked: they are your config, not model
+> output. Read a project's hooks before you trust them.
+
+| Event | When | Matcher is matched against | What a hook can do |
+|---|---|---|---|
+| `SessionStart` | Before the first turn of a session, and after a compaction | the source: `startup`, `resume`, `clear`, `compact` | Add context for the rest of the session |
+| `UserPromptSubmit` | After you send a prompt, before it is stored or sent | — | Reject the prompt, or add context for this turn |
+| `PreToolUse` | Before each tool call, before any approval prompt | the tool name | `allow`, `deny` or `ask`; rewrite the arguments |
+| `PostToolUse` | After a tool call ran | the tool name | Append text to the result the model sees |
+| `Stop` | When the agent is about to give its final answer | — | Block, so the turn continues with your reason |
+| `SubagentStop` | Same, for a `delegate_to_subagent` run | — | Same |
+
+### Config
+
+`matcher` is a Python regex that must match the whole name (`edit_file` does not match `edit_file_v2`); empty or `*`
+matches everything. `if` (tool events only) is searched in a `bash_command`'s `command`. Inline flags such as `(?i)`
+go first in a pattern. `timeout` (default 30 s, 1–300) and `fail_closed` can be set on a group or on one hook. This is
+the example from the spec, and the two scripts it runs are below:
+
+```yaml
+hooks:
+  project_trust: ask          # ask | allow | deny  (D4) — only read from ~/.dostuff/config.yaml
+  stop_block_limit: 3         # Stop blocks honoured per turn before the loop is allowed to end (1–10)
+  SessionStart:
+    - matcher: "startup|resume|clear"   # regex, full match against the source; empty or "*" = all
+      hooks:
+        - type: command
+          command: "git status --short"
+  PreToolUse:
+    - matcher: "bash_command"           # regex, full match against the tool name
+      if: "(?i)^\\s*git\\s+push"        # optional regex, searched in tool_input.command (shell tool only)
+      fail_closed: true
+      timeout: 10
+      hooks:
+        - type: command
+          name: block-main-push
+          command: "python .dostuff/hooks/block_main_push.py"
+  PostToolUse:
+    - matcher: "write_file|edit_file"
+      hooks:
+        # the script reads tool_input.path from the stdin JSON and runs the formatter on it;
+        # its stdout is fed back to the model (D5)
+        - type: command
+          name: format
+          command: "python .dostuff/hooks/format_file.py"
+  Stop:
+    - hooks:
+        - { type: command, name: tests, command: "python .dostuff/hooks/run_tests.py" }
+```
+
+- **`fail_closed: true`** (`PreToolUse` and `UserPromptSubmit` only) is for guardrails: if the hook crashes or times
+  out, the call is denied (or the prompt rejected) instead of going ahead. A `fail_closed` hook with a config mistake,
+  such as a bad regex, is kept and denies everything it matches; any other invalid hook is dropped with a warning.
+- **`stop_block_limit`** (1–10) bounds how many times `Stop` hooks can continue one turn; after that the turn ends with
+  a note.
+- User hooks come first, then the project's are added after them; a project file can't remove or reorder yours.
+
+```python
+# .dostuff/hooks/block_main_push.py: PreToolUse on bash_command; the group's `if` already matched `git push`
+import json
+import subprocess
+import sys
+
+payload = json.load(sys.stdin)
+words = payload["tool_input"].get("command", "").replace(":", " ").split()
+branch = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True,
+                        cwd=payload["cwd"]).stdout.strip()
+if "main" in words or branch == "main":
+    print("Don't push to main: push a feature branch and open a pull request.", file=sys.stderr)
+    sys.exit(2)  # exit 2 = deny; stderr is the reason the model sees
+```
+
+```python
+# .dostuff/hooks/format_file.py: PostToolUse on write_file|edit_file; stdout is appended to the tool result
+import json
+import subprocess
+import sys
+
+payload = json.load(sys.stdin)
+path = payload["tool_input"].get("path", "")
+if path.endswith(".py"):
+    result = subprocess.run(["ruff", "format", path], capture_output=True, text=True, cwd=payload["cwd"])
+    print((result.stdout + result.stderr).strip())
+```
+
+```python
+# .dostuff/hooks/run_tests.py: Stop; exit 2 sends the failures back and the turn continues
+import json
+import subprocess
+import sys
+
+payload = json.load(sys.stdin)
+result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x"], capture_output=True, text=True,
+                        cwd=payload["cwd"])
+if result.returncode not in (0, 5):  # 5: no tests collected
+    print("Tests fail; fix them before finishing:\n" + result.stdout[-3000:], file=sys.stderr)
+    sys.exit(2)
+```
+
+### Input and output
+
+Each hook runs through the same shell as `bash_command`, in the project directory (a worktree subagent's own
+worktree), with no terminal. stdin is one JSON object:
+
+```json
+{"hook_event_name": "PreToolUse", "session_id": "…", "turn_id": "…", "cwd": "…", "turn_type": "interactive_loop",
+ "tool_name": "bash_command", "tool_input": {"command": "git push origin main"}, "tool_use_id": "…"}
+```
+
+| Event | Extra keys |
+|---|---|
+| `PreToolUse`, `PostToolUse` | `tool_name`, `tool_input`, `tool_use_id`; `PostToolUse` also `tool_response` (the result, already truncated) |
+| `UserPromptSubmit` | `prompt` |
+| `SessionStart` | `source` |
+| `Stop`, `SubagentStop` | `last_assistant_message`, `stop_hook_active` (true once a Stop hook already continued this turn) |
+
+The environment adds `DOSTUFF_HOOK_EVENT`, `DOSTUFF_SESSION_ID`, `DOSTUFF_TURN_ID`, `DOSTUFF_PROJECT_ROOT` and
+`DOSTUFF_TURN_TYPE`. Output is capped at `loop.max_tool_output_chars`.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Success. Plain stdout is context (`SessionStart`, `UserPromptSubmit`, `PostToolUse`); JSON on stdout can carry a decision (below) |
+| `2` | Block. stderr (or stdout) is the reason: `PreToolUse` denies the call, `PostToolUse` appends it to the result, `UserPromptSubmit` rejects the prompt, `Stop` continues the turn |
+| other | The hook failed: an error line in the transcript, and the run goes on (unless `fail_closed`) |
+
+JSON on stdout (exit 0), in either Claude Code spelling:
+
+```json
+{"decision": "block", "reason": "…"}
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow|deny|ask",
+                        "permissionDecisionReason": "…", "updatedInput": {"command": "…"},
+                        "additionalContext": "…"}}
+```
+
+When several hooks match, they run one after another, each on the original input: the strictest decision wins
+(`deny` > `ask` > `allow`), contexts are joined in config order, and the last `updatedInput` wins. Plan mode still
+applies: a hook `allow` never runs a call plan mode refused, and settings changes still ask. Rewritten arguments are
+checked again, so a rewrite can't skip the prompt the new call needs. Each hook's effect shows in the transcript as a
+line like `⚓ PreToolUse bash_command → deny (reason)` (a `hook` event in `--output-format stream-json`). ESC kills a
+running hook.
+
+### Project hooks and trust
+
+Hooks in `./.dostuff/config.yaml` come with the repo, so they are code from whoever wrote it. They run only once you
+trust them, set by `hooks.project_trust` in **`~/.dostuff/config.yaml`** (a project file can't set it):
+
+- `ask` (default): before the first project hook would run, the TUI lists every project hook's command and file and
+  asks. A yes is saved in `~/.dostuff/trusted_hooks.json` for that project, until the hooks block or any file in
+  `.dostuff/hooks/` changes; then it asks again. A no skips them for the session.
+- `allow` runs them without asking; `deny` never runs them.
+- Headless (`dostuff -p`) can't ask: it honours a saved yes, runs them with `--trust-project-hooks`, and otherwise
+  skips them with a warning. If a skipped hook is `fail_closed`, it refuses to start (exit code 2) instead.
+
+Keep hook scripts in `.dostuff/hooks/`: trust covers the files there, and the model can't edit anything under
+`.dostuff/` without a settings prompt. A script elsewhere in the repo can be changed after you trusted it.
+
+`/hooks` lists every hook per event with its file, matcher, timeout, `fail_closed` and whether it runs (`user`,
+`trusted`, `untrusted`, `disabled` or `broken`); `/hooks r` re-reads the config files. `dostuff doctor` reports
+invalid hooks, commands not found on `PATH` and project scripts outside `.dostuff/hooks/`.
+
+### Coming from Claude Code
+
+The stdin envelope, exit codes, JSON output, event names and the `matcher` + `hooks: [{type: command, command}]`
+nesting are the same. Tool names and some argument names differ, so rename the matcher and any `tool_input` keys:
+
+| Claude Code | DoStuff `tool_name` | `tool_input` keys that differ |
+|---|---|---|
+| `Bash` | `bash_command` | none (`command`, plus `cwd`, `timeout`) |
+| `Write` | `write_file` | `file_path` → `path` |
+| `Edit` | `edit_file` | `file_path` → `path`, `old_string`/`new_string` → `old_str`/`new_str` |
+| `Read` | `read_file` | `file_path` → `path` |
+| `Grep` / `Glob` | `grep` / `glob` | per tool |
+| `mcp__<server>__<tool>` | `call_mcp_tool` | server and tool are inside `tool_input` |
+
+Not supported yet: `http`, `prompt` and `agent` hook types, and the `Notification`, `PreCompact`, `SessionEnd` and
+`SubagentStart` events.
 
 ---
 

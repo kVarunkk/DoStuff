@@ -8,9 +8,13 @@ from opentelemetry.trace import get_current_span
 
 from dostuff.agent.permissions import (
     ApprovalReply, PermissionConfig, PermissionDecision, PermissionMode, SessionPermissions, check,
-    describe_approval_keys, to_reply,
+    describe_approval_keys, effective_kind, forced_ask, to_reply,
 )
 from dostuff.config import get_config
+from dostuff.helpers.agent.tool_output import truncate_tool_output
+from dostuff.helpers.hooks import HookOutcome, run_hooks
+from dostuff.helpers.hooks.dispatch import report_outcome
+from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path
 from dostuff.lib.checkpoints import CHECKPOINT_TOOLS, get_checkpoint_store
 from dostuff.lib.mcp.mcp_client import MCPClient
@@ -20,6 +24,7 @@ from dostuff.tools.settings import SETTINGS_TOOLS, settings_preview
 
 # Legacy approval flags a model may still try to pass; always dropped before dispatch.
 APPROVAL_KEYS = frozenset({"_confirmed", "overwrite"})
+CANCELLED_RESULT = "Cancelled by user"
 _PREVIEW_MAX_LINES = 40
 
 
@@ -63,12 +68,34 @@ def permission_config() -> PermissionConfig:
     return PermissionConfig(mode=cast(PermissionMode, cfg.permission_mode), allow=list(cfg.permission_allow))
 
 
-def _decide(fn_name: str, fn_args: dict[str, Any], permissions: SessionPermissions | None) -> PermissionDecision:
+def _hook_decision(
+    hook: HookOutcome | None, spec: ToolSpec, args: dict[str, Any], base: PermissionDecision, preview: str,
+) -> PermissionDecision:
+    """Combine a PreToolUse outcome with the permission layer's decision; first match wins (hooks spec D2)."""
+    if hook is None or base.action == "deny":
+        return base  # 1. plan mode: a hook can only tighten it
+    if hook.decision == "deny":
+        return PermissionDecision("deny", reason=hook.reason or f"Blocked by hook '{hook.decided_by}'.")  # 2.
+    if effective_kind(spec.kind, args) == "settings":
+        return base  # 3. settings changes ask in every mode; a hook allow cannot silence them
+    if hook.decision == "ask":  # 4. even in auto mode and for read-only / allowlisted calls
+        note = f"Hook '{hook.decided_by}' asks: {hook.reason}" if hook.reason else f"Hook '{hook.decided_by}' asks"
+        return forced_ask(spec.name, args, preview, note)
+    if hook.decision == "allow" and hook.updated_input is None:
+        return PermissionDecision("allow")  # 5. like permissions.allow; a rewrite voids it (D6)
+    return base  # 6.
+
+
+def _decide(
+    fn_name: str, fn_args: dict[str, Any], permissions: SessionPermissions | None, hook: HookOutcome | None = None,
+) -> PermissionDecision:
     spec = TOOL_MAP.get(fn_name)
     if spec is None:
         return PermissionDecision("allow")  # unknown tools fail in dispatch with a clear error
     args = _sanitize_args(spec, fn_args)
-    return check(fn_name, spec.kind, args, permissions, permission_config(), _approval_preview(fn_name, args))
+    preview = _approval_preview(fn_name, args)
+    base = check(fn_name, spec.kind, args, permissions, permission_config(), preview)
+    return _hook_decision(hook, spec, args, base, preview)
 
 
 def _denial(decision: PermissionDecision, reply: ApprovalReply | None = None) -> str:
@@ -85,12 +112,13 @@ async def authorize_tool(
     fn_args: dict[str, Any],
     adapter: Any = None,
     permissions: SessionPermissions | None = None,
+    hook: HookOutcome | None = None,
 ) -> str | None:
-    """Run the permission check (asking the user if needed).
+    """Run the permission check (asking the user if needed), with the call's PreToolUse outcome as an input.
 
     Returns None if the call may proceed, else the denial text to use as the tool result.
     """
-    decision = _decide(fn_name, fn_args, permissions)
+    decision = _decide(fn_name, fn_args, permissions, hook)
     if decision.action == "allow":
         return None
     if decision.action == "deny":
@@ -111,8 +139,9 @@ async def authorize_batch(
     calls: list[tuple[str, dict[str, Any]]],
     adapter: Any = None,
     permissions: SessionPermissions | None = None,
+    hooks: list[HookOutcome | None] | None = None,
 ) -> list[str | None] | None:
-    """Ask once for every call of a model response that needs approval.
+    """Ask once for every call of a model response that needs approval (`hooks`: one PreToolUse outcome per call).
 
     Returns one result per call (None = may run, str = denial), or None when there's nothing
     to batch (fewer than two prompts, or an adapter without `ask_batch`) or the user chose
@@ -120,7 +149,8 @@ async def authorize_batch(
     """
     if adapter is None or not hasattr(adapter, "ask_batch") or len(calls) < 2:
         return None
-    decisions = [_decide(name, args, permissions) for name, args in calls]
+    outcomes = hooks if hooks is not None else [None] * len(calls)
+    decisions = [_decide(name, args, permissions, hook) for (name, args), hook in zip(calls, outcomes)]
     asking = [d for d in decisions if d.action == "ask"]
     if len(asking) < 2:
         return None
@@ -139,6 +169,57 @@ async def authorize_batch(
         else None
         for d in decisions
     ]
+
+
+async def pre_tool_use(
+    fn_name: str, args: dict[str, Any], *, session_id: str | None, turn_id: str | None, turn_type: str,
+    adapter: Any = None, tool_use_id: str = "",
+) -> tuple[dict[str, Any], HookOutcome]:
+    """Run PreToolUse hooks. Returns the (possibly rewritten, re-sanitized) args and the merged outcome.
+
+    The caller turns `deny` into the tool result and `cancelled` into CANCELLED_RESULT, and passes the
+    outcome to authorize_tool / authorize_batch, which apply the rest of the D2 precedence.
+    """
+    payload = payload_for(
+        "PreToolUse", session_id=session_id or "", turn_id=turn_id or "", turn_type=turn_type,
+        tool_name=fn_name, tool_input=args, tool_use_id=tool_use_id,
+    )
+    outcome = await run_hooks("PreToolUse", payload, adapter=adapter)
+    if outcome.updated_input is not None:
+        # Re-sanitize before the permission layer sees it: a rewrite can't smuggle in _confirmed,
+        # overwrite or harness params, and faces the same gate as a model call (spec D6)
+        spec = TOOL_MAP.get(fn_name)
+        merged = {**args, **outcome.updated_input}
+        args = _sanitize_args(spec, merged) if spec is not None else merged
+    await report_outcome("PreToolUse", outcome, adapter=adapter, target=fn_name)
+    return args, outcome
+
+
+def _assemble(result: str, outcome: HookOutcome, cap: int) -> str:
+    """Append each PostToolUse context (or a block note) as `<hook name="…">…</hook>`, then cap (spec D5)."""
+    parts = [result]
+    parts += [f'<hook name="{name}">{text}</hook>' for name, text in outcome.contexts]
+    if outcome.decision == "deny":
+        parts.append(f'<hook name="{outcome.decided_by}" status="blocked">{outcome.reason}</hook>')
+    return truncate_tool_output("\n".join(parts), cap)
+
+
+async def post_tool_use(
+    fn_name: str, args: dict[str, Any], result: Any, *, session_id: str | None, turn_id: str | None,
+    turn_type: str, adapter: Any = None, tool_use_id: str = "",
+) -> tuple[Any, HookOutcome]:
+    """Run PostToolUse hooks; their context lands in the result the model sees. Cancelled → result unchanged."""
+    cap = get_config().max_tool_output_chars
+    payload = payload_for(
+        "PostToolUse", session_id=session_id or "", turn_id=turn_id or "", turn_type=turn_type,
+        tool_name=fn_name, tool_input=args, tool_use_id=tool_use_id,
+        tool_response=truncate_tool_output(str(result), cap),
+    )
+    outcome = await run_hooks("PostToolUse", payload, adapter=adapter)
+    await report_outcome("PostToolUse", outcome, adapter=adapter, target=fn_name)
+    if outcome.cancelled or (not outcome.contexts and outcome.decision != "deny"):
+        return result, outcome
+    return _assemble(str(result), outcome, cap), outcome
 
 
 @traced("tool_call")
@@ -202,14 +283,23 @@ async def run_tool(
     turn_id: str | None = None,
     adapter: Any = None,
     permissions: SessionPermissions | None = None,
+    turn_type: str = "interactive_loop",
 ) -> Any:
-    """Authorize then dispatch one tool call. A denial is returned as the result, not raised."""
+    """Hooks, authorize, dispatch, hooks: the same order as loop(). A denial is returned as the result, not raised."""
     if not isinstance(fn_name, str):
         raise ValueError("Tool name must be a string.")
-    denial = await authorize_tool(fn_name, fn_args, adapter=adapter, permissions=permissions)
+    ids: dict[str, Any] = {"session_id": session_id, "turn_id": turn_id, "turn_type": turn_type, "adapter": adapter}
+    fn_args, hook = await pre_tool_use(fn_name, fn_args, **ids)
+    if hook.cancelled:
+        return CANCELLED_RESULT
+    if hook.decision == "deny":
+        return hook.reason
+    denial = await authorize_tool(fn_name, fn_args, adapter=adapter, permissions=permissions, hook=hook)
     if denial is not None:
         return denial
-    return await dispatch_tool(
+    result = await dispatch_tool(
         fn_name, fn_args, mcp_client=mcp_client, session_id=session_id, turn_id=turn_id,
         adapter=adapter, permissions=permissions,
     )
+    result, _ = await post_tool_use(fn_name, fn_args, result, **ids)
+    return result

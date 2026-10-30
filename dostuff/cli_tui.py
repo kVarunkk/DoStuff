@@ -46,9 +46,11 @@ from dostuff.helpers.agent.model_cost import format_cost
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
-from dostuff.helpers.ui.doctor import doctor_checks
+from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.agent.slash_suggestion import slash_suggestion
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
+from dostuff.helpers.hooks.dispatch import hook_line
+from dostuff.helpers.hooks.events import blocked_prompt_message, parse_stop_note, session_start, user_prompt_submit, with_prompt_context
 from dostuff.helpers.mcp.load_mcp_config import load_mcp_config, mcp_config_sources, read_mcp_file
 from dostuff.helpers.skills.custom_commands import discover_commands
 from dostuff.helpers.skills.skill_command import parse_skill_command, skill_commands, skill_prompt
@@ -703,6 +705,7 @@ class TuiAdapter:
         self._confirm_event: asyncio.Event | None = None
         self._confirm_reply: ApprovalReply | None = None
         self._feedback_mode = False  # "No" was picked; the input now takes feedback for the model
+        self._feedback_on_no = True  # whether "No" asks for that feedback (not for the hook trust prompt)
         self._ask_lock = asyncio.Lock()  # one prompt at a time
         self._last_turn_usage: dict = {}
         self._session_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -777,6 +780,9 @@ class TuiAdapter:
         if event_type in ("confirm", "system", "error"):
             app._append(str(data), msg_type=event_type)
             return
+        if event_type == "hook" and isinstance(data, dict):
+            app._append(hook_line(data), msg_type="system")
+            return
         if event_type == "settings_changed":  # the settings tools changed config.yaml or the MCP servers
             app._apply_settings(mcp=data == "mcp")
             return
@@ -801,11 +807,18 @@ class TuiAdapter:
         options += [("each", "Let me review each one"), ("no", "No to all, and tell the model what to do differently")]
         return await self._prompt(details, f"Allow these {count} actions?", options)
 
-    async def _prompt(self, details: str, question: str, options: list[tuple[str, str]]) -> ApprovalReply:
+    async def ask_trust(self, message: str) -> ApprovalReply:
+        """The project-hooks trust question (helpers/hooks/trust.py): no feedback, nothing goes to the model."""
+        options = [("yes", "Yes, run them (asked again if they change)"), ("no", "No, skip them this session")]
+        return await self._prompt(f"⚠ {message}", "Run this project's hooks?", options, feedback=False)
+
+    async def _prompt(self, details: str, question: str, options: list[tuple[str, str]],
+                      feedback: bool = True) -> ApprovalReply:
         # Runs on the UI loop (turns are async workers), so widgets can be touched directly
         async with self._ask_lock:
             self._waiting_for_confirm = True
             self._feedback_mode = False
+            self._feedback_on_no = feedback
             self._confirm_reply = None
             evt = asyncio.Event()
             self._confirm_event = evt
@@ -835,7 +848,7 @@ class TuiAdapter:
         """An option was picked; "no" first asks for (optional) feedback in the input."""
         if not self._waiting_for_confirm:
             return
-        if value == "no":
+        if value == "no" and self._feedback_on_no:
             self._feedback_mode = True
             self._app._ask_denial_feedback()
             return
@@ -957,6 +970,9 @@ class DostuffTUI(App):
         self.user_id = ""
         self.steps_history: list = []
         self.current_session_history: list = []
+        # SessionStart hook context for this session (hooks spec REQ-2.4), and the source to fire on its next turn
+        self.session_hook_context: dict[str, str] = {}
+        self._pending_session_start: str | None = None
         self._setup_done = False
         self._system_instructions: str = ""
         self._loader_widget: Static | None = None  # loader widget at bottom of stream
@@ -1183,6 +1199,8 @@ class DostuffTUI(App):
                 f"Known: {', '.join(STATUS_BAR_ITEMS)}.",
                 msg_type="error",
             )
+        for warning in self.config.hooks_warnings:
+            self._append(warning, msg_type="error")
 
         self._update_status()
         self._append("Type a message or /help for commands.")
@@ -1273,6 +1291,8 @@ class DostuffTUI(App):
         self.steps_history = await self.store.load(session_id)
         self.current_session_history = []
         existing_meta = await self.store.get_session_meta(session_id)
+        self.session_hook_context = {}
+        self._pending_session_start = "resume" if existing_meta else "startup"
         meta = existing_meta or {}
         if existing_meta:
             await self.store.save_session_meta(
@@ -1332,7 +1352,11 @@ class DostuffTUI(App):
             return
         if role == "user":
             shell = _parse_shell_step(content)
-            if shell is not None:
+            stop_note = parse_stop_note(content)
+            if stop_note is not None:  # live, the loop showed this as a ⚓ line, not a prompt
+                self._append(hook_line({"event": "Stop", "decision": "block", "reason": stop_note[1]}),
+                             msg_type="system")
+            elif shell is not None:
                 self._append(f"! {shell[0]}", msg_type="shell")
                 self._append_tool_result(shell[1], SHELL_PREVIEW_LINES, msg_type="shell-output")
             elif content and content != EMPTY_RESPONSE_NUDGE:
@@ -1385,6 +1409,8 @@ class DostuffTUI(App):
         self.session_id = new_session_id
         self.steps_history = []
         self.current_session_history = []
+        self.session_hook_context = {}
+        self._pending_session_start = "clear"
         self.adapter.reset_usage()
         await self.query_one("#msg-container", Vertical).remove_children()
         self._refresh_context_status(0)
@@ -2082,6 +2108,21 @@ class DostuffTUI(App):
                     style="#e06c75" if problems else "#98c379")
         self._mount_message(Static(text, classes="msg msg-system", markup=False))
 
+    async def _show_hooks(self, reload: bool = False) -> None:
+        """/hooks: what loaded from which file and whether it will run; `/hooks r` re-reads config first."""
+        try:
+            if reload:
+                self.config = get_config()  # the instance the hook engine reads
+                await asyncio.to_thread(self.config.reload)
+                self._apply_settings(mcp=False)
+            text = await asyncio.to_thread(hooks_listing)
+        except Exception as e:
+            self._append(f"Could not list hooks: {e}", msg_type="error")
+            return
+        if reload:
+            self._append("Reloaded config.yaml (user and project).", msg_type="system")
+        self._append(text, msg_type="system")
+
     async def _rename_session(self, title: str) -> None:
         try:
             await self.store.set_title(self.session_id, title)
@@ -2259,6 +2300,12 @@ class DostuffTUI(App):
             return
         if name == "/doctor" and not arg:
             self._start_worker(self._show_doctor(), name="doctor")
+            return
+        if name == "/hooks":
+            if arg.lower() not in ("", "r", "reload"):
+                self._append("Usage: /hooks [r]  (r re-reads the config files)", msg_type="error")
+            else:
+                self._start_worker(self._show_hooks(reload=bool(arg)), name="hooks")
             return
         if name == "/status" and not arg:
             self._start_worker(self._show_status(), name="status")
@@ -2528,6 +2575,21 @@ class DostuffTUI(App):
                 what = "command" if skill_run[0].get("kind") == "command" else "skill"
                 self._append(f"Running {what} {skill_run[0]['name']} ({_rel_path(skill_run[0]['location'])})",
                              msg_type="system")
+
+            # Reset cancel state before the hooks below, so ESC can stop a slow one
+            self.adapter._cancelled = False
+            self.adapter._cancel_event.clear()
+            # SessionStart, then UserPromptSubmit: both before the user step is appended (hooks spec D1)
+            if self._pending_session_start:
+                source, self._pending_session_start = self._pending_session_start, None
+                await session_start(source, self.session_hook_context, session_id=self.session_id,
+                                    turn_id=turn_id, adapter=self.adapter)
+            blocked, prompt_context = await user_prompt_submit(content, session_id=self.session_id,
+                                                               turn_id=turn_id, adapter=self.adapter)
+            if blocked is not None:
+                self._append(blocked_prompt_message(blocked), msg_type="system")
+                return
+
             self._sent_prompts[(self.session_id, len(self.steps_history))] = user_text
             await append_step(
                 {"role": "user", "content": content},
@@ -2539,15 +2601,13 @@ class DostuffTUI(App):
                 "interactive_loop",
             )
 
-            dynamic_instructions = await self._build_instructions(user_text)
+            # The hook context is for this turn only: it is not part of the stored user step
+            dynamic_instructions = with_prompt_context(await self._build_instructions(user_text), prompt_context)
 
             loader_widget = self._show_loader("Working... (ESC to cancel)")
             self._set_title("running")
             self._turn_start_time = time.time()
             self._start_timer()
-            # Reset cancel state for new turn
-            self.adapter._cancelled = False
-            self.adapter._cancel_event.clear()
             self.adapter._turn_cost = 0.0
             self._last_streamed_answer = ""
 
@@ -2571,6 +2631,7 @@ class DostuffTUI(App):
                 stream=True,
                 max_iterations=self.max_iterations,
                 permissions=self.permissions,
+                session_hook_context=self.session_hook_context,
             )
 
             agent_text = result or "(no response)"
@@ -2752,7 +2813,8 @@ class DostuffTUI(App):
             step = self.steps_history[i]
             content = step.get("content") if isinstance(step, dict) else None
             if (step.get("role") == "user" and isinstance(content, str) and content != EMPTY_RESPONSE_NUDGE
-                    and not content.startswith("[/undo]") and _parse_shell_step(content) is None):
+                    and not content.startswith("[/undo]") and _parse_shell_step(content) is None
+                    and parse_stop_note(content) is None):
                 return i
         return None
 

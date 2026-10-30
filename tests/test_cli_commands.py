@@ -352,3 +352,99 @@ def test_print_mode_flags(env, headless):
     assert runner.invoke(app, ["-p", "go", "--output-format", "xml"]).exit_code == 2
     assert runner.invoke(app, ["-p", "go", "--json", "--output-format", "text"]).exit_code == 2
     assert runner.invoke(app, ["--max-turns", "2"]).exit_code == 2
+
+
+# --- hooks (plan/2026-10-29-hooks, T3.1 / T3.4) ------------------------------------------------
+
+def _write_hooks(home, hooks: dict) -> None:
+    import yaml
+    from dostuff import config as config_module
+    (home / ".dostuff" / "config.yaml").write_text(yaml.safe_dump({"hooks": hooks}), encoding="utf-8")
+    config_module.reset_config()
+
+
+def test_headless_prompt_blocked_by_hook(env, headless, hook_cmd):
+    blocker = hook_cmd("import sys; sys.stderr.write('not in this repo please'); sys.exit(2)")
+    _write_hooks(env["home"], {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": blocker}]}]})
+    result = runner.invoke(env["app"], ["-p", "push it", "--json"])
+    assert result.exit_code == 2, result.output
+    assert "Prompt blocked by a UserPromptSubmit hook: not in this repo please" in result.stderr
+    assert headless == []  # the loop never ran
+    session_id = json.loads(result.stdout)["session_id"]
+
+    from dostuff.lib.memory.session_store import SQLiteSessionStore
+
+    async def stored():
+        store = SQLiteSessionStore(db_path=str(env["home"] / ".dostuff" / "data" / "sessions.db"))
+        try:
+            return await store.load(session_id)
+        finally:
+            await store.close()
+    assert asyncio.run(stored()) == []
+
+
+def test_headless_session_start_sources(env, headless, hook_cmd, tmp_path):
+    log = tmp_path / "sources.log"
+    logger = hook_cmd(f"""
+        import json, sys
+        source = json.load(sys.stdin)["source"]
+        open({str(log)!r}, "a").write(source + "\\n")
+        print("ctx-" + source)
+    """)
+    _write_hooks(env["home"], {"SessionStart": [{"hooks": [{"type": "command", "command": logger}]}]})
+    result = runner.invoke(env["app"], ["-p", "go", "--json", "-q"])
+    assert result.exit_code == 0, result.output
+    assert log.read_text().split() == ["startup"]
+    session_id = json.loads(result.stdout)["session_id"]
+
+    result = runner.invoke(env["app"], ["-p", "and then?", "-q", "--session", session_id])
+    assert result.exit_code == 0, result.output
+    assert log.read_text().split() == ["startup", "resume"]
+
+
+def test_headless_project_hooks(env, headless, hook_cmd, tmp_path, monkeypatch):
+    import yaml
+    from dostuff import config as config_module
+    from dostuff.helpers.hooks import trust
+    log = tmp_path / "ran.log"
+    logger = hook_cmd(f"open({str(log)!r}, 'a').write('ran' + chr(10))")
+    project_file = env["proj"] / ".dostuff" / "config.yaml"
+    project_file.parent.mkdir(exist_ok=True)
+
+    def project_hooks(**group):
+        project_file.write_text(yaml.safe_dump({"hooks": {"UserPromptSubmit": [
+            {**group, "hooks": [{"type": "command", "name": "guard", "command": logger}]}]}}), encoding="utf-8")
+        config_module.reset_config()
+
+    def runs():
+        return len(log.read_text().splitlines()) if log.exists() else 0
+
+    def run(*flags):
+        monkeypatch.setattr(trust, "_decisions", {})  # a fresh process each time
+        return runner.invoke(env["app"], ["-p", "go", *flags])
+
+    # untrusted, not a guardrail: skipped with one warning, the turn still runs
+    project_hooks()
+    result = run()
+    assert result.exit_code == 0, result.output
+    assert runs() == 0 and len(headless) == 1
+    assert result.stderr.count("project hooks") == 1 and "--trust-project-hooks" in result.stderr
+
+    # a trust record from an earlier TUI session is honoured
+    trust.remember(trust.trust_key(trust.project_entries(config_module.get_config().hooks)))
+    assert run().exit_code == 0 and runs() == 1
+    (env["home"] / ".dostuff" / "trusted_hooks.json").unlink()
+
+    # --trust-project-hooks runs them for this run only
+    assert run("--trust-project-hooks").exit_code == 0 and runs() == 2
+    assert not (env["home"] / ".dostuff" / "trusted_hooks.json").exists()
+
+    # an untrusted guardrail: refuse to start rather than fail open
+    project_hooks(fail_closed=True)
+    result = run()
+    assert result.exit_code == 2, result.output
+    assert len(headless) == 3 and runs() == 2
+    assert "guard" in result.stderr and "--trust-project-hooks" in result.stderr
+    assert run("--trust-project-hooks").exit_code == 0 and runs() == 3
+
+    assert "--trust-project-hooks" in runner.invoke(env["app"], ["--help"]).output

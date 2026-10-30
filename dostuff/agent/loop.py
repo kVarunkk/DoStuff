@@ -15,7 +15,15 @@ import inspect
 import random
 from dataclasses import dataclass
 from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, SessionPermissions
-from dostuff.agent.run_tool import authorize_batch, authorize_tool, dispatch_tool
+from dostuff.agent.run_tool import (
+    CANCELLED_RESULT, authorize_batch, authorize_tool, dispatch_tool, post_tool_use, pre_tool_use,
+)
+from dostuff.helpers.hooks import HookOutcome, run_hooks
+from dostuff.helpers.hooks.dispatch import report_outcome
+from dostuff.helpers.hooks.events import (
+    STOP_LIMIT_MESSAGE, STOP_NOTE, session_context_suffix, session_start, stop_event_for,
+)
+from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
 from dostuff.tools.definitions import TOOL_MAP
 from typing import Any, Literal
@@ -26,7 +34,6 @@ from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_
 
 TOOL_TIMEOUT_S = 120.0
 RETRY_BASE_DELAY_S = 1.0
-CANCELLED_RESULT = "Cancelled by user"
 CANCELLED_RUNNING_RESULT = "Cancelled by user (may still be running)"
 # Read-only tools that must still run one at a time (a subagent may prompt for approval)
 _SEQUENTIAL_READ_TOOLS = frozenset({"delegate_to_subagent"})
@@ -85,6 +92,7 @@ class _ToolCall:
     id: str
     error: str | None = None  # set when the call can't run (bad JSON, unavailable tool, denied)
     result: str | None = None
+    hook: HookOutcome | None = None  # its PreToolUse outcome, an input to the permission check
 
 
 def _parse_tool_calls(tool_calls: list[Any], tool_names: list[str] | None) -> list[_ToolCall]:
@@ -154,8 +162,12 @@ async def _sleep_or_cancel(seconds: float, adapter: Any) -> bool:
     return is_cancelled(adapter)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None) -> str:
-    """Run one agent turn. `working_history` is mutated in place (appends and compaction)."""
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None) -> str:
+    """Run one agent turn. `working_history` is mutated in place (appends and compaction).
+
+    `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
+    every model call's system instruction, refreshed here on compaction, never written to history.
+    """
     current_session_id.set(session_id)
     iteration = 0
     token_limit = get_model_token_limit()
@@ -190,6 +202,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             except Exception as e:
                 await loop_emit("error", f"Could not save compaction: {e}", adapter=adapter)
         await loop_emit("system", f"{reason} Context compacted. Notes: {compaction_notes}", adapter=adapter)
+        if session_hook_context is not None:
+            # Earlier SessionStart context may be stale now; refresh it under its own key (REQ-2.4)
+            await session_start("compact", session_hook_context, session_id=session_id, turn_id=turn_id,
+                                turn_type=turn_type, adapter=adapter)
         return True
 
     async def check_cancelled() -> bool:
@@ -209,6 +225,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
 
         max_iter = max_iterations
         nudged = False
+        stop_blocks = 0  # Stop-hook continuations this turn, bounded by hooks.stop_block_limit
         while iteration < max_iter:
             iteration += 1
             with tracer.start_as_current_span("iteration") as iter_span:
@@ -232,7 +249,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                             steps_history=working_history,
                             system_instruction=dynamic_system_instruction
                             + (f"\n\n{PLAN_MODE_INSTRUCTION}" if plan_mode else "")
-                            + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else ""),
+                            + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else "")
+                            + session_context_suffix(session_hook_context),
                             tool_names=tool_names,
                             stream=stream,
                         )
@@ -325,6 +343,25 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     }
                     await append_step(model_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
 
+                    # Stop / SubagentStop: only here, on a final answer, never on cancel, errors or the
+                    # iteration cap. A block keeps the turn going, at most stop_block_limit times (REQ-2.3)
+                    stop_event = stop_event_for(turn_type)
+                    stop = await run_hooks(stop_event, payload_for(
+                        stop_event, session_id=session_id, turn_id=turn_id, turn_type=turn_type,
+                        last_assistant_message=content, stop_hook_active=stop_blocks > 0,
+                    ), adapter=adapter)
+                    await report_outcome(stop_event, stop, adapter=adapter)
+                    if stop.decision == "deny" and not stop.cancelled:
+                        name = stop.decided_by or stop_event
+                        if stop_blocks < config.hooks_stop_block_limit:
+                            stop_blocks += 1
+                            note = STOP_NOTE.format(name=name, reason=stop.reason or "keep going")
+                            await append_step({"role": "user", "content": note}, steps_history, working_history, current_session_history, session_id, store, turn_type)
+                            iter_span.set_status(Status(StatusCode.OK))
+                            continue
+                        await loop_emit("system", STOP_LIMIT_MESSAGE.format(
+                            event=stop_event, name=name, limit=config.hooks_stop_block_limit), adapter=adapter)
+
                     turn_span.set_attribute("outcome", "success")
                     turn_span.set_status(Status(StatusCode.OK))
                     iter_span.set_status(Status(StatusCode.OK))
@@ -355,18 +392,34 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     await loop_emit("tool_call", _call_label(call), adapter=adapter)
 
                 cancelled = False
+                hook_ids: dict[str, Any] = {"session_id": session_id, "turn_id": turn_id, "turn_type": turn_type, "adapter": adapter}
+
+                # PreToolUse hooks run for every call, one at a time, before any prompt: a hook deny costs
+                # the user no prompt, and a rewrite is what the permission layer sees (hooks spec D2, D6)
+                for call in calls:
+                    if call.error is not None:
+                        continue
+                    call.args, call.hook = await pre_tool_use(call.name, call.args, tool_use_id=call.id, **hook_ids)
+                    if call.hook.cancelled:
+                        call.error = call.result = CANCELLED_RESULT
+                        cancelled = True
+                        break
+                    if call.hook.decision == "deny":
+                        call.error = call.hook.reason
 
                 # Permission checks run first, outside the tool timeout so a slow human doesn't time the
                 # call out: one prompt for all calls that need approval, else one at a time.
-                pending = [c for c in calls if c.error is None]
-                batch = await authorize_batch([(c.name, dict(c.args)) for c in pending], adapter=adapter, permissions=permissions)
+                pending = [c for c in calls if c.error is None] if not cancelled else []
+                batch = await authorize_batch([(c.name, dict(c.args)) for c in pending], adapter=adapter, permissions=permissions, hooks=[c.hook for c in pending])
                 decided = dict(zip(map(id, pending), batch)) if batch is not None else {}
                 for call in calls:
+                    if cancelled:
+                        break
                     if call.error is None:
                         if id(call) in decided:
                             call.error = decided[id(call)]
                         else:
-                            call.error = await authorize_tool(call.name, dict(call.args), adapter=adapter, permissions=permissions)
+                            call.error = await authorize_tool(call.name, dict(call.args), adapter=adapter, permissions=permissions, hook=call.hook)
                     if call.error is not None:
                         call.result = call.error
                         await loop_emit("tool_result", f"{call.name}: {call.result}", adapter=adapter)
@@ -394,6 +447,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                             call.result = f"Error: {exc}"
                         else:
                             call.result = str(task.result())
+                        if not was_cancelled:
+                            # PostToolUse runs here, after the dispatch task and outside TOOL_TIMEOUT_S, so the
+                            # parallel read-only batch stays intact and its context reaches the tool step (D5)
+                            call.result, _ = await post_tool_use(call.name, call.args, call.result, tool_use_id=call.id, **hook_ids)
                         await loop_emit("tool_result", f"{call.name}: {call.result}", adapter=adapter)
                     return was_cancelled
 
@@ -411,7 +468,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 # Keep the assistant step and every result (completed or not) so history stays valid
                 await append_step(assistant_tool_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
                 for call in calls:
-                    result_text = call.result if call.result is not None else CANCELLED_RESULT
+                    result_text = call.result if call.result is not None else call.error or CANCELLED_RESULT
                     result_step = {
                         "role": "tool",
                         "name": call.name,

@@ -43,3 +43,4 @@ htmlcov/
 .ruff_cache/
 AGENTS.md
 openspec/
+.dostuff

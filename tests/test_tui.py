@@ -1195,3 +1195,317 @@ def test_roadmap_021_commands_memory_context_doctor_history(tui, tmp_path, monke
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- hooks (plan/2026-10-29-hooks, T3.1 / T3.4) ------------------------------------------------
+
+def _write_hooks(hooks: dict) -> None:
+    import yaml
+    from dostuff import config as config_module
+    (Path.home() / ".dostuff" / "config.yaml").write_text(yaml.safe_dump({"hooks": hooks}), encoding="utf-8")
+    config_module.reset_config()
+
+
+def _recording_loop(cli_tui, monkeypatch):
+    calls: list[dict] = []
+
+    async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        calls.append({"instructions": instructions, "history": list(working_history),
+                      "session_hook_context": dict(kwargs.get("session_hook_context") or {})})
+        step = {"role": "assistant", "content": f"answer to {user_text}"}
+        steps_history.append(step)
+        current_session_history.append(step)
+        await store.append(session_id, step)
+        return step["content"]
+    monkeypatch.setattr(cli_tui, "agent_loop", fake_loop)
+    return calls
+
+
+def test_tui_prompt_blocked_by_hook(tui, monkeypatch, hook_cmd):
+    cli_tui = tui
+    calls = _recording_loop(cli_tui, monkeypatch)
+    blocker = hook_cmd("import sys; sys.stderr.write('not in this repo please'); sys.exit(2)")
+    _write_hooks({"UserPromptSubmit": [{"hooks": [{"type": "command", "command": blocker}]}]})
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="blocked")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("push it"))
+            await _until(pilot, lambda: any("not in this repo please" in t for t in _texts(app)), tries=200)
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert calls == [] and app.steps_history == []
+            assert await app.store.load("blocked") == []
+            assert any(t.startswith("Prompt blocked by a UserPromptSubmit hook") for t in _texts(app))
+
+            # a context hook: the context reaches the turn's instructions, not the history
+            ctx = hook_cmd("print('team rules: be brief')")
+            _write_hooks({"UserPromptSubmit": [{"hooks": [{"type": "command", "command": ctx}]}]})
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("hello"))
+            await _until(pilot, lambda: bool(calls) and not app._turn_in_progress, tries=200)
+            assert "team rules: be brief" in calls[0]["instructions"]
+            assert calls[0]["history"] == [{"role": "user", "content": "hello"}]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tui_session_start_sources(tui, monkeypatch, hook_cmd, tmp_path):
+    cli_tui = tui
+    calls = _recording_loop(cli_tui, monkeypatch)
+    log = tmp_path / "sources.log"
+    logger = hook_cmd(f"""
+        import json, sys
+        source = json.load(sys.stdin)["source"]
+        open({str(log)!r}, "a").write(source + "\\n")
+        print("ctx-" + source)
+    """)
+    _write_hooks({"SessionStart": [{"hooks": [{"type": "command", "command": logger}]}]})
+
+    def sources():
+        return log.read_text().split() if log.exists() else []
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="first")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            async def turn(text):
+                n = len(calls)
+                app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))
+                await _until(pilot, lambda: len(calls) > n and not app._turn_in_progress, tries=200)
+
+            await turn("one")
+            await turn("two")
+            assert sources() == ["startup"]  # once per session, not per prompt
+            assert calls[0]["session_hook_context"] == calls[1]["session_hook_context"] == {"startup": "ctx-startup"}
+
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/clear"))
+            await _until(pilot, lambda: app.session_id != "first")
+            assert app.session_hook_context == {}
+            await turn("three")
+            assert sources() == ["startup", "clear"]
+            assert calls[-1]["session_hook_context"] == {"clear": "ctx-clear"}
+
+            await app._switch_session("first")
+            await turn("four")
+            assert sources() == ["startup", "clear", "resume"]
+            assert calls[-1]["session_hook_context"] == {"resume": "ctx-resume"}
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tui_reports_hook_warnings_once(tui):
+    cli_tui = tui
+    _write_hooks({"PreToolUse": 5, "Bogus": []})
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="hook-warnings")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            texts = _texts(app)
+            await app._cleanup_and_save_session()
+            return texts
+
+    texts = asyncio.run(scenario())
+    assert len([t for t in texts if "hooks.PreToolUse" in t]) == 1
+    assert len([t for t in texts if "hooks.Bogus" in t]) == 1
+
+
+# --- hooks (plan/2026-10-29-hooks, T5.1 / T5.2) ------------------------------------------------
+
+def _write_project_hooks(hooks: dict) -> Path:
+    import yaml
+    from dostuff import config as config_module
+    path = Path.cwd() / ".dostuff" / "config.yaml"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(yaml.safe_dump({"hooks": hooks}), encoding="utf-8")
+    config_module.reset_config()
+    return path
+
+
+@pytest.fixture
+def fresh_trust(monkeypatch):
+    from dostuff.helpers.hooks import dispatch, trust
+    monkeypatch.setattr(trust, "_decisions", {})
+    monkeypatch.setattr(dispatch, "_untrusted_warned", set())
+    return trust
+
+
+def test_hooks_command(tui, fresh_trust):
+    cli_tui, trust = tui, fresh_trust
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="hooks-cmd")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+
+            def listing(marker: str, count: int = 1) -> list[str]:
+                return [t for t in _texts(app) if marker in t][count - 1].splitlines()
+
+            # nothing configured: a hint and where to read about hooks
+            submit("/hooks")
+            await _until(pilot, lambda: any("No hooks configured" in t for t in _texts(app)))
+            empty = next(t for t in _texts(app) if "No hooks configured" in t)
+            assert "README" in empty and "config.example.yaml" in empty
+
+            _write_hooks({"PreToolUse": [{
+                "matcher": "bash_command", "if": "(?i)^\\s*git\\s+push", "fail_closed": True, "timeout": 10,
+                "hooks": [{"type": "command", "name": "block-main-push",
+                           "command": "python .dostuff/hooks/block_main_push.py"}]}]})
+            project = _write_project_hooks({
+                "PostToolUse": [{"matcher": "write_file|edit_file", "hooks": [
+                    {"type": "command", "name": "format", "command": "python .dostuff/hooks/format_file.py"}]}],
+                "PreToolUse": [{"fail_closed": True, "matcher": "bash_command", "if": "(", "hooks": [
+                    {"type": "command", "name": "guard", "command": "echo ok"}]}],
+            })
+            submit("/hooks")
+            await _until(pilot, lambda: any("block-main-push" in t for t in _texts(app)))
+            lines = listing("block-main-push")
+            text = "\n".join(lines)
+            user_line = next(line for line in lines if "block-main-push" in line)
+            for part in ("user", "matcher bash_command", "if (?i)^\\s*git\\s+push", "timeout 10s", "fail_closed",
+                         "python .dostuff/hooks/block_main_push.py", str(Path.home() / ".dostuff" / "config.yaml")):
+                assert part in user_line, (part, user_line)
+            fmt_line = next(line for line in lines if " format " in line)
+            assert "untrusted" in fmt_line and str(project) in fmt_line and "timeout 30s" in fmt_line
+            assert "matcher write_file|edit_file" in fmt_line
+            assert "broken" in next(line for line in lines if " guard " in line)
+            # grouped per event, in the order the engine runs them
+            assert lines.index("PreToolUse") < lines.index(user_line)
+            guard_line = next(line for line in lines if " guard " in line)
+            assert lines.index(user_line) < lines.index(guard_line) < lines.index("PostToolUse")  # user first
+            assert "unsandboxed" in text and ".dostuff/hooks/" in text and "/hooks r" in text
+
+            # trusted once the user said yes
+            trust.remember(trust.trust_key(trust.project_entries(cli_tui.get_config().hooks)))
+            submit("/hooks")
+            await _until(pilot, lambda: sum("block-main-push" in t for t in _texts(app)) == 2)
+            fmt_line = next(line for line in listing("block-main-push", 2) if " format " in line)
+            assert "trusted" in fmt_line and "untrusted" not in fmt_line
+
+            # r re-reads the config files after an on-disk edit
+            (Path.home() / ".dostuff" / "config.yaml").write_text(
+                "hooks:\n  Stop:\n    - hooks:\n        - {type: command, name: lint, command: echo lint}\n",
+                encoding="utf-8")
+            submit("/hooks r")
+            await _until(pilot, lambda: any(" lint " in t for t in _texts(app)))
+            assert any("Reloaded" in t for t in _texts(app))
+            assert [e.name for e in cli_tui.get_config().hooks["Stop"]] == ["lint"]
+            assert not any("block-main-push" in line for line in listing(" lint "))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tui_hook_frame(tui, fresh_trust, monkeypatch, hook_cmd, tmp_path):
+    """Trust prompt before the first project hook, then ⚓ lines for pre/post/stop, live and on resume."""
+    import json
+    from types import SimpleNamespace
+    from dostuff.agent import loop as loop_module
+    from dostuff.helpers.hooks import dispatch
+    cli_tui, trust = tui, fresh_trust
+
+    async def real_loop(*args, **kwargs):
+        return await loop_module.loop(*args, **kwargs)
+    monkeypatch.setattr(cli_tui, "agent_loop", real_loop)
+
+    def msg(content=None, tool_calls=None):
+        message = SimpleNamespace(content=content, tool_calls=tool_calls)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
+
+    raw = json.dumps({"path": "a.txt"})
+    tc = SimpleNamespace(id="c1", type="function", function=SimpleNamespace(name="read_file", arguments=raw))
+    tc.model_dump = lambda: {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": raw}}
+    responses: list = []
+
+    async def fake_call_agent(steps_history, system_instruction, tool_names=None, stream=False):
+        return responses.pop(0), None
+
+    async def fake_dispatch(name, args, *a, **kw):
+        return "contents"
+    monkeypatch.setattr(loop_module, "call_agent", fake_call_agent)
+    monkeypatch.setattr(loop_module, "dispatch_tool", fake_dispatch)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+
+    log, counter = tmp_path / "ran.log", tmp_path / "stop.count"
+
+    def logged(tag: str, body: str = "") -> str:
+        return hook_cmd(f"open({str(log)!r}, 'a').write({tag!r} + chr(10))\n{body}")
+
+    stop = logged("stop", f"""
+import os, sys
+n = int(open({str(counter)!r}).read()) if os.path.exists({str(counter)!r}) else 0
+open({str(counter)!r}, "w").write(str(n + 1))
+if n == 0:
+    sys.stderr.write("tests are failing"); sys.exit(2)
+""")
+    post = logged("post", "print('lint ok')")
+    _write_hooks({"PreToolUse": [{"hooks": [{"type": "command", "name": "crashy",
+                                             "command": hook_cmd("import sys; sys.exit(3)")}]}]})
+    project = _write_project_hooks({
+        "PreToolUse": [{"matcher": "read_file", "hooks": [
+            {"type": "command", "name": "pre", "command": logged("pre", "print('pre ctx')")}]}],
+        "PostToolUse": [{"hooks": [{"type": "command", "name": "post", "command": post}]}],
+        "Stop": [{"hooks": [{"type": "command", "name": "tests", "command": stop}]}],
+    })
+
+    def ran() -> list[str]:
+        return log.read_text().split() if log.exists() else []
+
+    async def first_turn(app, pilot):
+        responses[:] = [msg(tool_calls=[tc]), msg("done"), msg("done again")]
+        app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("go"))
+        await _until(pilot, app.adapter.has_pending_confirm, tries=200)
+        prompt = next(t for t in _texts(app) if "This project defines hooks" in t)
+        assert str(project) in prompt and "PostToolUse 'post'" in prompt and post in prompt
+        assert ran() == []  # asked before any project hook ran
+
+    async def declined():
+        app = cli_tui.DostuffTUI(session_id="frame-no")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await first_turn(app, pilot)
+            app.adapter.choose("no")  # skips them; no "tell the model what to do differently" step
+            await _until(pilot, lambda: not app._turn_in_progress, tries=300)
+            assert any("project hooks not trusted; skipped" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    async def accepted():
+        app = cli_tui.DostuffTUI(session_id="frame")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await first_turn(app, pilot)
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: not app._turn_in_progress, tries=300)
+            assert ran() == ["pre", "post", "stop", "stop"]
+            texts = _texts(app)
+            anchors = [t for t in texts if t.startswith("⚓")]
+            assert [a.split()[1] for a in anchors] == ["PreToolUse", "PostToolUse", "Stop"]
+            assert "tests are failing" in anchors[2]
+            errors = [str(getattr(w, "content", "")) for w in app.query("#msg-container Static")
+                      if w.has_class("msg-error")]
+            assert any("crashy" in e for e in errors)
+            assert not any("[Stop hook" in t for t in texts)  # the Stop step is not shown as a user message
+            assert any(str(s.get("content")).startswith("[Stop hook tests]") for s in app.steps_history)
+            assert trust.is_trusted(trust.trust_key(trust.project_entries(cli_tui.get_config().hooks)))
+
+            # after /resume the Stop step renders as a ⚓ line too
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/clear"))
+            await _until(pilot, lambda: app.session_id != "frame")
+            await app._switch_session("frame")
+            texts = _texts(app)
+            assert not any("[Stop hook" in t for t in texts)
+            assert any(t.startswith("⚓ Stop") and "tests are failing" in t for t in texts)
+            assert app._last_prompt_index() == 0  # Esc Esc edits the real prompt, not the Stop note
+            await app._cleanup_and_save_session()
+
+    asyncio.run(declined())
+    assert ran() == [] and not (Path.home() / ".dostuff" / "trusted_hooks.json").exists()
+    trust._decisions.clear()
+    dispatch._untrusted_warned.clear()
+    asyncio.run(accepted())

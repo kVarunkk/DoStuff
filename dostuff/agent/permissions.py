@@ -261,6 +261,35 @@ def _plan_denies(kind: ToolKind, args: dict[str, Any]) -> bool:
     return False
 
 
+def _mentions_dostuff_dir(text: str) -> bool:
+    """`.dostuff` named in a shell command or cwd, other than a path into a subagent worktree."""
+    lowered = text.lower()
+    if ".." not in lowered:  # same worktree exemption as has_unsafe_constructs
+        lowered = _WORKTREES_PREFIX.sub("", lowered)
+    return ".dostuff" in lowered
+
+
+def effective_kind(kind: ToolKind, args: dict[str, Any]) -> ToolKind:
+    """write_file / edit_file on ./.dostuff/config.yaml, mcp_config.json, .env … count as settings changes.
+
+    So does a shell command naming `.dostuff` (in `command` or `cwd`): otherwise auto mode would let
+    `echo … >> ~/.dostuff/config.yaml` add a user hook, which no trust check covers, without a prompt.
+    A heuristic: a name built indirectly (`.dost''uff`, a variable holding it) is not caught here.
+    """
+    if kind == "write" and _is_settings_path(str(args.get("path") or "")):
+        return "settings"
+    if kind == "shell" and any(_mentions_dostuff_dir(str(args.get(key) or "")) for key in ("command", "cwd")):
+        return "settings"
+    return kind
+
+
+def forced_ask(tool: str, args: dict[str, Any], preview: str = "", note: str = "") -> PermissionDecision:
+    """A prompt in every mode, without "always" — e.g. when a PreToolUse hook asks (hooks spec D2 step 4)."""
+    description = _describe_call(tool, args)
+    prompt = "\n".join(part for part in (description, note, preview) if part)
+    return PermissionDecision("ask", prompt=prompt, reason=description)
+
+
 def check(
     tool: str,
     kind: ToolKind,
@@ -273,8 +302,7 @@ def check(
     mode = (session.mode if session and session.mode else cfg.mode)
     description = _describe_call(tool, args)
     prompt = f"{description}\n{preview}".rstrip()
-    if kind == "write" and _is_settings_path(str(args.get("path") or "")):
-        kind = "settings"  # write_file / edit_file on ./.dostuff/config.yaml, mcp_config.json, .env …
+    kind = effective_kind(kind, args)
     if mode == "plan" and _plan_denies(kind, args):
         return PermissionDecision("deny", reason=(
             f"Plan mode: not run ({description.splitlines()[0]}). Only read-only tools run in plan mode; "

@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from dostuff.agent.permissions import ApprovalReply, PermissionMode, SessionPermissions, parse_answer
+from dostuff.helpers.hooks import trust
+from dostuff.helpers.hooks.dispatch import hook_line, untrusted_notice_given
+from dostuff.helpers.hooks.events import blocked_prompt_message, session_start, user_prompt_submit, with_prompt_context
 
 PREVIEW_LINES = 4
 MCP_CONNECT_TIMEOUT_S = 150.0
@@ -23,6 +26,11 @@ MAX_ITERATIONS_PREFIX = "Reached maximum iterations"  # loop()'s answer when it 
 
 def _err(text: str) -> None:
     print(text, file=sys.stderr, flush=True)
+
+
+class _Refused(Exception):
+    """The run stops before the model is called (exit code 2): a UserPromptSubmit hook rejected the prompt,
+    or an untrusted fail_closed project hook can't be asked about. Nothing is stored."""
 
 
 class HeadlessAdapter:
@@ -57,6 +65,8 @@ class HeadlessAdapter:
             self._stream({"type": "usage", **{k: data.get(k) for k in ("prompt_tokens", "completion_tokens", "cached_tokens", "cost")}})
         elif event_type in ("error", "system"):
             self._stream({"type": event_type, "message": str(data)})
+        elif event_type == "hook" and isinstance(data, dict):
+            self._stream({"type": "hook", **data})
 
     def emit(self, event_type: str, data: Any) -> None:
         self._stream_event(event_type, data)
@@ -80,8 +90,11 @@ class HeadlessAdapter:
             _err(str(data))  # errors show even with --quiet
         elif event_type in ("diff", "confirm"):
             self._progress(str(data))
+        elif event_type == "hook" and isinstance(data, dict):
+            self._progress(hook_line(data))
 
     async def ask(self, message: str, always_label: str = "") -> ApprovalReply:
+        # No terminal → deny. Project hook trust follows the same rule (trust.headless_decision)
         if not self._interactive:
             self.denied_without_terminal += 1
             self._progress(f"✗ Denied (no terminal to ask): {message.splitlines()[0] if message else ''}")
@@ -120,11 +133,13 @@ async def run_headless(
     interactive: bool = True,
     max_turns: int | None = None,
     allowed_tools: list[str] | None = None,
+    trust_project_hooks: bool = False,
 ) -> int:
     """Run one turn and print the answer; returns the process exit code.
 
     max_turns caps the model calls (loop.max_iterations otherwise); allowed_tools are patterns
-    that run without asking in any mode (see SessionPermissions.allow).
+    that run without asking in any mode (see SessionPermissions.allow). trust_project_hooks runs the
+    project's hooks without a trust record (hooks spec D4).
     """
     # Heavy imports here so `dostuff --help` stays fast
     from dostuff.agent.instructions import build_base_instructions, build_turn_instructions
@@ -164,6 +179,13 @@ async def run_headless(
     result = ""
     code = 0
     try:
+        # Nobody can answer the trust prompt here, so it is settled before anything runs
+        refusal, warning = trust.headless_decision(config.hooks_project_trust, config.hooks, trust_project_hooks)
+        if refusal:
+            raise _Refused(refusal)
+        if warning:
+            _err(warning)
+            untrusted_notice_given(session_id)
         if output_format == "stream-json":
             from dostuff.lib.model import get_model
             stream({"type": "init", "session_id": session_id, "model": get_model(), "cwd": str(Path.cwd()),
@@ -184,9 +206,18 @@ async def run_headless(
         if expansion.skipped:
             adapter.emit("error", "Not attached: " + "; ".join(expansion.skipped))
         content = await asyncio.to_thread(skill_prompt, skill_run[0], expansion.content) if skill_run else expansion.content
+        # SessionStart, then UserPromptSubmit: both before the user step is appended (hooks spec D1)
+        session_hook_context: dict[str, str] = {}
+        await session_start("resume" if meta else "startup", session_hook_context, session_id=session_id,
+                            turn_id=turn_id, adapter=adapter)
+        blocked, prompt_context = await user_prompt_submit(content, session_id=session_id, turn_id=turn_id,
+                                                           adapter=adapter)
+        if blocked is not None:
+            raise _Refused(blocked_prompt_message(blocked))
         await append_step({"role": "user", "content": content}, steps_history, working_history,
                           current_session_history, session_id, store, "interactive_loop")
         instructions = await build_turn_instructions(base, prompt, get_semantic_store(), get_episodic_store(), config.get_user_id())
+        instructions = with_prompt_context(instructions, prompt_context)  # this turn only, never stored
         result = await agent_loop(
             session_id, turn_id, prompt, instructions, mcp_client, working_history, "interactive_loop",
             current_session_history, steps_history, store,
@@ -199,9 +230,13 @@ async def run_headless(
             stream=True,
             max_iterations=max_turns or config.max_iterations,
             permissions=SessionPermissions(mode=permission_mode, allow=list(allowed_tools or [])),
+            session_hook_context=session_hook_context,
         )
         if result.startswith(MAX_ITERATIONS_PREFIX):
             code = 1
+    except _Refused as e:
+        _err(str(e))
+        code = 2
     except Exception as e:
         _err(f"Error: {e}")
         code = 1
