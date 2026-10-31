@@ -105,13 +105,15 @@ def _merge(outcome: HookOutcome, entry: HookEntry, result: HookResult) -> None:
 
 async def run_hooks(event: str, payload: dict[str, Any], *, adapter: Any = None) -> HookOutcome:
     """Run the hooks configured for `event`, sequentially in config order, each on the same payload."""
-    # Read per dispatch, not cached here, so Config.reload() (edit_config) applies without a restart (REQ-1.5).
+    # Read per dispatch, not cached here, so a config.yaml change applies without a restart (REQ-1.5): edit_config
+    # reloads itself, and reload_if_changed() catches edit_file, shell and editor writes.
     # Lazy import: config.py imports this package to load hooks.
     from dostuff.config import get_config
     config = get_config()
+    config.reload_if_changed()
     entries = config.hooks.get(event)
     if not entries:
-        return HookOutcome()  # the cost of having no hooks: one attribute read and one dict lookup (REQ-1.4)
+        return HookOutcome()  # the cost of having no hooks: two stats, one attribute read and one dict lookup (REQ-1.4)
 
     runnable = [e for e in entries if _matches(e, payload)]
     skipped: list[HookEntry] = []

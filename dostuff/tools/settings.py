@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 import yaml
 
-from dostuff.config import STATUS_BAR_ITEMS, get_config
+from dostuff.config import RETIRED_STATUS_BAR_ITEMS, STATUS_BAR_ITEMS, get_config
 from dostuff.helpers.hooks.load_hooks import load_hooks
 from dostuff.helpers.mcp.load_mcp_config import (global_mcp_config_path, project_mcp_config_path, read_mcp_file,
                                                  write_mcp_file)
@@ -21,7 +21,7 @@ from dostuff.helpers.tools.diff import diff_stats, plain_diff, report_change, un
 Scope = Literal["user", "project"]
 REDACTED = "<redacted>"
 # Top-level keys config.yaml understands (see templates/config.example.yaml)
-CONFIG_KEYS = ("tracing", "models", "model", "loop", "memory", "permissions", "mcp", "ui", "search", "hooks")
+CONFIG_KEYS = ("tracing", "models", "model", "loop", "memory", "permissions", "mcp", "ui", "search", "hooks", "jobs")
 HOOKS_NOTE = (
     "hooks: commands dostuff runs at fixed points (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, "
     "SubagentStop). They are config, not model output: not permission-checked and not sandboxed — they run with the "
@@ -113,7 +113,7 @@ def _config_warnings(data: dict[str, Any]) -> list[str]:
     ui = data.get("ui")
     items = ui.get("status_bar") if isinstance(ui, dict) else None
     if isinstance(items, list):
-        warnings += [f"unknown ui.status_bar item '{i}'" for i in items if str(i).strip().lower() not in (*STATUS_BAR_ITEMS, "timer")]
+        warnings += [f"unknown ui.status_bar item '{i}'" for i in items if str(i).strip().lower() not in (*STATUS_BAR_ITEMS, *RETIRED_STATUS_BAR_ITEMS)]
     perms = data.get("permissions")
     mode = perms.get("mode") if isinstance(perms, dict) else None
     if mode is not None and str(mode).lower() not in ("ask", "allowlist", "auto", "plan"):

@@ -13,6 +13,8 @@ RETRY_MAX_DELAY_S = 60.0
 KNOWN_PROVIDERS = ("gemini", "anthropic", "openai", "groq", "mistral", "openrouter", "ollama", "opencode-go", "opencode")
 STATUS_BAR_ITEMS = ("help", "cwd", "session", "model", "mode", "tokens", "cost", "context")
 DEFAULT_STATUS_BAR = ("cwd", "model", "mode", "context")
+# Former items, accepted without a warning: "timer" moved to the loader message, "jobs" to an item that is always shown
+RETIRED_STATUS_BAR_ITEMS = ("timer", "jobs")
 PASTE_COLLAPSE_LINES = 10
 PASTE_FILE_LINES = 200
 PASTE_RETENTION_DAYS = 7
@@ -148,12 +150,13 @@ class Config:
         self.notify_after_seconds = max(float(after), 0.0) if after is not None else NOTIFY_AFTER_SECONDS
         collapse = ui.get("paste_collapse_lines")
         self.paste_collapse_lines = max(int(collapse), 0) if collapse is not None else PASTE_COLLAPSE_LINES
+        # Start a turn when a background job ends while the TUI is idle (background shell spec D15)
+        self.jobs_wake_on_end = str(_block(self.raw, "jobs").get("wake_on_end", True)).lower() not in ("0", "false", "no", "off")
         # TUI status bar: which items show, in this order; unknown names are reported once at startup
         items = _block(self.raw, "ui").get("status_bar")
         names = [str(i).strip().lower() for i in items] if isinstance(items, list) else list(DEFAULT_STATUS_BAR)
         self.status_bar_items = [n for n in names if n in STATUS_BAR_ITEMS]
-        # "timer" moved to the loader message; older configs may still list it
-        self.status_bar_unknown = [n for n in names if n not in STATUS_BAR_ITEMS and n != "timer"]
+        self.status_bar_unknown = [n for n in names if n not in (*STATUS_BAR_ITEMS, *RETIRED_STATUS_BAR_ITEMS)]
 
     def reload(self) -> None:
         """Re-read config.yaml in place (after a settings change); /model and /compact auto choices for this session stay."""
@@ -225,7 +228,38 @@ class Config:
             return None
         return os.environ.get(self.api_key_env_explicit) or None
 
+    def _files_signature(self) -> tuple[tuple[int, int] | None, ...]:
+        """(mtime, size) of the user and project config.yaml; None for a missing file."""
+        signature: list[tuple[int, int] | None] = []
+        for path in (self.path, project_config_path()):
+            try:
+                st = path.stat()
+                signature.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                signature.append(None)
+        return tuple(signature)
+
+    def reload_if_changed(self) -> bool:
+        """Reload when a config.yaml changed on disk since the last load: edit_file, a shell command or an
+        editor, not only edit_config. A file that doesn't parse (half-written, or a bad edit) keeps the
+        loaded config and is retried on the next check. True when it reloaded."""
+        if self._files_signature() == self._loaded_signature:
+            return False
+        for path in (self.path, project_config_path()):
+            try:
+                if path.exists():
+                    yaml.safe_load(path.read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError) as e:
+                self.load_error = f"{path}: {e}"
+                return False
+        self.reload()
+        return True
+
     def load(self):
+        # Before reading, so a write that lands mid-read is seen by the next reload_if_changed()
+        self._loaded_signature = self._files_signature()
+        # Why the last reload_if_changed() kept the loaded config ("" = the files on disk are in use)
+        self.load_error = ""
         load_env_files()
         if self.path.exists():
             with open(self.path, encoding="utf-8") as f:

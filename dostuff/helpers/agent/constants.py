@@ -13,6 +13,8 @@ COMMAND_DESCRIPTIONS = {
     "/memory": "Edit the instructions file (AGENTS.md) the agent follows (/memory [project|global]); `# note` adds a line",
     "/doctor": "Check config, API key, MCP config and memory setup, with a fix for each problem",
     "/hooks": "List the configured hooks, where each came from and whether it runs (/hooks r reloads config)",
+    "/jobs": "List this session's background shell jobs; /jobs <id> shows its output, /jobs kill <id> stops it",
+    "/queue": "Show the prompts waiting for the current turn: edit, run next or remove one (/queue clear drops them all)",
     "/rename": "Name this session (/rename <title>); shown by `dostuff sessions`",
     "/export": "Save this session as Markdown (/export [path])",
     "/compact": "Summarize older history to free up context; /compact auto <1-100|off> sets the auto-compact threshold",
@@ -29,6 +31,14 @@ COMMANDS = set(COMMAND_DESCRIPTIONS)
 COMMAND_FLAGS = {"/model": "--active", "/fork": "--worktree"}
 MAX_ITERATIONS = 100
 DEFAULT_IDENTITY = "You are DoStuff, a coding agent that works in the user's project directory."
+# {background_wait} in SYSTEM_INSTRUCTIONS: the TUI wakes the agent when its job ends (background shell
+# spec D15); headless kills every job when the run ends, so there the agent has to wait
+BACKGROUND_WAIT_INTERACTIVE = """ For a long job whose final result you need (a build,
+  test suite, scrape), don't block on it with `wait_for`: tell the user what is running and end
+  your turn. The harness starts a new turn with that message when the job ends. Keep `wait_for`
+  for short waits, like a server's "ready" line."""
+BACKGROUND_WAIT_HEADLESS = """ This run ends, and its background jobs are killed, when
+  you finish answering, so wait for a job you need with `bash_output`'s `wait_for`."""
 SYSTEM_INSTRUCTIONS = """{dostuff_identity}
 
 You can help with a wide range of tasks using the tools and skills available to you.
@@ -41,9 +51,13 @@ You can help with a wide range of tasks using the tools and skills available to 
 - Change part of a file with `edit_file` (exact string replacement). Use `write_file` only to
   create a file or replace it entirely. Read a file before editing it.
 - `bash_command` runs in the shell named in <environment>; use that shell's syntax. Commands
-  get no stdin and are killed on timeout, so keep them non-interactive. Start servers, GUI apps
-  and other long-running programs in the background with output redirected to a file, then
-  check the file in a later command.
+  get no stdin and are killed on timeout, so keep them non-interactive.
+- Start servers, watchers, GUI apps and anything long-running with `run_in_background=true`
+  and a short `background_id` (e.g. "dev"). Read its output with `bash_output`; to wait for a
+  "ready" line use its `wait_for` regex instead of sleeping. Stop jobs you no longer need with
+  `kill_shell`. Don't background processes yourself with `&`, `start` or similar: the harness
+  can't track or stop those. A <background-job> message is the harness reporting that one of
+  your background jobs ended.{background_wait}
 - Messages wrapped in <bash-input>/<bash-output> are shell commands the user ran themselves
   with `!`; use their output as context.
 - <attached_file> / <attached_dir> blocks in a user message are files and folders the user

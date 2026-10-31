@@ -32,8 +32,9 @@ memory:
 
 ui:
   # Status bar items, shown in this order. Default: [cwd, model, mode, context].
-  # All items: help, cwd, session, model, mode, tokens, cost, context. When the terminal is too
-  # narrow, the least important are dropped first: help, session, cwd, tokens, cost, model, context, mode.
+  # All items: help, cwd, session, model, mode, tokens, cost, context. When the terminal is too narrow,
+  # the least important are dropped first: help, session, cwd, tokens, cost, model, context, mode.
+  # Running background jobs always add a "⚙ 2 shells" item at the end (click it, or ↓, to list them).
   status_bar: [cwd, model, mode, context]
   paste_collapse_lines: 10  # pastes longer than this show as [Pasted text #1 +N lines] in the input (0 = never)
   terminal_title: true      # show the run status in the terminal tab title: ⏳ working, ✋ waiting for approval, ✓ done
@@ -42,6 +43,13 @@ ui:
   # iTerm2, WezTerm, Ghostty, kitty …; Windows Terminal ignores it, use bell). /notifications on|off per session.
   notifications: off
   notify_after_seconds: 30
+
+jobs:
+  # When a background job the agent started ends on its own while the TUI is idle, start a turn so the
+  # agent can react (it waits while you type or an approval is open; at most 3 such turns in a row
+  # without a message from you). false: the agent hears about it with your next message. Headless runs
+  # stop their jobs at the end, so this is TUI-only.
+  wake_on_end: true
 
 search:
   # web_search is free with no API key: DuckDuckGo by default (the `ddgs` package if installed,

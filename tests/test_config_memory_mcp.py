@@ -51,6 +51,15 @@ def test_empty_blocks_and_model_read_at_call_time(home, monkeypatch):
 
 
 
+
+def test_jobs_status_item_retired(home):
+    """`jobs` moved from a configurable status-bar item to one that is always shown; old configs listing it get no warning."""
+    user, _ = home
+    assert "jobs" not in config_module.STATUS_BAR_ITEMS and "jobs" not in config_module.DEFAULT_STATUS_BAR
+    (user / ".dostuff" / "config.yaml").write_text("ui:\n  status_bar: [mode, jobs]\n")
+    config = Config()
+    assert config.status_bar_items == ["mode"] and config.status_bar_unknown == []
+
 def test_retry_settings(home):
     user, _ = home
     cfg_file = user / ".dostuff" / "config.yaml"

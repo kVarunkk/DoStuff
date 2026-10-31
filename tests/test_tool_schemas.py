@@ -11,7 +11,7 @@ from dostuff.tools.definitions import TOOL_SCHEMAS
 
 SNAPSHOT = Path(__file__).parent / "snapshots" / "tool_schemas.json"
 APPROVAL_PARAMS = {"_confirmed", "overwrite", "confirmed"}
-INJECTED = {"mcp_client", "session_id", "turn_id", "adapter", "permissions"}
+INJECTED = {"mcp_client", "session_id", "turn_id", "adapter", "permissions", "owner"}
 
 
 def _normalized() -> dict:

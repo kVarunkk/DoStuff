@@ -451,3 +451,56 @@ def test_headless_project_hooks(env, headless, hook_cmd, tmp_path, monkeypatch):
     help_text = runner.invoke(env["app"], ["--help"], env={"NO_COLOR": "1", "FORCE_COLOR": None,
                                                           "TERM": "dumb", "COLUMNS": "200"}).output
     assert "--trust-project-hooks" in help_text
+
+
+# --- background shell T5.4: headless kills its jobs (plan/2026-10-31-background-shell) ---------
+
+@pytest.fixture
+def headless_jobs(headless, registry, monkeypatch, _py):
+    """The fake loop starts a background sleeper the way the real one would; `raise_after` makes it
+    raise once the job is running. Returns the list of started jobs."""
+    from dostuff.agent import loop as loop_module
+    from dostuff.tools.bash import jobs as jobs_module
+    from dostuff.tools.bash.bash_command import bash_command
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    sleeper = _py("import time; time.sleep(30)")
+    started: list = []
+    state = {"raise_after": None}
+
+    async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        await bash_command(sleeper, run_in_background=True, background_id="srv", owner=session_id)
+        job = registry.get(session_id, "srv")
+        started.append(job)
+        adapter.emit("job", {"id": job.id, "status": job.status, "code": job.exit_code})
+        if state["raise_after"] is not None:
+            raise state["raise_after"]
+        return "answer"
+    monkeypatch.setattr(loop_module, "loop", fake_loop)
+    return started, state
+
+
+def test_headless_kills_jobs(env, headless_jobs, _wait_dead):
+    app = env["app"]
+    started, _ = headless_jobs
+    result = runner.invoke(app, ["-p", "serve"])
+    assert result.exit_code == 0, result.output
+    job = started[-1]
+    assert _wait_dead(job.pid, 5) and job.status == "killed"
+    assert f'⚙ stopped background job "srv" (pid {job.pid})' in result.stderr
+
+    result = runner.invoke(app, ["-p", "serve", "-q", "--output-format", "stream-json"])
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    jobs = [e for e in events if e["type"] == "job"]
+    assert [(e["id"], e["status"]) for e in jobs] == [("srv", "running"), ("srv", "killed")]
+    assert "stopped background job" not in result.stderr
+    assert _wait_dead(started[-1].pid, 5)
+
+
+def test_headless_ctrl_c_kills_jobs(env, headless_jobs, _wait_dead):
+    from dostuff.headless import run_headless
+    started, state = headless_jobs
+    state["raise_after"] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(run_headless("serve", interactive=False, quiet=True))
+    assert _wait_dead(started[-1].pid, 5) and started[-1].status == "killed"

@@ -20,12 +20,14 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.actions import SkipAction
 from textual.binding import Binding
 from textual.worker import Worker, WorkerState
+from rich.style import Style
 from rich.text import Text
 from rich.markdown import Markdown as RichMarkdown
-from textual.events import Key, Paste, TextSelected
+from textual.events import Click, Key, Paste, TextSelected
 from dostuff import __version__
 from dostuff.config import NOTIFY_KINDS, STATUS_BAR_ITEMS, get_config, parse_compact_threshold
 from dostuff.agent.permissions import PERMISSION_MODES, ApprovalReply, SessionPermissions, next_mode, parse_answer
@@ -33,7 +35,12 @@ from dostuff.agent.instructions import build_base_instructions, build_turn_instr
 from dostuff.helpers.agent.constants import COMMAND_DESCRIPTIONS, COMMAND_FLAGS
 from dostuff.helpers.memory.export_session import session_to_markdown
 from dostuff.helpers.memory.shell_step import format_shell_step as _format_shell_step, parse_shell_step as _parse_shell_step
-from dostuff.tools.bash.bash_command import run_shell
+from dostuff.tools.bash.bash_command import detached_job_id, run_shell
+from dostuff.tools.bash.jobs import (
+    KILL_WAIT_S, Job, JobError, JobEvent, find_orphans, fmt_runtime, format_notice, get_registry, notice_line,
+    parse_notice, prune_logs,
+    session_of,
+)
 from dostuff.lib.memory.session_store import SQLiteSessionStore
 from dostuff.lib.checkpoints import UndoResult, get_checkpoint_store
 from dostuff.lib.worktree import Worktree, WorktreeError, create_worktree, detect_worktree, has_changes, remove_worktree, worktree_changes
@@ -72,8 +79,17 @@ if TYPE_CHECKING:
 
 MCP_CONNECT_TIMEOUT_S = 150.0  # covers the 120 s OAuth browser callback
 SHELL_TIMEOUT_S = 110.0  # `!command` typed by the user
+WORKING_LABEL = "Working... (ESC to cancel)"
+WORKING_LABEL_JOBS = "Working... (ESC to cancel · Ctrl+B to background)"  # a model shell call is running
+SETTINGS_WATCH_INTERVAL_S = 1.0  # config.yaml / mcp_config.json edited by hand: picked up within this
+JOB_WAKE_DELAY_S = 1.0  # batch jobs that end together into one wake-up turn; also the retry interval while busy
+JOB_WAKE_LIMIT = 3  # wake-up turns in a row without a message from the user (background shell spec D15)
+JOB_WAKE_IDLE_WORKERS = frozenset({"jobs_housekeeping", "load_backend", "mcp_connect", "mcp_sync"})  # don't block a wake
 TOOL_RESULT_PREVIEW_LINES = 8  # tool output shown in the conversation; the model gets all of it
 SHELL_PREVIEW_LINES = 40
+JOB_DETAIL_LINES = 8  # output rows in a job's picker (from the jobs list)
+QUEUE_BAR_MAX_ROWS = 4  # queued prompts listed above the input; /queue lists them all
+QUEUE_DETAIL_LINES = 8  # rows of a queued prompt shown in its picker
 PREVIEW_CHARS_PER_LINE = 200  # preview char budget = lines * this, so one giant line can't flood the screen
 PICKER_MAX_SESSIONS = 9  # /resume picker: number keys reach every option
 PICKER_MAX_VISIBLE = 10  # longer option lists scroll with the cursor
@@ -85,6 +101,18 @@ TODO_RESULT_PREFIX = "todo_write: "  # loop() emits results as "<tool>: <result>
 # over THOUGHT_REVEAL_TICKS ticks so it reads like streaming instead of popping in as a block
 THOUGHT_REVEAL_INTERVAL_S = 0.03
 THOUGHT_REVEAL_TICKS = 25
+
+
+def _mcp_files_signature() -> tuple[tuple[int, int] | None, ...]:
+    """(mtime, size) of each MCP config file; None for a missing one. A change means reconnect."""
+    signature: list[tuple[int, int] | None] = []
+    for path in mcp_config_sources():
+        try:
+            st = path.stat()
+            signature.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            signature.append(None)
+    return tuple(signature)
 
 
 # litellm, chromadb and mcp take several seconds to import, so the TUI draws its first frame
@@ -243,6 +271,32 @@ class JumpToBottom(Static):
         self.display = False
 
 
+class JobsBar(Static):
+    """Beside the status bar while background shells run; a click (or ↓ in an empty input) lists them,
+    a second click closes the list."""
+
+    ALLOW_SELECT = False  # a click with a little mouse movement would start a selection instead
+
+    def on_click(self) -> None:
+        self.app.action_toggle_jobs()  # type: ignore[attr-defined]
+
+
+class QueueBar(Static):
+    """Above the input while prompts are queued, one row each; a click (or /queue) lists them to
+    edit, run next or remove, a second click closes the list."""
+
+    ALLOW_SELECT = False
+
+    def on_click(self) -> None:
+        self.app.action_toggle_queue()  # type: ignore[attr-defined]
+
+
+def _one_line(text: str, width: int) -> str:
+    """`text` on one row: whitespace runs collapsed, cut to `width` with an ellipsis."""
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
 def _fmt_elapsed(seconds: float) -> str:
     """Whole seconds, Claude Code style: 45s, 1m 5s, 1h 2m."""
     s = int(seconds)
@@ -251,6 +305,13 @@ def _fmt_elapsed(seconds: float) -> str:
     if s < 3600:
         return f"{s // 60}m {s % 60}s"
     return f"{s // 3600}h {s % 3600 // 60}m"
+
+
+def _job_status(job: Job) -> str:
+    """`running` / `exited (1)` / `killed (by user)` for /jobs."""
+    if job.status == "running":
+        return "running"
+    return f"exited ({job.exit_code})" if job.status == "exited" else f"killed (by {job.killed_by})"
 
 
 def _thought_text(text: str) -> Text:
@@ -377,6 +438,7 @@ class PermissionPrompt(Static, can_focus=True):
 
     SHORTCUTS = {"y": "yes", "a": "always", "n": "no"}
     APPROVAL_HINT = "↑/↓ select · Enter confirm · Esc deny and stop"
+    ALLOW_SELECT = False  # clicking an option picks it
 
     class Chosen(Message):
         def __init__(self, value: str, source_id: str = "") -> None:
@@ -387,7 +449,13 @@ class PermissionPrompt(Static, can_focus=True):
     def __init__(self, question: str, options: list[tuple[str, str]], hint: str = APPROVAL_HINT, cursor: int = 0,
                  filterable: bool = False, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.configure(question, options, hint=hint, cursor=cursor, filterable=filterable)
+
+    def configure(self, question: str, options: list[tuple[str, str]], hint: str = APPROVAL_HINT, cursor: int = 0,
+                  filterable: bool = False, detail: list[tuple[str, str]] | None = None) -> None:
+        """Show a new question; the app reuses one #picker rather than mounting another with the same id."""
         self._question = question
+        self._detail = detail or []  # (line, style) between the question and the options, cut to one row each
         self._all_options = options  # (value, label)
         self._options = options  # the ones matching the filter
         self._hint = hint
@@ -395,12 +463,17 @@ class PermissionPrompt(Static, can_focus=True):
         self._chosen = False
         self._filterable = filterable
         self._filter = ""
+        if self.is_mounted:
+            self._render_options()
 
     def on_mount(self) -> None:
         self._render_options()
 
     def _render_options(self) -> None:
         text = Text(self._question, style="bold")
+        width = max((self.content_size.width or self.app.size.width - 4) - 2, 20)
+        for line, style in self._detail:
+            text.append("\n  " + (line if len(line) <= width else line[:width - 1] + "…"), style=style)
         if self._filterable:
             text.append(f"\n  Filter: {self._filter}▏", style="#8ab4f8")
             if not self._options:
@@ -413,10 +486,12 @@ class PermissionPrompt(Static, can_focus=True):
             text.append(f"\n  ↑ {start} more", style="dim")
         for i in range(start, end):
             label = self._options[i][1]
+            row = Style(meta={"option": i})  # read back by on_click, wrapped lines included
+            text.append("\n")
             if i == self._cursor:
-                text.append(f"\n❯ {i + 1}. {label}", style="bold #8ab4f8")
+                text.append(f"❯ {i + 1}. {label}", style=Style(bold=True, color="#8ab4f8") + row)
             else:
-                text.append(f"\n  {i + 1}. {label}")
+                text.append(f"  {i + 1}. {label}", style=row)
         if end < count:
             text.append(f"\n  ↓ {count - end} more", style="dim")
         text.append("\n" + self._hint, style="dim")
@@ -427,6 +502,13 @@ class PermissionPrompt(Static, can_focus=True):
             return
         self._chosen = True
         self.post_message(self.Chosen(self._options[index][0], source_id=self.id or ""))
+
+    def on_click(self, event: Click) -> None:
+        index = event.style.meta.get("option")
+        if isinstance(index, int) and index < len(self._options):
+            self._cursor = index
+            self._render_options()
+            self._choose(index)
 
     def _set_filter(self, text: str) -> None:
         self._filter = text
@@ -639,6 +721,11 @@ class EnterSubmits(TextArea):
             event.stop()
             event.prevent_default()
             return
+        if event.key == "down" and not self.text and self.app.query_one("#jobs-bar", JobsBar).display:
+            event.stop()
+            event.prevent_default()
+            self.app.action_show_jobs()  # type: ignore[attr-defined]
+            return
         if event.key == "enter":
             event.stop()
             event.prevent_default()
@@ -775,7 +862,7 @@ class TuiAdapter:
             if text.startswith(TODO_RESULT_PREFIX):  # the plan is short and worth seeing in full
                 app._append_tool_result(text.removeprefix(TODO_RESULT_PREFIX), max_lines=100)
                 return
-            app._append_tool_result(text)
+            app._append_call_result(text)
             return
         if event_type in ("confirm", "system", "error"):
             app._append(str(data), msg_type=event_type)
@@ -811,6 +898,11 @@ class TuiAdapter:
         """The project-hooks trust question (helpers/hooks/trust.py): no feedback, nothing goes to the model."""
         options = [("yes", "Yes, run them (asked again if they change)"), ("no", "No, skip them this session")]
         return await self._prompt(f"⚠ {message}", "Run this project's hooks?", options, feedback=False)
+
+    async def confirm(self, details: str, question: str, yes: str, no: str) -> bool:
+        """A yes/no question from the app itself (stopping background jobs); ESC means no."""
+        reply = await self._prompt(details, question, [("yes", yes), ("no", no)], feedback=False)
+        return reply.answer == "yes"
 
     async def _prompt(self, details: str, question: str, options: list[tuple[str, str]],
                       feedback: bool = True) -> ApprovalReply:
@@ -915,7 +1007,12 @@ class DostuffTUI(App):
     #input > .text-area--cursor-line { background: transparent; }
     /* Ghost text: the theme's $text-muted is the terminal's plain foreground under ansi-dark */
     #input > .text-area--suggestion { color: #6a6a6a; }
-    #status { height: 1; color: #8a8a8a; padding: 0 1; }
+    #status-row { height: 1; }
+    #status { width: auto; height: 1; color: #8a8a8a; padding: 0 1; }
+    #jobs-bar { width: auto; height: 1; display: none; padding: 0 1; }
+    #jobs-bar:hover { background: #2c2c2c; }
+    #queue-bar { height: auto; display: none; padding: 0 1; margin-top: 1; }
+    #queue-bar:hover { background: #2c2c2c; }
     #jump-bottom {
         dock: bottom; display: none; width: 100%; height: 1;
         text-align: center; color: #8ab4f8; text-style: bold; background: #2c2c2c;
@@ -934,6 +1031,7 @@ class DostuffTUI(App):
         Binding("ctrl+o", "toggle_tool_results", "Expand tool output", priority=True),
         Binding("shift+tab", "cycle_permission_mode", "Cycle permission mode", priority=True),
         Binding("ctrl+r", "history_search", "Search prompt history", priority=True),
+        Binding("ctrl+b", "background_jobs", "Move running commands to the background", priority=True),
     ]
 
     # ── Setup ──────────────────────────────────────────────────────────────────
@@ -987,9 +1085,12 @@ class DostuffTUI(App):
         self._pending_workers: list[Worker] = []
         self._copy_hint_timer: Timer | None = None
         self._turn_in_progress: bool = False
+        self._wake_timer: Timer | None = None
+        self._wake_turns = 0  # wake-up turns since the user's last message
         self._turn_start_time: float | None = None
         self._timer: Timer | None = None
         self._quitting = False
+        self._quit_confirming = False
         self.max_iterations = self.config.max_iterations
         # Session-scoped approvals ("always") — reset when the app restarts
         self.permissions = SessionPermissions()
@@ -999,6 +1100,9 @@ class DostuffTUI(App):
         self._skill_commands: dict[str, dict[str, Any]] = {}
         self._mcp_configured: list[str] = []
         self._mcp_server_configs: dict[str, dict] = {}  # as connected; diffed when the settings change
+        self._mcp_files_signature: tuple[tuple[int, int] | None, ...] = ()  # set when the backend connects MCP
+        self._settings_check_running = False
+        self._reported_load_error = ""  # a broken config.yaml is reported once, not every check
         self._tool_results_expanded = False  # Ctrl+O; new results follow it
         self._history_path = self.config.get_data_dir() / "prompt_history.jsonl"
         self._pastes = PasteStore()  # collapsed pastes in the input (helpers/agent/pastes.py)
@@ -1020,8 +1124,14 @@ class DostuffTUI(App):
                 yield Vertical(id="msg-container")
                 yield JumpToBottom("↓ Jump to bottom", id="jump-bottom")
             yield CommandMenu(id="command-menu")
+        yield QueueBar(id="queue-bar")
+        picker = PermissionPrompt("", [], id="picker")
+        picker.display = False  # shown in place of the input by _show_picker
+        yield picker
         yield EnterSubmits(id="input", language="")
-        yield Static(id="status")
+        with Horizontal(id="status-row"):
+            yield Static(id="status")
+            yield JobsBar(id="jobs-bar")
 
     def ui(self, fn: Callable[[], Any]) -> None:
         """Run fn on the UI thread (directly if already there)."""
@@ -1044,8 +1154,9 @@ class DostuffTUI(App):
             return
         try:
             for widget in (*self.query(PermissionPrompt), *self.query(SettingsEditor)):
-                self.screen.set_focus(widget)
-                return
+                if widget.display:  # the #picker stays mounted while hidden
+                    self.screen.set_focus(widget)
+                    return
             inp = self.query_one("#input", EnterSubmits)
         except Exception:
             return  # shutting down
@@ -1130,6 +1241,7 @@ class DostuffTUI(App):
         inp = self.query_one("#input", EnterSubmits)
         inp.focus()
         self.watch(self.screen, "focused", self._keep_input_focus, init=False)
+        get_registry().add_listener(self._on_job_event)
         inp.prompt_history = load_history(self._history_path, os.getcwd())
         inp.pastes = self._pastes
         inp.paste_collapse_lines = self.config.paste_collapse_lines
@@ -1138,7 +1250,7 @@ class DostuffTUI(App):
         except OSError:
             pass
 
-        self._system_instructions, skills = build_base_instructions()
+        self._system_instructions, skills = build_base_instructions(interactive=True)
         self.user_id = self.config.get_user_id()
         existing_meta = await self._load_session(self.session_id)
 
@@ -1201,6 +1313,8 @@ class DostuffTUI(App):
             )
         for warning in self.config.hooks_warnings:
             self._append(warning, msg_type="error")
+        self._start_worker(self._jobs_housekeeping(), name="jobs_housekeeping")
+        self.set_interval(SETTINGS_WATCH_INTERVAL_S, self._check_settings_files)
 
         self._update_status()
         self._append("Type a message or /help for commands.")
@@ -1236,6 +1350,8 @@ class DostuffTUI(App):
         self._refresh_context_status(self._context_tokens)
         self._warn_if_model_unconfigured()
 
+        # Before reading, so an edit that lands mid-read is seen by the next _check_settings_files()
+        self._mcp_files_signature = await asyncio.to_thread(_mcp_files_signature)
         mcp_servers = load_mcp_config()
         self._mcp_configured = list(mcp_servers)
         self._mcp_server_configs = dict(mcp_servers)
@@ -1348,14 +1464,18 @@ class DostuffTUI(App):
         role = step.get("role", "?")
         content = step.get("content") or ""
         if role == "tool":
-            self._append_tool_result(f"{step.get('name', '')}: {content}")
+            self._append_call_result(f"{step.get('name', '')}: {content}")
             return
         if role == "user":
             shell = _parse_shell_step(content)
             stop_note = parse_stop_note(content)
+            notices = parse_notice(content)
             if stop_note is not None:  # live, the loop showed this as a ⚓ line, not a prompt
                 self._append(hook_line({"event": "Stop", "decision": "block", "reason": stop_note[1]}),
                              msg_type="system")
+            elif notices is not None:  # live, these showed when the jobs ended
+                for line in notices:
+                    self._append(line, msg_type="system")
             elif shell is not None:
                 self._append(f"! {shell[0]}", msg_type="shell")
                 self._append_tool_result(shell[1], SHELL_PREVIEW_LINES, msg_type="shell-output")
@@ -1402,11 +1522,12 @@ class DostuffTUI(App):
 
         Todos and undo checkpoints are keyed by session id, so they start fresh too.
         Session-scoped approvals ("always") are kept. The new session's DB row is created with
-        its first step.
+        its first step. Running background jobs keep running and move to the new session.
         """
         old_session_id = self.session_id
         new_session_id = uuid.uuid4().hex[:16]
         self.session_id = new_session_id
+        carried = self._carry_jobs(old_session_id)
         self.steps_history = []
         self.current_session_history = []
         self.session_hook_context = {}
@@ -1418,6 +1539,7 @@ class DostuffTUI(App):
             f" New session '{new_session_id}'. Previous session saved; /resume or `dostuff resume {old_session_id}` brings it back.",
             msg_type="system",
         )
+        self._report_carried_jobs(carried)
 
     async def _undo_changes(self, force: bool) -> None:
         """Revert the newest file checkpoint, then tell the model which files went back."""
@@ -1499,11 +1621,14 @@ class DostuffTUI(App):
         except Exception as e:
             self._append(f"Resume failed: {e}", msg_type="error")
             return
+        finally:
+            carried = self._carry_jobs(old_session_id)  # _load_session may switch before it fails
         await self.query_one("#msg-container", Vertical).remove_children()
         self._append(f" Resumed session '{session_id}' ({len(self.steps_history)} step(s)).", msg_type="system")
         self._render_history()
         if had_steps:
             self._append(f" Previous session '{old_session_id}' saved; /resume brings it back.", msg_type="system")
+        self._report_carried_jobs(carried)
 
     async def _fork_session(self, arg: str) -> None:
         """/fork [--worktree] [title]: copy this session into a new one and switch to it; the original stays as it was.
@@ -1611,7 +1736,7 @@ class DostuffTUI(App):
     async def _move_to(self, path: Path) -> None:
         """chdir the session to path; tools, the status bar and the system prompt follow the cwd."""
         os.chdir(path)
-        self._system_instructions, _ = await asyncio.to_thread(build_base_instructions)
+        self._system_instructions, _ = await asyncio.to_thread(build_base_instructions, True)
         meta = await self.store.get_session_meta(self.session_id)
         if meta:
             await self.store.save_session_meta(
@@ -1937,7 +2062,7 @@ class DostuffTUI(App):
 
     def _reload_instructions(self) -> None:
         """Rebuild the system prompt, e.g. after an AGENTS.md change, so the next message sees it."""
-        self._system_instructions, _ = build_base_instructions()
+        self._system_instructions, _ = build_base_instructions(interactive=True)
 
     # ── /memory and `# note`: the AGENTS.md instruction files ──────────────────
 
@@ -2123,6 +2248,66 @@ class DostuffTUI(App):
             self._append("Reloaded config.yaml (user and project).", msg_type="system")
         self._append(text, msg_type="system")
 
+    def _session_jobs(self) -> list[Job]:
+        """This session's background jobs, main agent and subagents (foreground calls and `!command`s aren't)."""
+        return [j for j in get_registry().jobs() if not j.foreground and session_of(j.owner) == self.session_id]
+
+    def _find_job(self, job_id: str) -> Job:
+        """A job by id; the main agent's wins when a subagent used the same id."""
+        matches = [j for j in self._session_jobs() if j.id == job_id.casefold()]
+        if not matches:
+            raise JobError(f'No job "{job_id}". Type /jobs to list them.')
+        return next((j for j in matches if j.owner == self.session_id), matches[-1])
+
+    async def _jobs_command(self, arg: str) -> None:
+        """/jobs: the session's jobs; `/jobs <id>`: its recent output and logs; `/jobs kill <id>`: stop it."""
+        registry = get_registry()
+        words = arg.split()
+        if not words:
+            jobs = self._session_jobs()
+            if not jobs:
+                self._append("No background jobs.", msg_type="system")
+                return
+            rows = [("ID", "OWNER", "STATUS", "RUNTIME", "COMMAND")] + [
+                (j.id, registry.owner_label(j.owner), _job_status(j), fmt_runtime(j.runtime),
+                 " ".join(j.command.split())) for j in jobs]
+            widths = [max(len(r[i]) for r in rows) for i in range(4)]
+            lines = ["  ".join(c.ljust(w) for c, w in zip(r[:4], widths)) + "  " + r[4] for r in rows]
+            self._append("\n".join(lines) + "\n\n/jobs <id> shows its output · /jobs kill <id> stops it",
+                         msg_type="system")
+            return
+        if len(words) > 2 or (words[0] == "kill") != (len(words) == 2):
+            self._append("Usage: /jobs [<id> | kill <id>]", msg_type="error")
+            return
+        try:
+            job = self._find_job(words[-1])
+        except JobError as e:
+            self._append(str(e), msg_type="error")
+            return
+        if words[0] == "kill":
+            await self._kill_job(job)
+        else:
+            self._show_job_output(job)
+
+    async def _kill_job(self, job: Job) -> None:
+        if job.ended is not None:
+            self._append(f'Job "{job.id}" already {_job_status(job)}.', msg_type="system")
+            return
+        await get_registry().kill(job, "user")  # the owner gets a notice on its next model call (D7)
+        self._append(f'Killed job "{job.id}" (pid {job.pid}); the agent will be told.', msg_type="system")
+
+    def _show_job_output(self, job: Job) -> None:
+        """`/jobs <id>`: the job's last 40 lines of each stream and its log files."""
+        registry = get_registry()
+        parts = [f'⚙ job "{job.id}" · {registry.owner_label(job.owner)} · {_job_status(job)} · '
+                 f"{fmt_runtime(job.runtime)} · pid {job.pid}", f"$ {job.command}"]
+        for stream in ("stdout", "stderr"):
+            lines = job.tail(stream, 40)  # type: ignore[arg-type]
+            parts.append(f"{stream} (last {len(lines)} lines):" if lines else f"{stream}: (none)")
+            parts += [f"  {line}" for line in lines]
+        parts.append(f"Logs: {job.out_path}\n      {job.err_path}")
+        self._append("\n".join(parts), msg_type="system")
+
     async def _rename_session(self, title: str) -> None:
         try:
             await self.store.set_title(self.session_id, title)
@@ -2307,6 +2492,17 @@ class DostuffTUI(App):
             else:
                 self._start_worker(self._show_hooks(reload=bool(arg)), name="hooks")
             return
+        if name == "/jobs":
+            self._start_worker(self._jobs_command(arg), name="jobs")
+            return
+        if name == "/queue":
+            if arg.lower() == "clear":
+                self._clear_queue()
+            elif arg:
+                self._append("Usage: /queue [clear]", msg_type="error")
+            else:
+                self.action_show_queue()
+            return
         if name == "/status" and not arg:
             self._start_worker(self._show_status(), name="status")
             return
@@ -2371,8 +2567,7 @@ class DostuffTUI(App):
             self._begin_turn(text)
         else:
             self._prompt_queue.append(text)
-            self._render_loader()
-            self._append(f" Queued — will run after current turn (position {len(self._prompt_queue)})", msg_type="system")
+            self._render_queue()
 
     # ── Approval prompt ────────────────────────────────────────────────────────
 
@@ -2427,27 +2622,30 @@ class DostuffTUI(App):
         self.adapter.choose(event.value)
 
     def _show_picker(self, question: str, options: list[tuple[str, str]], on_choose: Callable[[str], Awaitable[None]],
-                     cursor: int = 0, filterable: bool = False) -> None:
-        """A selector in place of the input (/resume, /model, /permissions); ESC closes it."""
-        self._close_picker()
+                     cursor: int = 0, filterable: bool = False, detail: list[tuple[str, str]] | None = None) -> None:
+        """A selector in place of the input (/resume, /model, /permissions); ESC closes it.
+
+        One #picker is reused: mounting a new one while Textual is still removing the last
+        (removal is asynchronous) raised DuplicateIds, and the leftover kept _picker_open() true."""
         self._picker_callback = on_choose
         menu = self.query_one("#command-menu", CommandMenu)
         menu.display = False
         self.query_one("#input", EnterSubmits).display = False
         hint = ("Type to filter · " if filterable else "") + "↑/↓ select · Enter confirm · Esc close"
-        picker = PermissionPrompt(question, options, hint=hint, cursor=cursor, filterable=filterable, id="picker")
-        self.mount(picker, before="#input")
+        picker = self.query_one("#picker", PermissionPrompt)
+        picker.configure(question, options, hint=hint, cursor=cursor, filterable=filterable, detail=detail)
+        picker.display = True
         self.call_after_refresh(picker.focus)
 
     def _picker_open(self) -> bool:
-        return bool(self.query("#picker"))
+        pickers = self.query("#picker")
+        return bool(pickers) and pickers.first().display
 
     def _close_picker(self) -> None:
         self._picker_callback = None
         if not self._picker_open():
             return
-        for widget in self.query("#picker"):
-            widget.remove()
+        self.query_one("#picker", PermissionPrompt).display = False
         if self.query("#permission-prompt"):
             return  # an approval prompt owns the input area
         try:
@@ -2459,6 +2657,7 @@ class DostuffTUI(App):
 
     def _begin_turn(self, text: str) -> None:
         self._turn_in_progress = True
+        self._wake_turns = 0
         self._start_worker(self._run_turn(text), name=f"turn_{uuid.uuid4().hex[:6]}")
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
@@ -2493,10 +2692,12 @@ class DostuffTUI(App):
         self.adapter._cancelled = False
         self.adapter._cancel_event.clear()
         try:
-            task = asyncio.ensure_future(run_shell(command, timeout=SHELL_TIMEOUT_S))
+            # Owner "user": not Ctrl+B-able, and nobody would receive its notices (spec OUT-002)
+            task = asyncio.ensure_future(run_shell(command, timeout=SHELL_TIMEOUT_S, owner="user"))
             while not task.done():
                 if self.adapter._cancel_event.is_set():
                     task.cancel()
+                    await asyncio.wait({task})  # let it kill the process tree before checking
                     break
                 await asyncio.wait({task}, timeout=0.1)
             if task.cancelled():
@@ -2543,7 +2744,9 @@ class DostuffTUI(App):
     async def _build_instructions(self, user_text: str) -> str:
         return await build_turn_instructions(self._system_instructions, user_text, self.memory_store, self.episodic_store, self.user_id)
 
-    async def _run_turn(self, user_text: str) -> None:
+    async def _run_turn(self, user_text: str, wake: bool = False) -> None:
+        """One agent turn. `wake`: started by a background job ending (D15) — `user_text` is the pending
+        notice text, and no user step is stored: the loop drains the notice into history itself."""
         loader_widget: Static | None = None
         try:
             if not await self._wait_for_backend():
@@ -2555,56 +2758,68 @@ class DostuffTUI(App):
             meta = await self.store.get_session_meta(self.session_id) or {}
             working_history = await self.store.load_working_history(self.session_id)
 
-            # `/<skill> args`: only the args get @mentions and pastes; the SKILL.md text goes around them
-            skill_run = parse_skill_command(user_text, self._skill_commands)
-            expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else user_text,
-                                                self.config.max_tool_output_chars)
-            if expansion.attached:
-                self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
-            if expansion.skipped:
-                self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
-            # After the @mentions, so an "@" inside pasted text isn't taken as one
-            content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
-                                              self.config.paste_file_lines, self.config.max_tool_output_chars)
-            if skill_run:
-                try:
-                    content = await asyncio.to_thread(skill_prompt, skill_run[0], content)
-                except OSError as e:
-                    self._append(f"Could not read /{skill_run[0]['name']}: {e}", msg_type="error")
-                    return
-                what = "command" if skill_run[0].get("kind") == "command" else "skill"
-                self._append(f"Running {what} {skill_run[0]['name']} ({_rel_path(skill_run[0]['location'])})",
-                             msg_type="system")
+            content = user_text
+            if not wake:
+                # `/<skill> args`: only the args get @mentions and pastes; the SKILL.md text goes around them
+                skill_run = parse_skill_command(user_text, self._skill_commands)
+                expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else user_text,
+                                                    self.config.max_tool_output_chars)
+                if expansion.attached:
+                    self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
+                if expansion.skipped:
+                    self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
+                # After the @mentions, so an "@" inside pasted text isn't taken as one
+                content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
+                                                  self.config.paste_file_lines, self.config.max_tool_output_chars)
+                if skill_run:
+                    try:
+                        content = await asyncio.to_thread(skill_prompt, skill_run[0], content)
+                    except OSError as e:
+                        self._append(f"Could not read /{skill_run[0]['name']}: {e}", msg_type="error")
+                        return
+                    what = "command" if skill_run[0].get("kind") == "command" else "skill"
+                    self._append(f"Running {what} {skill_run[0]['name']} ({_rel_path(skill_run[0]['location'])})",
+                                 msg_type="system")
 
             # Reset cancel state before the hooks below, so ESC can stop a slow one
             self.adapter._cancelled = False
             self.adapter._cancel_event.clear()
+            # config.yaml edited outside edit_config since the last turn (edit_file, a shell, an editor): apply it
+            # here so the status bar etc. follow; the hooks below would reload it anyway
+            if await asyncio.to_thread(self.config.reload_if_changed):
+                self._apply_settings(mcp=False)
             # SessionStart, then UserPromptSubmit: both before the user step is appended (hooks spec D1)
             if self._pending_session_start:
                 source, self._pending_session_start = self._pending_session_start, None
                 await session_start(source, self.session_hook_context, session_id=self.session_id,
                                     turn_id=turn_id, adapter=self.adapter)
-            blocked, prompt_context = await user_prompt_submit(content, session_id=self.session_id,
-                                                               turn_id=turn_id, adapter=self.adapter)
-            if blocked is not None:
-                self._append(blocked_prompt_message(blocked), msg_type="system")
-                return
+            prompt_context = ""
+            if wake:
+                # Nobody typed a prompt, so no UserPromptSubmit. A user turn may have taken the notices meanwhile.
+                if not get_registry().pending_notices(self.session_id):
+                    return
+            else:
+                blocked, prompt_context = await user_prompt_submit(content, session_id=self.session_id,
+                                                                   turn_id=turn_id, adapter=self.adapter)
+                if blocked is not None:
+                    self._append(blocked_prompt_message(blocked), msg_type="system")
+                    return
 
-            self._sent_prompts[(self.session_id, len(self.steps_history))] = user_text
-            await append_step(
-                {"role": "user", "content": content},
-                self.steps_history,
-                working_history,
-                self.current_session_history,
-                self.session_id,
-                self.store,
-                "interactive_loop",
-            )
+                self._sent_prompts[(self.session_id, len(self.steps_history))] = user_text
+                await append_step(
+                    {"role": "user", "content": content},
+                    self.steps_history,
+                    working_history,
+                    self.current_session_history,
+                    self.session_id,
+                    self.store,
+                    "interactive_loop",
+                )
 
             # The hook context is for this turn only: it is not part of the stored user step
             dynamic_instructions = with_prompt_context(await self._build_instructions(user_text), prompt_context)
 
-            loader_widget = self._show_loader("Working... (ESC to cancel)")
+            loader_widget = self._show_loader(WORKING_LABEL)
             self._set_title("running")
             self._turn_start_time = time.time()
             self._start_timer()
@@ -2654,6 +2869,7 @@ class DostuffTUI(App):
                     self._notify("dostuff: turn finished", time.time() - started)
             self._render_status()  # session cost changed
             self._process_prompt_queue()
+            self._schedule_wake()  # a job that ended after the loop's last drain
 
     def _append_turn_summary(self, elapsed: float) -> None:
         """`✻ Worked for 1m 5s · $0.01 · done 12:59 PM` under a finished turn."""
@@ -2665,14 +2881,121 @@ class DostuffTUI(App):
         self._append(" · ".join(parts), msg_type="system")
 
     def _process_prompt_queue(self) -> None:
-        """Start the next queued prompt, if any."""
+        """Start the next queued prompt, if any. After Esc the queue goes back in the input instead:
+        cancelling stops the work, not just the turn that happened to be running."""
         if not self._prompt_queue or self._quitting:
             return
+        if self.adapter._cancelled:
+            prompts, self._prompt_queue = self._prompt_queue, []
+            self._render_queue()
+            self._put_back_in_input(prompts)
+            self._append(f"Moved {len(prompts)} queued prompt{'s' if len(prompts) != 1 else ''} back to the input: "
+                         "edit and send, or clear it.", msg_type="system")
+            return
         next_text = self._prompt_queue.pop(0)
+        self._render_queue()
         self._append(next_text, msg_type="user")
-        if self._prompt_queue:
-            self._append(f" {len(self._prompt_queue)} queued", msg_type="system")
         self._begin_turn(next_text)
+
+    # ── Queued prompts: listed above the input; /queue (or a click) edits, reorders or removes them ──
+
+    def _queue_bar_text(self) -> Text:
+        width = max(self.size.width - 8, 20)
+        text = Text(f"{len(self._prompt_queue)} queued · click or /queue to edit, reorder or remove", style="#8a8a8a")
+        for i, prompt in enumerate(self._prompt_queue[:QUEUE_BAR_MAX_ROWS], 1):
+            text.append(f"\n  {i}. {_one_line(prompt, width)}")
+        if (more := len(self._prompt_queue) - QUEUE_BAR_MAX_ROWS) > 0:
+            text.append(f"\n  … {more} more", style="dim")
+        return text
+
+    def _render_queue(self) -> None:
+        """The queue changed: the bar above the input and the loader's count."""
+        self._render_loader()
+        try:
+            bar = self.query_one("#queue-bar", QueueBar)
+        except Exception:
+            return  # not mounted yet / shutting down
+        bar.display = bool(self._prompt_queue)
+        if self._prompt_queue:
+            bar.update(self._queue_bar_text())
+        elif self._queue_picker_open():
+            self._close_picker()
+
+    def _put_back_in_input(self, prompts: list[str]) -> None:
+        """Queued prompts into the input, ahead of anything already typed there."""
+        inp = self.query_one("#input", EnterSubmits)
+        inp.text = "\n\n".join(prompts + ([inp.text] if inp.text.strip() else []))
+        inp.recalled_text = inp.text  # keep the "/" menu shut for a queued skill command
+        inp.move_cursor(inp.document.end)
+
+    def _clear_queue(self) -> None:
+        count = len(self._prompt_queue)
+        self._prompt_queue.clear()
+        self._render_queue()
+        self._append(f"Cleared {count} queued prompt{'s' if count != 1 else ''}." if count else "No queued prompts.",
+                     msg_type="system")
+
+    def _queue_picker_open(self) -> bool:
+        return self._picker_open() and self.query_one("#picker", PermissionPrompt)._question.startswith("Queued prompt")
+
+    def action_toggle_queue(self) -> None:
+        """The queue bar was clicked: open the list, or close it when it's already showing."""
+        if self._queue_picker_open():
+            self._close_picker()
+        else:
+            self.action_show_queue()
+
+    def action_show_queue(self) -> None:
+        """/queue or a click on the queue bar: pick a queued prompt, or clear them all."""
+        if not self._prompt_queue:
+            self._append("No queued prompts. Prompts sent while a turn runs wait here.", msg_type="system")
+            return
+        if self._picker_open() or self._settings_open() or self.query("#permission-prompt"):
+            return
+        prompts = list(self._prompt_queue)
+        options = [(f"q{i}", f"{i + 1}. {_one_line(p, 70)}") for i, p in enumerate(prompts)]
+        options.append(("clear", "Clear the queue"))
+
+        async def choose(value: str) -> None:
+            if value == "clear":
+                self._clear_queue()
+            else:
+                self._queued_prompt_actions(prompts[int(value[1:])])
+
+        self._show_picker("Queued prompts (run in order after the current turn)", options, choose)
+
+    def _queued_prompt_actions(self, prompt: str) -> None:
+        """One queued prompt: its text, then edit it, run it next, remove it, or go back."""
+        if prompt not in self._prompt_queue:
+            self._append("That prompt already started.", msg_type="system")
+            return
+        position = self._prompt_queue.index(prompt)
+        options = [("edit", "Edit it (moves it back to the input)")]
+        if position:
+            options.append(("next", "Run it next"))
+        options += [("remove", "Remove it"), ("back", "Back to the list")]
+        lines = prompt.splitlines() or [""]
+        detail = [(line, "#8a8a8a") for line in lines[:QUEUE_DETAIL_LINES]]
+        if len(lines) > QUEUE_DETAIL_LINES:
+            detail.append((f"… {len(lines) - QUEUE_DETAIL_LINES} more lines", "dim"))
+
+        async def act(choice: str) -> None:
+            if choice == "back":
+                self.action_show_queue()
+                return
+            if prompt not in self._prompt_queue:
+                self._append("That prompt already started.", msg_type="system")
+                return
+            self._prompt_queue.remove(prompt)
+            if choice == "next":
+                self._prompt_queue.insert(0, prompt)
+            elif choice == "edit":
+                self._put_back_in_input([prompt])
+            else:
+                self._append(f"Removed queued prompt: {_one_line(prompt, 60)}", msg_type="system")
+            self._render_queue()
+
+        self._show_picker(f"Queued prompt {position + 1} of {len(self._prompt_queue)}", options, act, detail=detail)
 
     # ── Loader / timer / streaming helpers ─────────────────────────────────────
 
@@ -2805,6 +3128,90 @@ class DostuffTUI(App):
         self._loader_label = "Cancelling..."
         self._render_loader()
 
+    # ── Ctrl+B: move the turn's running commands to the background (background shell D9) ──
+
+    def _foreground_jobs(self) -> list[Job]:
+        """Running model shell calls of this session and its subagents (never a `!command`)."""
+        return [j for j in get_registry().jobs()
+                if j.foreground and j.ended is None and session_of(j.owner) == self.session_id]
+
+    def action_background_jobs(self) -> None:
+        if not self._turn_in_progress or not self._foreground_jobs():
+            raise SkipAction()  # nothing to background: the key goes to the focused widget
+        get_registry().detach_foreground(self.session_id)
+
+    def _on_job_event(self, job: Job, event: JobEvent) -> None:
+        if session_of(job.owner) == self.session_id:
+            self.call_later(self._refresh_job_hint)
+            self.call_later(self._render_jobs_bar)
+            if event == "end" and not job.foreground and job.killed_by in (None, "user"):
+                self.call_later(self._job_ended, job)  # the ones the owner gets a notice for (D7)
+
+    def _job_ended(self, job: Job) -> None:
+        """A background job ended on its own or by /jobs kill: a system line, and a notification
+        when the terminal is in the background. The model hears on its next call, which is started
+        now if the main agent's job ended on its own while the TUI is idle (D15)."""
+        line = notice_line(job.id, job.status, job.exit_code, job.killed_by, fmt_runtime(job.runtime))
+        self._append(line, msg_type="system")
+        self._notify(f"dostuff: {line.removeprefix('⚙ ')}", 0.0)
+        if job.owner == self.session_id and job.killed_by is None:
+            self._schedule_wake()
+
+    # ── Wake-up: a turn for background jobs that ended while idle (spec D15) ─────
+
+    def _wake_notices(self) -> list:
+        """Queued notices that warrant a wake-up: the main agent's jobs that ended on their own.
+        A /jobs kill alone doesn't wake it (the user is right there); it rides along with one that does."""
+        notices = get_registry().pending_notices(self.session_id)
+        return notices if any(n.killed_by is None for n in notices) else []
+
+    def _schedule_wake(self) -> None:
+        """Check for a wake-up after JOB_WAKE_DELAY_S, so jobs that end together start one turn."""
+        if not self.config.jobs_wake_on_end or self._wake_timer is not None or not self._wake_notices():
+            return
+        self._wake_timer = self.set_timer(JOB_WAKE_DELAY_S, self._try_wake)
+
+    def _wake_blocked(self) -> bool:
+        """Busy, or the user is in the middle of something: a turn, typing, a prompt or picker,
+        a session command (/compact, /clear, …) or a queued prompt that will run first."""
+        if self._turn_in_progress or self._quitting or self._quit_confirming or self._prompt_queue:
+            return True
+        if self._picker_open() or self.query("#permission-prompt"):
+            return True
+        if any(w.name not in JOB_WAKE_IDLE_WORKERS for w in self._pending_workers):
+            return True
+        try:
+            return bool(self.query_one("#input", EnterSubmits).text.strip())
+        except Exception:
+            return True
+
+    def _try_wake(self) -> None:
+        self._wake_timer = None
+        notices = self._wake_notices()
+        if not notices or not self.config.jobs_wake_on_end:
+            return  # a user turn drained them meanwhile
+        if self._wake_blocked():
+            self._schedule_wake()  # retry; a prompt the user sends drains the notices instead
+            return
+        if self._wake_turns >= JOB_WAKE_LIMIT:
+            if self._wake_turns == JOB_WAKE_LIMIT:  # say it once per streak
+                self._wake_turns += 1
+                self._append(f"⚙ Not resuming the agent: {JOB_WAKE_LIMIT} automatic turns in a row. "
+                             "It sees the job results with your next message.", msg_type="system")
+            return
+        self._wake_turns += 1
+        ids = ", ".join(f'"{n.id}"' for n in notices)
+        self._append(f"⚙ Resuming the agent: background job {ids} ended", msg_type="system")
+        self._turn_in_progress = True
+        self._start_worker(self._run_turn(format_notice(notices), wake=True), name=f"wake_{uuid.uuid4().hex[:6]}")
+
+    def _refresh_job_hint(self) -> None:
+        """The loader offers Ctrl+B only while a model shell call is running."""
+        if not self._turn_in_progress or self._loader_label not in (WORKING_LABEL, WORKING_LABEL_JOBS):
+            return
+        self._loader_label = WORKING_LABEL_JOBS if self._foreground_jobs() else WORKING_LABEL
+        self._render_loader()
+
     # ── Esc Esc: edit the previous prompt · Ctrl+R: search prompt history ──────
 
     def _last_prompt_index(self) -> int | None:
@@ -2814,7 +3221,7 @@ class DostuffTUI(App):
             content = step.get("content") if isinstance(step, dict) else None
             if (step.get("role") == "user" and isinstance(content, str) and content != EMPTY_RESPONSE_NUDGE
                     and not content.startswith("[/undo]") and _parse_shell_step(content) is None
-                    and parse_stop_note(content) is None):
+                    and parse_stop_note(content) is None and parse_notice(content) is None):
                 return i
         return None
 
@@ -2889,11 +3296,78 @@ class DostuffTUI(App):
     # ── Exit ───────────────────────────────────────────────────────────────────
 
     async def action_quit(self) -> None:
-        """Ctrl+Q / /exit: clean up and quit; repeated presses are ignored."""
-        if self._quitting:
+        """Ctrl+Q / /exit: clean up and quit; repeated presses are ignored.
+
+        With background jobs running it asks first (in a worker: an action can't wait for a key).
+        """
+        if self._quitting or self._quit_confirming:
+            return
+        if self._running_jobs():
+            self._quit_confirming = True
+            self.run_worker(self._quit_after_confirm(), name="quit_confirm", exit_on_error=False)
             return
         self._quitting = True
         self.run_worker(self._run_cleanup_and_exit(), name="cleanup_worker", exit_on_error=False)
+
+    async def _quit_after_confirm(self) -> None:
+        try:
+            if not await self._confirm_quit_jobs():
+                return
+        finally:
+            self._quit_confirming = False
+        self._quitting = True
+        await self._run_cleanup_and_exit()
+
+    # ── Background jobs (plan/2026-10-31-background-shell D8) ────────────────────
+
+    def _running_jobs(self) -> list[Job]:
+        return [j for j in get_registry().jobs() if j.ended is None and not j.foreground]
+
+    async def _jobs_housekeeping(self) -> None:
+        """Startup: drop old job logs; warn once about jobs a crashed earlier session may have left (D11)."""
+        try:
+            await asyncio.to_thread(prune_logs)
+            orphans = await asyncio.to_thread(find_orphans, self.session_id)
+        except Exception:
+            return
+        if orphans:
+            count = f"{len(orphans)} background job{'s' if len(orphans) != 1 else ''}"
+            listed = "; ".join(f"{command}, pid {pid}" for command, pid in orphans[:5])
+            more = "; …" if len(orphans) > 5 else ""
+            self._append(f"⚠ {count} from an earlier session may still be running ({listed}{more}). "
+                         "Check them with your OS tools.", msg_type="error")
+
+    async def _confirm_quit_jobs(self) -> bool:
+        """Ask before quitting stops the running background jobs; True to go ahead (also with none)."""
+        jobs = self._running_jobs()
+        if not jobs:
+            return True
+        count = f"{len(jobs)} background job{'s' if len(jobs) != 1 else ''}"
+        names = ", ".join(j.id for j in jobs)
+        return await self.adapter.confirm(
+            f"⚙ Quit and stop {count}? ({names})", "Quit?", f"Yes, stop {count} and quit", "No, keep working")
+
+    def _carry_jobs(self, old_session_id: str) -> list[Job]:
+        """/clear and /resume: the old session's running jobs keep running in the current one (D8)."""
+        if old_session_id == self.session_id:
+            return []
+        carried = get_registry().transfer(old_session_id, self.session_id)
+        self.call_later(self._render_jobs_bar)
+        self._schedule_wake()  # notices queued for the old session now belong to this one
+        return carried
+
+    def _report_carried_jobs(self, carried: list[Job]) -> None:
+        if carried:
+            count = f"{len(carried)} background job{'s' if len(carried) != 1 else ''}"
+            self._append(f"⚙ {count} ({', '.join(j.id for j in carried)}) kept running.", msg_type="system")
+
+    async def _stop_jobs(self) -> None:
+        """Kill every job, bounded; falls back to the synchronous kill."""
+        registry = get_registry()
+        try:
+            await asyncio.wait_for(registry.kill_all(), timeout=KILL_WAIT_S + 1)
+        except Exception:
+            registry.kill_all_sync()
 
     async def _run_cleanup_and_exit(self) -> None:
         self._append("Saving session...")
@@ -2906,7 +3380,10 @@ class DostuffTUI(App):
             self.exit()
 
     async def _cleanup_and_save_session(self) -> None:
-        """Cancel pending work, close MCP sessions and the DB, with bounded timeouts."""
+        """Stop jobs, cancel pending work, close MCP sessions and the DB, with bounded timeouts."""
+        # 0. Background and foreground shell jobs: none outlives the app (background shell CON-008)
+        get_registry().remove_listener(self._on_job_event)
+        await self._stop_jobs()
         # 1. Cancel in-flight workers (turns, MCP connect, ...); they run on this loop
         self.adapter._cancelled = True
         self.adapter._cancel_event.set()
@@ -2978,6 +3455,14 @@ class DostuffTUI(App):
         self._mount_message(ToolResult(text, max_lines, expanded=self._tool_results_expanded,
                                        classes=f"msg msg-{msg_type}"))
 
+    def _append_call_result(self, text: str) -> None:
+        """A tool call's result; one Ctrl+B moved to the background collapses to that fact."""
+        job_id = detached_job_id(text) if text.startswith("bash_command: ") else None
+        if job_id is None:
+            self._append_tool_result(text)
+        else:
+            self._append_tool_result(f'moved to background as "{job_id}"\n{text}', max_lines=1)
+
     def action_toggle_tool_results(self) -> None:
         """Ctrl+O: expand every truncated tool / shell result, or collapse them all again."""
         self._tool_results_expanded = not self._tool_results_expanded
@@ -3011,6 +3496,34 @@ class DostuffTUI(App):
         await asyncio.gather(*(self._connect_one_mcp_server(name, cfg) for name, cfg in mcp_servers.items()))
         servers = self.mcp_client.servers if self.mcp_client is not None else {}
         self._append(f"MCP ready ({len(servers)} server(s)).", msg_type="system")
+
+    async def _check_settings_files(self) -> None:
+        """Pick up config.yaml and mcp_config.json edited outside dostuff (an editor, a shell) while it
+        runs, idle or mid-turn, so a change applies without restarting the session."""
+        if self._settings_check_running:
+            return
+        self._settings_check_running = True
+        try:
+            reloaded = await asyncio.to_thread(self.config.reload_if_changed)
+            if reloaded:
+                self._append("config.yaml changed on disk: reloaded.", msg_type="system")
+                for warning in self.config.hooks_warnings:
+                    self._append(warning, msg_type="error")
+            error = self.config.load_error
+            if error and error != self._reported_load_error:
+                self._append(f"config.yaml not reloaded, keeping the previous settings: {error}", msg_type="error")
+            self._reported_load_error = error
+            mcp_changed = False
+            if self.mcp_client is not None:
+                signature = await asyncio.to_thread(_mcp_files_signature)
+                mcp_changed = signature != self._mcp_files_signature
+                self._mcp_files_signature = signature
+            if reloaded or mcp_changed:
+                self._apply_settings(mcp=mcp_changed)
+        except Exception as e:
+            self._append(f"Could not check the settings files: {e}", msg_type="error")
+        finally:
+            self._settings_check_running = False
 
     def _apply_settings(self, mcp: bool) -> None:
         """Pick up a settings change (Config is already reloaded) without a restart."""
@@ -3077,7 +3590,9 @@ class DostuffTUI(App):
         """Fit the bar to the terminal: shorten items, then drop the least important ones."""
         items = self._status_items()
         choice = {name: 0 for name in items}
-        width = max(self.size.width - 2, 1)  # #status has 1 cell of padding each side
+        jobs = self._jobs_bar_text()  # beside the status items, so it takes from their room
+        # #status (and #jobs-bar) have 1 cell of padding each side
+        width = max(self.size.width - 2 - (jobs.cell_len + 2 if jobs else 0), 1)
 
         def line() -> Text:
             return Text("  ").join(items[name][choice[name]] for name in items)
@@ -3096,6 +3611,88 @@ class DostuffTUI(App):
             self.query_one("#status", Static).update(line())
         except Exception:
             pass  # not mounted yet / shutting down
+
+    def _jobs_bar_text(self) -> Text | None:
+        """`⚙ 2 shells`, or None while this session has no background jobs running."""
+        running = sum(1 for j in self._session_jobs() if j.ended is None)
+        return Text(f"⚙ {running} shell{'s' if running != 1 else ''}", style="#e5c07b") if running else None
+
+    def _render_jobs_bar(self) -> None:
+        """The jobs item beside the status bar: shown while this session has background jobs running."""
+        text = self._jobs_bar_text()
+        try:
+            bar = self.query_one("#jobs-bar", JobsBar)
+        except Exception:
+            return  # not mounted yet / shutting down
+        bar.display = text is not None
+        if text is not None:
+            bar.update(text)
+        self._render_status()  # the status items get more or less room
+
+    def _jobs_picker_open(self) -> bool:
+        """The jobs list, or one job's actions, is showing."""
+        if not self._picker_open():
+            return False
+        question = self.query_one("#picker", PermissionPrompt)._question
+        return question == "Background jobs" or question.startswith('Job "')
+
+    def action_toggle_jobs(self) -> None:
+        """The jobs item was clicked: open the list, or close it when it's already showing."""
+        if self._jobs_picker_open():
+            self._close_picker()
+        else:
+            self.action_show_jobs()
+
+    def action_show_jobs(self) -> None:
+        """The jobs line was clicked (or ↓ in an empty input): pick a job, running ones first."""
+        if self._picker_open() or self._settings_open() or self.query("#permission-prompt"):
+            return
+        jobs = sorted(self._session_jobs(), key=lambda j: (j.ended is not None, j.started))
+        if not jobs:
+            return
+        registry = get_registry()
+
+        def label(job: Job) -> str:
+            command = " ".join(job.command.split())
+            command = command if len(command) <= 60 else command[:59] + "…"
+            since = time.strftime("%H:%M:%S", time.localtime(job.started))
+            return (f"{job.id}  {_job_status(job)}  since {since} ({fmt_runtime(job.runtime)})  "
+                    f"{registry.owner_label(job.owner)}  $ {command}")
+
+        self._show_picker("Background jobs", [(j.uid, label(j)) for j in jobs], self._job_actions)
+
+    def _job_detail(self, job: Job) -> list[tuple[str, str]]:
+        """The job's last JOB_DETAIL_LINES lines of output (stderr in red, at most half when there's
+        stdout too) and its log path, for the job's picker: a few rows, not the whole screen."""
+        out, err = job.tail("stdout", JOB_DETAIL_LINES), job.tail("stderr", JOB_DETAIL_LINES)
+        if not out and not err:
+            lines = [("(no output yet)", "dim")]
+        else:
+            err = err[-(JOB_DETAIL_LINES // 2 if out else JOB_DETAIL_LINES):] if err else []
+            out = out[-(JOB_DETAIL_LINES - len(err)):]
+            lines = [(line, "#8a8a8a") for line in out] + [(line, "#e06c75") for line in err]
+        return lines + [(f"Full log: {job.out_path}", "dim")]
+
+    async def _job_actions(self, uid: str) -> None:
+        """A job picked from the jobs list: its recent output, then refresh it, stop it, or go back."""
+        job = next((j for j in self._session_jobs() if j.uid == uid), None)
+        if job is None:
+            return
+        options = [("refresh", "Refresh output")]
+        if job.ended is None:
+            options.append(("kill", "Stop it (the agent is told)"))
+        options.append(("back", "Back to the list"))
+
+        async def act(choice: str) -> None:
+            if choice == "refresh":
+                await self._job_actions(uid)
+            elif choice == "kill":
+                await self._kill_job(job)
+            else:
+                self.action_show_jobs()
+
+        self._show_picker(f'Job "{job.id}" · {_job_status(job)} · $ {" ".join(job.command.split())[:60]}',
+                          options, act, detail=self._job_detail(job))
 
     def _fmt_tokens(self, n: int) -> str:
         if n < 1000:

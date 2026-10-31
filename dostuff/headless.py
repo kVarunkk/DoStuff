@@ -67,6 +67,8 @@ class HeadlessAdapter:
             self._stream({"type": event_type, "message": str(data)})
         elif event_type == "hook" and isinstance(data, dict):
             self._stream({"type": "hook", **data})
+        elif event_type == "job" and isinstance(data, dict):
+            self._stream({"type": "job", **{k: data.get(k) for k in ("id", "status", "code")}})
 
     def emit(self, event_type: str, data: Any) -> None:
         self._stream_event(event_type, data)
@@ -122,6 +124,21 @@ async def _connect_mcp(mcp_client: Any, servers: dict[str, Any], adapter: Headle
         except Exception as e:
             adapter.emit("error", f"MCP {name}: {e}")
     await asyncio.gather(*(one(name, cfg) for name, cfg in servers.items()))
+
+
+async def _stop_jobs(adapter: HeadlessAdapter) -> None:
+    """Kill every job still running; report each (stderr line, or a stream-json `job` event)."""
+    from dostuff.tools.bash.jobs import get_registry
+    try:
+        killed = await get_registry().kill_all()
+    except Exception as e:
+        _err(f"Could not stop background jobs: {e}")
+        return
+    for job in killed:
+        if adapter._stream is not None:
+            adapter.emit("job", {"id": job.id, "status": job.status, "code": job.exit_code})
+        else:
+            adapter._progress(f'⚙ stopped background job "{job.id}" (pid {job.pid}) at the end of the run')
 
 
 async def run_headless(
@@ -241,6 +258,7 @@ async def run_headless(
         _err(f"Error: {e}")
         code = 1
     finally:
+        await _stop_jobs(adapter)  # also on Ctrl+C: nothing outlives the run (background shell spec D8)
         try:
             await asyncio.wait_for(mcp_client.cleanup(), timeout=5.0)
         except Exception:

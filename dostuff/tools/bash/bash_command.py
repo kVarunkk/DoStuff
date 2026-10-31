@@ -1,17 +1,23 @@
 import asyncio
 import functools
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from dostuff.helpers.tools.project_root import project_root
+if TYPE_CHECKING:
+    from dostuff.tools.bash.jobs import Job
+
 
 DEFAULT_TIMEOUT_S = 60
 MAX_TIMEOUT_S = 110  # stays under the loop's per-tool timeout (TOOL_TIMEOUT_S)
-_DRAIN_GRACE_S = 2.0  # how long to keep reading after the shell exits (background jobs may hold the pipes)
+IMMEDIATE_EXIT_S = 0.2  # a background job gone this fast is reported in its start result
+IMMEDIATE_EXIT_LINES = 10
+DETACHED_RE = re.compile(r'^moved to background by the user after \S+ as job "([^"]+)"', re.M)
 
 
 @functools.lru_cache(maxsize=1)
@@ -90,77 +96,128 @@ def _stop_reading(proc: asyncio.subprocess.Process, readers: asyncio.Future) -> 
             transport.close()
 
 
-async def run_shell(command: str, cwd: str = "", timeout: float = DEFAULT_TIMEOUT_S) -> tuple[int | None, str, str, str]:
-    """Run `command` detached from the terminal, with no stdin.
+def _read_log(path: Path) -> str:
+    try:
+        return path.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
-    Returns (exit code or None if killed, stdout, stderr, note). Cancelling the caller kills the
-    process tree.
+
+async def run_shell(command: str, cwd: str = "", timeout: float = DEFAULT_TIMEOUT_S, owner: str = "") -> tuple[int | None, str, str, str]:
+    """Run `command` detached from the terminal, with no stdin, as a foreground job (spec D1).
+
+    Output goes to the job's log files, so a background process started by the command can't hold
+    the call open. Returns (exit code or None if killed, stdout, stderr, note). Cancelling the
+    caller kills the process tree. `owner` defaults to the running session (`"user"` for `!command`).
     """
-    _, argv = select_shell()
-    proc = await asyncio.create_subprocess_exec(
-        *argv, command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=str(project_root() / cwd),  # an absolute cwd replaces the root
-        **_detach_kwargs(),
-    )
-    out, err = bytearray(), bytearray()
-    readers = asyncio.gather(_read_into(proc.stdout, out), _read_into(proc.stderr, err))
-    readers.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+    from dostuff.lib.model import current_session_id
+    from dostuff.tools.bash.jobs import get_registry
+
+    registry = get_registry()
+    job = await registry.start(command, cwd, owner or current_session_id.get(), background=False)
     note = ""
     try:
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await _kill_tree(proc)
+        outcome = await registry.wait(job, timeout)
+        if outcome == "timeout":
+            await registry.kill(job, by="timeout")
             note = (
                 f"Timed out after {timeout:.0f}s; the process and its children were killed. "
-                "Long-running programs (servers, GUI apps, watchers) must be started in the background "
-                "with output redirected to a file, e.g. `nohup python app.py > app.log 2>&1 &`, then "
-                "check the log in a separate command."
+                "Start long-running programs (servers, GUI apps, watchers) with run_in_background=true "
+                "instead, then read their output with bash_output."
             )
-        # A background job started by the command may keep the pipes open after the shell exits
-        done, _ = await asyncio.wait({readers}, timeout=_DRAIN_GRACE_S)
-        if not done:
-            _stop_reading(proc, readers)
-            if not note:
-                note = "Output capture stopped: a background process is still holding stdout/stderr."
+        elif outcome == "detached":
+            note = _detached_note(job)
     except asyncio.CancelledError:
-        _stop_reading(proc, readers)
-        await _kill_tree(proc)
+        await registry.kill(job, by="user")
         raise
-    code = proc.returncode if not note.startswith("Timed out") else None
-    decode = lambda b: b.decode("utf-8", errors="replace")  # noqa: E731
-    return code, decode(out), decode(err), note
+    code = job.exit_code if outcome == "exited" else None
+    return code, _read_log(job.out_path), _read_log(job.err_path), note
 
 
-async def bash_command(command: str, cwd: str = "", timeout: int = DEFAULT_TIMEOUT_S) -> str:
+def _detached_note(job: "Job") -> str:
+    """Ctrl+B's result body (spec D9). The shown output is consumed, so bash_output returns what comes after."""
+    from dostuff.tools.bash.jobs import NOTICE_TAIL_LINES, fmt_runtime, get_registry, indent_block
+
+    output = get_registry().read_new(job)
+    return (
+        f'moved to background by the user after {fmt_runtime(job.runtime)} as job "{job.id}" (pid {job.pid})\n'
+        f"stdout so far:\n{indent_block(output.stdout.splitlines()[-NOTICE_TAIL_LINES:])}\n"
+        f"stderr so far:\n{indent_block(output.stderr.splitlines()[-NOTICE_TAIL_LINES:])}\n"
+        f'Use bash_output("{job.id}") to read more and kill_shell("{job.id}") to stop it.'
+    )
+
+
+def detached_job_id(result: str) -> str | None:
+    """The job id when a bash_command result says Ctrl+B moved it to the background."""
+    match = DETACHED_RE.search(result)
+    return match.group(1) if match else None
+
+
+async def _start_background(command: str, cwd: str, background_id: str, owner: str) -> str:
+    """Start a background job and return at once (spec D4)."""
+    from dostuff.lib.model import current_session_id
+    from dostuff.tools.bash.jobs import get_registry
+
+    registry = get_registry()
+    owner = owner or current_session_id.get()
+    try:
+        job = await registry.start(command, cwd, owner, background=True, job_id=background_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        return f"$ {command}\nerror: {e}"
+    # A quick exit is almost always a typo or a port in use: say so now rather than in a notice
+    if await registry.wait(job, IMMEDIATE_EXIT_S) == "exited":
+        registry.discard_notices(owner, job)
+        output = registry.read_new(job)
+        stream, text = ("stderr", output.stderr) if output.stderr.strip() else ("stdout", output.stdout)
+        head = "".join(text.splitlines(keepends=True)[:IMMEDIATE_EXIT_LINES])
+        text = f'$ {command}\nbackground job "{job.id}" exited immediately with code {job.exit_code}\n'
+        return text + f"{stream}:\n{head}" if head else text
+    return (
+        f"$ {command}\n"
+        f'started background job "{job.id}" (pid {job.pid})\n'
+        f"stdout: {job.out_path}\n"
+        f"stderr: {job.err_path}\n"
+        f'Use bash_output("{job.id}") to read its output and kill_shell("{job.id}") to stop it.'
+    )
+
+
+async def bash_command(
+    command: str, cwd: str = "", timeout: int = DEFAULT_TIMEOUT_S,
+    run_in_background: bool = False, background_id: str = "", owner: str = "",
+) -> str:
     """Run a shell command and return its output as a single string.
 
     The shell is not sandboxed: commands that are not read-only require user approval.
     Commands get no stdin and are killed when they time out, so never run interactive or
-    long-running programs (servers, GUI apps, watchers) in the foreground: start them in the
-    background with output redirected to a file and read the file afterwards.
+    long-running programs (servers, GUI apps, watchers) in the foreground: start them with
+    run_in_background=true, then read their output with bash_output and stop them with kill_shell.
 
     Args:
         command: Shell command to run, e.g. 'ls -la'.
         cwd: Optional working directory (defaults to the project root).
-        timeout: Seconds before the command and its children are killed (default 60, max 110).
+        timeout: Seconds before the command and its children are killed (default 60, max 110). Ignored for background jobs.
+        run_in_background: Start the command as a background job and return at once instead of waiting for it to exit.
+        background_id: Optional short name for a background job, e.g. 'dev' (lowercase letters, digits, '.', '_', '-'); one is generated if omitted.
 
     Returns:
-        Combined stdout, stderr, and exit code as a formatted string.
+        Combined stdout, stderr, and exit code as a formatted string; for a background job, its id, pid and log files.
     """
+    if run_in_background:
+        return await _start_background(command, cwd, background_id, owner)
     try:
         limit = max(1, min(int(timeout or DEFAULT_TIMEOUT_S), MAX_TIMEOUT_S))
     except (TypeError, ValueError):
         limit = DEFAULT_TIMEOUT_S
     try:
-        code, stdout, stderr, note = await run_shell(command, cwd, limit)
+        code, stdout, stderr, note = await run_shell(command, cwd, limit, owner=owner)
     except asyncio.CancelledError:
         raise
     except Exception as e:
         return f"$ {command}\nerror: {e}"
+    if DETACHED_RE.match(note):
+        return f"$ {command}\n{note}"
     text = (
         f"$ {command}\n"
         f"exit: {code if code is not None else 'killed'}\n"

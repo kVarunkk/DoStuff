@@ -34,6 +34,8 @@ def tui(tmp_path, monkeypatch):
     from dostuff.lib.memory import chroma
     monkeypatch.setattr(chroma, "embedding_model_missing", lambda: False)  # no 80 MB download in tests
     monkeypatch.setattr(cli_tui, "get_model_token_limit", lambda: 100_000)
+    # A job ending while idle would start a turn of the fake loop below; the wake-up tests turn it on
+    config_module.get_config().jobs_wake_on_end = False
 
     async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
                         current_session_history, steps_history, store, adapter=None, **kwargs):
@@ -797,6 +799,45 @@ def test_settings_changes_apply_without_restart(tui):
     asyncio.run(scenario())
 
 
+def test_settings_files_edited_by_hand_apply_while_idle(tui, tmp_path):
+    """config.yaml and mcp_config.json written outside dostuff (an editor) apply without a prompt or restart."""
+    cli_tui = tui
+    config_path = tmp_path / "home" / ".dostuff" / "config.yaml"
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="hand-edit")
+        async with app.run_test(size=(160, 24)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            status = app.query_one("#status", cli_tui.Static)
+            connected = []
+
+            async def fake_connect(server_name, **kwargs):
+                connected.append(server_name)
+                app.mcp_client.servers[server_name] = object()
+            app.mcp_client.connect_to_server = fake_connect
+
+            config_path.write_text("ui:\n  status_bar: [mode]\n", encoding="utf-8")
+            await _until(pilot, lambda: str(status.render()).strip() == "ask mode")
+            assert any("config.yaml changed on disk: reloaded." in t for t in _texts(app))
+
+            # A broken edit keeps the loaded settings and is reported once
+            config_path.write_text("ui: [unclosed\n", encoding="utf-8")
+            await _until(pilot, lambda: any("config.yaml not reloaded" in t for t in _texts(app)))
+            await pilot.pause(2.5)
+            assert sum("config.yaml not reloaded" in t for t in _texts(app)) == 1
+            assert str(status.render()).strip() == "ask mode"
+            config_path.write_text("ui:\n  status_bar: [mode]\npermissions:\n  mode: plan\n", encoding="utf-8")
+            await _until(pilot, lambda: str(status.render()).strip() == "plan mode")
+
+            (tmp_path / "home" / ".dostuff" / "mcp_config.json").write_text(
+                '{"mcpServers": {"git": {"command": "uvx", "args": ["mcp-server-git"]}}}', encoding="utf-8")
+            await _until(pilot, lambda: connected == ["git"])
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_tool_result_preview_caps_one_long_line():
     """A one-line result (e.g. a JSON list of 800 tool names) is cut by chars, not shown whole."""
     from dostuff.cli_tui import PREVIEW_CHARS_PER_LINE, _preview, _preview_clipped
@@ -1509,3 +1550,781 @@ if n == 0:
     trust._decisions.clear()
     dispatch._untrusted_warned.clear()
     asyncio.run(accepted())
+
+
+# --- background shell T3.2: `!command` runs as a `user` job (plan/2026-10-31-background-shell) ---
+
+def test_bang_command_output_unchanged(tui, registry, monkeypatch, tmp_path, _py, _wait_dead):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    pid_file = tmp_path / "pid"
+    sleeper = _py(f"""
+        import os, time
+        open(r"{pid_file}", "w").write(str(os.getpid()))
+        time.sleep(30)
+    """)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="bang")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Startup lines ("Running with local tools only.") must land before the snapshot
+            await _until(pilot, lambda: any("local tools only" in t for t in _texts(app)), tries=200)
+            before = len(_texts(app))
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("!echo hi"))
+            await _until(pilot, lambda: app.steps_history and not app._turn_in_progress, tries=200)
+            # Snapshot taken with the pre-swap (pipe) run_shell
+            assert _texts(app)[before:] == ["! echo hi", "  ⎿  hi"]
+            assert app.steps_history[-1]["content"] == "<bash-input>echo hi</bash-input>\n<bash-output>\nhi\n</bash-output>"
+            [job] = registry.jobs()
+            assert job.owner == "user" and job.status == "exited"
+
+            # Not Ctrl+B-able (OUT-002), and ESC kills it
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(f"!{sleeper}"))
+            await _until(pilot, pid_file.exists, tries=200)
+            assert registry.detach_foreground(app.session_id) == []
+            app.adapter._cancel_event.set()
+            await _until(pilot, lambda: not app._turn_in_progress, tries=200)
+            assert any("Cancelled (process killed)" in t for t in _texts(app))
+            assert _wait_dead(int(pid_file.read_text()), 5)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- background shell T5.5: quit, /clear and /resume stop the session's jobs ------------------
+
+def _start_bg(registry, owner, job_id, cmd):
+    return registry.start(cmd, "", owner, background=True, job_id=job_id)
+
+
+def test_tui_quit_with_jobs(tui, registry, monkeypatch, _py, _alive, _wait_dead):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    sleeper = _py("import time; time.sleep(30)")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="quit")
+        exited: list = []
+        app.exit = lambda *a, **k: exited.append(True)  # type: ignore[method-assign]
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            job = await _start_bg(registry, "quit", "srv", sleeper)
+            await pilot.press("ctrl+q")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            assert any("Quit and stop 1 background job?" in t for t in _texts(app))
+            app.adapter.choose("no")
+            await _until(pilot, lambda: not app.adapter.has_pending_confirm())
+            await pilot.pause(0.2)
+            assert not exited and not app._quitting and _alive(job.pid)
+
+            await pilot.press("ctrl+q")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: bool(exited), tries=200)
+            assert _wait_dead(job.pid, 5) and job.status == "killed"
+
+    asyncio.run(scenario())
+
+    async def no_jobs():
+        app = cli_tui.DostuffTUI(session_id="quit2")
+        exited: list = []
+        app.exit = lambda *a, **k: exited.append(True)  # type: ignore[method-assign]
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("ctrl+q")
+            await _until(pilot, lambda: bool(exited), tries=200)  # no prompt: unchanged quit path
+    asyncio.run(no_jobs())
+
+
+def test_tui_clear_resume_with_jobs(tui, registry, monkeypatch, _py, _alive, _wait_dead):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    sleeper = _py("import time; time.sleep(30)")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="first")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+            dev = await _start_bg(registry, "first", "dev", sleeper)
+            watch = await _start_bg(registry, "first", "watch", sleeper)
+
+            # /compact keeps jobs (nothing to compact here, and no prompt)
+            submit("/compact")
+            await pilot.pause(0.3)
+            assert not app.adapter.has_pending_confirm() and _alive(dev.pid)
+
+            # /clear: no prompt; both keep running and move to the new session
+            submit("/clear")
+            await _until(pilot, lambda: app.session_id != "first", tries=200)
+            await pilot.pause(0.2)
+            assert not app.adapter.has_pending_confirm()
+            assert any("2 background jobs (dev, watch) kept running" in t for t in _texts(app))
+            assert _alive(dev.pid) and _alive(watch.pid)
+            cleared = app.session_id
+            assert registry.get(cleared, "dev") is dev and dev.owner == cleared
+            assert registry.jobs("first") == []
+
+            # /resume <id>: same, the jobs follow into the resumed session
+            await app.store.append("other", {"role": "user", "content": "x"})
+            submit("/resume other")
+            await _until(pilot, lambda: app.session_id == "other", tries=200)
+            await pilot.pause(0.2)
+            assert not app.adapter.has_pending_confirm()
+            assert _alive(dev.pid) and _alive(watch.pid)
+            assert {j.id for j in registry.jobs("other")} == {"dev", "watch"}
+
+            # quit still stops them
+            await app._cleanup_and_save_session()
+            assert _wait_dead(dev.pid, 5) and _wait_dead(watch.pid, 5)
+
+    asyncio.run(scenario())
+
+
+# --- background shell T6.1: Ctrl+B moves foreground commands to the background ---------------
+
+def _bash_loop(cli_tui, monkeypatch, commands, results, after=None):
+    """A fake agent loop that runs each `(owner suffix, command)` as a foreground bash_command
+    concurrently, emits the main call's result and stores one tool step per call."""
+    from dostuff.tools.bash.bash_command import bash_command
+
+    async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        calls = [bash_command(cmd, timeout=100, owner=session_id + suffix) for suffix, cmd in commands]
+        adapter.emit("tool_call", "bash_command(...)")
+        for suffix, text in zip([s for s, _ in commands], await asyncio.gather(*calls)):
+            results.append(text)
+            if suffix:
+                continue  # a subagent's call: its result goes to the subagent, not the transcript
+            adapter.emit("tool_result", f"bash_command: {text}")
+            step = {"role": "tool", "name": "bash_command", "tool_call_id": "c1", "content": text}
+            steps_history.append(step)
+            current_session_history.append(step)
+            await store.append(session_id, step)
+        if after is not None:
+            await after(adapter)
+        return "done"
+    monkeypatch.setattr(cli_tui, "agent_loop", fake_loop)
+
+
+def test_ctrl_b_backgrounds_call(tui, registry, monkeypatch, tmp_path, _py, _alive, _wait_dead):
+    import re
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    go = tmp_path / "go"
+    sleeper = _py(f"""
+        import os, sys, time
+        print("server up", flush=True)
+        print("warming", file=sys.stderr, flush=True)
+        while not os.path.exists(r"{go}"):
+            time.sleep(0.05)
+        print("bye", flush=True)
+    """)
+    results: list[str] = []
+    _bash_loop(cli_tui, monkeypatch, [("", sleeper)], results)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctrlb")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("start the server"))
+            await _until(pilot, lambda: bool(registry.jobs("ctrlb")), tries=200)
+            [job] = registry.jobs("ctrlb")
+            await _until(pilot, lambda: job.out_path.read_text().strip() == "server up", tries=200)
+            assert "Ctrl+B to background" in app._loader_label
+
+            await pilot.press("ctrl+b")
+            await _until(pilot, lambda: bool(results), tries=20)  # within 1 s
+            [text] = results
+            lines = text.splitlines()
+            assert lines[0] == f"$ {sleeper}"
+            assert re.fullmatch(rf'moved to background by the user after \d+s as job "bg-1" \(pid {job.pid}\)', lines[1])
+            assert "stdout so far" in text and "server up" in text
+            assert "stderr so far" in text and "warming" in text
+            assert lines[-1] == 'Use bash_output("bg-1") to read more and kill_shell("bg-1") to stop it.'
+            assert _alive(job.pid) and not job.foreground and job.status == "running"
+            await _until(pilot, lambda: not app._turn_in_progress, tries=200)
+            assert [s["content"] for s in app.steps_history if s.get("role") == "tool"] == [text]  # CON-007
+            # Collapsed to the one line (Ctrl+O shows the whole result)
+            [shown] = [t for t in _texts(app) if "moved to background" in t]
+            assert shown.splitlines()[0].strip() == '⎿  moved to background as "bg-1"' and "server up" not in shown
+
+            # The shown output is consumed: bash_output only returns what came after
+            go.write_text("")
+            await _until(pilot, lambda: job.ended is not None, tries=200)
+            [notice] = registry.drain_notices("ctrlb")
+            assert notice.id == "bg-1" and notice.status == "exited" and notice.code == 0
+            assert registry.read_new(job).stdout == "bye\n"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_b_edge_cases(tui, registry, monkeypatch, tmp_path, _py, _alive, _wait_dead):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    sleeper = _py("import time; time.sleep(30)")
+    results: list[str] = []
+    released = asyncio.Event()
+
+    async def after(adapter):  # the turn keeps going until ESC
+        await adapter._cancel_event.wait()
+        released.set()
+    _bash_loop(cli_tui, monkeypatch, [("", sleeper), ("/sub/r1", sleeper)], results, after=after)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="edge")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Idle: no foreground job → no-op (the input still gets the key)
+            await pilot.press("ctrl+b")
+            await pilot.pause(0.1)
+            assert registry.jobs() == [] and not app._turn_in_progress
+
+            # A subagent's foreground call in the same turn is detached too
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("go"))
+            await _until(pilot, lambda: len(registry.jobs()) == 2, tries=200)
+            await pilot.pause(0.3)
+            await pilot.press("ctrl+b")
+            await _until(pilot, lambda: len(results) == 2, tries=20)
+            assert all("moved to background by the user" in r for r in results)
+            main, sub = registry.jobs("edge")[0], registry.jobs("edge/sub/r1")[0]
+            assert "Ctrl+B" not in app._loader_label  # nothing left to background
+
+            # ESC after Ctrl+B ends the turn but does not kill the now-background jobs
+            await pilot.press("escape")
+            await _until(pilot, lambda: not app._turn_in_progress, tries=200)
+            assert released.is_set()
+            await pilot.pause(0.3)
+            assert _alive(main.pid) and _alive(sub.pid)
+            assert main.status == "running" and sub.status == "running"
+
+            # During a `!command`: Ctrl+B is a no-op (OUT-002)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(f"!{sleeper}"))
+            await _until(pilot, lambda: bool(registry.jobs("user")), tries=200)
+            await pilot.press("ctrl+b")
+            await pilot.pause(0.3)
+            [bang] = registry.jobs("user")
+            assert bang.foreground and bang.status == "running"
+            app.adapter._cancel_event.set()
+            await _until(pilot, lambda: bang.ended is not None, tries=200)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- background shell T6.2: /jobs, /jobs <id>, /jobs kill <id> --------------------------------
+
+def test_jobs_command(tui, registry, monkeypatch, _py, _alive, _wait_dead):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    sleeper = _py("import sys, time; print('dev ready'); print('warn', file=sys.stderr); sys.stdout.flush(); "
+                  "sys.stderr.flush(); time.sleep(30)")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="jobs")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+
+            def last(marker: str) -> str:
+                return [t for t in _texts(app) if marker in t][-1]
+
+            # no jobs
+            submit("/jobs")
+            await _until(pilot, lambda: any("No background jobs" in t for t in _texts(app)))
+
+            # table: id, owner, status, runtime, command — the main agent's and a subagent's
+            dev = await _start_bg(registry, "jobs", "dev", sleeper)
+            registry.set_role("jobs/sub/r1", "reviewer")
+            lint = await _start_bg(registry, "jobs/sub/r1", "lint", "exit 3")
+            await _until(pilot, lambda: lint.ended is not None, tries=100)
+            await _until(pilot, lambda: dev.out_path.read_text() and dev.err_path.read_text(), tries=100)
+            await _start_bg(registry, "other-session", "nope", "exit 0")  # another session's: not listed
+            submit("/jobs")
+            await _until(pilot, lambda: any("ID" in t and "OWNER" in t for t in _texts(app)))
+            table = last("OWNER").splitlines()
+            header = table[0].split()
+            assert header == ["ID", "OWNER", "STATUS", "RUNTIME", "COMMAND"]
+            [dev_row] = [r for r in table if r.lstrip().startswith("dev ")]
+            [lint_row] = [r for r in table if r.lstrip().startswith("lint ")]
+            assert "main" in dev_row and "running" in dev_row and sleeper in dev_row
+            assert "subagent: reviewer" in lint_row and "exited (3)" in lint_row and "exit 3" in lint_row
+            assert not any("nope" in r for r in table)
+
+            # /jobs <id>: tails and log paths
+            submit("/jobs dev")
+            await _until(pilot, lambda: any(str(dev.out_path) in t for t in _texts(app)))
+            detail = last(str(dev.out_path))
+            assert "dev ready" in detail and "warn" in detail and str(dev.err_path) in detail
+            assert registry.read_new(dev).stdout == "dev ready\n"  # looking doesn't consume the model's output
+
+            # unknown id → hint
+            submit("/jobs ghost")
+            await _until(pilot, lambda: any('No job "ghost"' in t for t in _texts(app)))
+            assert "/jobs" in last('No job "ghost"')
+            submit("/jobs kill")
+            await _until(pilot, lambda: any("Usage: /jobs" in t for t in _texts(app)))
+
+            # /jobs kill <id>: dead, and the owner hears it was the user
+            submit("/jobs kill dev")
+            await _until(pilot, lambda: dev.ended is not None, tries=200)
+            assert _wait_dead(dev.pid, 5) and dev.status == "killed" and dev.killed_by == "user"
+            await _until(pilot, lambda: any('Killed job "dev"' in t for t in _texts(app)))
+            [notice] = registry.drain_notices("jobs")
+            assert notice.id == "dev" and notice.killed_by == "user"
+            assert 'killed_by="user"' in jobs_module.format_notice([notice])
+
+            # listed in the menu and /help
+            assert "/jobs" in cli_tui.COMMAND_DESCRIPTIONS
+            submit("/help")
+            await _until(pilot, lambda: any("Commands:" in t for t in _texts(app)))
+            assert "/jobs" in last("Commands:")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- background shell T6.3: the jobs line under the input -----------------------------------------
+
+def test_jobs_bar(tui, registry, monkeypatch, _py):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    sleeper = _py("import time; time.sleep(30)")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="bar")
+        async with app.run_test(size=(160, 24)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            jobs_bar = app.query_one("#jobs-bar", cli_tui.JobsBar)
+
+            def bar() -> str:
+                return str(jobs_bar.render()) if jobs_bar.display else ""
+
+            def question() -> str:
+                return app.query_one("#picker", cli_tui.PermissionPrompt)._question if app._picker_open() else ""
+
+            assert not jobs_bar.display  # nothing at zero
+            app.config.status_bar_items = ["mode"]  # shown whatever ui.status_bar lists
+            dev = await _start_bg(registry, "bar", "dev", sleeper)
+            await _until(pilot, lambda: bar() == "⚙ 1 shell")  # no keypress needed
+            status = app.query_one("#status", cli_tui.Static)
+            assert "⚙" not in str(status.render())
+            # on the status line, right after its items
+            assert jobs_bar.region.y == status.region.y and jobs_bar.region.x == status.region.right
+            lint = await _start_bg(registry, "bar/sub/r1", "lint", sleeper)  # a subagent's counts too
+            await _until(pilot, lambda: bar() == "⚙ 2 shells")
+            await _start_bg(registry, "elsewhere", "x", "exit 0")  # another session's doesn't
+
+            # a click lists them: status, start time, runtime, owner, command
+            await pilot.click("#jobs-bar")
+            await _until(pilot, lambda: question() == "Background jobs")
+            labels = [label for _, label in app.query_one("#picker", cli_tui.PermissionPrompt)._all_options]
+            assert len(labels) == 2 and labels[0].startswith("dev  running  since ") and "main" in labels[0]
+            assert labels[1].startswith("lint  running  since ") and sleeper[:40] in labels[1]
+            # clicking a row picks it, on any of its lines (line 0 is the question; dev's label wraps)
+            await pilot.click("#picker", offset=(5, 2))
+            await _until(pilot, lambda: question().startswith('Job "dev"'))
+            # clicking the item again closes the list, and once more opens it; Esc closes it too
+            await pilot.click("#jobs-bar")
+            await _until(pilot, lambda: not app._picker_open())
+            await pilot.click("#jobs-bar")
+            await _until(pilot, lambda: question() == "Background jobs")
+            await pilot.press("escape")
+            await _until(pilot, lambda: not app._picker_open())
+            await pilot.click("#jobs-bar")
+            await _until(pilot, lambda: question() == "Background jobs")
+            # pick dev → its actions; "Stop it" kills it and the agent is told
+            await pilot.press("enter")
+            await _until(pilot, lambda: question().startswith('Job "dev"'))
+            await pilot.press("2")
+            await _until(pilot, lambda: dev.ended is not None, tries=200)
+            assert dev.killed_by == "user"
+            await _until(pilot, lambda: bar() == "⚙ 1 shell")
+
+            # ↓ in an empty input opens the list too; lint's picker shows its recent output and log
+            # path in a few rows, not in the conversation
+            await pilot.press("down")
+            await _until(pilot, lambda: question() == "Background jobs")
+            await pilot.press("1")
+            await _until(pilot, lambda: question().startswith('Job "lint"'))
+            picker = app.query_one("#picker", cli_tui.PermissionPrompt)
+            assert picker._detail[-1] == (f"Full log: {lint.out_path}", "dim")
+            assert len(picker._detail) <= cli_tui.JOB_DETAIL_LINES + 1
+            assert [label for _, label in picker._options] == ["Refresh output", "Stop it (the agent is told)",
+                                                               "Back to the list"]
+            assert not any(str(lint.out_path) in t for t in _texts(app))
+            # one #picker, reused: a second one mounted while the first was still being removed
+            # raised DuplicateIds (Textual removes asynchronously) and the list never opened again
+            await pilot.press("1")  # Refresh output
+            await _until(pilot, lambda: question().startswith('Job "lint"'))
+            await pilot.press("escape")
+            await _until(pilot, lambda: not app._picker_open())
+            await pilot.press("down")
+            await _until(pilot, lambda: question() == "Background jobs")
+            assert len(app.query("#picker")) == 1 and app.query_one("#picker") is picker
+            await pilot.press("escape")
+            await registry.kill_all()
+            await _until(pilot, lambda: not jobs_bar.display)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- background shell T6.4: notice rendering, orphan warning, notification ---------------------
+
+def test_job_notice_rendering(tui, registry, monkeypatch, _py):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    sleeper = _py("import time; time.sleep(30)")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="notice")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+
+            # live: a system line when the job ends, also while idle
+            test = await _start_bg(registry, "notice", "test", "exit 1")
+            await _until(pilot, lambda: any('⚙ job "test" exited (1) after' in t for t in _texts(app)), tries=100)
+            dev = await _start_bg(registry, "notice", "dev", sleeper)
+            await registry.kill(dev, "user")
+            await _until(pilot, lambda: any('⚙ job "dev" killed by user after' in t for t in _texts(app)))
+            await _start_bg(registry, "notice", "quiet", sleeper)
+            await registry.kill(registry.get("notice", "quiet"), "model")  # the model knows: no line
+            await registry.kill_owner("other-session", "owner_ended")
+            await pilot.pause(0.3)
+            assert not any('"quiet"' in t for t in _texts(app))
+            assert test.ended is not None
+
+            # resume: the stored notice step and a Ctrl+B'd call re-render as system lines
+            notice_step = jobs_module.format_notice(registry.drain_notices("notice"))
+            detached = ('$ npm run dev\nmoved to background by the user after 3s as job "bg-1" (pid 42)\n'
+                        'stdout so far:\n  up\nUse bash_output("bg-1") to read more and kill_shell("bg-1") to stop it.')
+            for step in ({"role": "user", "content": "start it"},
+                         {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
+                          "function": {"name": "bash_command", "arguments": '{"command": "npm run dev"}'}}]},
+                         {"role": "tool", "tool_call_id": "c1", "name": "bash_command", "content": detached},
+                         {"role": "user", "content": notice_step}):
+                await app.store.append("other", step)
+            submit("/resume other")
+            await _until(pilot, lambda: app.session_id == "other", tries=200)
+            await pilot.pause(0.3)
+            texts = _texts(app)
+            idx = max(i for i, t in enumerate(texts) if "start it" in t)
+            resumed = texts[idx:]
+            assert any('⚙ job "test" exited (1) after' in t for t in resumed)
+            assert any('⚙ job "dev" killed by user after' in t for t in resumed)
+            assert not any("<background-job" in t for t in resumed)  # not shown as a user message
+            assert any('moved to background as "bg-1"' in t for t in resumed)
+            # and Esc Esc's "previous prompt" skips the notice
+            assert app.steps_history[app._last_prompt_index()]["content"] == "start it"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_orphan_warning(tui, jobs_home, monkeypatch, tmp_path):
+    import json
+    import os
+    import time
+    cli_tui = tui
+    stale = jobs_home / "old-session"
+    stale.mkdir(parents=True)
+    (stale / "jobs.json").write_text(json.dumps([
+        {"id": "dev", "pid": 4812, "command": "npm run dev", "started": 1.0, "ended": None},
+        {"id": "t", "pid": 4813, "command": "pytest", "started": 1.0, "ended": 2.0},
+    ]), encoding="utf-8")
+    ancient = jobs_home / "ancient"
+    ancient.mkdir()
+    (ancient / "x.out").write_text("old")
+    week = time.time() - 8 * 86400
+    os.utime(ancient, (week, week))
+
+    async def scenario(session_id):
+        app = cli_tui.DostuffTUI(session_id=session_id)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            await _until(pilot, lambda: not ancient.exists(), tries=60)
+            await pilot.pause(0.2)
+            texts = _texts(app)
+            await app._cleanup_and_save_session()
+            return texts
+
+    texts = asyncio.run(scenario("fresh"))
+    warnings = [t for t in texts if "earlier session may still be running" in t]
+    assert len(warnings) == 1
+    assert "1 background job" in warnings[0] and "npm run dev, pid 4812" in warnings[0]
+    assert "pytest" not in warnings[0] and "OS tools" in warnings[0]
+    assert not ancient.exists()  # old log dirs pruned at startup
+
+    (stale / "jobs.json").write_text("[]", encoding="utf-8")
+    ancient.mkdir()
+    os.utime(ancient, (week, week))
+    texts = asyncio.run(scenario("fresh2"))
+    assert not any("earlier session" in t for t in texts)
+
+
+def test_job_notice_notification(tui, registry, monkeypatch):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="notify")
+        written: list[str] = []
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._write_terminal = written.append  # type: ignore[method-assign]
+            app._notify_kind = "osc9"
+            app.app_focus = False
+            await _start_bg(registry, "notify", "build", "exit 2")
+            await _until(pilot, lambda: any('job "build" exited (2)' in w for w in written), tries=100)
+
+            written.clear()  # focused: no notification for a job that just ended
+            app.app_focus = True
+            await _start_bg(registry, "notify", "build2", "exit 0")
+            await _until(pilot, lambda: any('"build2"' in t for t in _texts(app)), tries=100)
+            assert not any("build2" in w for w in written)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- background shell D15: a job ending while idle starts a turn ---------------------------------
+
+def _wake_loop(cli_tui, monkeypatch, registry, calls, restart=None):
+    """A fake agent loop that drains its notices like the real one and records
+    `(user_text, drained ids)`; `restart()` true starts another quick background job."""
+    async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        calls.append((user_text, [n.id for n in registry.drain_notices(session_id)]))
+        if restart is not None and restart():
+            await registry.start("exit 0", "", session_id, background=True)
+        return "handled"
+    monkeypatch.setattr(cli_tui, "agent_loop", fake_loop)
+
+
+def test_job_wake_up(tui, registry, monkeypatch, _py):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    sleeper = _py("import time; time.sleep(30)")
+    calls: list[tuple[str, list[str]]] = []
+    _wake_loop(cli_tui, monkeypatch, registry, calls)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="wake")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            app.config.jobs_wake_on_end = True
+
+            # idle: the job's end starts a turn whose input is the notice
+            await _start_bg(registry, "wake", "test", "exit 1")
+            await _until(pilot, lambda: len(calls) == 1, tries=100)
+            text, ids = calls[0]
+            assert text.startswith('<background-job id="test" status="exited" code="1"') and ids == ["test"]
+            assert any('⚙ Resuming the agent: background job "test" ended' in t for t in _texts(app))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert not any(s.get("content") == text for s in app.steps_history)  # the loop stores it, not the TUI
+
+            # jobs that end together: one turn
+            await _start_bg(registry, "wake", "a", "exit 0")
+            await _start_bg(registry, "wake", "b", "exit 0")
+            await _until(pilot, lambda: len(calls) == 2, tries=100)
+            assert sorted(calls[1][1]) == ["a", "b"]
+
+            # a /jobs kill alone doesn't wake it, a model kill leaves no notice; both ride along with the next one
+            dev = await _start_bg(registry, "wake", "dev", sleeper)
+            await registry.kill(dev, "user")
+            quiet = await _start_bg(registry, "wake", "quiet", sleeper)
+            await registry.kill(quiet, "model")
+            await _start_bg(registry, "wake/sub/r1", "sub", "exit 0")  # a subagent's job: not ours to wake for
+            await pilot.pause(1.5)
+            assert len(calls) == 2
+            await _start_bg(registry, "wake", "c", "exit 0")
+            await _until(pilot, lambda: len(calls) == 3, tries=100)
+            assert calls[2][1] == ["dev", "c"]
+            registry.drain_notices("wake/sub/r1")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_job_wake_waits_for_user(tui, registry, monkeypatch):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    calls: list[tuple[str, list[str]]] = []
+    _wake_loop(cli_tui, monkeypatch, registry, calls)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="later")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+
+            # off: the notice waits for the next message
+            await _start_bg(registry, "later", "off", "exit 0")
+            await _until(pilot, lambda: any('"off" exited' in t for t in _texts(app)), tries=100)
+            await pilot.pause(1.5)
+            assert calls == []
+            registry.drain_notices("later")
+            app.config.jobs_wake_on_end = True
+
+            # typing: wait; an emptied input lets it through
+            inp.text = "half a thought"
+            await _start_bg(registry, "later", "typed", "exit 0")
+            await pilot.pause(1.5)
+            assert calls == []
+            inp.text = ""
+            await _until(pilot, lambda: len(calls) == 1, tries=100)
+            assert calls[0][1] == ["typed"]
+            await _until(pilot, lambda: not app._turn_in_progress)
+
+            # the user sends a prompt first: that turn gets the notice, no wake-up after it
+            inp.text = "still typing"
+            await _start_bg(registry, "later", "sent", "exit 0")
+            await _until(pilot, lambda: any('"sent" exited' in t for t in _texts(app)), tries=100)
+            inp.text = ""
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("what happened?"))
+            await _until(pilot, lambda: len(calls) == 2, tries=100)
+            assert calls[1] == ("what happened?", ["sent"])
+            await pilot.pause(1.5)
+            assert len(calls) == 2
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_job_wake_limit(tui, registry, monkeypatch):
+    cli_tui = tui
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    calls: list[tuple[str, list[str]]] = []
+    chain = {"on": True}
+    _wake_loop(cli_tui, monkeypatch, registry, calls, restart=lambda: chain["on"])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="chain")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            app.config.jobs_wake_on_end = True
+
+            # every wake-up turn starts a job that ends at once: it stops after JOB_WAKE_LIMIT turns
+            await _start_bg(registry, "chain", "first", "exit 0")
+            await _until(pilot, lambda: any("Not resuming the agent" in t for t in _texts(app)), tries=200)
+            assert len(calls) == cli_tui.JOB_WAKE_LIMIT
+            await pilot.pause(1.5)
+            assert len(calls) == cli_tui.JOB_WAKE_LIMIT
+            assert sum("Not resuming the agent" in t for t in _texts(app)) == 1
+
+            # a message from the user resets the count
+            chain["on"] = False
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("carry on"))
+            await _until(pilot, lambda: len(calls) == cli_tui.JOB_WAKE_LIMIT + 1, tries=100)
+            assert calls[-1][0] == "carry on" and len(calls[-1][1]) == 1
+            await _start_bg(registry, "chain", "again", "exit 0")
+            await _until(pilot, lambda: len(calls) == cli_tui.JOB_WAKE_LIMIT + 2, tries=100)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- prompt queue: listed above the input, /queue edits / reorders / removes, Esc puts it back ---
+
+def test_prompt_queue(tui, monkeypatch):
+    cli_tui = tui
+    ran: list[str] = []
+
+    async def gated_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                         current_session_history, steps_history, store, adapter=None, **kwargs):
+        ran.append(user_text)
+        await adapter._cancel_event.wait()  # every turn runs until Esc
+        return ""
+    monkeypatch.setattr(cli_tui, "agent_loop", gated_loop)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="queue")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+            bar = app.query_one("#queue-bar", cli_tui.QueueBar)
+            picker = app.query_one("#picker", cli_tui.PermissionPrompt)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+
+            async def choose(value: str) -> None:
+                app.on_permission_prompt_chosen(cli_tui.PermissionPrompt.Chosen(value, "picker"))
+                await pilot.pause()
+
+            submit("first")
+            await _until(pilot, lambda: ran == ["first"])
+            assert not bar.display
+            for text in ("second", "third", "fourth"):
+                submit(text)
+            await pilot.pause()
+            # each queued prompt is listed, not just counted
+            assert bar.display
+            shown = str(bar.render())
+            assert "3 queued" in shown and "1. second" in shown and "3. fourth" in shown
+
+            # /queue: run "fourth" next
+            submit("/queue")
+            await pilot.pause()
+            assert [label for _, label in picker._options] == ["1. second", "2. third", "3. fourth", "Clear the queue"]
+            await choose("q2")
+            assert [v for v, _ in picker._options] == ["edit", "next", "remove", "back"]
+            await choose("next")
+            assert app._prompt_queue == ["fourth", "second", "third"]
+
+            # remove "second", edit "third" (back to the input)
+            submit("/queue")
+            await pilot.pause()
+            await choose("q1")
+            await choose("remove")
+            assert app._prompt_queue == ["fourth", "third"]
+            submit("/queue")
+            await pilot.pause()
+            await choose("q1")
+            await choose("edit")
+            assert app._prompt_queue == ["fourth"] and inp.text == "third"
+
+            # the turn ends on its own: the next queued prompt starts and leaves the queue
+            app.adapter._cancel_event.set()
+            await _until(pilot, lambda: ran == ["first", "fourth"])
+            assert app._prompt_queue == [] and not bar.display
+
+            # Esc with prompts queued: they go back in the input, ahead of the draft, instead of running
+            inp.text = ""
+            submit("fifth")
+            submit("sixth")
+            inp.text = "draft"
+            await pilot.pause()
+            await app.action_cancel()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await pilot.pause()
+            assert ran == ["first", "fourth"] and app._prompt_queue == [] and not bar.display
+            assert inp.text == "fifth\n\nsixth\n\ndraft"
+            assert any("Moved 2 queued prompts back to the input" in t for t in _texts(app))
+
+            # /queue clear, and listed in the menu
+            submit("/queue clear")
+            await _until(pilot, lambda: any("No queued prompts." in t for t in _texts(app)))
+            assert "/queue" in cli_tui.COMMAND_DESCRIPTIONS
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

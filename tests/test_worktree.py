@@ -85,7 +85,7 @@ def _delegate(monkeypatch, repo, writes: bool, isolation="worktree"):
     seen = {}
 
     async def fake_loop(task, role, mcp_client, session_id, turn_id, adapter, permissions,
-                        instruction, working_history, tool_names):
+                        instruction, working_history, tool_names, owner=None):
         seen["root"] = project_root()
         seen["instruction"] = instruction
         if writes:

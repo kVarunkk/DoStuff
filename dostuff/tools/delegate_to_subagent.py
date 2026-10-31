@@ -6,6 +6,7 @@ from typing import Any
 from dostuff.helpers.tools.project_root import project_root, use_project_root
 from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.worktree import Worktree, WorktreeError, create_worktree, remove_worktree, worktree_changes
+from dostuff.tools.bash.jobs import get_registry
 
 BASE_SUBAGENT_INSTRUCTIONS = """You are a focused subagent operating in an isolated sub-loop.
 
@@ -142,7 +143,7 @@ def _close_worktree(wt: Worktree) -> str:
 
 def resolve_subagent_tools(requested_tools: list[str] | None) -> tuple[list[str], list[str]]:
     """Split requested tool names into (allowed, dropped). Restricted and unknown names are dropped."""
-    from dostuff.tools.definitions import TOOL_MAP
+    from dostuff.tools.definitions import TOOL_MAP, with_shell_job_tools
     allowed: list[str] = []
     dropped: list[str] = []
     for name in dict.fromkeys(requested_tools or DEFAULT_SUBAGENT_TOOLS):
@@ -150,7 +151,7 @@ def resolve_subagent_tools(requested_tools: list[str] | None) -> tuple[list[str]
             dropped.append(name)
         else:
             allowed.append(name)
-    return allowed, dropped
+    return with_shell_job_tools(allowed), dropped
 
 
 async def _impl_delegate_to_subagent(
@@ -200,16 +201,21 @@ Your Specific Role: {role}
             "the project; use paths relative to it. Your changes stay there for the parent agent to review.\n"
         )
     working_history: list[dict[str, Any]] = [{"role": "user", "content": task}]
+    owner = f"{session_id}/sub/{uuid.uuid4().hex[:8]}"  # this run's shell jobs (background shell spec D3)
+    get_registry().set_role(owner, role)
     try:
         with use_project_root(worktree.path) if worktree else contextlib.nullcontext():
             subagent_result = await _run_subagent_loop(
                 task, role, mcp_client, session_id, turn_id, adapter, permissions,
-                subagent_system_instruction, working_history, allowed_tool_names,
+                subagent_system_instruction, working_history, allowed_tool_names, owner,
             )
     except BaseException:
         if worktree is not None:
             _close_worktree(worktree)  # cancelled or failed: still drop it if unchanged
         raise
+    finally:
+        # Its jobs die with it: nobody is left to read them or hear when they end (spec D8)
+        await get_registry().kill_owner(owner, "owner_ended")
     if worktree is not None:
         subagent_result += "\n\n" + await asyncio.to_thread(_close_worktree, worktree)
 
@@ -230,6 +236,7 @@ async def _run_subagent_loop(
     subagent_system_instruction: str,
     working_history: list[dict[str, Any]],
     allowed_tool_names: list[str],
+    owner: str | None = None,
 ) -> str:
     """The subagent's loop, plus a partial report if it stopped before a final answer."""
     from dostuff.agent.loop import loop
@@ -249,6 +256,7 @@ async def _run_subagent_loop(
         tool_names=allowed_tool_names,
         stream=False,
         max_iterations=get_config().subagent_max_iterations,
+        owner=owner,
     )
 
     if not _finished(working_history) and not is_cancelled(adapter):

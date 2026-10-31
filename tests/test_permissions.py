@@ -323,3 +323,55 @@ def test_mode_cycle():
     from dostuff.agent.permissions import next_mode
     assert [next_mode(m) for m in ("ask", "auto", "plan", "allowlist")] == ["auto", "plan", "allowlist", "ask"]
     assert next_mode("bogus") == "ask"
+
+
+# --- background shell T4.4 (plan/2026-10-31-background-shell) ----------------------------------
+
+def test_bg_tools_registered():
+    from dostuff.tools.definitions import TOOL_MAP, default_tool_names
+    from dostuff.tools.delegate_to_subagent import resolve_subagent_tools
+    for name in ("bash_output", "kill_shell"):
+        assert TOOL_MAP[name].kind == "read" and TOOL_MAP[name].injected == frozenset({"owner"})
+        assert name in default_tool_names()
+    allowed, _ = resolve_subagent_tools(["read_file", "bash_command"])
+    assert allowed == ["read_file", "bash_command", "bash_output", "kill_shell"]
+    allowed, _ = resolve_subagent_tools(["read_file", "bash_output", "kill_shell"])
+    assert allowed == ["read_file"]
+    assert resolve_subagent_tools(None)[0] == resolve_subagent_tools(None)[0]  # default set unchanged
+    assert "bash_output" not in resolve_subagent_tools(None)[0]
+
+
+def test_bg_permissions(monkeypatch, tmp_path, registry):
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    monkeypatch.chdir(tmp_path)
+    _ask_config(monkeypatch)
+    adapter = FakeAdapter("n")
+
+    # bash_output / kill_shell never ask, in ask or plan mode
+    for mode in ("ask", "plan"):
+        session = SessionPermissions(mode=mode)
+        for tool in ("bash_output", "kill_shell"):
+            result = asyncio.run(run_tool(tool, {"background_id": "dev"}, adapter=adapter, permissions=session, session_id="s1"))
+            assert result.startswith('error: no job "dev"')
+    assert adapter.prompts == []
+
+    # A background start asks with the mode in the approval text
+    result = asyncio.run(run_tool(
+        "bash_command", {"command": "npm run dev", "run_in_background": True, "background_id": "dev"},
+        adapter=adapter, session_id="s1",
+    ))
+    assert adapter.prompts[-1].startswith('Run shell command (background job "dev"):\n  npm run dev')
+    assert result.startswith("User denied") and registry.jobs() == []
+    unnamed = check("bash_command", "shell", {"command": "npm run dev", "run_in_background": True}, None, ASK)
+    assert unnamed.prompt.startswith("Run shell command (background job):\n  npm run dev")
+    # "always" keys are keyed on the command alone
+    fg = check("bash_command", "shell", {"command": "npm run dev"}, None, ASK)
+    assert unnamed.approval_keys == fg.approval_keys == [("bash_command", "npm run")]
+
+    # Plan mode: a read-only background command runs, anything else is denied
+    plan = PermissionConfig(mode="plan")
+    tail = check("bash_command", "shell", {"command": "tail -f app.log", "run_in_background": True}, None, plan)
+    assert tail.action == "allow"
+    dev = check("bash_command", "shell", {"command": "npm run dev", "run_in_background": True, "background_id": "dev"}, None, plan)
+    assert dev.action == "deny" and dev.reason.startswith('Plan mode: not run (Run shell command (background job "dev"):)')

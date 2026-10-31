@@ -26,7 +26,9 @@ from dostuff.helpers.hooks.events import (
 from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
 from dostuff.tools.definitions import TOOL_MAP
-from typing import Any, Literal
+from dostuff.tools.bash.jobs import Job, JobEvent, format_notice, get_registry
+from typing import Any, Iterator, Literal
+import contextlib
 import json
 import litellm
 from dostuff.helpers.agent.consume_stream import StreamProgress, consume_stream as _consume_stream
@@ -162,13 +164,30 @@ async def _sleep_or_cancel(seconds: float, adapter: Any) -> bool:
     return is_cancelled(adapter)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None) -> str:
+@contextlib.contextmanager
+def _job_events(owner: str, adapter: Any) -> Iterator[None]:
+    """While a run is going, emit `("job", {id, status, code})` for its own background jobs (spec D13)."""
+    def on_job(job: Job, event: JobEvent) -> None:
+        if job.owner == owner and not job.foreground and adapter is not None and hasattr(adapter, "emit"):
+            adapter.emit("job", {"id": job.id, "status": job.status, "code": job.exit_code})
+    registry = get_registry()
+    registry.add_listener(on_job)
+    try:
+        yield
+    finally:
+        registry.remove_listener(on_job)
+
+
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction).
 
     `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
     every model call's system instruction, refreshed here on compaction, never written to history.
+
+    `owner` is who this run's shell jobs belong to: the session, or `<session>/sub/<run>` for a subagent.
     """
     current_session_id.set(session_id)
+    owner = owner or session_id
     iteration = 0
     token_limit = get_model_token_limit()
     config = get_config()
@@ -208,6 +227,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                                 turn_type=turn_type, adapter=adapter)
         return True
 
+    async def append_note(text: str) -> None:
+        """A harness-authored user step: a Stop-hook continuation or background-job notices."""
+        await append_step({"role": "user", "content": text}, steps_history, working_history, current_session_history, session_id, store, turn_type)
+
     async def check_cancelled() -> bool:
         return await loop_check_cancelled(steps_history, working_history, current_session_history, session_id, store, turn_type, adapter=adapter)
 
@@ -217,7 +240,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     if context_token_threshold is not None and last_input_tokens > context_token_threshold:
         await compact("Token threshold exceeded.", keep_recent_token_budget)
 
-    with tracer.start_as_current_span("turn") as turn_span:
+    with tracer.start_as_current_span("turn") as turn_span, _job_events(owner, adapter):
         turn_span.set_attribute("session_id", session_id)
         turn_span.set_attribute("turn_type", turn_type)
         turn_span.set_attribute("turn_id", turn_id)
@@ -233,6 +256,11 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
 
                 if await check_cancelled():
                     return "Cancelled by user."
+
+                # Background jobs of this run that ended since the last model call (spec D7)
+                notices = get_registry().drain_notices(owner)
+                if notices:
+                    await append_note(format_notice(notices))
 
                 # Model call with classified retries and exponential backoff
                 interaction = None
@@ -355,8 +383,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         name = stop.decided_by or stop_event
                         if stop_blocks < config.hooks_stop_block_limit:
                             stop_blocks += 1
-                            note = STOP_NOTE.format(name=name, reason=stop.reason or "keep going")
-                            await append_step({"role": "user", "content": note}, steps_history, working_history, current_session_history, session_id, store, turn_type)
+                            await append_note(STOP_NOTE.format(name=name, reason=stop.reason or "keep going"))
                             iter_span.set_status(Status(StatusCode.OK))
                             continue
                         await loop_emit("system", STOP_LIMIT_MESSAGE.format(
@@ -429,7 +456,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
 
                 def start(call: _ToolCall) -> asyncio.Task:
                     return asyncio.ensure_future(asyncio.wait_for(
-                        dispatch_tool(call.name, dict(call.args), mcp_client=mcp_client, session_id=session_id, turn_id=turn_id, adapter=adapter, permissions=permissions),
+                        dispatch_tool(call.name, dict(call.args), mcp_client=mcp_client, session_id=session_id, turn_id=turn_id, adapter=adapter, permissions=permissions, owner=owner),
                         timeout=None if call.name in _UNTIMED_TOOLS else TOOL_TIMEOUT_S,
                     ))
 

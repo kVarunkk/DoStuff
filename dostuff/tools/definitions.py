@@ -4,6 +4,8 @@ from typing import Any, Callable
 from dostuff.agent.permissions import ToolKind
 from dostuff.helpers.tools.generate_tool_schema import generate_litellm_tool_schema
 from dostuff.tools.bash.bash_command import bash_command, select_shell
+from dostuff.tools.bash.bash_output import bash_output
+from dostuff.tools.bash.kill_shell import kill_shell
 from dostuff.tools.delegate_to_subagent import _impl_delegate_to_subagent
 from dostuff.tools.files.delete_file import delete_file
 from dostuff.tools.files.edit_file import edit_file
@@ -24,7 +26,7 @@ from dostuff.tools.web_fetch import web_fetch
 from dostuff.tools.web_search import web_search
 
 # Parameters the harness supplies; never exposed to (or accepted from) the model.
-HARNESS_PARAMS = frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions"})
+HARNESS_PARAMS = frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions", "owner"})
 
 
 @dataclass(frozen=True)
@@ -84,8 +86,12 @@ _TOOLS = [
         "bash_command",
         bash_command,
         "shell",
+        frozenset({"owner"}),  # the agent that owns its jobs (spec D3)
         description_suffix=f"Commands run in {select_shell()[0]}.",
     ),
+    # Only reach jobs their own owner started, each already approved (spec D10)
+    ToolSpec("bash_output", bash_output, "read", frozenset({"owner"})),
+    ToolSpec("kill_shell", kill_shell, "read", frozenset({"owner"})),
 ]
 
 TOOL_MAP: dict[str, ToolSpec] = {spec.name: spec for spec in _TOOLS}
@@ -94,6 +100,18 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {name: spec.schema for name, spec in T
 
 # Need chromadb (the `memory` extra); not offered to the model without it
 MEMORY_TOOLS = frozenset({"save_memory", "save_episode"})
+
+# Offered exactly when bash_command is: they only work on jobs it started
+SHELL_JOB_TOOLS = ("bash_output", "kill_shell")
+
+
+def with_shell_job_tools(names: list[str]) -> list[str]:
+    """`names` with bash_output/kill_shell added after bash_command, or removed when it is absent."""
+    rest = [name for name in names if name not in SHELL_JOB_TOOLS]
+    if "bash_command" not in rest:
+        return rest
+    i = rest.index("bash_command") + 1
+    return rest[:i] + list(SHELL_JOB_TOOLS) + rest[i:]
 
 
 def default_tool_names() -> list[str]:

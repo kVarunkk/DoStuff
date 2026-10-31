@@ -217,7 +217,10 @@ def _patterns_allow(patterns: list[str], tool: str, tokens: list[str] | None) ->
 
 def _describe_call(tool: str, args: dict[str, Any]) -> str:
     if tool == "bash_command":
-        return f"Run shell command:\n  {args.get('command', '')}"
+        mode = ""
+        if args.get("run_in_background"):  # the user is approving something that keeps running
+            mode = f' (background job "{args["background_id"]}")' if args.get("background_id") else " (background job)"
+        return f"Run shell command{mode}:\n  {args.get('command', '')}"
     if tool == "call_mcp_tool":
         return f"Call MCP tool '{args.get('name', '')}' with arguments:\n  {str(args.get('arguments', {}))[:500]}"
     if tool == "web_fetch":

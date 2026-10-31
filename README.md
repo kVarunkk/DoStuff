@@ -37,6 +37,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
 - **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
 - **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
+- **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
 - **File sandbox** — file tools stay inside the project directory and never read `.env*` files or `~/.dostuff/`
 - **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`
 - **Subagents** — `delegate_to_subagent` runs a bounded task with a restricted tool set; its approval prompts and ESC go through the same TUI
@@ -181,6 +182,7 @@ In the TUI:
 | `Ctrl+R`      | Search the prompts typed in this directory (type to filter, `Enter` puts the prompt in the input) |
 | `Esc` `Esc`   | With an empty input: take back your last prompt. It and everything after it (answer, tool calls) leave the conversation and the prompt goes back in the input to edit and resend. Files that turn changed stay as they are; `/undo` restores them |
 | `Ctrl+O`      | Expand / collapse every truncated tool and shell result (click one to toggle just that one) |
+| `Ctrl+B`      | While the agent waits on a shell command (the loader says `Ctrl+B to background`): move it, and any a subagent is running, to the background; the agent gets what it printed so far and carries on. Not for `!command`s. See [Background jobs](#background-jobs) |
 | `Shift+Tab`   | Cycle the permission mode for this session: ask → auto → plan → allowlist (shown in the status bar) |
 | `Ctrl+Backspace` / `Ctrl+W` / `Alt+Backspace` | Delete the previous word; `Ctrl+Delete` / `Alt+Delete` the next one |
 | `/exit`       | Save the session and quit           |
@@ -198,6 +200,8 @@ In the TUI:
 | `/memory [project\|global]` | Edit `AGENTS.md` (this project's or `~/.dostuff/AGENTS.md`) in the same editor as `/config`; `Ctrl+S` saves and the agent follows it from the next message |
 | `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory, hooks), with a fix for each problem |
 | `/hooks [r]`  | List the configured hooks per event: file, matcher, timeout, `fail_closed`, and whether each runs (`user` / `trusted` / `untrusted` / `disabled` / `broken`). `/hooks r` re-reads the config files. See [Hooks](#hooks) |
+| `/queue` / `/queue clear` | List the prompts waiting for the current turn: edit one (back into the input), run it next or remove it / drop them all |
+| `/jobs [<id>]` / `/jobs kill <id>` | List this session's background jobs (id, owner, status, runtime, command) / show a job's last 40 lines of output and its log files / stop one (the agent is told). See [Background jobs](#background-jobs) |
 | `/<skill> [args]` | Run a skill: every discovered skill is a command (listed in the `/` menu and `/help`). See [Skills](#skills) |
 | `/<command> [args]` | Run a custom command from `.dostuff/commands/` or `~/.dostuff/commands/`. See [Custom commands](#custom-commands) |
 | `/rename <title>` | Name this session (shown by `dostuff sessions`) |
@@ -219,7 +223,9 @@ In the TUI:
 - **Diffs** — `write_file` / `edit_file` changes shown as a coloured diff
 - **Errors** — red background
 - **Status bar** — `cwd • model • permission mode • context usage %` by default; `help`, `session`, `tokens` and `cost` can be added. Choose and order the items with `ui.status_bar` in `config.yaml`; when the terminal is too narrow (or zoomed in), long items are shortened and the least important dropped (help, session, cwd, tokens, cost, model, context, mode) instead of being cut off
+- **Shells** — while background jobs run, a `⚙ 2 shells` item sits at the end of the status bar whatever `ui.status_bar` says. Click it (or press `↓` in an empty input) to list the session's jobs with when each started and how long it has run, and click it again to close the list; pick one (click or Enter) to see its last 8 lines of output and log path in the same small panel, refresh them, or stop it
 - **Loading** — bold `Working...` with a live elapsed timer and queued-prompt count, or streamed thoughts displayed live
+- **Queued prompts** — prompts sent while a turn runs wait above the input, one row each, and run in order. Click the list (or `/queue`) to pick one and edit it (back into the input), run it next or remove it, or clear them all (`/queue clear`). `Esc` cancels the turn and moves the queued prompts back into the input instead of running them
 - **Terminal title** — the tab / window title shows the run status: `⏳ dostuff · <folder>` while working, `✋` while an approval waits, `✓` when done; the old title comes back on exit. `ui.terminal_title: false` turns it off
 - **Notifications** (off by default) — `ui.notifications: bell` (terminal bell) or `osc9` (desktop notification in iTerm2, WezTerm, Ghostty, kitty …) when a turn finishes or an approval is waiting, if it took longer than `ui.notify_after_seconds` (30) or the terminal is in the background. `/notifications` switches it per session
 
@@ -230,6 +236,7 @@ In the TUI:
 | Tool | Kind | Asks? |
 | ---- | ---- | ----- |
 | `read_file`, `list_files`, `grep`, `glob`, `get_current_datetime`, `search_mcp_tools`, `get_mcp_tool_details` | read | never |
+| `bash_output`, `kill_shell` | read | never (they only touch the agent's own background jobs) |
 | `write_file`, `edit_file`, `delete_file` | write | yes (shows a diff) |
 | `bash_command` | shell | yes, unless every part of the command is on the read-only allow-list (`ls`, `cat`, `git status`, `git diff`, …) with no redirection or substitution |
 | `call_mcp_tool` | mcp | yes |
@@ -273,9 +280,67 @@ API keys stay in `.env` files, which the agent can't read or change. Subagents d
 
 > [!NOTE]
 > **Cancelling a running tool.** ESC stops waiting for tools at once and the turn ends; results that already
-> finished are kept. Tools that run in a worker thread (file tools, `bash_command`) cannot be interrupted
-> mid-call, so one that was still running may finish in the background; its result is recorded as
+> finished are kept. A running `bash_command` is killed with its children; tools that run in a worker thread (file tools) cannot
+> be interrupted mid-call, so one that was still running may finish in the background; its result is recorded as
 > `Cancelled by user (may still be running)`.
+
+---
+
+## Background jobs
+
+Dev servers, file watchers and long test runs don't fit a shell call that has to finish within its timeout. The agent
+starts them as **background jobs** instead and keeps working while they run:
+
+| Tool | What it does |
+|---|---|
+| `bash_command(command, run_in_background=true, background_id="dev")` | Starts the job and returns at once with its id, pid and log files. `background_id` is optional (`bg-1`, `bg-2`, … otherwise); starting an id that is still running is refused. At most 8 running jobs per agent |
+| `bash_output("dev", filter=…, wait_for=…, timeout=…)` | The job's status and the stdout / stderr it printed since the last read. `wait_for` is a regex: wait (1–110 s) until a new line matches, e.g. a server's `ready` line, instead of sleeping. `filter` keeps only matching lines |
+| `kill_shell("dev")` | Kills the job and everything it started, and shows its last lines |
+
+The approval prompt for a background start reads `Run shell command (background job "dev"):`; `bash_output` and
+`kill_shell` never ask, because they only reach the calling agent's own jobs. Hooks see `run_in_background` and
+`background_id` in `PreToolUse`, and can deny `kill_shell` like any tool. Plan mode allows a background job only for a
+read-only command.
+
+**When a job ends** on its own (or you stop it with `/jobs kill`), the agent is told before its next model call with a
+`<background-job id="test" status="exited" code="1" runtime="42s">` message holding the last 20 lines of each stream,
+so it doesn't have to poll to notice a crashed server. In the TUI the same moment shows as `⚙ job "test" exited (1)
+after 42s`, with a notification when the terminal is in the background (`ui.notifications`). If the agent is idle,
+the TUI starts a turn for it right away (`⚙ Resuming the agent: …`), so it can look at the failed test run or crashed
+server on its own. It waits while you are typing, an approval is open or a command like `/compact` runs; if you send a
+prompt first, that turn gets the message instead. A `/jobs kill` alone doesn't wake it, and after 3 such automatic
+turns in a row it waits for your next message. Turn this off with `jobs: {wake_on_end: false}` in `config.yaml`; the
+agent then sees the message with your next prompt.
+
+**In the TUI:**
+
+- `Ctrl+B` while the agent waits on a shell command (the loader says `Ctrl+B to background`) moves that command, and
+  any a subagent is running in the same turn, to the background. The agent gets what it printed so far and carries on;
+  the transcript shows `⎿ moved to background as "bg-3"`. `!command`s can't be backgrounded.
+- `/jobs` lists the session's jobs: id, owner (`main` or `subagent: <role>`), status, runtime and command.
+  `/jobs <id>` shows the last 40 lines of each stream and the log paths, `/jobs kill <id>` stops one.
+- While any run, a `⚙ 2 shells` item shows at the end of the status bar; click it (or `↓` in an empty input) to pick a job
+  from a list (status, start time, runtime, command) and show its output or stop it.
+
+**Logs** go to `~/.dostuff/jobs/<session>/<job>.out` and `.err` (you can `tail -f` them; `/jobs <id>` prints the
+paths). Directories older than 7 days are removed at startup.
+
+**Jobs live until their owner ends; in the TUI that is the app, not the conversation:**
+
+| Event | What happens to the jobs |
+|---|---|
+| Subagent run ends (done, error or cancelled) | its jobs are killed |
+| `/compact` | kept |
+| `/clear` | kept, no prompt: they move to the new session, which gets their end notices and can use `bash_output`/`kill_shell` on them |
+| `/resume` another session | same as `/clear`: the running jobs follow you into the resumed session |
+| Quit (`Ctrl+Q`, `/exit`) | "Quit and stop 2 background jobs?", then they are killed |
+| Headless run (`dostuff -p`) ends, or `Ctrl+C` | all killed, one stderr line each (`stream-json`: `{"type": "job", …}` events) |
+
+> [!WARNING]
+> If DoStuff is killed hard (task manager, `kill -9`, power loss), its jobs keep running: they are detached from the
+> terminal by design. Each session records its jobs in `~/.dostuff/jobs/<session>/jobs.json`, and the next start
+> warns `1 background job from an earlier session may still be running (npm run dev, pid 4812)`. It doesn't kill
+> them, since a pid may have been reused by then; check with your OS tools.
 
 ---
 

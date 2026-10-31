@@ -687,6 +687,50 @@ def test_claude_code_script_contract(home, tmp_path):
     assert _run(run_hooks("PreToolUse", _pre("bash_command", {"command": "ls"}))).decision == "deny"
 
 
+def test_config_file_edit_applies_without_reload(home, proj):
+    """A config.yaml written by edit_file or a shell (no edit_config, no reload()) applies on the next dispatch."""
+    path = write_project_config(proj, _hooks_block("PreToolUse", _group(_cmd("exit 2"))))
+    write_user_config(home, {"hooks": {"project_trust": "allow"}})
+    assert _run(run_hooks("PreToolUse", _pre("bash_command", {"command": "ls"}))).decision == "deny"
+
+    path.write_text(yaml.safe_dump({"hooks": {}}) + "# hook removed\n", encoding="utf-8")
+    assert _run(run_hooks("PreToolUse", _pre("bash_command", {"command": "ls"}))).decision == "none"
+
+
+def test_config_file_broken_edit_keeps_loaded_hooks(home):
+    """YAML that doesn't parse keeps the loaded config, and the next good write applies."""
+    path = write_user_config(home, _hooks_block("PreToolUse", _group(_cmd("exit 2"))))
+    assert _run(run_hooks("PreToolUse", _pre("bash_command", {"command": "ls"}))).decision == "deny"
+
+    path.write_text("hooks: [unclosed\n", encoding="utf-8")
+    assert get_config().reload_if_changed() is False
+    assert _run(run_hooks("PreToolUse", _pre("bash_command", {"command": "ls"}))).decision == "deny"
+
+    path.write_text(yaml.safe_dump({"hooks": {}}), encoding="utf-8")
+    assert get_config().reload_if_changed() is True
+    assert _run(run_hooks("PreToolUse", _pre("bash_command", {"command": "ls"}))).decision == "none"
+    assert get_config().load_error == ""
+
+
+def test_config_file_broken_edit_records_error(home):
+    """reload_if_changed() says why it kept the loaded config, so the TUI can tell the user."""
+    path = write_user_config(home, {"permissions": {"mode": "ask"}})
+    get_config()
+    path.write_text("permissions: [unclosed\n", encoding="utf-8")
+    assert get_config().reload_if_changed() is False
+    assert str(path) in get_config().load_error
+
+
+def test_permissions_edited_by_hand_apply_to_next_tool_call(home):
+    """permission_config() reads a config.yaml changed mid-session, not the one loaded at startup."""
+    from dostuff.agent.run_tool import permission_config
+    path = write_user_config(home, {"permissions": {"mode": "ask"}})
+    assert permission_config().mode == "ask"
+    path.write_text(yaml.safe_dump({"permissions": {"mode": "plan", "allow": ["bash_command(ls)"]}}), encoding="utf-8")
+    cfg = permission_config()
+    assert (cfg.mode, cfg.allow) == ("plan", ["bash_command(ls)"])
+
+
 # === Phase 2 — tool events ===================================================================
 
 from types import SimpleNamespace
@@ -1599,3 +1643,41 @@ def test_plans_point_at_the_hooks_spec():
     future = _section(roadmap, "## Future")
     assert not any(line.startswith("- **Hooks**") for line in future.splitlines())
     assert "✅ **Hooks**" in roadmap
+
+
+# --- background shell T4.5: hooks see and can stop the job tools ------------------------------
+
+def test_hooks_bg_tools(home, tmp_path, monkeypatch, registry, _py, _alive):
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    _mode(monkeypatch, "auto")
+    assert dispatch_module.SHELL_TOOLS == ("bash_command",)
+    seen = tmp_path / "seen.json"
+    record = _script(tmp_path, f"import sys; open(r'{seen}', 'w').write(sys.stdin.read())")
+    deny_kill = _stderr_exit2(tmp_path, "keep the server up")
+    write_user_config(home, {"hooks": {"PreToolUse": [
+        _group(record, matcher="bash_command"),
+        _group(deny_kill, matcher="kill_shell"),
+    ]}})
+    sleeper = _py("import time; time.sleep(30)")
+
+    async def scenario():
+        args = {"command": sleeper, "run_in_background": True, "background_id": "dev"}
+        started = await run_tool("bash_command", args, **_tool_kwargs())
+        assert started.startswith(f'$ {sleeper}\nstarted background job "dev"')
+        tool_input = json.loads(seen.read_text(encoding="utf-8"))["tool_input"]
+        assert tool_input["run_in_background"] is True and tool_input["background_id"] == "dev"
+
+        result = await run_tool("kill_shell", {"background_id": "dev"}, **_tool_kwargs())
+        job = registry.get("s1", "dev")
+        assert result == "keep the server up" and job.status == "running" and _alive(job.pid)
+        await registry.kill_all()
+    _run(scenario())
+
+    # A rewrite that turns a read-only call into a background server is re-authorized: plan mode denies it
+    write_user_config(home, _hooks_block("PreToolUse", _decide(
+        tmp_path, updated={"command": "npm run dev", "run_in_background": True, "background_id": "dev"})))
+    result = _run(run_tool("bash_command", {"command": "git status"}, adapter=AskAdapter(),
+                           permissions=SessionPermissions(mode="plan"), **_tool_kwargs()))
+    assert result.startswith('Plan mode: not run (Run shell command (background job "dev"):)')
+    assert [j.id for j in registry.jobs()] == ["dev"]  # only the job from the first part

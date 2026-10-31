@@ -65,6 +65,7 @@ def _approval_preview(tool: str, args: dict[str, Any]) -> str:
 
 def permission_config() -> PermissionConfig:
     cfg = get_config()
+    cfg.reload_if_changed()  # permissions edited in config.yaml by hand apply from the next tool call
     return PermissionConfig(mode=cast(PermissionMode, cfg.permission_mode), allow=list(cfg.permission_allow))
 
 
@@ -231,15 +232,19 @@ async def dispatch_tool(
     turn_id: str | None = None,
     adapter: Any = None,
     permissions: SessionPermissions | None = None,
+    owner: str | None = None,
 ) -> Any:
-    """Execute an already-authorized tool call, injecting harness params the tool declares."""
+    """Execute an already-authorized tool call, injecting harness params the tool declares.
+
+    `owner` is the agent shell jobs belong to: the session, or `<session>/sub/<run>` for a subagent.
+    """
     spec = TOOL_MAP.get(fn_name)
     if spec is None:
         raise KeyError(f"Tool '{fn_name}' not found.")
     args = _sanitize_args(spec, fn_args)
     available: dict[str, Any] = {
         "mcp_client": mcp_client, "session_id": session_id, "turn_id": turn_id,
-        "adapter": adapter, "permissions": permissions,
+        "adapter": adapter, "permissions": permissions, "owner": owner or session_id or "",
     }
     for param in spec.injected:
         if available[param] is None and param in ("mcp_client", "session_id", "turn_id"):
@@ -284,6 +289,7 @@ async def run_tool(
     adapter: Any = None,
     permissions: SessionPermissions | None = None,
     turn_type: str = "interactive_loop",
+    owner: str | None = None,
 ) -> Any:
     """Hooks, authorize, dispatch, hooks: the same order as loop(). A denial is returned as the result, not raised."""
     if not isinstance(fn_name, str):
@@ -299,7 +305,7 @@ async def run_tool(
         return denial
     result = await dispatch_tool(
         fn_name, fn_args, mcp_client=mcp_client, session_id=session_id, turn_id=turn_id,
-        adapter=adapter, permissions=permissions,
+        adapter=adapter, permissions=permissions, owner=owner,
     )
     result, _ = await post_tool_use(fn_name, fn_args, result, **ids)
     return result

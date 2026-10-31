@@ -1,10 +1,14 @@
 {
   "bash_command": {
     "function": {
-      "description": "Run a shell command and return its output as a single string.\n\nThe shell is not sandboxed: commands that are not read-only require user approval.\nCommands get no stdin and are killed when they time out, so never run interactive or\nlong-running programs (servers, GUI apps, watchers) in the foreground: start them in the\nbackground with output redirected to a file and read the file afterwards.\n\nCommands run in <shell>.",
+      "description": "Run a shell command and return its output as a single string.\n\nThe shell is not sandboxed: commands that are not read-only require user approval.\nCommands get no stdin and are killed when they time out, so never run interactive or\nlong-running programs (servers, GUI apps, watchers) in the foreground: start them with\nrun_in_background=true, then read their output with bash_output and stop them with kill_shell.\n\nCommands run in <shell>.",
       "name": "bash_command",
       "parameters": {
         "properties": {
+          "background_id": {
+            "description": "Optional short name for a background job, e.g. 'dev' (lowercase letters, digits, '.', '_', '-'); one is generated if omitted.",
+            "type": "string"
+          },
           "command": {
             "description": "Shell command to run, e.g. 'ls -la'.",
             "type": "string"
@@ -13,13 +17,48 @@
             "description": "Optional working directory (defaults to the project root).",
             "type": "string"
           },
+          "run_in_background": {
+            "description": "Start the command as a background job and return at once instead of waiting for it to exit.",
+            "type": "boolean"
+          },
           "timeout": {
-            "description": "Seconds before the command and its children are killed (default 60, max 110).",
+            "description": "Seconds before the command and its children are killed (default 60, max 110). Ignored for background jobs.",
             "type": "integer"
           }
         },
         "required": [
           "command"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "bash_output": {
+    "function": {
+      "description": "Read a background job's new output (since the previous bash_output call) and its status.\n\nwait_for blocks until the job prints a line you expect, e.g. a server's \"ready\" line.\nCancelling the wait does not stop the job.",
+      "name": "bash_output",
+      "parameters": {
+        "properties": {
+          "background_id": {
+            "description": "The job's id, as returned by bash_command(run_in_background=true).",
+            "type": "string"
+          },
+          "filter": {
+            "description": "Optional regex; only matching lines are returned (the others are still consumed).",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Seconds to wait for wait_for (default 30, 1-110).",
+            "type": "integer"
+          },
+          "wait_for": {
+            "description": "Optional regex; wait until a new line matches it, the job ends, or timeout passes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "background_id"
         ],
         "type": "object"
       }
@@ -267,6 +306,25 @@
         },
         "required": [
           "pattern"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "kill_shell": {
+    "function": {
+      "description": "Stop a background job: kill its process and everything it started.\n\nKilling a job that has already ended just reports how it ended.",
+      "name": "kill_shell",
+      "parameters": {
+        "properties": {
+          "background_id": {
+            "description": "The job's id, as returned by bash_command(run_in_background=true).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "background_id"
         ],
         "type": "object"
       }

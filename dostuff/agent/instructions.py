@@ -4,7 +4,9 @@ from pathlib import Path
 from typing import Any
 
 from dostuff.config import get_config
-from dostuff.helpers.agent.constants import MEMORY_INSTRUCTIONS, SYSTEM_INSTRUCTIONS
+from dostuff.helpers.agent.constants import (
+    BACKGROUND_WAIT_HEADLESS, BACKGROUND_WAIT_INTERACTIVE, MEMORY_INSTRUCTIONS, SYSTEM_INSTRUCTIONS,
+)
 from dostuff.helpers.agent.environment_context import build_environment_block
 from dostuff.helpers.agent.load_identity import load_identity
 from dostuff.helpers.agent.load_project_instructions import load_project_instructions
@@ -13,8 +15,19 @@ from dostuff.helpers.ui.emit import emit
 from dostuff.lib.memory import chroma
 
 
-def build_base_instructions() -> tuple[str, list[dict[str, Any]]]:
-    """(identity + skills + project instructions, the skills found). Built once per session."""
+def _background_wait(interactive: bool) -> str:
+    """How to wait for a background job: the TUI resumes the agent when one ends (unless
+    jobs.wake_on_end is off, then nothing is said); headless kills them at the end of the run."""
+    if not interactive:
+        return BACKGROUND_WAIT_HEADLESS
+    return BACKGROUND_WAIT_INTERACTIVE if get_config().jobs_wake_on_end else ""
+
+
+def build_base_instructions(interactive: bool = False) -> tuple[str, list[dict[str, Any]]]:
+    """(identity + skills + project instructions, the skills found). Built once per session.
+
+    `interactive`: the TUI, which wakes the agent when a background job ends; headless doesn't.
+    """
     skills = discover_skills()
     skills_summary = "\n\n".join(
         f"- name: {s['name']}\n  description: {s['description']}\n  location: {s['location']}"
@@ -24,6 +37,7 @@ def build_base_instructions() -> tuple[str, list[dict[str, Any]]]:
         dostuff_identity=load_identity(),
         skills_summary=skills_summary or "(none available)",
         memory_section=MEMORY_INSTRUCTIONS if chroma.chroma_available() else "",
+        background_wait=_background_wait(interactive),
     )
     project_instructions = load_project_instructions()
     if project_instructions:
