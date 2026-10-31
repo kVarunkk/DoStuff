@@ -177,3 +177,32 @@ def test_fork_copies_session_and_leaves_original(tmp_path):
             await store.close()
 
     asyncio.run(scenario())
+
+
+# --- subagents rebuild T1.3: sessions that used delegate_to_subagent still load and replay (CON-005) ---
+
+def test_pin_old_delegate_history_replays(tmp_path, fake_model):
+    from pathlib import Path
+
+    from dostuff.agent.loop import loop
+    snapshot = json.loads((Path(__file__).parent / "snapshots" / "old_delegate_session.json").read_text("utf-8"))
+
+    async def scenario():
+        store = SQLiteSessionStore(str(tmp_path / "sessions.db"))
+        try:
+            for step in snapshot:
+                await store.append("old", step)
+            assert await store.load("old") == snapshot
+            working = await store.load_working_history("old")
+            assert working == snapshot
+            result = await loop(session_id="old", turn_id="t", user_text="and logout?",
+                                dynamic_system_instruction="sys", mcp_client=object(),  # type: ignore[arg-type]
+                                working_history=working + [{"role": "user", "content": "and logout?"}],
+                                turn_type="interactive_loop", stream=False)
+        finally:
+            await store.close()
+        return result
+
+    assert asyncio.run(scenario()) == "done"
+    [call] = fake_model.calls
+    assert call["messages"][1:len(snapshot) + 1] == snapshot  # the old steps reach the model unchanged

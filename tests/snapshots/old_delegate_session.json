@@ -1,0 +1,30 @@
+[
+  {
+    "role": "user",
+    "content": "Where is auth handled?"
+  },
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "call_d1",
+        "type": "function",
+        "function": {
+          "name": "delegate_to_subagent",
+          "arguments": "{\"task\": \"Find where login tokens are checked\", \"role\": \"researcher\"}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_d1",
+    "name": "delegate_to_subagent",
+    "content": "Tokens are checked in auth/session.py:42 (verify_token)."
+  },
+  {
+    "role": "assistant",
+    "content": "Auth is handled in auth/session.py:42."
+  }
+]

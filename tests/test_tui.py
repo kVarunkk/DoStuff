@@ -2330,3 +2330,33 @@ def test_prompt_queue(tui, monkeypatch):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- subagents rebuild T1.3: a session that used delegate_to_subagent still renders on /resume ----
+
+def test_pin_old_delegate_history_renders(tui):
+    import json
+    cli_tui = tui
+    snapshot = json.loads((Path(__file__).parent / "snapshots" / "old_delegate_session.json").read_text("utf-8"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for step in snapshot:
+                await app.store.append("old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume old"))
+            await _until(pilot, lambda: app.session_id == "old", tries=200)
+            await pilot.pause(0.3)
+            texts = _texts(app)
+            idx = max(i for i, t in enumerate(texts) if "Where is auth handled?" in t)
+            resumed = texts[idx:]
+            assert any(t.startswith("● delegate_to_subagent(") for t in resumed)
+            assert any("auth/session.py:42 (verify_token)" in t for t in resumed)
+            agent_md = [w for w in app.query("#msg-container .msg-agent") if hasattr(w.content, "markup")]
+            assert any("Auth is handled in auth/session.py:42." in w.content.markup for w in agent_md)
+            assert not app.query("#msg-container .msg-error")
+            assert app.steps_history == snapshot
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

@@ -112,3 +112,154 @@ def registry(jobs_home):
     reg.kill_all_sync()
     leaked = [pid for pid in pids if not _pid_wait_dead(pid, 5)]
     assert not leaked, f"job processes still alive after teardown: {leaked}"
+
+
+# --- subagents (plan/2026-11-01-subagents/tasks.md) ---------------------------------------------
+
+def fake_response(text: str | None = None, tool_calls: list | None = None, usage=None):
+    """A non-streamed litellm response with one message."""
+    from types import SimpleNamespace
+    message = SimpleNamespace(content=text, tool_calls=tool_calls or None)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+
+
+def fake_tool_call(name: str, args: dict, call_id: str = "c1"):
+    import json
+    from types import SimpleNamespace
+    arguments = json.dumps(args)
+    tc = SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(name=name, arguments=arguments))
+    tc.model_dump = lambda: {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+    return tc
+
+
+class FakeStep:
+    """One scripted reply: wait for `gate` (if any), sleep `delay`, then return `response` (or raise it)."""
+
+    def __init__(self, response, delay: float = 0.0, gate=None):
+        self.response = response
+        self.delay = delay
+        self.gate = gate
+
+
+class FakeModel:
+    """Stands in for `litellm.acompletion`. Replies are scripted per agent: `script("[A]", …)` serves calls
+    whose first user message contains `[A]`, so parallel runs don't take each other's replies. Calls with no
+    matching marker take from `script(None, …)`, then get `"done"`. Every call is recorded in `calls`."""
+
+    def __init__(self):
+        self.scripts: dict[str | None, list[FakeStep]] = {}
+        self.calls: list[dict] = []
+
+    def script(self, marker: str | None, *steps) -> None:
+        self.scripts.setdefault(marker, []).extend(s if isinstance(s, FakeStep) else FakeStep(s) for s in steps)
+
+    def gate(self, marker: str | None, response):
+        """Script a reply held until the returned event is set."""
+        import asyncio
+        event = asyncio.Event()
+        self.script(marker, FakeStep(response, gate=event))
+        return event
+
+    def _marker(self, messages: list[dict]) -> str | None:
+        first_user = next((str(m.get("content") or "") for m in messages if m.get("role") == "user"), "")
+        return next((m for m in self.scripts if m is not None and m in first_user), None)
+
+    def calls_for(self, marker: str) -> list[dict]:
+        return [c for c in self.calls if self._marker(c["messages"]) == marker]
+
+    async def acompletion(self, **kwargs):
+        import asyncio
+        self.calls.append(kwargs)
+        queue = self.scripts.get(self._marker(kwargs["messages"])) or self.scripts.get(None) or []
+        step = queue.pop(0) if queue else FakeStep(fake_response("done"))
+        if step.gate is not None:
+            await step.gate.wait()
+        if step.delay:
+            await asyncio.sleep(step.delay)
+        if isinstance(step.response, BaseException):
+            raise step.response
+        return step.response
+
+
+@pytest.fixture
+def fake_model(monkeypatch):
+    """Fake the model for every agent (main and subagents); returns the `FakeModel`."""
+    from dostuff.agent import call_agent as call_agent_module
+    from dostuff.agent import loop as loop_module
+    model = FakeModel()
+    monkeypatch.setattr(call_agent_module, "acompletion", model.acompletion)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+    return model
+
+
+class FakeAdapter:
+    """A parent adapter. `ask` waits on a future the test resolves (`answer(i, value)`), unless `auto` is set;
+    prompts are recorded in order in `asks` as (title, future)."""
+
+    def __init__(self, auto=None):
+        import asyncio
+        self.events: list = []
+        self.asks: list = []
+        self.auto = auto
+        self._cancelled = False
+        self._cancel_event = asyncio.Event()
+
+    def emit(self, event_type, data):
+        self.events.append((event_type, data))
+
+    async def ask(self, message, **kwargs):
+        import asyncio
+        if self.auto is not None:
+            self.asks.append((message, None))
+            return self.auto
+        future = asyncio.get_running_loop().create_future()
+        self.asks.append((message, future))
+        return await future
+
+    async def ask_batch(self, messages, **kwargs):
+        return "each"
+
+    def answer(self, index: int, value) -> None:
+        self.asks[index][1].set_result(value)
+
+    def cancel(self):
+        self._cancelled = True
+        self._cancel_event.set()
+
+
+@pytest.fixture
+def agents(registry, monkeypatch):
+    """A fresh `AgentRegistry` (on top of a fresh jobs `registry`); teardown fails if any run's task is left."""
+    from dostuff.agent.subagents import registry as agents_module
+    from dostuff.tools.bash import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    reg = agents_module.AgentRegistry()
+    monkeypatch.setattr(agents_module, "_agent_registry", reg)
+    yield reg
+    leaked = [r.id for r in reg.runs() if r.task is not None and not r.task.done()]
+    assert not leaked, f"agent runs still running after the test: {leaked}"
+
+
+@pytest.fixture
+def agents_home(tmp_path, monkeypatch):
+    """A fake `~` with empty `.dostuff/agents` and `.claude/agents`, so tests never read the real ones."""
+    home = tmp_path / "home"
+    for folder in (".dostuff", ".claude"):
+        (home / folder / "agents").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    return home
+
+
+@pytest.fixture
+def _start_subagent(monkeypatch):
+    """`await _start_subagent(task, tools=…, isolation=…, adapter=…)`: start a subagent the way the main agent
+    does and return the tool result. The Phase 1 pins go through this one helper (tasks.md T1.x, T2.6)."""
+    from dostuff.tools.delegate_to_subagent import _impl_delegate_to_subagent
+
+    async def start(task: str, *, tools=None, isolation: str = "", adapter=None, permissions=None) -> str:
+        return await _impl_delegate_to_subagent(
+            task=task, role="pin", mcp_client=object(),  # type: ignore[arg-type]
+            session_id="s", turn_id="t", requested_tools=tools, adapter=adapter,
+            permissions=permissions, isolation=isolation,
+        )
+    return start
