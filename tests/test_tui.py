@@ -1573,7 +1573,9 @@ def test_bang_command_output_unchanged(tui, registry, monkeypatch, tmp_path, _py
             await _until(pilot, lambda: any("local tools only" in t for t in _texts(app)), tries=200)
             before = len(_texts(app))
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("!echo hi"))
-            await _until(pilot, lambda: app.steps_history and not app._turn_in_progress, tries=200)
+            # The loader's remove() lands a tick after the turn ends; wait for it too
+            await _until(pilot, lambda: app.steps_history and not app._turn_in_progress
+                         and not any(t.startswith("Running...") for t in _texts(app)), tries=200)
             # Snapshot taken with the pre-swap (pipe) run_shell
             assert _texts(app)[before:] == ["! echo hi", "  ⎿  hi"]
             assert app.steps_history[-1]["content"] == "<bash-input>echo hi</bash-input>\n<bash-output>\nhi\n</bash-output>"

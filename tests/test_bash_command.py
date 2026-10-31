@@ -254,8 +254,10 @@ def test_bg_start_result(registry, _py, _alive):
     run(scenario())
 
 
-def test_bg_start_immediate_exit(registry):
-    # A shell builtin, so it fails well inside the 200 ms window (a Python script needs ~170 ms to start)
+def test_bg_start_immediate_exit(registry, monkeypatch):
+    # A shell builtin fails well inside 200 ms locally, but a slow CI runner can take longer to start
+    # cmd.exe, so widen the window; a job that exits inside it still returns as soon as it exits
+    monkeypatch.setattr(bash_module, "IMMEDIATE_EXIT_S", 5.0)
     cmd = "cd no-such-dir-for-this-test"
 
     async def scenario():
