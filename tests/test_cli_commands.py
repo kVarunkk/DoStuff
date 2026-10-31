@@ -504,3 +504,32 @@ def test_headless_ctrl_c_kills_jobs(env, headless_jobs, _wait_dead):
     with pytest.raises(KeyboardInterrupt):
         asyncio.run(run_headless("serve", interactive=False, quiet=True))
     assert _wait_dead(started[-1].pid, 5) and started[-1].status == "killed"
+
+
+# --- subagents rebuild T2.7: parallel runs never ask on the terminal at the same time ----------------
+
+def test_headless_ask_lock(monkeypatch):
+    import asyncio
+    import builtins
+    import threading
+    import time
+
+    from dostuff.headless import HeadlessAdapter
+    log: list[str] = []
+    lock = threading.Lock()
+
+    def fake_input(prompt=""):
+        with lock:
+            log.append("enter")
+        time.sleep(0.1)
+        with lock:
+            log.append("exit")
+        return "y"
+    monkeypatch.setattr(builtins, "input", fake_input)
+    adapter = HeadlessAdapter(interactive=True, quiet=True)
+
+    async def go():
+        return await asyncio.gather(adapter.ask("[agent: a] Run x?"), adapter.ask("[agent: b] Run y?"))
+    replies = asyncio.run(go())
+    assert [r.answer for r in replies] == ["yes", "yes"]
+    assert log == ["enter", "exit", "enter", "exit"]

@@ -234,7 +234,7 @@ def test_episode_find_duplicate_list_and_delete():
 
 def test_memory_tools_registered_but_not_for_subagents():
     from dostuff.tools.definitions import TOOL_SCHEMAS
-    from dostuff.tools.delegate_to_subagent import resolve_subagent_tools
+    from dostuff.agent.subagents.run import resolve_subagent_tools
     assert "session_id" not in TOOL_SCHEMAS["save_episode"]["function"]["parameters"]["properties"]
     assert resolve_subagent_tools(["save_memory", "save_episode", "read_file"]) == (["read_file"], ["save_memory", "save_episode"])
 

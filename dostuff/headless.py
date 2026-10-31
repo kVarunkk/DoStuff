@@ -46,6 +46,7 @@ class HeadlessAdapter:
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.cost_usd: float | None = None  # None while no call had a known price
         self.denied_without_terminal = 0
+        self._ask_lock = asyncio.Lock()  # parallel subagents ask one at a time (subagents spec D6)
 
     def _progress(self, text: str) -> None:
         if not self._quiet:
@@ -101,9 +102,10 @@ class HeadlessAdapter:
             self.denied_without_terminal += 1
             self._progress(f"✗ Denied (no terminal to ask): {message.splitlines()[0] if message else ''}")
             return ApprovalReply("no", feedback="Running non-interactively (dostuff -p); nobody can approve this call.")
-        _err(f"⚠ {message}")
-        choices = "[y]es / [a]lways" if always_label else "[y]es"
-        answer = await asyncio.to_thread(input, f"Allow? {choices} / [N]o: ")
+        async with self._ask_lock:
+            _err(f"⚠ {message}")
+            choices = "[y]es / [a]lways" if always_label else "[y]es"
+            answer = await asyncio.to_thread(input, f"Allow? {choices} / [N]o: ")
         reply = parse_answer(answer)
         return ApprovalReply("yes" if reply == "always" and not always_label else reply)
 

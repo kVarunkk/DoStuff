@@ -1,9 +1,11 @@
-"""delegate_to_subagent wiring (REQ-2.1 – 2.4)."""
+"""Subagent wiring through the `agent` tool (REQ-2.1 – 2.4; subagents rebuild pins)."""
 import asyncio
 from types import SimpleNamespace
 
 from dostuff.agent import call_agent as call_agent_module
-from dostuff.tools.delegate_to_subagent import _impl_delegate_to_subagent, resolve_subagent_tools
+from dostuff.agent.subagents.definitions import BUILTIN_TYPES, AgentDef
+from dostuff.agent.subagents.run import resolve_subagent_tools
+from dostuff.tools.agent import agent
 
 from conftest import FakeStep, fake_response, fake_tool_call
 
@@ -21,13 +23,17 @@ def _run(monkeypatch, requested_tools=None, adapter=None):
         return _fake_response("done")
 
     monkeypatch.setattr(call_agent_module, "acompletion", fake_acompletion)
-    result = asyncio.run(_impl_delegate_to_subagent(
-        task="Summarize README.md",
-        role="researcher",
+    agent_type = "general-purpose"
+    if requested_tools is not None:
+        monkeypatch.setitem(BUILTIN_TYPES, "custom", AgentDef("custom", "d", tools=tuple(requested_tools)))
+        agent_type = "custom"
+    result = asyncio.run(agent(
+        description="researcher",
+        prompt="Summarize README.md",
         mcp_client=object(),  # type: ignore[arg-type]
         session_id="s",
         turn_id="t",
-        requested_tools=requested_tools,
+        subagent_type=agent_type,
         adapter=adapter,
     ))
     return result, captured
@@ -38,10 +44,10 @@ def _tool_names(captured) -> set[str]:
 
 
 def test_tools_exclude_restricted(monkeypatch):
-    result, captured = _run(monkeypatch, ["read_file", "delegate_to_subagent", "delete_file", "bash_command"])
+    result, captured = _run(monkeypatch, ["read_file", "agent", "delete_file", "bash_command"])
     # bash_command brings its job tools along (background shell spec D10)
     assert _tool_names(captured) == {"read_file", "bash_command", "bash_output", "kill_shell"}
-    assert "delegate_to_subagent" in result and "delete_file" in result  # warning returned to the parent
+    assert "agent" in result and "delete_file" in result  # warning returned to the parent
 
 
 def test_default_tools_all_exist(monkeypatch):
@@ -49,7 +55,7 @@ def test_default_tools_all_exist(monkeypatch):
     assert not dropped
     _, captured = _run(monkeypatch)
     assert _tool_names(captured) == set(allowed)
-    assert "delegate_to_subagent" not in _tool_names(captured)
+    assert "agent" not in _tool_names(captured)
     assert "delete_file" not in _tool_names(captured)
 
 
@@ -82,7 +88,7 @@ def test_output_routed_through_parent_adapter(monkeypatch):
 
     _run(monkeypatch, adapter=Parent())
     # no tool calls in this fake run, but the cancel state was read through the wrapper without error
-    assert all(not isinstance(d, str) or d.startswith("[subagent: researcher]") for k, d in events if k != "usage")
+    assert all(not isinstance(d, str) or d.startswith("[agent: researcher]") for k, d in events if k != "usage")
 
 
 # --- background shell T5.3: a subagent's jobs die with it --------------------------------------

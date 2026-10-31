@@ -37,11 +37,11 @@ from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_
 TOOL_TIMEOUT_S = 120.0
 RETRY_BASE_DELAY_S = 1.0
 CANCELLED_RUNNING_RESULT = "Cancelled by user (may still be running)"
-# Read-only tools that must still run one at a time (a subagent may prompt for approval)
-_SEQUENTIAL_READ_TOOLS = frozenset({"delegate_to_subagent"})
+CANCELLED_TURN = "Cancelled by user."  # what loop() returns when the user cancelled
+MODEL_ERROR_PREFIX = "Model call failed: "  # what loop() returns, + the error, when the model call failed
 # Tools exempt from TOOL_TIMEOUT_S: a subagent is bounded by its iteration cap, each of its own
 # tool calls has the normal timeout, and its approval prompts must not count against a deadline
-_UNTIMED_TOOLS = frozenset({"delegate_to_subagent"})
+_UNTIMED_TOOLS = frozenset({"agent"})
 
 _RETRYABLE_ERRORS: tuple[type[BaseException], ...] = (
     litellm.RateLimitError, litellm.Timeout, litellm.APIConnectionError,
@@ -132,7 +132,7 @@ def _call_label(call: _ToolCall) -> str:
 
 def _runs_in_parallel(name: str) -> bool:
     spec = TOOL_MAP.get(name)
-    return spec is not None and spec.kind == "read" and name not in _SEQUENTIAL_READ_TOOLS
+    return spec is not None and spec.kind == "read"
 
 
 def _is_thread_tool(name: str) -> bool:
@@ -255,7 +255,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 iter_span.set_attribute("iteration_number", iteration)
 
                 if await check_cancelled():
-                    return "Cancelled by user."
+                    return CANCELLED_TURN
 
                 # Background jobs of this run that ended since the last model call (spec D7)
                 notices = get_registry().drain_notices(owner)
@@ -308,12 +308,12 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         await loop_emit("error", f"Model call failed: {e}", adapter=adapter)
                         turn_span.set_attribute("outcome", "model_error")
                         turn_span.set_status(Status(StatusCode.ERROR, str(e)))
-                        return f"Model call failed: {e}"
+                        return f"{MODEL_ERROR_PREFIX}{e}"
 
                 if await check_cancelled():
-                    return "Cancelled by user."
+                    return CANCELLED_TURN
                 if interaction is None:
-                    return "Cancelled by user."
+                    return CANCELLED_TURN
 
                 usage_dict = None
                 usage = getattr(interaction, "usage", None)
@@ -507,7 +507,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
 
                 if cancelled or is_cancelled(adapter):
                     await check_cancelled()
-                    return "Cancelled by user."
+                    return CANCELLED_TURN
 
                 if context_token_threshold is not None and current_context_tokens > context_token_threshold:
                     await compact("Token threshold exceeded.", keep_recent_token_budget)
@@ -517,4 +517,4 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             turn_span.set_attribute("outcome", "max_iterations_exceeded")
             turn_span.set_status(Status(StatusCode.ERROR, "max_iterations_exceeded"))
             return msg
-    return "Cancelled by user."
+    return CANCELLED_TURN

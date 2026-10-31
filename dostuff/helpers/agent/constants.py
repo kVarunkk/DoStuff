@@ -90,10 +90,10 @@ You can help with a wide range of tasks using the tools and skills available to 
   need to read dostuff's own source to use it.
 
 {memory_section}## Delegating to subagents
-- `delegate_to_subagent` runs a bounded, multi-step task (e.g. investigating several files) in an
-  isolated loop and returns its report. Do not delegate single tool calls or questions for the user.
-- The subagent cannot see this conversation: put every path, constraint and goal in `task`, and
-  request only the tools it needs. Subagents cannot delegate further.
+- `agent` runs a bounded, multi-step task (e.g. investigating several files) in an isolated loop and
+  returns its report. Do not delegate single tool calls or questions for the user.
+- The subagent cannot see this conversation: put every path, constraint and goal in `prompt`.
+  Subagents cannot start agents themselves.
 - For a subagent that writes files, pass `isolation="worktree"` (git repos only) so it works in its
   own checkout of HEAD; then review its changes and bring over what the user wants.
 

@@ -117,7 +117,7 @@ def test_settings_changes_ask_in_every_mode_without_always(home):
 
 
 def test_settings_tools_are_not_given_to_subagents():
-    from dostuff.tools.delegate_to_subagent import resolve_subagent_tools
+    from dostuff.agent.subagents.run import resolve_subagent_tools
     allowed, dropped = resolve_subagent_tools(["read_file", "edit_config", "set_mcp_server", "read_settings"])
     assert allowed == ["read_file"]
     assert set(dropped) == {"edit_config", "set_mcp_server", "read_settings"}

@@ -37,7 +37,7 @@ class HookOutcome:
 
 def hook_line(data: dict[str, Any]) -> str:
     """How a `hook` event reads in the TUI and on headless stderr: `⚓ PreToolUse bash_command → deny (reason)`."""
-    prefix = f"[subagent: {data['subagent']}] " if data.get("subagent") else ""
+    prefix = f"[agent: {data['subagent']}] " if data.get("subagent") else ""
     target = f" {data['tool']}" if data.get("tool") else ""
     reason = f" ({data['reason']})" if data.get("reason") else ""
     return f"{prefix}⚓ {data.get('event', '')}{target} → {data.get('decision', '')}{reason}"

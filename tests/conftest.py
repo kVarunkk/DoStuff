@@ -253,13 +253,34 @@ def agents_home(tmp_path, monkeypatch):
 @pytest.fixture
 def _start_subagent(monkeypatch):
     """`await _start_subagent(task, tools=…, isolation=…, adapter=…)`: start a subagent the way the main agent
-    does and return the tool result. The Phase 1 pins go through this one helper (tasks.md T1.x, T2.6)."""
-    from dostuff.tools.delegate_to_subagent import _impl_delegate_to_subagent
+    does and return the tool result, without the `agent_id` footer. The Phase 1 pins go through this one helper
+    (tasks.md T1.x, T2.6); `tools` registers a `pin` type with that tool list."""
+    from dostuff.agent.subagents.definitions import BUILTIN_TYPES, AgentDef
+    from dostuff.tools.agent import FOOTER, agent
 
     async def start(task: str, *, tools=None, isolation: str = "", adapter=None, permissions=None) -> str:
-        return await _impl_delegate_to_subagent(
-            task=task, role="pin", mcp_client=object(),  # type: ignore[arg-type]
-            session_id="s", turn_id="t", requested_tools=tools, adapter=adapter,
-            permissions=permissions, isolation=isolation,
+        agent_type = "general-purpose"
+        if tools is not None:
+            monkeypatch.setitem(BUILTIN_TYPES, "pin", AgentDef(name="pin", description="pin", tools=tuple(tools)))
+            agent_type = "pin"
+        result = await agent(
+            description="pin", prompt=task, mcp_client=object(),  # type: ignore[arg-type]
+            session_id="s", turn_id="t", subagent_type=agent_type, isolation=isolation, adapter=adapter,
+            permissions=permissions,
         )
+        body, sep, footer = result.rpartition("\n\n" + FOOTER.split("{")[0])
+        return body if sep else result  # errors have no footer
     return start
+
+
+@pytest.fixture
+def agent_type(monkeypatch):
+    """`agent_type("rev", tools=["read_file"])`: register an agent type for this test only."""
+    from dostuff.agent.subagents.definitions import BUILTIN_TYPES, AgentDef
+
+    def register(name: str, *, tools=None, prompt: str = "", model: str = "inherit", description: str = "test type"):
+        agent_def = AgentDef(name=name, description=description, prompt=prompt,
+                             tools=tuple(tools) if tools is not None else None, model=model, source="test")
+        monkeypatch.setitem(BUILTIN_TYPES, name, agent_def)
+        return agent_def
+    return register

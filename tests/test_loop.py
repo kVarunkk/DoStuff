@@ -173,12 +173,12 @@ def test_cancel_keeps_completed_results(monkeypatch):
     adapter = Adapter()
     calls = [
         _tc("read_file", json.dumps({"path": "fast"}), "c1"),
-        _tc("delegate_to_subagent", json.dumps({"task": "t", "role": "r"}), "c2"),
+        _tc("agent", json.dumps({"description": "d", "prompt": "t"}), "c2"),
     ]
     monkeypatch.setattr(loop_module, "authorize_tool", lambda *a, **k: _none())
 
     async def slow_dispatch(name, args, **kw):
-        if name == "delegate_to_subagent":
+        if name == "agent":
             adapter._cancelled = True
             await asyncio.sleep(5)
         return f"read {args.get('path')}"

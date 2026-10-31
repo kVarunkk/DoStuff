@@ -13,7 +13,7 @@ from dostuff.lib import checkpoints as checkpoints_module
 from dostuff.lib import model as model_module
 from dostuff.lib.checkpoints import CheckpointStore
 from dostuff.tools.definitions import TOOL_SCHEMAS
-from dostuff.tools.delegate_to_subagent import resolve_subagent_tools
+from dostuff.agent.subagents.run import resolve_subagent_tools
 from dostuff.tools.todo_write import get_todos, todo_write
 
 

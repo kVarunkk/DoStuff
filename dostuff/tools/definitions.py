@@ -3,10 +3,10 @@ from typing import Any, Callable
 
 from dostuff.agent.permissions import ToolKind
 from dostuff.helpers.tools.generate_tool_schema import generate_litellm_tool_schema
+from dostuff.tools.agent import agent
 from dostuff.tools.bash.bash_command import bash_command, select_shell
 from dostuff.tools.bash.bash_output import bash_output
 from dostuff.tools.bash.kill_shell import kill_shell
-from dostuff.tools.delegate_to_subagent import _impl_delegate_to_subagent
 from dostuff.tools.files.delete_file import delete_file
 from dostuff.tools.files.edit_file import edit_file
 from dostuff.tools.files.list_files import list_files
@@ -70,13 +70,8 @@ _TOOLS = [
     ToolSpec("search_mcp_tools", _impl_search_mcp_tools, "read", frozenset({"mcp_client"})),
     ToolSpec("get_mcp_tool_details", _impl_get_mcp_tool_details, "read", frozenset({"mcp_client"})),
     ToolSpec("call_mcp_tool", _impl_call_mcp_tool, "mcp", frozenset({"mcp_client"})),
-    # Delegation itself never asks: the subagent's own tool calls go through the permission layer.
-    ToolSpec(
-        "delegate_to_subagent",
-        _impl_delegate_to_subagent,
-        "read",
-        frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions"}),
-    ),
+    # Starting an agent never asks: the agent's own tool calls go through the permission layer (REQ-1.5)
+    ToolSpec("agent", agent, "read", frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions"})),
     # dostuff's own config.yaml and MCP servers; changes ask in every mode (permissions.py)
     ToolSpec("read_settings", read_settings, "read"),
     ToolSpec("edit_config", edit_config, "settings", frozenset({"adapter"})),

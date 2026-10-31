@@ -329,7 +329,7 @@ def test_mode_cycle():
 
 def test_bg_tools_registered():
     from dostuff.tools.definitions import TOOL_MAP, default_tool_names
-    from dostuff.tools.delegate_to_subagent import resolve_subagent_tools
+    from dostuff.agent.subagents.run import resolve_subagent_tools
     for name in ("bash_output", "kill_shell"):
         assert TOOL_MAP[name].kind == "read" and TOOL_MAP[name].injected == frozenset({"owner"})
         assert name in default_tool_names()

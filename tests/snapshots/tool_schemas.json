@@ -1,4 +1,44 @@
 {
+  "agent": {
+    "function": {
+      "description": "Start a subagent: a separate agent loop that works on one task with its own tools and returns a report.",
+      "name": "agent",
+      "parameters": {
+        "properties": {
+          "description": {
+            "description": "3-5 words saying what the agent does, shown to the user (e.g. \"find auth code\").",
+            "type": "string"
+          },
+          "isolation": {
+            "description": "\"worktree\" runs the agent in a new git worktree (a separate checkout of HEAD on its own branch), so its file changes don't touch the working tree. Use it for agents that write files. It does not see uncommitted changes. If it changes nothing the worktree is removed; otherwise the result says where the changes are. Leave empty to work in the project directory.",
+            "type": "string"
+          },
+          "model": {
+            "description": "A model for this agent: an alias from agents.models or a full model name. Empty uses the type's model, which by default is the session's.",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "The task. The agent cannot see this conversation, so include every path, constraint and goal it needs, and say what its report should contain.",
+            "type": "string"
+          },
+          "run_in_background": {
+            "description": "Not available yet; leave false.",
+            "type": "boolean"
+          },
+          "subagent_type": {
+            "description": "Which agent type to start; the system prompt lists them.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "description",
+          "prompt"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
   "bash_command": {
     "function": {
       "description": "Run a shell command and return its output as a single string.\n\nThe shell is not sandboxed: commands that are not read-only require user approval.\nCommands get no stdin and are killed when they time out, so never run interactive or\nlong-running programs (servers, GUI apps, watchers) in the foreground: start them with\nrun_in_background=true, then read their output with bash_output and stop them with kill_shell.\n\nCommands run in <shell>.",
@@ -84,48 +124,6 @@
         "required": [
           "name",
           "arguments"
-        ],
-        "type": "object"
-      }
-    },
-    "type": "function"
-  },
-  "delegate_to_subagent": {
-    "function": {
-      "description": "Executes a subagent task in an isolated context loop.",
-      "name": "delegate_to_subagent",
-      "parameters": {
-        "properties": {
-          "isolation": {
-            "description": "\"worktree\" runs the subagent in a new git worktree (a separate checkout of HEAD on its own branch), so its file changes don't touch the working tree. Use it for subagents that write files. It does not see uncommitted changes. If it changes nothing the worktree is removed; otherwise the result says where the changes are. Leave empty to work in the project directory.",
-            "type": "string"
-          },
-          "requested_tools": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "List of tool names the subagent may use. If omitted, defaults to read-only tools. delegate_to_subagent and delete_file are never granted."
-          },
-          "role": {
-            "description": "Role framing descriptor used to specialize the subagent's system prompt.",
-            "type": "string"
-          },
-          "task": {
-            "description": "Self-contained instructions detailing what the subagent must accomplish.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "task",
-          "role"
         ],
         "type": "object"
       }

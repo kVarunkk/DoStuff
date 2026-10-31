@@ -2360,3 +2360,44 @@ def test_pin_old_delegate_history_renders(tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- subagents rebuild T2.7: the input stays responsive while agents run (CON-004) ----------------
+
+def test_tui_responsive_during_agents(tui, monkeypatch, fake_model):
+    import time
+    cli_tui = tui
+    from conftest import fake_response
+    from dostuff.agent.subagents import registry as agents_module
+    reg = agents_module.AgentRegistry()
+    monkeypatch.setattr(agents_module, "_agent_registry", reg)
+    gates: list = []
+
+    async def agents_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                          current_session_history, steps_history, store, adapter=None, **kwargs):
+        runs = [await reg.start(owner=session_id, agent_type="general-purpose", description=f"a{m}",
+                                prompt=f"[{m}] x", adapter=adapter, turn_id=turn_id) for m in "AB"]
+        await asyncio.gather(*(r.done for r in runs))
+        return "done"
+    monkeypatch.setattr(cli_tui, "agent_loop", agents_loop)
+
+    async def scenario():
+        gates.extend(fake_model.gate(f"[{m}]", fake_response(f"r{m}")) for m in "AB")
+        app = cli_tui.DostuffTUI(session_id="responsive")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("go"))
+            await _until(pilot, lambda: len([r for r in reg.runs() if r.status == "running"]) == 2)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            inp.focus()
+            start = time.monotonic()
+            await pilot.press("a", "b", "c")
+            await _until(pilot, lambda: inp.text == "abc")
+            assert time.monotonic() - start < 0.2 * 3 + 0.5  # three keypresses, each well under 0.2 s
+            assert all(r.status == "running" for r in reg.runs())
+            for gate in gates:
+                gate.set()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

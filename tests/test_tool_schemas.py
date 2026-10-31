@@ -68,7 +68,16 @@ def test_call_mcp_tool_arguments_is_object():
 
 
 def test_requested_tools_is_nullable_string_array():
-    prop = TOOL_SCHEMAS["delegate_to_subagent"]["function"]["parameters"]["properties"]["requested_tools"]
+    from dostuff.helpers.tools.generate_tool_schema import generate_litellm_tool_schema
+
+    def pick(requested_tools: list[str] | None = None) -> str:
+        """Pick tools.
+
+        Args:
+            requested_tools: Tool names.
+        """
+        return ""
+    prop = generate_litellm_tool_schema(pick, name="pick")["function"]["parameters"]["properties"]["requested_tools"]
     assert {"type": "array", "items": {"type": "string"}} in prop["anyOf"]
     assert {"type": "null"} in prop["anyOf"]
 

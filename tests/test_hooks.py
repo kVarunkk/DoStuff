@@ -1292,12 +1292,14 @@ def test_subagent_events(home, tmp_path, monkeypatch):
     assert events_module.stop_event_for("subagent_loop") == "SubagentStop"
     assert events_module.stop_event_for("interactive_loop") == "Stop"
 
-    # hook lines from a subagent carry its role, like the rest of its output
-    from dostuff.tools.delegate_to_subagent import _SubagentAdapter
+    # hook lines from a subagent carry its description, like the rest of its output
+    from dostuff.agent.subagents.adapter import SubagentAdapter
+    from dostuff.agent.subagents.registry import AgentRun
     parent = ScriptedAdapter()
-    _SubagentAdapter(parent, "reviewer").emit("hook", {"event": "PreToolUse", "tool": "bash_command",
-                                                       "decision": "deny", "reason": "no"})
-    assert hook_line(parent.events[0][1]) == "[subagent: reviewer] ⚓ PreToolUse bash_command → deny (no)"
+    run = AgentRun(id="a1b2c3", owner="s", agent_type="general-purpose", description="reviewer", model="m")
+    SubagentAdapter(parent, run).emit("hook", {"event": "PreToolUse", "tool": "bash_command",
+                                               "decision": "deny", "reason": "no"})
+    assert hook_line(parent.events[0][1]) == "[agent: reviewer] ⚓ PreToolUse bash_command → deny (no)"
 
 
 # --- T3.4 -------------------------------------------------------------------------------------
