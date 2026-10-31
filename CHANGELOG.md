@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-11-01
+
+Background shell jobs: start long-running commands, read their output, stop them, and move a running command to the background with Ctrl+B.
+
+### Added
+- **Background jobs**: `bash_command(run_in_background=true, background_id=…)` starts a job and returns its id, pid and log paths. Ids are case-folded `[a-z0-9][a-z0-9._-]{0,31}`, otherwise `bg-<n>`; at most 8 running background jobs per owner. A job that exits within 200 ms is reported as `exited immediately with code N` with its first stderr lines.
+- **`bash_output(background_id, filter, wait_for, timeout)`** returns new stdout / stderr since the last read; `wait_for` waits (1–110 s) for a matching line or the job's exit instead of sleeping. **`kill_shell(background_id)`** kills the process tree and returns the last 20 lines per stream. Both are read tools, available to subagents that have `bash_command`.
+- **Completion notices**: a background job that ends on its own, or is stopped by the user, is reported to its owner as a `<background-job …>` message before the next model call, and shown in the TUI as `⚙ job "test" exited (1) after 42s` (with a terminal notification when the window is in the background). When the TUI is idle it resumes the agent for it (`jobs.wake_on_end`, default on, at most 3 turns in a row without a user message).
+- **Ctrl+B** moves the running turn's shell calls (main agent and subagents) to the background; the call returns the output so far and the job id. `!command` is never moved.
+- **`/jobs`** lists the session's background jobs; `/jobs <id>` shows the last 40 lines of each stream and the log paths; `/jobs kill <id>` stops one. Running jobs also show as `⚙ 2 background jobs · ↓ or click to view` under the input, which opens a picker to view or stop them.
+- **Lifecycle**: jobs are owner-scoped. A subagent's jobs are killed when it ends, headless `-p` kills every job at the end and on Ctrl+C, and the TUI confirms before `/clear`, `/resume` or quit stops them. Logs live in `~/.dostuff/jobs/<session>/` and are pruned after 7 days; at startup the TUI warns about jobs an earlier session never marked ended.
+
+### Changed
+- Every shell command runs as a job writing to log files, so `cmd &` returns as soon as the shell exits (the 2 s drain grace and the "Output capture stopped" note are gone). Timeout and Esc still kill the whole process tree.
+- **Config edits on disk apply without a reload**: a changed user or project `config.yaml` is reloaded at the start of each turn and before each hook dispatch, so a hook removed with an editor or a shell command stops running without `/hooks r` or a restart. YAML that doesn't parse keeps the loaded config.
+- The `jobs` status-bar item is retired in favour of the jobs line; it is still accepted without a warning.
+- The system prompt describes `run_in_background`, `bash_output`, `kill_shell` and `<background-job>` messages instead of `nohup` / `&` advice.
+
+### Fixed
+- Esc on a running `!command` showed `Shell error: Result is not set.` instead of `Cancelled (process killed)`.
+
+### Documentation
+- README "Background jobs" section (tools, notices, Ctrl+B, `/jobs`, logs, lifecycle table, hard-crash caveat), plus `bash_output` / `kill_shell` in the tools table and `jobs.wake_on_end` in `templates/config.example.yaml`.
+
 ## [0.2.4] - 2026-10-30
 
 Hooks: run your own commands on agent events, with Claude Code's contract.
