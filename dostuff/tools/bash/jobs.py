@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Literal
 
+from dostuff.helpers.agent.notices import NoticeQueue, get_notice_queue
 from dostuff.helpers.tools.project_root import project_root
 from dostuff.tools.bash import bash_command as _bash  # select_shell / _detach_kwargs, looked up per call
 
@@ -145,6 +146,7 @@ class Notice:
     killed_by: KilledBy | None
     stdout_tail: list[str]
     stderr_tail: list[str]
+    kind: Literal["job"] = "job"
 
 
 def clamp_wait_timeout(timeout: object) -> float:
@@ -161,13 +163,17 @@ def _kill_argv(pid: int) -> list[str] | None:
 
 
 class JobRegistry:
-    def __init__(self) -> None:
+    def __init__(self, notices: NoticeQueue | None = None) -> None:
         self._jobs: dict[tuple[str, str], Job] = {}
         self._counters: dict[str, int] = {}
-        self._notices: dict[str, list[Notice]] = {}
+        self._own_notices = notices  # None: the process-wide queue shared with background agents (subagents D7)
         self._listeners: list[Callable[[Job, JobEvent], None]] = []
         self._roles: dict[str, str] = {}  # subagent owner -> role, for /jobs
         self._atexit_registered = False
+
+    @property
+    def _notices(self) -> NoticeQueue:
+        return self._own_notices if self._own_notices is not None else get_notice_queue()
 
     # --- listeners (loop `job` events, the TUI status bar) ------------------------------------
 
@@ -208,8 +214,7 @@ class JobRegistry:
             del self._jobs[(old_owner, job.id)]
             job.owner = new_owner
             self._jobs[(new_owner, job.id)] = job
-        if old_owner in self._notices:
-            self._notices.setdefault(new_owner, []).extend(self._notices.pop(old_owner))
+        self._notices.transfer(old_owner, new_owner)
         # never reuse a bg-<n> the jobs already carry
         self._counters[new_owner] = max(self._counters.get(new_owner, 0), self._counters.get(old_owner, 0))
         if moved:
@@ -304,7 +309,7 @@ class JobRegistry:
         job.status = "killed" if job.killed_by else "exited"
         job._exited.set()
         if not job.foreground and job.killed_by in (None, "user"):
-            self._notices.setdefault(job.owner, []).append(Notice(
+            self._notices.put(job.owner, Notice(
                 id=job.id, status=job.status, code=code, runtime=job.runtime, killed_by=job.killed_by,
                 stdout_tail=_tail(job.out_path, NOTICE_TAIL_LINES),
                 stderr_tail=_tail(job.err_path, NOTICE_TAIL_LINES),
@@ -524,17 +529,16 @@ class JobRegistry:
     # --- notices ----------------------------------------------------------------------------
 
     def drain_notices(self, owner: str) -> list[Notice]:
-        return self._notices.pop(owner, [])
+        """The owner's job notices; agent notices in the shared queue stay."""
+        return self._notices.drain(owner, "job")
 
     def pending_notices(self, owner: str) -> list[Notice]:
-        """The owner's queued notices, left in place for the loop to drain (the TUI's idle wake-up, D15)."""
-        return list(self._notices.get(owner, []))
+        """The owner's queued job notices, left in place for the loop to drain (the TUI's idle wake-up, D15)."""
+        return self._notices.pending(owner, "job")
 
     def discard_notices(self, owner: str, job: Job) -> None:
         """Drop queued notices for `job` (its start result already reported how it ended)."""
-        queue = self._notices.get(owner)
-        if queue:
-            queue[:] = [n for n in queue if n.id != job.id]
+        self._notices.discard(owner, lambda n: n.kind == "job" and n.id == job.id)
 
 
 def indent_block(lines: list[str]) -> str:

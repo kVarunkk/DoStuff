@@ -4,7 +4,7 @@ from typing import Any
 
 from dostuff.helpers.agent.loop_emit import loop_emit
 from dostuff.helpers.hooks import trust
-from dostuff.helpers.hooks.load_hooks import TOOL_EVENTS, HookEntry
+from dostuff.helpers.hooks.load_hooks import AGENT_EVENTS, TOOL_EVENTS, HookEntry
 from dostuff.helpers.hooks.run_hook import FAILED_REASON, Decision, HookResult, run_hook
 
 SHELL_TOOLS = ("bash_command",)  # the tools an `if` pattern is searched in (tool_input.command)
@@ -75,8 +75,10 @@ def _matches(entry: HookEntry, payload: dict[str, Any]) -> bool:
         target = payload.get("tool_name")
     elif event == "SessionStart":
         target = payload.get("source")
+    elif event in AGENT_EVENTS:
+        target = payload.get("agent_type")
     else:
-        return True  # UserPromptSubmit / Stop / SubagentStop have nothing to match against
+        return True  # UserPromptSubmit / Stop have nothing to match against
     if entry.matcher_re is not None and not entry.matcher_re.fullmatch(str(target)):
         return False
     if entry.if_re is not None and payload.get("tool_name") in SHELL_TOOLS:

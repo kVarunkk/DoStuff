@@ -4,6 +4,9 @@ from typing import Any, Callable
 from dostuff.agent.permissions import ToolKind
 from dostuff.helpers.tools.generate_tool_schema import generate_litellm_tool_schema
 from dostuff.tools.agent import agent
+from dostuff.tools.create_agent_type import create_agent_type
+from dostuff.tools.send_message import send_message
+from dostuff.tools.stop_agent import stop_agent
 from dostuff.tools.bash.bash_command import bash_command, select_shell
 from dostuff.tools.bash.bash_output import bash_output
 from dostuff.tools.bash.kill_shell import kill_shell
@@ -26,7 +29,8 @@ from dostuff.tools.web_fetch import web_fetch
 from dostuff.tools.web_search import web_search
 
 # Parameters the harness supplies; never exposed to (or accepted from) the model.
-HARNESS_PARAMS = frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions", "owner"})
+HARNESS_PARAMS = frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions", "owner",
+                            "fork_context"})
 
 
 @dataclass(frozen=True)
@@ -71,7 +75,14 @@ _TOOLS = [
     ToolSpec("get_mcp_tool_details", _impl_get_mcp_tool_details, "read", frozenset({"mcp_client"})),
     ToolSpec("call_mcp_tool", _impl_call_mcp_tool, "mcp", frozenset({"mcp_client"})),
     # Starting an agent never asks: the agent's own tool calls go through the permission layer (REQ-1.5)
-    ToolSpec("agent", agent, "read", frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions"})),
+    # fork_context: what a fork inherits from the main loop (spec D11)
+    ToolSpec("agent", agent, "read",
+             frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions", "fork_context"})),
+    ToolSpec("send_message", send_message, "read",
+             frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions", "fork_context"})),
+    ToolSpec("stop_agent", stop_agent, "read", frozenset({"session_id"})),
+    # Writes an agent file (a system prompt + a tool grant): a settings change, asks in every mode
+    ToolSpec("create_agent_type", create_agent_type, "settings"),
     # dostuff's own config.yaml and MCP servers; changes ask in every mode (permissions.py)
     ToolSpec("read_settings", read_settings, "read"),
     ToolSpec("edit_config", edit_config, "settings", frozenset({"adapter"})),

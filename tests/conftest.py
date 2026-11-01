@@ -103,9 +103,12 @@ def jobs_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def registry(jobs_home):
-    """A fresh `JobRegistry`; teardown kills what is left and fails if any job process survives."""
+def registry(jobs_home, monkeypatch):
+    """A fresh `JobRegistry` on a fresh notice queue; teardown kills what is left and fails if any job process
+    survives."""
+    from dostuff.helpers.agent import notices
     from dostuff.tools.bash.jobs import JobRegistry
+    monkeypatch.setattr(notices, "_queue", notices.NoticeQueue())
     reg = JobRegistry()
     yield reg
     pids = [j.pid for j in reg.jobs()]
@@ -130,6 +133,9 @@ def fake_tool_call(name: str, args: dict, call_id: str = "c1"):
     tc = SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(name=name, arguments=arguments))
     tc.model_dump = lambda: {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
     return tc
+
+
+FORK_DIRECTIVE_START = "You are a fork of the main agent"  # dostuff.agent.subagents.fork.FORK_DIRECTIVE
 
 
 class FakeStep:
@@ -161,7 +167,9 @@ class FakeModel:
         return event
 
     def _marker(self, messages: list[dict]) -> str | None:
-        first_user = next((str(m.get("content") or "") for m in messages if m.get("role") == "user"), "")
+        users = [str(m.get("content") or "") for m in messages if m.get("role") == "user"]
+        # A fork's history starts with the main agent's; its own task is the step with the fork directive
+        first_user = next((u for u in users if u.startswith(FORK_DIRECTIVE_START)), users[0] if users else "")
         return next((m for m in self.scripts if m is not None and m in first_user), None)
 
     def calls_for(self, marker: str) -> list[dict]:
@@ -278,9 +286,11 @@ def agent_type(monkeypatch):
     """`agent_type("rev", tools=["read_file"])`: register an agent type for this test only."""
     from dostuff.agent.subagents.definitions import BUILTIN_TYPES, AgentDef
 
-    def register(name: str, *, tools=None, prompt: str = "", model: str = "inherit", description: str = "test type"):
+    def register(name: str, *, tools=None, prompt: str = "", model: str = "inherit", description: str = "test type",
+                 max_iterations=None):
         agent_def = AgentDef(name=name, description=description, prompt=prompt,
-                             tools=tuple(tools) if tools is not None else None, model=model, source="test")
+                             tools=tuple(tools) if tools is not None else None, model=model, source="test",
+                             max_iterations=max_iterations)
         monkeypatch.setitem(BUILTIN_TYPES, name, agent_def)
         return agent_def
     return register

@@ -1,7 +1,7 @@
 import litellm
 from dostuff.config import get_config
 from dostuff.helpers.models.opencode import context_window, is_opencode
-from dostuff.lib.model import get_litellm_model, get_model
+from dostuff.lib.model import get_litellm_model, get_model, get_provider
 
 FALLBACK_CONTEXT_WINDOW = 128_000
 _warned_models: set[str] = set()
@@ -25,12 +25,12 @@ def get_model_token_limit() -> int:
     different window on each gateway.
     """
     configured = get_config().context_window
-    if configured > 0:
+    if configured > 0 and get_model() == get_config().model_name:  # it describes the main model, not a subagent's
         return configured
-    opencode = is_opencode(get_config().provider)
+    opencode = is_opencode(get_provider())
     if opencode:
         model_id = get_model().split("/", 1)[-1]
-        known = context_window(get_config().provider, model_id)
+        known = context_window(get_provider(), model_id)
         if known:
             return known
     model = get_litellm_model()

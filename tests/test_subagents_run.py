@@ -348,7 +348,7 @@ def test_agent_tool_never_asks(agents, fake_model, agent_type, tmp_path, monkeyp
                               permissions=SessionPermissions(mode="ask"))
     result = asyncio.run(go())
     assert result.startswith("wrote it")
-    assert len(parent.asks) == 1 and parent.asks[0][0].startswith("[agent: write] ")
+    assert len(parent.asks) == 1 and parent.asks[0][0].startswith("[agent: write · writer] ")
     assert (tmp_path / "out.txt").read_text() == "hi"
 
 

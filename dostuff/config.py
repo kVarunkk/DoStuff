@@ -6,7 +6,7 @@ from dotenv import dotenv_values
 from dostuff.helpers.agent.constants import MAX_ITERATIONS
 from dostuff.helpers.hooks.load_hooks import HookEntry, load_merged_hooks
 
-SUBAGENT_MAX_ITERATIONS = 25
+DEFAULT_AGENTS_MAX_CONCURRENT = 4  # running + waiting_approval agents at once; more are queued (subagents D4)
 MAX_TOOL_OUTPUT_CHARS = 30_000
 MAX_RETRIES = 6
 RETRY_MAX_DELAY_S = 60.0
@@ -107,7 +107,7 @@ class Config:
         )
         loop_cfg = _block(self.raw, "loop")
         self.max_iterations = int(loop_cfg.get("max_iterations") or MAX_ITERATIONS)
-        self.subagent_max_iterations = int(loop_cfg.get("subagent_max_iterations") or SUBAGENT_MAX_ITERATIONS)
+        self.subagent_max_iterations = int(loop_cfg.get("subagent_max_iterations") or 0)  # 0: unset (older name)
         # Overrides litellm's model info; useful for models litellm doesn't know
         self.context_window = int(loop_cfg.get("context_window") or 0)
         self.max_tool_output_chars = int(loop_cfg.get("max_tool_output_chars") or MAX_TOOL_OUTPUT_CHARS)
@@ -152,11 +152,27 @@ class Config:
         self.paste_collapse_lines = max(int(collapse), 0) if collapse is not None else PASTE_COLLAPSE_LINES
         # Start a turn when a background job ends while the TUI is idle (background shell spec D15)
         self.jobs_wake_on_end = str(_block(self.raw, "jobs").get("wake_on_end", True)).lower() not in ("0", "false", "no", "off")
+        # Subagents (plan/2026-11-01-subagents/spec.md D18): agent files, model aliases
+        agents = _block(self.raw, "agents")
+        # Per run; loop.subagent_max_iterations is still read for older configs
+        self._agents_max_iterations = int(agents.get("max_iterations") or 0)
+        self.agents_max_concurrent = max(int(agents.get("max_concurrent") or DEFAULT_AGENTS_MAX_CONCURRENT), 1)
+        self.agents_wake_on_end = str(agents.get("wake_on_end", True)).lower() not in ("0", "false", "no", "off")
+        self.agents_read_claude_agents = str(agents.get("read_claude_agents", True)).lower() not in ("0", "false", "no", "off")
+        self.agents_explore_model = str(agents.get("explore_model") or "inherit").strip()
+        models = agents.get("models")
+        self.agents_models = {str(k).strip(): str(v).strip() for k, v in models.items() if v} if isinstance(models, dict) else {}
         # TUI status bar: which items show, in this order; unknown names are reported once at startup
         items = _block(self.raw, "ui").get("status_bar")
         names = [str(i).strip().lower() for i in items] if isinstance(items, list) else list(DEFAULT_STATUS_BAR)
         self.status_bar_items = [n for n in names if n in STATUS_BAR_ITEMS]
         self.status_bar_unknown = [n for n in names if n not in (*STATUS_BAR_ITEMS, *RETIRED_STATUS_BAR_ITEMS)]
+
+    @property
+    def agents_max_iterations(self) -> int:
+        """Model calls per subagent run: agents.max_iterations, else loop.subagent_max_iterations (older configs),
+        else the main agent's loop.max_iterations."""
+        return max(self._agents_max_iterations or self.subagent_max_iterations or self.max_iterations, 1)
 
     def reload(self) -> None:
         """Re-read config.yaml in place (after a settings change); /model and /compact auto choices for this session stay."""

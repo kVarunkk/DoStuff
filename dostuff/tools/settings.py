@@ -21,10 +21,10 @@ from dostuff.helpers.tools.diff import diff_stats, plain_diff, report_change, un
 Scope = Literal["user", "project"]
 REDACTED = "<redacted>"
 # Top-level keys config.yaml understands (see templates/config.example.yaml)
-CONFIG_KEYS = ("tracing", "models", "model", "loop", "memory", "permissions", "mcp", "ui", "search", "hooks", "jobs")
+CONFIG_KEYS = ("tracing", "models", "model", "loop", "memory", "permissions", "mcp", "ui", "search", "hooks", "jobs", "agents")
 HOOKS_NOTE = (
     "hooks: commands dostuff runs at fixed points (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, "
-    "SubagentStop). They are config, not model output: not permission-checked and not sandboxed — they run with the "
+    "SubagentStart, SubagentStop). They are config, not model output: not permission-checked and not sandboxed — they run with the "
     "user's privileges. User hooks always run; project hooks are appended after them (never replacing them) and only "
     "run once the user trusts them (hooks.project_trust, read from the user file only). Keep project hook scripts in "
     ".dostuff/hooks/, which the trust check covers.")
@@ -239,11 +239,14 @@ def save_settings_file(kind: SettingsKind, scope: Scope, text: str, adapter: Any
     return summary + ("\nWarnings: " + "; ".join(warnings) if warnings else "")
 
 
-SETTINGS_TOOLS = frozenset({"edit_config", "set_mcp_server", "remove_mcp_server"})
+SETTINGS_TOOLS = frozenset({"edit_config", "set_mcp_server", "remove_mcp_server", "create_agent_type"})
 
 
 def settings_preview(tool: str, args: dict[str, Any]) -> str:
     """What the approval prompt shows: the config diff, or the MCP entry (secrets redacted)."""
+    if tool == "create_agent_type":
+        from dostuff.tools.create_agent_type import create_agent_type_preview
+        return create_agent_type_preview(args)
     try:
         if tool == "edit_config":
             path, content, updated, _ = _edited_config(str(args.get("old_str", "")), str(args.get("new_str", "")),

@@ -338,7 +338,8 @@ def test_bg_tools_registered():
     allowed, _ = resolve_subagent_tools(["read_file", "bash_output", "kill_shell"])
     assert allowed == ["read_file"]
     assert resolve_subagent_tools(None)[0] == resolve_subagent_tools(None)[0]  # default set unchanged
-    assert "bash_output" not in resolve_subagent_tools(None)[0]
+    # tools omitted = every subagent tool (subagents spec D2/D3), so the shell and its job tools are in
+    assert "bash_output" in resolve_subagent_tools(None)[0]
 
 
 def test_bg_permissions(monkeypatch, tmp_path, registry):

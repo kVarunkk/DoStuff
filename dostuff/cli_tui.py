@@ -6,6 +6,7 @@ Tools that run in threads (via asyncio.to_thread) reach the UI through TuiAdapte
 which hops back to the UI thread when needed.
 """
 import asyncio
+import contextlib
 import os
 import subprocess
 import sys
@@ -37,8 +38,8 @@ from dostuff.helpers.memory.export_session import session_to_markdown
 from dostuff.helpers.memory.shell_step import format_shell_step as _format_shell_step, parse_shell_step as _parse_shell_step
 from dostuff.tools.bash.bash_command import detached_job_id, run_shell
 from dostuff.tools.bash.jobs import (
-    KILL_WAIT_S, Job, JobError, JobEvent, find_orphans, fmt_runtime, format_notice, get_registry, notice_line,
-    parse_notice, prune_logs,
+    KILL_WAIT_S, Job, JobError, JobEvent, find_orphans, fmt_runtime, get_registry, notice_line,
+    prune_logs,
     session_of,
 )
 from dostuff.lib.memory.session_store import SQLiteSessionStore
@@ -50,11 +51,13 @@ from dostuff.helpers.agent.append_step import append_step
 from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_paths, expand_file_mentions,
                                                  format_mention, mention_candidates, strip_attachments)
 from dostuff.helpers.agent.model_cost import format_cost
+from dostuff.helpers.agent.notices import WAKE_LIMIT, agent_notice_line, fmt_agent_runtime, format_notices, get_notice_queue, parse_notices
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
-from dostuff.helpers.agent.slash_suggestion import slash_suggestion
+from dostuff.helpers.ui.tools_listing import tools_listing
+from dostuff.helpers.agent.slash_suggestion import slash_arg_hint, slash_suggestion
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
 from dostuff.helpers.hooks.dispatch import hook_line
 from dostuff.helpers.hooks.events import blocked_prompt_message, parse_stop_note, session_start, user_prompt_submit, with_prompt_context
@@ -73,6 +76,7 @@ from dostuff.tools.settings import (Scope, SettingsKind, mcp_path, new_settings_
                                     settings_file)
 
 if TYPE_CHECKING:
+    from dostuff.agent.subagents.registry import AgentEvent, AgentRun
     from dostuff.lib.mcp.mcp_client import MCPClient
     from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
     from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
@@ -80,10 +84,11 @@ if TYPE_CHECKING:
 MCP_CONNECT_TIMEOUT_S = 150.0  # covers the 120 s OAuth browser callback
 SHELL_TIMEOUT_S = 110.0  # `!command` typed by the user
 WORKING_LABEL = "Working... (ESC to cancel)"
-WORKING_LABEL_JOBS = "Working... (ESC to cancel · Ctrl+B to background)"  # a model shell call is running
+LOADING_LIBRARIES_LABEL = "Loading model libraries..."
+WORKING_LABEL_JOBS = "Working... (ESC to cancel · Ctrl+B to background)"  # a model shell call or subagent is running
 SETTINGS_WATCH_INTERVAL_S = 1.0  # config.yaml / mcp_config.json edited by hand: picked up within this
 JOB_WAKE_DELAY_S = 1.0  # batch jobs that end together into one wake-up turn; also the retry interval while busy
-JOB_WAKE_LIMIT = 3  # wake-up turns in a row without a message from the user (background shell spec D15)
+PROMPT_RETRY_S = 0.2  # how often a background agent's held-back approval prompt checks again (subagents D8)
 JOB_WAKE_IDLE_WORKERS = frozenset({"jobs_housekeeping", "load_backend", "mcp_connect", "mcp_sync"})  # don't block a wake
 TOOL_RESULT_PREVIEW_LINES = 8  # tool output shown in the conversation; the model gets all of it
 SHELL_PREVIEW_LINES = 40
@@ -94,6 +99,7 @@ PREVIEW_CHARS_PER_LINE = 200  # preview char budget = lines * this, so one giant
 PICKER_MAX_SESSIONS = 9  # /resume picker: number keys reach every option
 PICKER_MAX_VISIBLE = 10  # longer option lists scroll with the cursor
 EDIT_PROMPT_ESC_SECONDS = 1.5  # Esc, then Esc again within this, takes back the last prompt
+QUIT_HINT = "ctrl+q or /exit to quit"  # flashed when Esc / Ctrl+C has nothing to do
 HISTORY_SEARCH_MAX = 500  # Ctrl+R: newest prompts offered
 SKILL_MENU_DESCRIPTION_CHARS = 100  # skill descriptions can be paragraphs; the "/" menu shows the start
 TODO_RESULT_PREFIX = "todo_write: "  # loop() emits results as "<tool>: <result>"
@@ -281,6 +287,16 @@ class JobsBar(Static):
         self.app.action_toggle_jobs()  # type: ignore[attr-defined]
 
 
+class AgentsBar(Static):
+    """Beside the shells item while this session's subagents run: `⚙ 2 agents`, or `⚠ 1 agent waiting` while
+    one waits for approval; a click opens /agents (subagents spec D14)."""
+
+    ALLOW_SELECT = False
+
+    def on_click(self) -> None:
+        self.app.action_show_agents()  # type: ignore[attr-defined]
+
+
 class QueueBar(Static):
     """Above the input while prompts are queued, one row each; a click (or /queue) lists them to
     edit, run next or remove, a second click closes the list."""
@@ -305,6 +321,18 @@ def _fmt_elapsed(seconds: float) -> str:
     if s < 3600:
         return f"{s // 60}m {s % 60}s"
     return f"{s // 3600}h {s % 3600 // 60}m"
+
+
+def _agent_status(run: "AgentRun") -> str:
+    return "waiting for approval" if run.status == "waiting_approval" else run.status
+
+
+def _agent_label(run: "AgentRun") -> str:
+    """One /agents row: id, status, runtime, description · type, tokens, cost, background or foreground."""
+    from dostuff.helpers.agent.notices import fmt_agent_runtime
+    runtime = fmt_agent_runtime((run.ended or time.time()) - run.started) if run.started else "—"
+    return (f"{run.id}  {_agent_status(run)}  {runtime}  {run.description} · {run.agent_type}  "
+            f"{run.tokens:,} tokens  ${run.cost_usd:.2f}  {'background' if run.background else 'foreground'}")
 
 
 def _job_status(job: Job) -> str:
@@ -578,7 +606,8 @@ class EnterSubmits(TextArea):
     the last line goes forward again, back to the draft that was being typed.
 
     A slash command being typed shows the rest of it (or its flag, e.g. /model --active) as
-    dim ghost text after the cursor; Tab or Right accepts it.
+    dim ghost text after the cursor; Tab or Right accepts it. Then a dim hint for its arguments
+    (e.g. /rename <title>), which is only shown, never inserted.
     """
 
     # Ctrl+W / Ctrl+Backspace / Alt+Backspace delete the previous word (TextArea's own bindings)
@@ -599,6 +628,7 @@ class EnterSubmits(TextArea):
         self.pastes = PasteStore()
         self.paste_collapse_lines = 0  # set by the app from ui.paste_collapse_lines
         self.commands: Iterable[str] = COMMAND_DESCRIPTIONS  # for ghost text; the app adds the skill commands
+        self.completion = ""  # the part of `suggestion` Tab/Right accept; the rest is the argument hint
 
     def add_history(self, text: str) -> None:
         if not self.prompt_history or self.prompt_history[-1] != text:
@@ -638,7 +668,20 @@ class EnterSubmits(TextArea):
         """Ghost text for a slash command, only with the cursor at the end (not for recalled prompts)."""
         at_end = self.cursor_location == self.document.end and not self.selected_text
         recalled = self.text == self.recalled_text
-        self.suggestion = slash_suggestion(self.text, highlighted, self.commands) if at_end and not recalled else ""
+        if not at_end or recalled:
+            self.completion = self.suggestion = ""
+            return
+        self.completion = slash_suggestion(self.text, highlighted, self.commands)
+        self.suggestion = self.completion + slash_arg_hint(self.text + self.completion, self.commands)
+
+    def action_cursor_right(self, select: bool = False) -> None:
+        """Right accepts only the completion, never the argument hint."""
+        if self.completion:
+            self.insert(self.completion)
+            return
+        self.suggestion = ""  # just the hint (or nothing): TextArea would insert it, so move as usual
+        super().action_cursor_right(select)
+        self.update_suggestion()
 
     def on_text_area_selection_changed(self, event: TextArea.SelectionChanged) -> None:
         self.update_suggestion()  # TextArea only refreshes it on edits; the cursor may have moved to/off the end
@@ -693,16 +736,17 @@ class EnterSubmits(TextArea):
                 command = menu.selected_command()
                 menu.display = False
                 if command and event.key == "tab":
-                    # A space after a command with a flag, so its ghost text (e.g. --active) shows next
-                    self.text = command + (" " if command in COMMAND_FLAGS else "")
+                    # A space after a command taking arguments, so its flag (e.g. --active) or hint shows next
+                    takes_args = command in COMMAND_FLAGS or slash_arg_hint(command, self.commands)
+                    self.text = command + (" " if takes_args else "")
                     self.move_cursor(self.document.end)
                 elif command:
                     self.post_message(self.Submitted(command))
             return
-        if event.key == "tab" and self.suggestion:
+        if event.key == "tab" and self.completion:
             event.stop()
             event.prevent_default()
-            self.insert(self.suggestion)
+            self.insert(self.completion)
             return
         if event.key in NEWLINE_KEYS:
             event.stop()
@@ -769,6 +813,12 @@ class SettingsEditor(TextArea):
 
     def action_save(self) -> None:
         self.post_message(self.Save())
+
+
+def _agent_registry() -> Any:
+    """The subagent registry, imported late: it pulls in the MCP client, which loads after the first frame."""
+    from dostuff.agent.subagents.registry import get_agent_registry
+    return get_agent_registry()
 
 
 class TuiAdapter:
@@ -876,14 +926,15 @@ class TuiAdapter:
         label = event_type.upper().replace("_", " ")
         app._append(f"[{label}] {data}", msg_type="agent")
 
-    async def ask(self, message: str, always_label: str = "") -> ApprovalReply:
+    async def ask(self, message: str, always_label: str = "", background: bool = False) -> ApprovalReply:
+        """`background`: from a background agent, so it waits until the user isn't typing (subagents D8)."""
         options = [("yes", "Yes")]
         if always_label:
             options.append(("always", f"Yes, and don't ask again this session for {always_label}"))
         options.append(("no", "No, and tell the model what to do differently"))
-        return await self._prompt(f"⚠ {message}", "Do you want to proceed?", options)
+        return await self._prompt(f"⚠ {message}", "Do you want to proceed?", options, background=background)
 
-    async def ask_batch(self, messages: list[str], always_label: str = "") -> ApprovalReply:
+    async def ask_batch(self, messages: list[str], always_label: str = "", background: bool = False) -> ApprovalReply:
         count = len(messages)
         details = f"⚠ The model wants to run {count} actions that need approval:"
         for i, message in enumerate(messages, 1):
@@ -892,7 +943,7 @@ class TuiAdapter:
         if always_label:
             options.append(("always", f"Yes to all, and don't ask again this session for {always_label}"))
         options += [("each", "Let me review each one"), ("no", "No to all, and tell the model what to do differently")]
-        return await self._prompt(details, f"Allow these {count} actions?", options)
+        return await self._prompt(details, f"Allow these {count} actions?", options, background=background)
 
     async def ask_trust(self, message: str) -> ApprovalReply:
         """The project-hooks trust question (helpers/hooks/trust.py): no feedback, nothing goes to the model."""
@@ -904,10 +955,30 @@ class TuiAdapter:
         reply = await self._prompt(details, question, [("yes", yes), ("no", no)], feedback=False)
         return reply.answer == "yes"
 
+    async def _acquire_prompt(self, background: bool) -> None:
+        """Take `_ask_lock`; a background agent's prompt also waits until `_prompt_blocked()` is false, so it
+        never cuts into typing or another picker (subagents D8), unless the user picked Answer approval for
+        it in /agents. It doesn't hold the lock while it waits."""
+        from dostuff.agent.subagents import current_agent
+        run = current_agent.get()
+
+        def held() -> bool:
+            return background and not (run is not None and run.answer_now) and self._app._prompt_blocked()
+        while True:
+            while held():
+                await asyncio.sleep(PROMPT_RETRY_S)
+            await self._ask_lock.acquire()
+            if not held():
+                if run is not None:
+                    run.answer_now = False  # its next prompt waits again
+                return
+            self._ask_lock.release()  # the user started typing while it waited for the lock
+
     async def _prompt(self, details: str, question: str, options: list[tuple[str, str]],
-                      feedback: bool = True) -> ApprovalReply:
+                      feedback: bool = True, background: bool = False) -> ApprovalReply:
         # Runs on the UI loop (turns are async workers), so widgets can be touched directly
-        async with self._ask_lock:
+        await self._acquire_prompt(background)
+        try:
             self._waiting_for_confirm = True
             self._feedback_mode = False
             self._feedback_on_no = feedback
@@ -924,10 +995,13 @@ class TuiAdapter:
                 self._feedback_mode = False
                 self._confirm_event = None
                 self._app._hide_permission_prompt()
-                self._app._set_title("running")
+                # a background agent's prompt can come while idle
+                self._app._set_title("running" if self._app._turn_in_progress else "done")
             reply = self._confirm_reply or ApprovalReply("no")
             self._confirm_reply = None
             return reply
+        finally:
+            self._ask_lock.release()
 
     def _resolve(self, reply: ApprovalReply) -> None:
         if self._waiting_for_confirm and self._confirm_event is not None:
@@ -1011,6 +1085,8 @@ class DostuffTUI(App):
     #status { width: auto; height: 1; color: #8a8a8a; padding: 0 1; }
     #jobs-bar { width: auto; height: 1; display: none; padding: 0 1; }
     #jobs-bar:hover { background: #2c2c2c; }
+    #agents-bar { width: auto; height: 1; display: none; padding: 0 1; }
+    #agents-bar:hover { background: #2c2c2c; }
     #queue-bar { height: auto; display: none; padding: 0 1; margin-top: 1; }
     #queue-bar:hover { background: #2c2c2c; }
     #jump-bottom {
@@ -1018,6 +1094,11 @@ class DostuffTUI(App):
         text-align: center; color: #8ab4f8; text-style: bold; background: #2c2c2c;
     }
     #jump-bottom:hover { background: #3a3a3a; }
+    #agent-view { height: 1fr; }
+    #agent-view-title { height: auto; padding: 0 1; color: #8ab4f8; text-style: bold; }
+    #agent-view-scroll { height: 1fr; border: round #4a4a4a; }
+    #agent-view-msgs { height: auto; }
+    #agent-view-status { height: auto; padding: 0 1; color: #8a8a8a; }
     #settings-panel { height: 1fr; }
     #settings-title { height: auto; padding: 0 1; color: #8ab4f8; }
     #settings-editor { height: 1fr; background: transparent; border: round #8ab4f8; }
@@ -1095,7 +1176,14 @@ class DostuffTUI(App):
         # Session-scoped approvals ("always") — reset when the app restarts
         self.permissions = SessionPermissions()
         self._draft_before_feedback = ""  # input text set aside while it takes denial feedback
+        # The conversation's height before an approval prompt took the input's place (_hold_transcript)
+        self._viewport_before_prompt: int | None = None
         self._picker_callback: Callable[[str], Awaitable[None]] | None = None
+        self._message_target = "#msg-container"  # where _append mounts; the agent view swaps it while rendering
+        self._agent_view_run: "AgentRun | None" = None  # the agent whose transcript the agent view shows
+        self._agent_view_rendered = 0  # steps of it already rendered there
+        self._agent_view_timer: Timer | None = None
+        self._agent_view_refreshing = False
         # "/name" → skill or custom command (helpers/skills/skill_command.py)
         self._skill_commands: dict[str, dict[str, Any]] = {}
         self._mcp_configured: list[str] = []
@@ -1132,11 +1220,17 @@ class DostuffTUI(App):
         with Horizontal(id="status-row"):
             yield Static(id="status")
             yield JobsBar(id="jobs-bar")
+            yield AgentsBar(id="agents-bar")
 
     def ui(self, fn: Callable[[], Any]) -> None:
         """Run fn on the UI thread (directly if already there)."""
         if threading.get_ident() == getattr(self, "_thread_id", None):
             fn()
+            return
+        # An app that has exited keeps its closed loop, and call_from_thread would build its coroutine
+        # before failing on it ("coroutine ... was never awaited"); the emit shim still points here
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed():
             return
         try:
             self.call_from_thread(fn)
@@ -1242,6 +1336,8 @@ class DostuffTUI(App):
         inp.focus()
         self.watch(self.screen, "focused", self._keep_input_focus, init=False)
         get_registry().add_listener(self._on_job_event)
+        _agent_registry().add_listener(self._on_agent_event)
+        _agent_registry().attach_store(self.store)  # agent rows and transcripts (subagents D14)
         inp.prompt_history = load_history(self._history_path, os.getcwd())
         inp.pastes = self._pastes
         inp.paste_collapse_lines = self.config.paste_collapse_lines
@@ -1383,14 +1479,16 @@ class DostuffTUI(App):
             return
         self._append("Embedding model ready.", msg_type="system")
 
-    async def _wait_for_backend(self) -> bool:
-        """Wait for _load_backend (with a loader if it's still running); False if it failed."""
+    async def _wait_for_backend(self, keep_loader: bool = False) -> bool:
+        """Wait for _load_backend (with a loader if it's still running); False if it failed.
+        `keep_loader`: leave that loader up for the caller to relabel (a turn's, so it never blinks out)."""
         if not self._backend_ready.is_set():
-            loader_widget = self._show_loader("Loading model libraries...")
+            loader_widget = self._show_loader(LOADING_LIBRARIES_LABEL)
             try:
                 await self._backend_ready.wait()
             finally:
-                self._stop_loader(loader_widget)
+                if not keep_loader:
+                    self._stop_loader(loader_widget)
         if self._backend_error:
             self._append(f"Not available: startup failed ({self._backend_error}). Restart dostuff.", msg_type="error")
             return False
@@ -1411,6 +1509,10 @@ class DostuffTUI(App):
         self._pending_session_start = "resume" if existing_meta else "startup"
         meta = existing_meta or {}
         if existing_meta:
+            try:  # its agents, as records send_message can continue (subagents D14)
+                await _agent_registry().load(session_id, self.store)
+            except Exception as e:
+                self._append(f"Could not load this session's agents: {e}", msg_type="error")
             await self.store.save_session_meta(
                 session_id,
                 working_dir=str(Path.cwd()),
@@ -1459,37 +1561,39 @@ class DostuffTUI(App):
             msg_type="error",
         )
 
-    def _render_history_step(self, step: dict) -> None:
-        """Render a stored step like the live adapter does (● call / ⎿ result)."""
+    def _render_history_step(self, step: dict, prefix: str = "") -> None:
+        """Render a stored step like the live adapter does (● call / ⎿ result). `prefix` (`[agent: …] `) marks
+        a subagent's transcript in /agents."""
         role = step.get("role", "?")
         content = step.get("content") or ""
         if role == "tool":
-            self._append_call_result(f"{step.get('name', '')}: {content}")
+            self._append_call_result(f"{prefix}{step.get('name', '')}: {content}")
             return
         if role == "user":
             shell = _parse_shell_step(content)
             stop_note = parse_stop_note(content)
-            notices = parse_notice(content)
+            notices = parse_notices(content)
             if stop_note is not None:  # live, the loop showed this as a ⚓ line, not a prompt
-                self._append(hook_line({"event": "Stop", "decision": "block", "reason": stop_note[1]}),
+                self._append(prefix + hook_line({"event": "Stop", "decision": "block", "reason": stop_note[1]}),
                              msg_type="system")
             elif notices is not None:  # live, these showed when the jobs ended
                 for line in notices:
-                    self._append(line, msg_type="system")
+                    self._append(prefix + line, msg_type="system")
             elif shell is not None:
                 self._append(f"! {shell[0]}", msg_type="shell")
                 self._append_tool_result(shell[1], SHELL_PREVIEW_LINES, msg_type="shell-output")
             elif content and content != EMPTY_RESPONSE_NUDGE:
-                self._append(strip_attachments(content), msg_type="user")
+                self._append(prefix + strip_attachments(content), msg_type="user")
                 attached = attached_paths(content)
                 if attached:
                     self._append("Attached " + ", ".join(attached), msg_type="system")
             return
         if content:
-            self._append(content, msg_type="agent")
+            self._append(prefix + content, msg_type="agent")
         for tc in step.get("tool_calls") or []:
             fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-            self._append(f"● {format_call_label(fn.get('name', '?'), fn.get('arguments', ''))}", msg_type="tool")
+            self._append(f"{prefix}● {format_call_label(fn.get('name', '?'), fn.get('arguments', ''))}",
+                         msg_type="tool")
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -1527,7 +1631,7 @@ class DostuffTUI(App):
         old_session_id = self.session_id
         new_session_id = uuid.uuid4().hex[:16]
         self.session_id = new_session_id
-        carried = self._carry_jobs(old_session_id)
+        carried = self._carry_background(old_session_id)
         self.steps_history = []
         self.current_session_history = []
         self.session_hook_context = {}
@@ -1539,7 +1643,7 @@ class DostuffTUI(App):
             f" New session '{new_session_id}'. Previous session saved; /resume or `dostuff resume {old_session_id}` brings it back.",
             msg_type="system",
         )
-        self._report_carried_jobs(carried)
+        self._report_carried(carried)
 
     async def _undo_changes(self, force: bool) -> None:
         """Revert the newest file checkpoint, then tell the model which files went back."""
@@ -1622,13 +1726,13 @@ class DostuffTUI(App):
             self._append(f"Resume failed: {e}", msg_type="error")
             return
         finally:
-            carried = self._carry_jobs(old_session_id)  # _load_session may switch before it fails
+            carried = self._carry_background(old_session_id)  # _load_session may switch before it fails
         await self.query_one("#msg-container", Vertical).remove_children()
         self._append(f" Resumed session '{session_id}' ({len(self.steps_history)} step(s)).", msg_type="system")
         self._render_history()
         if had_steps:
             self._append(f" Previous session '{old_session_id}' saved; /resume brings it back.", msg_type="system")
-        self._report_carried_jobs(carried)
+        self._report_carried(carried)
 
     async def _fork_session(self, arg: str) -> None:
         """/fork [--worktree] [title]: copy this session into a new one and switch to it; the original stays as it was.
@@ -2248,6 +2352,17 @@ class DostuffTUI(App):
             self._append("Reloaded config.yaml (user and project).", msg_type="system")
         self._append(text, msg_type="system")
 
+    async def _show_tools(self) -> None:
+        """/tools: the agent's tools, how each asks, whether subagents get it, and the MCP servers' tools."""
+        if not await self._wait_for_backend():
+            return
+        try:
+            text = tools_listing(self.mcp_client.mcp_tools if self.mcp_client is not None else None)
+        except Exception as e:
+            self._append(f"Could not list tools: {e}", msg_type="error")
+            return
+        self._mount_message(Static(text, classes="msg msg-system", markup=False))
+
     def _session_jobs(self) -> list[Job]:
         """This session's background jobs, main agent and subagents (foreground calls and `!command`s aren't)."""
         return [j for j in get_registry().jobs() if not j.foreground and session_of(j.owner) == self.session_id]
@@ -2288,6 +2403,170 @@ class DostuffTUI(App):
             await self._kill_job(job)
         else:
             self._show_job_output(job)
+
+    async def _agents_command(self, arg: str) -> None:
+        """/agents: this session's agents, to read, stop or answer; /agents types: the agent types;
+        /agents reload: re-read the agent files (subagents spec D2, D14)."""
+        from dostuff.agent.subagents import definitions as agent_defs
+        word, _, name = arg.strip().partition(" ")
+        word, name = word.lower(), name.strip()
+        if word not in ("", "types", "reload", "r") or (name and word != "types"):
+            self._append("Usage: /agents [types [name] | reload]", msg_type="error")
+            return
+        if not word:
+            self._show_agents_list()
+            return
+        if word in ("reload", "r"):
+            loaded = await asyncio.to_thread(agent_defs.reload)
+            note = f" · {len(loaded.warnings)} warning(s), see /agents types" if loaded.warnings else ""
+            self._append(f"Reloaded: {len(loaded.types)} agent types{note}.", msg_type="system")
+            return
+        if name:
+            await self._show_agent_type(name)
+            return
+        loaded = await agent_defs.refresh_definitions()
+        self._append(agent_defs.types_listing(loaded, get_config()), msg_type="system")
+
+    async def _show_agent_type(self, name: str) -> None:
+        """One agent type's config and system prompt: `/agents types <name>`, or "Show its type" on an agent."""
+        from dostuff.agent.subagents import definitions as agent_defs
+        from dostuff.agent.subagents.fork import FORK_TYPE
+        loaded = await agent_defs.refresh_definitions()
+        detail = agent_defs.type_detail(name, loaded, get_config())
+        if detail is None:
+            known = ", ".join(sorted([*loaded.types, FORK_TYPE]))
+            self._append(f"No agent type '{name}'. Types: {known}.", msg_type="error")
+            return
+        self._append(detail, msg_type="system")
+
+    def _session_agents(self) -> list["AgentRun"]:
+        """This session's agents: the ones that haven't ended first, then by start time."""
+        from dostuff.agent.subagents.registry import ENDED_STATUSES
+        return sorted(_agent_registry().runs(self.session_id),
+                      key=lambda r: (r.status in ENDED_STATUSES, r.started or float("inf")))
+
+    def _show_agents_list(self) -> None:
+        """/agents (or a click on the agents item): pick one of this session's agents."""
+        runs = self._session_agents()
+        if not runs:
+            self._append("No agents in this session.", msg_type="system")
+            return
+        self._show_picker("Agents", [(r.id, _agent_label(r)) for r in runs], self._agent_actions)
+
+    async def _agent_actions(self, agent_id: str) -> None:
+        """An agent picked from /agents: its transcript, then Answer approval / Stop it / back."""
+        run = _agent_registry().get(agent_id)
+        if run is None or run.owner != self.session_id:
+            return
+        self._close_picker()
+        await self._open_agent_view(run)
+        options = []
+        if run.status == "waiting_approval":
+            options.append(("answer", "Answer approval (show its prompt now)"))
+        if run.task is not None and not run.task.done():
+            options.append(("stop", "Stop it (the agent's partial work comes as a notice)"))
+        options.append(("type", f"Show its type ({run.agent_type}): system prompt and config"))
+        options.append(("back", "Back to the list"))
+
+        async def act(choice: str) -> None:
+            if choice == "answer":
+                run.answer_now = True  # its prompt shows once this picker closes, even while you type
+                self._close_picker()
+                self._close_agent_view()
+            elif choice == "stop":
+                self._close_picker()
+                self._close_agent_view()
+                await _agent_registry().stop(run, "user")  # a notice without a wake-up (D7)
+                self._append(f'Stopped agent "{run.id}" ({run.description}).', msg_type="system")
+            elif choice == "type":
+                self._close_picker()
+                self._close_agent_view()
+                await self._show_agent_type(run.agent_type)
+            else:
+                self._close_agent_view()
+                self._show_agents_list()
+
+        self._show_picker(f'Agent "{run.id}" · {run.description} · {_agent_status(run)}', options, act)
+
+    # ── The agent view: one agent's transcript, in place of the conversation ──
+
+    def _agent_view_open(self) -> bool:
+        return bool(self.query("#agent-view"))
+
+    async def _agent_steps(self, run: "AgentRun") -> list[dict]:
+        """The agent's whole transcript from the store (compacted steps too), else what it has in memory."""
+        steps: list[dict] = []
+        try:
+            await _agent_registry().flush()
+            steps = await self.store.load_agent_steps(run.id)
+        except Exception:
+            pass
+        return steps or list(run.history)
+
+    def _agent_view_title(self, run: "AgentRun") -> str:
+        return (f'agent "{run.id}" · {run.description} · {run.agent_type} · {_agent_status(run)} · '
+                f"{self._agent_view_rendered} steps")
+
+    async def _open_agent_view(self, run: "AgentRun") -> None:
+        """Show the agent's transcript in its own panel, hiding the conversation (like /config's editor), so the
+        agent's steps never land in the main conversation. A running agent's new steps appear as they're saved."""
+        self._close_agent_view()
+        self.query_one("#command-menu", CommandMenu).display = False
+        self.query_one("#conversation").display = False
+        panel = Vertical(
+            Static("", id="agent-view-title", markup=False),
+            VerticalScroll(Vertical(id="agent-view-msgs"), id="agent-view-scroll", can_focus=False),
+            Static("Esc close · Ctrl+O expand results · /agents for the list", id="agent-view-status"),
+            id="agent-view",
+        )
+        await self.mount(panel, before="#queue-bar")
+        self._agent_view_run = run
+        self._agent_view_rendered = 0
+        await self._refresh_agent_view()
+        self.query_one("#agent-view-scroll", VerticalScroll).anchor()
+        self._agent_view_timer = self.set_interval(1.0, self._refresh_agent_view)
+
+    async def _refresh_agent_view(self) -> None:
+        """Render the steps saved since the last refresh; stop polling once the agent has ended."""
+        run = self._agent_view_run
+        if run is None or self._agent_view_refreshing or not self._agent_view_open():
+            return
+        from dostuff.agent.subagents.registry import ENDED_STATUSES
+        self._agent_view_refreshing = True
+        try:
+            ended = run.status in ENDED_STATUSES
+            steps = await self._agent_steps(run)
+            if self._agent_view_run is not run or not self._agent_view_open():
+                return
+            new = steps[self._agent_view_rendered:]
+            show_result = ended and run.result and not steps and self._agent_view_rendered == 0
+            if new or show_result:
+                self._message_target = "#agent-view-msgs"
+                try:
+                    for step in new:
+                        self._render_history_step(step)
+                    if show_result:
+                        self._append(run.result or "", msg_type="agent")
+                finally:
+                    self._message_target = "#msg-container"
+                self._agent_view_rendered = len(steps) or (1 if show_result else 0)
+            self.query_one("#agent-view-title", Static).update(self._agent_view_title(run))
+            if ended and self._agent_view_timer is not None:
+                self._agent_view_timer.stop()
+                self._agent_view_timer = None
+        finally:
+            self._agent_view_refreshing = False
+
+    def _close_agent_view(self) -> None:
+        if self._agent_view_timer is not None:
+            self._agent_view_timer.stop()
+            self._agent_view_timer = None
+        self._agent_view_run = None
+        if not self._agent_view_open():
+            return
+        for widget in self.query("#agent-view"):
+            widget.remove()
+        self.query_one("#conversation").display = True
 
     async def _kill_job(self, job: Job) -> None:
         if job.ended is not None:
@@ -2412,6 +2691,8 @@ class DostuffTUI(App):
         if not text:
             return
 
+        if self._agent_view_open():  # sending anything goes back to the conversation, where its output shows
+            self._close_agent_view()
         self._clear_input()
         self._remember_prompt(text)
         cmd = text.strip().lower()
@@ -2486,6 +2767,9 @@ class DostuffTUI(App):
         if name == "/doctor" and not arg:
             self._start_worker(self._show_doctor(), name="doctor")
             return
+        if name == "/tools" and not arg:
+            self._start_worker(self._show_tools(), name="tools")
+            return
         if name == "/hooks":
             if arg.lower() not in ("", "r", "reload"):
                 self._append("Usage: /hooks [r]  (r re-reads the config files)", msg_type="error")
@@ -2494,6 +2778,9 @@ class DostuffTUI(App):
             return
         if name == "/jobs":
             self._start_worker(self._jobs_command(arg), name="jobs")
+            return
+        if name == "/agents":
+            self._start_worker(self._agents_command(arg), name="agents")
             return
         if name == "/queue":
             if arg.lower() == "clear":
@@ -2576,7 +2863,10 @@ class DostuffTUI(App):
         self._hide_permission_prompt(restore_input=False)
         menu = self.query_one("#command-menu", CommandMenu)
         menu.display = False
-        self.query_one("#input", EnterSubmits).display = False
+        inp = self.query_one("#input", EnterSubmits)
+        if inp.display:  # not when one prompt follows another
+            self._viewport_before_prompt = self.query_one("#messages", VerticalScroll).size.height
+        inp.display = False
         prompt = PermissionPrompt(question, options, id="permission-prompt")
         self.mount(prompt, before="#input")
         self.query_one("#messages", VerticalScroll).anchor()  # show the details being approved
@@ -2584,6 +2874,8 @@ class DostuffTUI(App):
 
     def _ask_denial_feedback(self) -> None:
         """After "No": the input (yellow border) takes an optional note for the model."""
+        if self.query("#permission-prompt"):
+            self._hold_transcript()
         self._hide_permission_prompt(restore_input=False)
         inp = self.query_one("#input", EnterSubmits)
         self._draft_before_feedback = inp.text
@@ -2594,8 +2886,33 @@ class DostuffTUI(App):
         inp.display = True
         inp.focus()
 
+    def _hold_transcript(self) -> None:
+        """Called as an approval prompt gives its place back to the shorter input during a turn. The
+        conversation grows by the difference, and pinned to the bottom, every message would drop by it and
+        jump back up as the next lines arrive (the hook trust prompt at session start bounced so).
+        Instead the container keeps its height (min-height) for the turn: the freed rows are blank space
+        under the loader that the next messages fill, and _release_transcript drops it when the turn ends."""
+        before, self._viewport_before_prompt = self._viewport_before_prompt, None
+        if before is None or not self._turn_in_progress or self._agent_view_run is not None:
+            return
+        scroll = self.query_one("#messages", VerticalScroll)
+        grow = before - scroll.size.height
+        if grow <= 0 or scroll.max_scroll_y == 0 or not scroll.is_vertical_scroll_end:
+            return  # nothing would move: it all fits, or the user scrolled up
+        container = self.query_one("#msg-container", Vertical)
+        container.styles.min_height = container.size.height + grow
+
+    def _release_transcript(self) -> None:
+        try:
+            self.query_one("#msg-container", Vertical).styles.min_height = None  # back to the CSS min-height
+        except Exception:
+            pass  # shutting down
+
     def _hide_permission_prompt(self, restore_input: bool = True) -> None:
-        for widget in self.query("#permission-prompt"):
+        prompts = list(self.query("#permission-prompt"))
+        if prompts and restore_input:
+            self._hold_transcript()
+        for widget in prompts:
             widget.remove()
         if not restore_input:
             return
@@ -2749,7 +3066,11 @@ class DostuffTUI(App):
         notice text, and no user step is stored: the loop drains the notice into history itself."""
         loader_widget: Static | None = None
         try:
-            if not await self._wait_for_backend():
+            # One loader for the whole turn, from the start: a "Loading model libraries..." loader removed and
+            # a "Working..." one mounted later left a frame with neither (the session-start bounce)
+            ready = self._backend_ready.is_set()
+            loader_widget = self._show_loader(WORKING_LABEL if ready else LOADING_LIBRARIES_LABEL)
+            if not await self._wait_for_backend(keep_loader=True):
                 return
             turn_id = uuid.uuid4().hex
             turn_id_var.set(turn_id)
@@ -2788,6 +3109,9 @@ class DostuffTUI(App):
             # here so the status bar etc. follow; the hooks below would reload it anyway
             if await asyncio.to_thread(self.config.reload_if_changed):
                 self._apply_settings(mcp=False)
+            # The loader is up before the hooks: they can ask the project-hooks trust question, and a loader
+            # mounted only after the answer shifts the transcript (tool approvals already have one on screen)
+            loader_widget = self._show_loader(WORKING_LABEL)  # relabels the turn's loader
             # SessionStart, then UserPromptSubmit: both before the user step is appended (hooks spec D1)
             if self._pending_session_start:
                 source, self._pending_session_start = self._pending_session_start, None
@@ -2796,7 +3120,7 @@ class DostuffTUI(App):
             prompt_context = ""
             if wake:
                 # Nobody typed a prompt, so no UserPromptSubmit. A user turn may have taken the notices meanwhile.
-                if not get_registry().pending_notices(self.session_id):
+                if not get_notice_queue().pending(self.session_id):
                     return
             else:
                 blocked, prompt_context = await user_prompt_submit(content, session_id=self.session_id,
@@ -2819,7 +3143,6 @@ class DostuffTUI(App):
             # The hook context is for this turn only: it is not part of the stored user step
             dynamic_instructions = with_prompt_context(await self._build_instructions(user_text), prompt_context)
 
-            loader_widget = self._show_loader(WORKING_LABEL)
             self._set_title("running")
             self._turn_start_time = time.time()
             self._start_timer()
@@ -2867,6 +3190,7 @@ class DostuffTUI(App):
                 self._set_title("done")
                 if not self.adapter._cancelled and not self._prompt_queue:
                     self._notify("dostuff: turn finished", time.time() - started)
+            self._release_transcript()  # after the summary, in the same refresh, so it fills the held rows
             self._render_status()  # session cost changed
             self._process_prompt_queue()
             self._schedule_wake()  # a job that ended after the loop's last drain
@@ -3117,6 +3441,9 @@ class DostuffTUI(App):
         if self._settings_open():
             self._close_settings()
             return
+        if self._agent_view_open():
+            self._close_agent_view()
+            return
         if not self._turn_in_progress and not self.adapter.has_pending_confirm():
             # Nothing to cancel (a stale flag would cancel the next turn's first step); Esc Esc
             # with an empty input takes back the last prompt
@@ -3135,10 +3462,19 @@ class DostuffTUI(App):
         return [j for j in get_registry().jobs()
                 if j.foreground and j.ended is None and session_of(j.owner) == self.session_id]
 
+    def _foreground_agents(self) -> list["AgentRun"]:
+        """This session's foreground subagent runs that haven't ended (running, waiting or queued)."""
+        return [r for r in _agent_registry().runs(self.session_id)
+                if not r.background and r.status in ("queued", "running", "waiting_approval")]
+
     def action_background_jobs(self) -> None:
-        if not self._turn_in_progress or not self._foreground_jobs():
-            raise SkipAction()  # nothing to background: the key goes to the focused widget
+        """Ctrl+B: move the turn's foreground shell jobs and subagents to the background (subagents D9)."""
+        if not self._turn_in_progress or not (self._foreground_jobs() or self._foreground_agents()):
+            self._flash_input_hint("nothing running to move to the background")
+            raise SkipAction()  # the key still goes to the focused widget
         get_registry().detach_foreground(self.session_id)
+        _agent_registry().detach_foreground(self.session_id)
+        self._flash_input_hint("moved to the background · /jobs or /agents to see it")
 
     def _on_job_event(self, job: Job, event: JobEvent) -> None:
         if session_of(job.owner) == self.session_id:
@@ -3157,28 +3493,57 @@ class DostuffTUI(App):
         if job.owner == self.session_id and job.killed_by is None:
             self._schedule_wake()
 
+    def _on_agent_event(self, run: "AgentRun", event: "AgentEvent") -> None:
+        if run.owner != self.session_id:
+            return
+        self.call_later(self._refresh_job_hint)
+        self.call_later(self._render_agents_bar)
+        if event == "end" and run.background and run.stopped_by != "session_end":
+            self.call_later(self._agent_ended, run)
+            if run.stopped_by is None:  # ended on its own: the idle TUI resumes the agent (D7)
+                self.call_later(self._schedule_wake)
+
+    def _agent_ended(self, run: "AgentRun") -> None:
+        """A background agent ended: a notification when the terminal is in the background (its system line
+        came through the adapter; subagents spec D7)."""
+        line = agent_notice_line(run.description, run.agent_type, run.status,
+                                 fmt_agent_runtime((run.ended or 0) - (run.started or run.ended or 0)))
+        self._notify(f"dostuff: {line.removeprefix('⚙ ')}", 0.0)
+
     # ── Wake-up: a turn for background jobs that ended while idle (spec D15) ─────
 
     def _wake_notices(self) -> list:
-        """Queued notices that warrant a wake-up: the main agent's jobs that ended on their own.
-        A /jobs kill alone doesn't wake it (the user is right there); it rides along with one that does."""
-        notices = get_registry().pending_notices(self.session_id)
-        return notices if any(n.killed_by is None for n in notices) else []
+        """The main agent's queued notices, if any of them warrants a wake-up: a job (jobs.wake_on_end) or a
+        background agent (agents.wake_on_end) that ended on its own. A /jobs kill or a stopped agent alone
+        doesn't wake it (the user is right there); it rides along with one that does."""
+        notices = get_notice_queue().pending(self.session_id)
+        if any(n.killed_by is None for n in notices if n.kind == "job") and self.config.jobs_wake_on_end:
+            return notices
+        if any(n.wake for n in notices if n.kind == "agent") and self.config.agents_wake_on_end:
+            return notices
+        return []
 
     def _schedule_wake(self) -> None:
-        """Check for a wake-up after JOB_WAKE_DELAY_S, so jobs that end together start one turn."""
-        if not self.config.jobs_wake_on_end or self._wake_timer is not None or not self._wake_notices():
+        """Check for a wake-up after JOB_WAKE_DELAY_S, so jobs and agents that end together start one turn."""
+        if self._wake_timer is not None or not self._wake_notices():
             return
         self._wake_timer = self.set_timer(JOB_WAKE_DELAY_S, self._try_wake)
 
     def _wake_blocked(self) -> bool:
         """Busy, or the user is in the middle of something: a turn, typing, a prompt or picker,
         a session command (/compact, /clear, …) or a queued prompt that will run first."""
-        if self._turn_in_progress or self._quitting or self._quit_confirming or self._prompt_queue:
-            return True
-        if self._picker_open() or self.query("#permission-prompt"):
+        if self._turn_in_progress or self._prompt_queue:
             return True
         if any(w.name not in JOB_WAKE_IDLE_WORKERS for w in self._pending_workers):
+            return True
+        return self._prompt_blocked()
+
+    def _prompt_blocked(self) -> bool:
+        """The user is in the middle of something a background agent's approval prompt must not cut into:
+        typing, a prompt or picker, quitting (subagents D8)."""
+        if self._quitting or self._quit_confirming:
+            return True
+        if self._picker_open() or self.query("#permission-prompt"):
             return True
         try:
             return bool(self.query_one("#input", EnterSubmits).text.strip())
@@ -3188,28 +3553,31 @@ class DostuffTUI(App):
     def _try_wake(self) -> None:
         self._wake_timer = None
         notices = self._wake_notices()
-        if not notices or not self.config.jobs_wake_on_end:
+        if not notices:
             return  # a user turn drained them meanwhile
         if self._wake_blocked():
             self._schedule_wake()  # retry; a prompt the user sends drains the notices instead
             return
-        if self._wake_turns >= JOB_WAKE_LIMIT:
-            if self._wake_turns == JOB_WAKE_LIMIT:  # say it once per streak
+        if self._wake_turns >= WAKE_LIMIT:
+            if self._wake_turns == WAKE_LIMIT:  # say it once per streak
                 self._wake_turns += 1
-                self._append(f"⚙ Not resuming the agent: {JOB_WAKE_LIMIT} automatic turns in a row. "
+                self._append(f"⚙ Not resuming the agent: {WAKE_LIMIT} automatic turns in a row. "
                              "It sees the job results with your next message.", msg_type="system")
             return
         self._wake_turns += 1
-        ids = ", ".join(f'"{n.id}"' for n in notices)
-        self._append(f"⚙ Resuming the agent: background job {ids} ended", msg_type="system")
+        jobs = ", ".join(f'"{n.id}"' for n in notices if n.kind == "job")
+        agents = ", ".join(f'"{n.description}"' for n in notices if n.kind == "agent")
+        what = " and ".join(([f"background job {jobs}"] if jobs else []) + ([f"background agent {agents}"] if agents else []))
+        self._append(f"⚙ Resuming the agent: {what} ended", msg_type="system")
         self._turn_in_progress = True
-        self._start_worker(self._run_turn(format_notice(notices), wake=True), name=f"wake_{uuid.uuid4().hex[:6]}")
+        text = format_notices(notices, self.config.max_tool_output_chars)
+        self._start_worker(self._run_turn(text, wake=True), name=f"wake_{uuid.uuid4().hex[:6]}")
 
     def _refresh_job_hint(self) -> None:
-        """The loader offers Ctrl+B only while a model shell call is running."""
+        """The loader offers Ctrl+B only while a model shell call or a foreground subagent is running."""
         if not self._turn_in_progress or self._loader_label not in (WORKING_LABEL, WORKING_LABEL_JOBS):
             return
-        self._loader_label = WORKING_LABEL_JOBS if self._foreground_jobs() else WORKING_LABEL
+        self._loader_label = WORKING_LABEL_JOBS if self._foreground_jobs() or self._foreground_agents() else WORKING_LABEL
         self._render_loader()
 
     # ── Esc Esc: edit the previous prompt · Ctrl+R: search prompt history ──────
@@ -3221,14 +3589,17 @@ class DostuffTUI(App):
             content = step.get("content") if isinstance(step, dict) else None
             if (step.get("role") == "user" and isinstance(content, str) and content != EMPTY_RESPONSE_NUDGE
                     and not content.startswith("[/undo]") and _parse_shell_step(content) is None
-                    and parse_stop_note(content) is None and parse_notice(content) is None):
+                    and parse_stop_note(content) is None and parse_notices(content) is None):
                 return i
         return None
 
     def _escape_when_idle(self) -> None:
+        """Esc with no turn to cancel: Esc Esc (empty input) takes back the last prompt. Every press
+        says what it did or how to quit, since a reflexive Esc is often someone trying to leave."""
         inp = self.query_one("#input", EnterSubmits)
         if inp.text.strip() or self._last_prompt_index() is None:
             self._last_escape = 0.0
+            self._flash_input_hint(QUIT_HINT)
             return
         now = time.monotonic()
         if now - self._last_escape <= EDIT_PROMPT_ESC_SECONDS:
@@ -3236,7 +3607,8 @@ class DostuffTUI(App):
             self._start_worker(self._edit_previous_prompt(), name="edit_prompt")
             return
         self._last_escape = now
-        self._flash_input_hint("Esc again to edit the previous prompt", seconds=EDIT_PROMPT_ESC_SECONDS)
+        self._flash_input_hint(f"Esc again to edit the previous prompt · {QUIT_HINT}",
+                               seconds=EDIT_PROMPT_ESC_SECONDS)
 
     async def _edit_previous_prompt(self) -> None:
         """Drop the last prompt and everything after it (answer, tool calls) and put the prompt back
@@ -3295,6 +3667,10 @@ class DostuffTUI(App):
 
     # ── Exit ───────────────────────────────────────────────────────────────────
 
+    def action_help_quit(self) -> None:
+        """Ctrl+C with nothing selected: Textual's "Do you want to quit?" toast, as an input-border hint."""
+        self._flash_input_hint(QUIT_HINT)
+
     async def action_quit(self) -> None:
         """Ctrl+Q / /exit: clean up and quit; repeated presses are ignored.
 
@@ -3302,7 +3678,7 @@ class DostuffTUI(App):
         """
         if self._quitting or self._quit_confirming:
             return
-        if self._running_jobs():
+        if self._running_jobs() or self._running_background_agents():
             self._quit_confirming = True
             self.run_worker(self._quit_after_confirm(), name="quit_confirm", exit_on_error=False)
             return
@@ -3311,7 +3687,7 @@ class DostuffTUI(App):
 
     async def _quit_after_confirm(self) -> None:
         try:
-            if not await self._confirm_quit_jobs():
+            if not await self._confirm_quit_background():
                 return
         finally:
             self._quit_confirming = False
@@ -3321,7 +3697,8 @@ class DostuffTUI(App):
     # ── Background jobs (plan/2026-10-31-background-shell D8) ────────────────────
 
     def _running_jobs(self) -> list[Job]:
-        return [j for j in get_registry().jobs() if j.ended is None and not j.foreground]
+        """Running background jobs, not a subagent's: those die with their agent (counted as the agent)."""
+        return [j for j in get_registry().jobs() if j.ended is None and not j.foreground and "/sub/" not in j.owner]
 
     async def _jobs_housekeeping(self) -> None:
         """Startup: drop old job logs; warn once about jobs a crashed earlier session may have left (D11)."""
@@ -3337,29 +3714,51 @@ class DostuffTUI(App):
             self._append(f"⚠ {count} from an earlier session may still be running ({listed}{more}). "
                          "Check them with your OS tools.", msg_type="error")
 
-    async def _confirm_quit_jobs(self) -> bool:
-        """Ask before quitting stops the running background jobs; True to go ahead (also with none)."""
-        jobs = self._running_jobs()
-        if not jobs:
+    def _running_background_agents(self) -> list["AgentRun"]:
+        return [r for r in _agent_registry().runs()
+                if r.background and r.status in ("queued", "running", "waiting_approval")]
+
+    async def _confirm_quit_background(self) -> bool:
+        """Ask before quitting stops the running background jobs and agents; True to go ahead (also with none)."""
+        jobs, agents = self._running_jobs(), self._running_background_agents()
+        if not jobs and not agents:
             return True
-        count = f"{len(jobs)} background job{'s' if len(jobs) != 1 else ''}"
-        names = ", ".join(j.id for j in jobs)
+        parts = ([f"{len(jobs)} background job{'s' if len(jobs) != 1 else ''}"] if jobs else []) +             ([f"{len(agents)} agent{'s' if len(agents) != 1 else ''}"] if agents else [])
+        count = " and ".join(parts)
+        names = ", ".join([j.id for j in jobs] + [f'"{r.description}"' for r in agents])
         return await self.adapter.confirm(
             f"⚙ Quit and stop {count}? ({names})", "Quit?", f"Yes, stop {count} and quit", "No, keep working")
 
-    def _carry_jobs(self, old_session_id: str) -> list[Job]:
-        """/clear and /resume: the old session's running jobs keep running in the current one (D8)."""
+    def _carry_background(self, old_session_id: str) -> tuple[list[Job], list["AgentRun"]]:
+        """/clear and /resume: the old session's running jobs (background shell D8) and background agents
+        (subagents D14) keep running in the current one; queued notices move with them."""
         if old_session_id == self.session_id:
-            return []
-        carried = get_registry().transfer(old_session_id, self.session_id)
+            return [], []
+        jobs = get_registry().transfer(old_session_id, self.session_id)
+        agents = _agent_registry().transfer(old_session_id, self.session_id)
         self.call_later(self._render_jobs_bar)
+        self.call_later(self._render_agents_bar)
         self._schedule_wake()  # notices queued for the old session now belong to this one
-        return carried
+        return jobs, agents
 
-    def _report_carried_jobs(self, carried: list[Job]) -> None:
-        if carried:
-            count = f"{len(carried)} background job{'s' if len(carried) != 1 else ''}"
-            self._append(f"⚙ {count} ({', '.join(j.id for j in carried)}) kept running.", msg_type="system")
+    def _report_carried(self, carried: tuple[list[Job], list["AgentRun"]]) -> None:
+        jobs, agents = carried
+        if jobs:
+            count = f"{len(jobs)} background job{'s' if len(jobs) != 1 else ''}"
+            self._append(f"⚙ {count} ({', '.join(j.id for j in jobs)}) kept running.", msg_type="system")
+        if agents:
+            count = f"{len(agents)} agent{'s' if len(agents) != 1 else ''}"
+            names = ", ".join(f'"{r.description}"' for r in agents)
+            self._append(f"⚙ {count} ({names}) kept running.", msg_type="system")
+
+    async def _stop_agents(self) -> None:
+        """Stop every subagent run, bounded (subagents CON-007); no notices, nobody is left to read them.
+        Each run kills its own shell jobs; _stop_jobs catches any left over."""
+        from dostuff.agent.subagents.registry import STOP_GRACE_S
+        try:
+            await asyncio.wait_for(_agent_registry().stop_all("session_end"), timeout=STOP_GRACE_S + KILL_WAIT_S)
+        except Exception:
+            pass
 
     async def _stop_jobs(self) -> None:
         """Kill every job, bounded; falls back to the synchronous kill."""
@@ -3380,9 +3779,11 @@ class DostuffTUI(App):
             self.exit()
 
     async def _cleanup_and_save_session(self) -> None:
-        """Stop jobs, cancel pending work, close MCP sessions and the DB, with bounded timeouts."""
+        """Stop agents and jobs, cancel pending work, close MCP sessions and the DB, with bounded timeouts."""
         # 0. Background and foreground shell jobs: none outlives the app (background shell CON-008)
         get_registry().remove_listener(self._on_job_event)
+        _agent_registry().remove_listener(self._on_agent_event)
+        await self._stop_agents()
         await self._stop_jobs()
         # 1. Cancel in-flight workers (turns, MCP connect, ...); they run on this loop
         self.adapter._cancelled = True
@@ -3408,7 +3809,9 @@ class DostuffTUI(App):
         # 4. Paste files, when loop.paste_retention_days is 0 (otherwise the startup sweep ages them out)
         if self.config.paste_retention_days <= 0:
             self._pastes.delete_files()
-        # 5. Session DB
+        # 5. Session DB, after the agent rows and steps still queued for it (subagents D14)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(_agent_registry().flush(), timeout=5.0)
         await self.store.close()
         # 6. Force-stop any lingering litellm logging workers (background threads)
         try:
@@ -3423,10 +3826,12 @@ class DostuffTUI(App):
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _mount_message(self, widget: Static) -> None:
-        """Mount above the loader (so the loader stays at the bottom)."""
-        msg_container = self.query_one("#msg-container", Vertical)
+        """Mount above the loader (so the loader stays at the bottom). While the agent view renders a
+        transcript, `_message_target` points at that view's container instead of the conversation."""
+        msg_container = self.query_one(self._message_target, Vertical)
         loader = self._loader_widget
-        if loader is not None and loader.is_mounted and loader.parent is msg_container:
+        # Children, not is_mounted: a loader mounted moments ago (before the hooks' trust question) isn't yet
+        if loader is not None and loader.parent is msg_container and loader in msg_container.children:
             msg_container.mount(widget, before=loader)
         else:
             msg_container.mount(widget)
@@ -3468,6 +3873,8 @@ class DostuffTUI(App):
         self._tool_results_expanded = not self._tool_results_expanded
         for widget in self.query(ToolResult):
             widget.set_expanded(self._tool_results_expanded)
+        self._flash_input_hint("tool output expanded · ctrl+o to collapse" if self._tool_results_expanded
+                               else "tool output collapsed · ctrl+o to expand")
 
     async def _connect_one_mcp_server(self, name: str, cfg: dict) -> None:
         timeout = float(cfg.get("connect_timeout") or MCP_CONNECT_TIMEOUT_S)
@@ -3590,9 +3997,10 @@ class DostuffTUI(App):
         """Fit the bar to the terminal: shorten items, then drop the least important ones."""
         items = self._status_items()
         choice = {name: 0 for name in items}
-        jobs = self._jobs_bar_text()  # beside the status items, so it takes from their room
-        # #status (and #jobs-bar) have 1 cell of padding each side
-        width = max(self.size.width - 2 - (jobs.cell_len + 2 if jobs else 0), 1)
+        # the shells and agents items sit beside the status items, so they take from their room;
+        # #status, #jobs-bar and #agents-bar have 1 cell of padding each side
+        extras = [t for t in (self._jobs_bar_text(), self._agents_bar_text()) if t is not None]
+        width = max(self.size.width - 2 - sum(t.cell_len + 2 for t in extras), 1)
 
         def line() -> Text:
             return Text("  ").join(items[name][choice[name]] for name in items)
@@ -3628,6 +4036,39 @@ class DostuffTUI(App):
         if text is not None:
             bar.update(text)
         self._render_status()  # the status items get more or less room
+
+    def _agents_bar_text(self) -> Text | None:
+        """`⚠ 1 agent waiting` while any of this session's agents waits for approval, else `⚙ 2 agents` while
+        any runs (queued included); None when none do."""
+        try:
+            runs = [r for r in _agent_registry().runs(self.session_id)
+                    if r.status in ("queued", "running", "waiting_approval")]
+        except Exception:
+            return None
+        waiting = sum(1 for r in runs if r.status == "waiting_approval")
+        if waiting:
+            return Text(f"⚠ {waiting} agent{'s' if waiting != 1 else ''} waiting", style="#e5c07b")
+        return Text(f"⚙ {len(runs)} agent{'s' if len(runs) != 1 else ''}", style="#e5c07b") if runs else None
+
+    def _render_agents_bar(self) -> None:
+        text = self._agents_bar_text()
+        try:
+            bar = self.query_one("#agents-bar", AgentsBar)
+        except Exception:
+            return  # not mounted yet / shutting down
+        bar.display = text is not None
+        if text is not None:
+            bar.update(text)
+        self._render_status()
+
+    def action_show_agents(self) -> None:
+        """The agents item was clicked: the /agents list, or close it when it's already showing."""
+        if self._picker_open() and self.query_one("#picker", PermissionPrompt)._question == "Agents":
+            self._close_picker()
+            return
+        if self._picker_open() or self._settings_open() or self.query("#permission-prompt"):
+            return
+        self._show_agents_list()
 
     def _jobs_picker_open(self) -> bool:
         """The jobs list, or one job's actions, is showing."""

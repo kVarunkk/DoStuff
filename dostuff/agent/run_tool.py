@@ -8,8 +8,9 @@ from opentelemetry.trace import get_current_span
 
 from dostuff.agent.permissions import (
     ApprovalReply, PermissionConfig, PermissionDecision, PermissionMode, SessionPermissions, check,
-    describe_approval_keys, effective_kind, forced_ask, to_reply,
+    describe_approval_keys, effective_kind, forced_ask, is_read_only_shell, to_reply,
 )
+from dostuff.agent.subagents import read_only_shell
 from dostuff.config import get_config
 from dostuff.helpers.agent.tool_output import truncate_tool_output
 from dostuff.helpers.hooks import HookOutcome, run_hooks
@@ -25,6 +26,10 @@ from dostuff.tools.settings import SETTINGS_TOOLS, settings_preview
 # Legacy approval flags a model may still try to pass; always dropped before dispatch.
 APPROVAL_KEYS = frozenset({"_confirmed", "overwrite"})
 CANCELLED_RESULT = "Cancelled by user"
+READ_ONLY_SHELL_DENIAL = (
+    "Denied: this agent type is read-only, so bash_command may only run read-only commands (ls, cat, grep, "
+    "git status/log/diff, …). Report what needs changing instead."
+)
 _PREVIEW_MAX_LINES = 40
 
 
@@ -94,6 +99,8 @@ def _decide(
     if spec is None:
         return PermissionDecision("allow")  # unknown tools fail in dispatch with a clear error
     args = _sanitize_args(spec, fn_args)
+    if fn_name == "bash_command" and read_only_shell.get() and not is_read_only_shell(str(args.get("command", ""))):
+        return PermissionDecision("deny", reason=READ_ONLY_SHELL_DENIAL)
     preview = _approval_preview(fn_name, args)
     base = check(fn_name, spec.kind, args, permissions, permission_config(), preview)
     return _hook_decision(hook, spec, args, base, preview)
@@ -233,10 +240,12 @@ async def dispatch_tool(
     adapter: Any = None,
     permissions: SessionPermissions | None = None,
     owner: str | None = None,
+    fork_context: Any = None,
 ) -> Any:
     """Execute an already-authorized tool call, injecting harness params the tool declares.
 
     `owner` is the agent shell jobs belong to: the session, or `<session>/sub/<run>` for a subagent.
+    `fork_context` is what a fork inherits from the main agent's loop (`ForkContext`, subagents spec D11).
     """
     spec = TOOL_MAP.get(fn_name)
     if spec is None:
@@ -245,6 +254,7 @@ async def dispatch_tool(
     available: dict[str, Any] = {
         "mcp_client": mcp_client, "session_id": session_id, "turn_id": turn_id,
         "adapter": adapter, "permissions": permissions, "owner": owner or session_id or "",
+        "fork_context": fork_context,
     }
     for param in spec.injected:
         if available[param] is None and param in ("mcp_client", "session_id", "turn_id"):

@@ -12,8 +12,10 @@ COMMAND_DESCRIPTIONS = {
     "/context": "Show what fills the context window: system prompt, tools, project instructions, messages",
     "/memory": "Edit the instructions file (AGENTS.md) the agent follows (/memory [project|global]); `# note` adds a line",
     "/doctor": "Check config, API key, MCP config and memory setup, with a fix for each problem",
+    "/tools": "List the agent's tools: when each asks, whether subagents get it, and the connected MCP servers' tools",
     "/hooks": "List the configured hooks, where each came from and whether it runs (/hooks r reloads config)",
     "/jobs": "List this session's background shell jobs; /jobs <id> shows its output, /jobs kill <id> stops it",
+    "/agents": "This session's subagents: read a transcript, stop one or answer its approval (/agents types lists the agent types, /agents types <name> shows one's system prompt, /agents reload re-reads their files)",
     "/queue": "Show the prompts waiting for the current turn: edit, run next or remove one (/queue clear drops them all)",
     "/rename": "Name this session (/rename <title>); shown by `dostuff sessions`",
     "/export": "Save this session as Markdown (/export [path])",
@@ -29,8 +31,35 @@ COMMAND_DESCRIPTIONS = {
 COMMANDS = set(COMMAND_DESCRIPTIONS)
 # A flag each command takes, suggested as ghost text in the input after "<command> "
 COMMAND_FLAGS = {"/model": "--active", "/fork": "--worktree"}
+# The arguments each command takes, shown as dim hint text after its name (never inserted);
+# <x> is required, [x] optional. Skill and custom commands get SKILL_ARGS_HINT.
+COMMAND_ARGS = {
+    "/resume": "[session id]",
+    "/fork": "[--worktree] [title]",
+    "/worktree": "[name | exit]",
+    "/model": "[provider/model] [--active]",
+    "/permissions": "[ask | allowlist | auto | plan]",
+    "/config": "[mcp] [project]",
+    "/memory": "[project | global]",
+    "/hooks": "[r]",
+    "/jobs": "[id | kill <id>]",
+    "/agents": "[types [name] | reload]",
+    "/queue": "[clear]",
+    "/rename": "<title>",
+    "/export": "[path]",
+    "/compact": "[auto <1-100 | off>]",
+    "/notifications": "[on | off | bell | osc9]",
+    "/forget": "<memory key or episode id>",
+    "/undo": "[force]",
+}
+SKILL_ARGS_HINT = "[arguments]"
 MAX_ITERATIONS = 100
 DEFAULT_IDENTITY = "You are DoStuff, a coding agent that works in the user's project directory."
+# {agent_background} in SYSTEM_INSTRUCTIONS (subagents spec D13); left out headless with agents.wake_on_end off
+AGENT_BACKGROUND = """
+- Long, independent work whose result you don't need yet: pass `run_in_background=true`. The call
+  returns the agent_id at once and you keep working; when the agent ends, a <background-agent>
+  message brings its report. Don't poll or wait for it, and don't redo its work meanwhile."""
 # {background_wait} in SYSTEM_INSTRUCTIONS: the TUI wakes the agent when its job ends (background shell
 # spec D15); headless kills every job when the run ends, so there the agent has to wait
 BACKGROUND_WAIT_INTERACTIVE = """ For a long job whose final result you need (a build,
@@ -90,10 +119,30 @@ You can help with a wide range of tasks using the tools and skills available to 
   need to read dostuff's own source to use it.
 
 {memory_section}## Delegating to subagents
-- `agent` runs a bounded, multi-step task (e.g. investigating several files) in an isolated loop and
-  returns its report. Do not delegate single tool calls or questions for the user.
-- The subagent cannot see this conversation: put every path, constraint and goal in `prompt`.
-  Subagents cannot start agents themselves.
+- `agent` starts a subagent: a separate agent loop that works on a bounded, multi-step task (e.g.
+  investigating several files) and returns its report. Do not delegate single tool calls or questions
+  for the user.
+- Pick a type with `subagent_type`:
+{agent_types}
+- Use `explore` for read-only searches and `plan` for implementation plans; `general-purpose` can also
+  change files.
+- Independent tasks: call `agent` several times in one response and they run in parallel.{agent_background}
+- Follow-ups: `send_message(to=<agent_id>, message=…)` continues an agent with everything it did
+  before, so use it to ask for more or correct it instead of starting a new agent on the same
+  task. A finished agent starts again and reports; a running one reads the message before its
+  next step. Don't poll an agent for progress: its report comes back to you either way.
+- A typed subagent cannot see this conversation, so write a self-contained `prompt`: every path,
+  constraint and goal it needs, and what its report should contain. Subagents cannot start agents
+  themselves.
+- `subagent_type="fork"` starts a copy of you that inherits this whole conversation and your tools,
+  and always runs on your model; its `prompt` is just the task. Every fork call resends the whole
+  conversation, so fork only when the task needs this conversation; otherwise use a typed agent
+  with a self-contained prompt.
+- New agent types: when the user asks for a new kind of agent (e.g. "make a code-reviewer agent"),
+  or a role recurs, define it with `create_agent_type` (name, description, system prompt, optional
+  tools/model). It writes an agent file in .dostuff/agents/ (or ~/.dostuff/agents/ with
+  scope="user"), and `agent(subagent_type=<name>)` can start it right away, though this list
+  won't show it until the next session. Don't create a type for a one-off task.
 - For a subagent that writes files, pass `isolation="worktree"` (git repos only) so it works in its
   own checkout of HEAD; then review its changes and bring over what the user wants.
 

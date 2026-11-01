@@ -8,15 +8,32 @@ from dostuff.helpers.models.opencode import OPENCODE_PROVIDERS, is_opencode, lit
 
 # The running session, for providers that want a per-conversation id (OpenCode Go); set by the loop
 current_session_id: ContextVar[str] = ContextVar("current_session_id", default=uuid.uuid4().hex)
+# A subagent run's own model (subagents spec D15), set inside the run's task; None = the main model.
+# Context variables follow tasks and asyncio.to_thread, so the whole run (and only the run) uses it.
+current_model: ContextVar[str | None] = ContextVar("current_model", default=None)
+
+
+def _run_model() -> str | None:
+    """The running subagent's model when it differs from the main one."""
+    override = current_model.get()
+    return override if override and override != get_config().model_name else None
 
 
 def get_model() -> str:
-    """litellm model string, "provider/model" (env MODEL overrides config.yaml)."""
-    return get_config().model_name
+    """litellm model string, "provider/model" (a subagent's own model, else env MODEL, else config.yaml)."""
+    return _run_model() or get_config().model_name
 
 
 def get_provider() -> str:
-    return get_config().provider
+    override = _run_model()
+    if override is None:
+        return get_config().provider
+    return override.split("/", 1)[0] if "/" in override else get_config().provider
+
+
+def is_main_provider() -> bool:
+    """False inside a subagent whose model is on another provider (its key isn't `api_key_env`'s)."""
+    return get_provider() == get_config().provider
 
 
 def _opencode_id() -> str:
@@ -48,8 +65,9 @@ def uses_explicit_prompt_caching() -> bool:
 
 
 def completion_kwargs() -> dict[str, Any]:
-    """Common kwargs for every litellm call: the model, plus `api_key` when `api_key_env` is set."""
-    api_key = get_config().api_key()
+    """Common kwargs for every litellm call: the model, plus `api_key` when `api_key_env` is set and the
+    model is on the main provider (another provider's key comes from its usual environment variable)."""
+    api_key = get_config().api_key() if is_main_provider() else None
     provider = get_provider()
     if is_opencode(provider):
         from dostuff import __version__

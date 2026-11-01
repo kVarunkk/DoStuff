@@ -27,6 +27,8 @@ from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.helpers.tools.project_root import project_root, use_project_root
 from dostuff.tools.bash import bash_command as bash_module
 
+from conftest import fake_response, fake_tool_call
+
 D9 = r'''
 hooks:
   project_trust: ask          # ask | allow | deny  (D4) — only read from ~/.dostuff/config.yaml
@@ -1683,3 +1685,113 @@ def test_hooks_bg_tools(home, tmp_path, monkeypatch, registry, _py, _alive):
                            permissions=SessionPermissions(mode="plan"), **_tool_kwargs()))
     assert result.startswith('Plan mode: not run (Run shell command (background job "dev"):)')
     assert [j.id for j in registry.jobs()] == ["dev"]  # only the job from the first part
+
+
+# --- subagents rebuild T7.1–T7.2 (plan/2026-11-01-subagents/spec.md D16) ----------------------
+
+def _agent_run(agents, prompt: str, agent_type: str = "general-purpose", **kw):
+    """Start a foreground run as the `agent` tool would and wait for its report."""
+    from conftest import FakeAdapter
+    adapter = kw.pop("adapter", None) or FakeAdapter(auto="yes")
+
+    async def go():
+        run = await agents.start(owner="s1", agent_type=agent_type, description="hooked", prompt=prompt,
+                                 adapter=adapter, turn_id="t1", **kw)
+        await run.done
+        return run
+    return _run(go()), adapter
+
+
+def test_subagent_start_hook(home, tmp_path, agents, fake_model, agent_type):
+    log = tmp_path / "start.log"
+    logger = _event_logger(tmp_path, log, "hook_event_name", "agent_id", "agent_type", "background", "prompt",
+                           "turn_type")
+    context = _script(tmp_path, "print('start ctx for explore')")
+    write_user_config(home, {"hooks": {"SubagentStart": [_group(logger), _group(context, matcher="explore")]}})
+    agent_type("worker")
+    fake_model.script("[E]", fake_response("explored"))
+    fake_model.script("[W]", fake_response("worked"), fake_response("worked more"))
+
+    explore, _ = _agent_run(agents, "[E] look around", agent_type="explore")
+    worker, _ = _agent_run(agents, "[W] do it", agent_type="worker")
+    assert explore.status == worker.status == "completed"
+    assert log.read_text().splitlines() == [
+        f"SubagentStart|{explore.id}|explore|False|[E] look around|subagent_loop",
+        f"SubagentStart|{worker.id}|worker|False|[W] do it|subagent_loop",
+    ]
+    # the matcher picked the explore run only; its context reached that run's first model call
+    first_explore = fake_model.calls_for("[E]")[0]["messages"]
+    assert any("start ctx for explore" in str(m.get("content")) for m in first_explore)
+    assert not any("start ctx for explore" in str(m.get("content")) for c in fake_model.calls_for("[W]")
+                   for m in c["messages"])
+
+    # a send_message resume is a new run: the hook fires again, with the message as the prompt
+    async def resume():
+        run = await agents.resume(worker, "[W] and more", adapter=None, turn_id="t2")
+        await run.done
+    _run(resume())
+    assert log.read_text().splitlines()[-1] == f"SubagentStart|{worker.id}|worker|False|[W] and more|subagent_loop"
+
+
+@pytest.mark.parametrize("hook", ["exit2", "block_json", "crash"])
+def test_subagent_start_cannot_block(home, tmp_path, agents, fake_model, hook):
+    command = {
+        "exit2": _stderr_exit2(tmp_path, "not now"),
+        "block_json": _script(tmp_path, "import json; print(json.dumps({'decision': 'block', 'reason': 'no'}))"),
+        "crash": _script(tmp_path, "import sys; sys.exit(3)"),
+    }[hook]
+    write_user_config(home, _hooks_block("SubagentStart", _group(command, name="gate", fail_closed=True)))
+    fake_model.script("[G]", fake_response("the report"))
+    run, adapter = _agent_run(agents, "[G] go")
+    assert run.status == "completed" and run.result == "the report"
+    errors = [d for t, d in adapter.events if t == "error"]
+    assert errors, adapter.events  # logged, not silent
+    if hook != "crash":
+        assert "can't block" in errors[-1] and "gate" in errors[-1]
+
+
+def test_subagent_hook_payloads(home, tmp_path, agents, fake_model, agent_type, monkeypatch):
+    log = tmp_path / "payloads.log"
+    logger = _event_logger(tmp_path, log, "hook_event_name", "agent_id", "agent_type")
+    write_user_config(home, {"hooks": {
+        "PreToolUse": [_group(logger)], "PostToolUse": [_group(logger)],
+        "SubagentStop": [_group(logger, matcher="rev.*")],
+    }})
+    (Path.cwd() / "a.txt").write_text("x", encoding="utf-8")
+    agent_type("reviewer", tools=["read_file"])
+    agent_type("other", tools=["read_file"])
+    fake_model.script("[R]", fake_response(tool_calls=[fake_tool_call("read_file", {"path": "a.txt"})]),
+                      fake_response("reviewed"))
+    run, _ = _agent_run(agents, "[R] review", agent_type="reviewer")
+    assert run.result == "reviewed"
+    assert log.read_text().splitlines() == [
+        f"PreToolUse|{run.id}|reviewer", f"PostToolUse|{run.id}|reviewer", f"SubagentStop|{run.id}|reviewer"]
+
+    # the SubagentStop matcher matches agent_type: another type's stop doesn't fire it
+    log.unlink()
+    other, _ = _agent_run(agents, "[O] look", agent_type="other")
+    assert other.status == "completed" and not log.exists()
+
+    # the main agent's tool payloads don't carry the fields
+    _loop(monkeypatch, [_msg(tool_calls=[_tc("read_file", {"path": "a.txt"}, "c1")]), _msg(content="ok")],
+          dispatch=DispatchSpy())
+    assert log.read_text().splitlines() == ["PreToolUse|None|None", "PostToolUse|None|None"]
+
+
+def test_readme_documents_agents():
+    """subagents rebuild T7.7: the README's Subagents section (plan/2026-11-01-subagents/spec.md D18)."""
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "\n## Subagents\n" in readme
+    agents = _section(readme, "\n## Subagents\n")
+    for phrase in ("`agent`", "`send_message`", "`stop_agent`", ".dostuff/agents/", ".claude/agents/",
+                   "~/.dostuff/agents/", "~/.claude/agents/", "`general-purpose`", "`explore`", "`plan`", "`fork`",
+                   "agents.models", "run_in_background", "<background-agent", "Ctrl+B", "/agents", "/agents types",
+                   "SubagentStart", "max_concurrent", "isolation", "read_claude_agents"):
+        assert phrase in agents, phrase
+    for claude, ours in (("Read", "read_file"), ("Edit", "edit_file"), ("Bash", "bash_command"),
+                         ("mcp__*", "search_mcp_tools")):
+        assert f"`{claude}`" in agents and ours in agents, claude
+    tools = _section(readme, "## Tools and permissions")
+    assert "delegate_to_subagent" not in tools and "`agent`" in tools
+    assert "`SubagentStart`" in _section(readme, "\n## Hooks\n")
+    assert "**Subagents**" in _section(readme, "## Features")

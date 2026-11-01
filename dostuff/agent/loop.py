@@ -25,8 +25,10 @@ from dostuff.helpers.hooks.events import (
 )
 from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
-from dostuff.tools.definitions import TOOL_MAP
-from dostuff.tools.bash.jobs import Job, JobEvent, format_notice, get_registry
+from dostuff.tools.definitions import TOOL_MAP, default_tool_names
+from dostuff.agent.subagents.fork import ForkContext
+from dostuff.helpers.agent.notices import format_notices, get_notice_queue
+from dostuff.tools.bash.jobs import Job, JobEvent, get_registry
 from typing import Any, Iterator, Literal
 import contextlib
 import json
@@ -42,6 +44,7 @@ MODEL_ERROR_PREFIX = "Model call failed: "  # what loop() returns, + the error, 
 # Tools exempt from TOOL_TIMEOUT_S: a subagent is bounded by its iteration cap, each of its own
 # tool calls has the normal timeout, and its approval prompts must not count against a deadline
 _UNTIMED_TOOLS = frozenset({"agent"})
+_FORK_TOOLS = frozenset({"agent", "send_message"})  # get the fork_context harness param (subagents spec D11)
 
 _RETRYABLE_ERRORS: tuple[type[BaseException], ...] = (
     litellm.RateLimitError, litellm.Timeout, litellm.APIConnectionError,
@@ -178,13 +181,16 @@ def _job_events(owner: str, adapter: Any) -> Iterator[None]:
         registry.remove_listener(on_job)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction).
 
     `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
     every model call's system instruction, refreshed here on compaction, never written to history.
 
     `owner` is who this run's shell jobs belong to: the session, or `<session>/sub/<run>` for a subagent.
+
+    `inbox` is a subagent's `send_message` queue (subagents spec D10): each message becomes a user step before
+    the next model call, and a final answer with messages waiting doesn't end the run.
     """
     current_session_id.set(session_id)
     owner = owner or session_id
@@ -215,21 +221,33 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
         compaction_notes = new_summary.strip()
         with tracer.start_as_current_span("context_compaction") as compaction_span:
             compaction_span.set_attribute("steps_after", len(working_history))
-        if turn_type == "interactive_loop" and store is not None and hasattr(store, "compact_working_history"):
+        if store is not None and hasattr(store, "compact_working_history"):  # a subagent's: its transcript
             try:
                 await store.compact_working_history(session_id, len(working_history), compaction_notes)
             except Exception as e:
                 await loop_emit("error", f"Could not save compaction: {e}", adapter=adapter)
         await loop_emit("system", f"{reason} Context compacted. Notes: {compaction_notes}", adapter=adapter)
-        if session_hook_context is not None:
+        if session_hook_context is not None and turn_type == "interactive_loop":  # a fork carries the main's
             # Earlier SessionStart context may be stale now; refresh it under its own key (REQ-2.4)
             await session_start("compact", session_hook_context, session_id=session_id, turn_id=turn_id,
                                 turn_type=turn_type, adapter=adapter)
         return True
 
     async def append_note(text: str) -> None:
-        """A harness-authored user step: a Stop-hook continuation or background-job notices."""
+        """A harness-authored user step: a Stop-hook continuation, background notices or a send_message."""
         await append_step({"role": "user", "content": text}, steps_history, working_history, current_session_history, session_id, store, turn_type)
+
+    def fork_context() -> ForkContext | None:
+        """What a fork started now inherits (subagents spec D11): the history as it is before this response's
+        assistant step is appended, and the system prompt parts as this model call got them. Main agent only."""
+        if turn_type != "interactive_loop":
+            return None
+        return ForkContext(
+            system_instruction=dynamic_system_instruction, compaction_notes=compaction_notes,
+            history=[dict(step) for step in working_history],
+            tool_names=list(tool_names) if tool_names is not None else default_tool_names(),
+            session_hook_context=dict(session_hook_context) if session_hook_context is not None else None,
+        )
 
     async def check_cancelled() -> bool:
         return await loop_check_cancelled(steps_history, working_history, current_session_history, session_id, store, turn_type, adapter=adapter)
@@ -257,10 +275,12 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 if await check_cancelled():
                     return CANCELLED_TURN
 
-                # Background jobs of this run that ended since the last model call (spec D7)
-                notices = get_registry().drain_notices(owner)
+                # Background jobs and agents of this run that ended since the last model call (spec D7)
+                notices = get_notice_queue().drain(owner)
                 if notices:
-                    await append_note(format_notice(notices))
+                    await append_note(format_notices(notices, max_tool_output_chars))
+                while inbox:  # send_message to this running subagent, oldest first (D10)
+                    await append_note(inbox.pop(0))
 
                 # Model call with classified retries and exponential backoff
                 interaction = None
@@ -370,6 +390,9 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         "content": content,
                     }
                     await append_step(model_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
+                    if inbox:  # a send_message arrived during this call: read it instead of ending
+                        iter_span.set_status(Status(StatusCode.OK))
+                        continue
 
                     # Stop / SubagentStop: only here, on a final answer, never on cancel, errors or the
                     # iteration cap. A block keeps the turn going, at most stop_block_limit times (REQ-2.3)
@@ -455,8 +478,9 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         break
 
                 def start(call: _ToolCall) -> asyncio.Task:
+                    fork = fork_context() if call.name in _FORK_TOOLS else None
                     return asyncio.ensure_future(asyncio.wait_for(
-                        dispatch_tool(call.name, dict(call.args), mcp_client=mcp_client, session_id=session_id, turn_id=turn_id, adapter=adapter, permissions=permissions, owner=owner),
+                        dispatch_tool(call.name, dict(call.args), mcp_client=mcp_client, session_id=session_id, turn_id=turn_id, adapter=adapter, permissions=permissions, owner=owner, fork_context=fork),
                         timeout=None if call.name in _UNTIMED_TOOLS else TOOL_TIMEOUT_S,
                     ))
 

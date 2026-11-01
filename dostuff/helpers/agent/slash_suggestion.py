@@ -2,7 +2,7 @@
 
 from collections.abc import Iterable
 
-from dostuff.helpers.agent.constants import COMMAND_DESCRIPTIONS, COMMAND_FLAGS
+from dostuff.helpers.agent.constants import COMMAND_ARGS, COMMAND_DESCRIPTIONS, COMMAND_FLAGS, SKILL_ARGS_HINT
 
 
 def slash_suggestion(text: str, highlighted: str | None = None, commands: Iterable[str] = COMMAND_DESCRIPTIONS) -> str:
@@ -28,3 +28,23 @@ def slash_suggestion(text: str, highlighted: str | None = None, commands: Iterab
     if not last:
         return flag
     return flag[len(last):] if last.startswith("-") and flag.startswith(last) else ""
+
+
+def slash_arg_hint(text: str, commands: Iterable[str] = COMMAND_DESCRIPTIONS) -> str:
+    """A hint for the arguments of the command in `text` (e.g. " <title>" after "/rename"), or "".
+
+    `text` is the input plus any completion ghost text. Shown only while no argument is typed yet;
+    a skill or custom command (in `commands` but not built in) gets SKILL_ARGS_HINT.
+    """
+    if not text.startswith("/") or "\n" in text:
+        return ""
+    name, space, arg = text.partition(" ")
+    name = name.lower()
+    if arg.strip():
+        return ""
+    hint = COMMAND_ARGS.get(name)
+    if hint is None and name not in COMMAND_DESCRIPTIONS and name in commands:
+        hint = SKILL_ARGS_HINT
+    if not hint:
+        return ""
+    return hint if space else " " + hint

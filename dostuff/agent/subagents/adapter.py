@@ -1,5 +1,6 @@
 """The adapter a subagent run talks to: its own cancel state, approvals forwarded to the parent (spec D5)."""
-from typing import TYPE_CHECKING, Any
+import contextlib
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from dostuff.helpers.agent.loop_check_cancelled import is_cancelled
 
@@ -32,14 +33,29 @@ class SubagentAdapter:
 
     Foreground: output goes to the parent prefixed `[agent: <description>]`. Background: only errors and usage do;
     the registry reports its start and end. Usage is also added to the run's own tokens and cost. Approval prompts go
-    to the parent with the prefix.
+    to the parent titled `[agent: <description> · <type>]`, one at a time behind the parent's own lock, and the
+    run is `waiting_approval` meanwhile (D8).
     """
 
-    def __init__(self, parent: Any, run: "AgentRun"):
+    def __init__(self, parent: Any, run: "AgentRun", set_status: "Callable[[AgentRun, Any], None] | None" = None):
         self._parent = parent
         self._run = run
         self._prefix = f"[agent: {run.description}]"
+        self._ask_prefix = f"[agent: {run.description} · {run.agent_type}]"
         self._cancel_event = RunCancel(run, parent)
+        self._set_status = set_status or (lambda r, status: setattr(r, "status", status))
+        self._asking = 0
+
+    @contextlib.contextmanager
+    def _waiting(self) -> Iterator[None]:
+        self._asking += 1
+        self._set_status(self._run, "waiting_approval")
+        try:
+            yield
+        finally:
+            self._asking -= 1
+            if not self._asking and self._run.status == "waiting_approval":
+                self._set_status(self._run, "running")
 
     @property
     def _cancelled(self) -> bool:
@@ -70,12 +86,18 @@ class SubagentAdapter:
     async def ask(self, message: str, **kwargs: Any) -> Any:
         if self._parent is None or not hasattr(self._parent, "ask"):
             return "no"
-        return await self._parent.ask(f"{self._prefix} {message}", **kwargs)
+        if self._run.background:
+            kwargs["background"] = True  # the TUI holds it back while the user types (D8)
+        with self._waiting():
+            return await self._parent.ask(f"{self._ask_prefix} {message}", **kwargs)
 
     async def ask_batch(self, messages: list[str], **kwargs: Any) -> Any:
         if not hasattr(self._parent, "ask_batch"):
             return "each"
-        return await self._parent.ask_batch([f"{self._prefix} {m}" for m in messages], **kwargs)
+        if self._run.background:
+            kwargs["background"] = True
+        with self._waiting():
+            return await self._parent.ask_batch([f"{self._ask_prefix} {m}" for m in messages], **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._parent, name)

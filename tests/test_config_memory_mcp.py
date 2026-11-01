@@ -262,3 +262,57 @@ def test_keyword_search_uses_token_overlap():
     names = [r["name"] for r in keyword_search("please create a github issue for me", client)]
     assert names[0] == "gh__create_issue"
     assert keyword_search("zzz", client) == []
+
+
+# --- subagents rebuild T7.6: the `agents` block (plan/2026-11-01-subagents/spec.md D18) ----------
+
+def test_agents_config(home, monkeypatch):
+    import yaml
+    from dostuff.helpers.agent.constants import MAX_ITERATIONS
+    from dostuff.tools import settings
+    user, _ = home
+    cfg_file = user / ".dostuff" / "config.yaml"
+    cfg_file.write_text("loop:\n")
+    cfg = Config()
+    assert (cfg.agents_max_iterations, cfg.agents_max_concurrent, cfg.agents_wake_on_end,
+            cfg.agents_read_claude_agents, cfg.agents_explore_model, cfg.agents_models) == (
+        MAX_ITERATIONS, 4, True, True, "inherit", {})
+    # unset: the main agent's loop.max_iterations
+    cfg_file.write_text("loop:\n  max_iterations: 42\n")
+    assert Config().agents_max_iterations == 42
+    # agents.max_iterations falls back to loop.subagent_max_iterations (old configs), then loop.max_iterations
+    cfg_file.write_text("loop:\n  subagent_max_iterations: 7\n")
+    assert Config().agents_max_iterations == 7
+    cfg_file.write_text("loop:\n  subagent_max_iterations: 7\nagents:\n  max_iterations: 9\n  max_concurrent: 2\n"
+                        "  models:\n    fast: openai/gpt-4o-mini\n")
+    cfg = Config()
+    assert (cfg.agents_max_iterations, cfg.agents_max_concurrent, cfg.agents_models) == (
+        9, 2, {"fast": "openai/gpt-4o-mini"})
+    # the registry follows the config unless a value is set on it
+    from dostuff.agent.subagents.registry import AgentRegistry
+    monkeypatch.setattr(config_module, "_config", cfg, raising=False)
+    monkeypatch.setattr(config_module, "get_config", lambda: cfg)
+    reg = AgentRegistry()
+    assert reg.max_concurrent == 2
+    reg.max_concurrent = 5
+    assert reg.max_concurrent == 5
+
+    # a known key: no unknown-key warning
+    assert "agents" in settings.CONFIG_KEYS
+    assert settings._config_warnings({"agents": {"max_concurrent": 3}}) == []
+
+    # a hand edit applies on the next check
+    cfg_file.write_text("agents:\n  max_concurrent: 6\n")
+    import os
+    os.utime(cfg_file, (os.path.getatime(cfg_file), os.path.getmtime(cfg_file) + 5))
+    assert cfg.reload_if_changed() and cfg.agents_max_concurrent == 6
+
+    # read_settings documents the block; edit_config can set an alias
+    monkeypatch.setattr(settings, "config_path", lambda scope: cfg_file)
+    text = settings.read_settings()
+    assert "# agents:" in text or "\nagents:" in text
+    for option in ("max_iterations", "max_concurrent", "wake_on_end", "read_claude_agents", "explore_model", "models"):
+        assert f"  {option}:" in text.split("agents:", 1)[1], option
+    monkeypatch.setattr(settings, "_apply", lambda adapter, what: None)
+    settings.edit_config("  max_concurrent: 6\n", "  max_concurrent: 6\n  models:\n    fast: openai/gpt-4o-mini\n")
+    assert yaml.safe_load(cfg_file.read_text())["agents"]["models"] == {"fast": "openai/gpt-4o-mini"}

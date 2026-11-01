@@ -36,11 +36,11 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Project instructions** — `AGENTS.md` / `CLAUDE.md` from `~/.dostuff/`, the repo root and every folder down to the current one, combined
 - **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
 - **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
-- **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
+- **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
 - **File sandbox** — file tools stay inside the project directory and never read `.env*` files or `~/.dostuff/`
 - **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`
-- **Subagents** — `delegate_to_subagent` runs a bounded task with a restricted tool set; its approval prompts and ESC go through the same TUI
+- **Subagents** — the `agent` tool starts agents in parallel, in the foreground or the background, from built-in types (`explore`, `plan`, `general-purpose`), your own Markdown agent files (Claude Code's `.claude/agents/` work too) or a `fork` of the conversation; continue one with `send_message`, stop it with `stop_agent`, see them all in `/agents`. See [Subagents](#subagents)
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
 - **Retries with backoff** for rate limits, timeouts and 5xx errors (6 by default, exponential with jitter, honors `Retry-After`; `loop.max_retries` / `loop.retry_max_delay`); auth / bad-request errors fail fast
 - **Token and cost tracking** — per-turn and cumulative totals in `/status` and the line after each turn (`✻ Worked for 1m 5s · $0.01`); cost in USD from litellm's price table (hidden when the model has no known price). The table bundled with litellm is used, so startup doesn't wait on a download; set `LITELLM_LOCAL_MODEL_COST_MAP=False` to fetch the latest one from GitHub instead
@@ -182,9 +182,10 @@ In the TUI:
 | `Ctrl+R`      | Search the prompts typed in this directory (type to filter, `Enter` puts the prompt in the input) |
 | `Esc` `Esc`   | With an empty input: take back your last prompt. It and everything after it (answer, tool calls) leave the conversation and the prompt goes back in the input to edit and resend. Files that turn changed stay as they are; `/undo` restores them |
 | `Ctrl+O`      | Expand / collapse every truncated tool and shell result (click one to toggle just that one) |
-| `Ctrl+B`      | While the agent waits on a shell command (the loader says `Ctrl+B to background`): move it, and any a subagent is running, to the background; the agent gets what it printed so far and carries on. Not for `!command`s. See [Background jobs](#background-jobs) |
+| `Ctrl+B`      | While the agent waits on a shell command or a foreground subagent (the loader says `Ctrl+B to background`): move them to the background; the agent gets what a command printed so far and carries on, and hears from the agent when it ends. Not for `!command`s. See [Background jobs](#background-jobs) and [Subagents](#subagents) |
 | `Shift+Tab`   | Cycle the permission mode for this session: ask → auto → plan → allowlist (shown in the status bar) |
 | `Ctrl+Backspace` / `Ctrl+W` / `Alt+Backspace` | Delete the previous word; `Ctrl+Delete` / `Alt+Delete` the next one |
+| `/agents` / `/agents types` / `/agents reload` | This session's agents (running first): pick one to read its transcript, answer its approval prompt or stop it / the agent types with their source, model and tools (`/agents types <name>`: one type's system prompt and config) / re-read the agent files |
 | `/exit`       | Save the session and quit           |
 | `/clear`      | Start a new session; the old one stays resumable |
 | `/resume [<id>]` | Pick another session from this directory (or switch to the given one) |
@@ -199,6 +200,7 @@ In the TUI:
 | `/context`    | What fills the context window: system prompt, tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
 | `/memory [project\|global]` | Edit `AGENTS.md` (this project's or `~/.dostuff/AGENTS.md`) in the same editor as `/config`; `Ctrl+S` saves and the agent follows it from the next message |
 | `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory, hooks), with a fix for each problem |
+| `/tools`      | Every tool the agent has: when it asks (in `ask` mode), whether subagents get it and what it does, then each connected MCP server's tools (reached through `call_mcp_tool`) |
 | `/hooks [r]`  | List the configured hooks per event: file, matcher, timeout, `fail_closed`, and whether each runs (`user` / `trusted` / `untrusted` / `disabled` / `broken`). `/hooks r` re-reads the config files. See [Hooks](#hooks) |
 | `/queue` / `/queue clear` | List the prompts waiting for the current turn: edit one (back into the input), run it next or remove it / drop them all |
 | `/jobs [<id>]` / `/jobs kill <id>` | List this session's background jobs (id, owner, status, runtime, command) / show a job's last 40 lines of output and its log files / stop one (the agent is told). See [Background jobs](#background-jobs) |
@@ -233,6 +235,8 @@ In the TUI:
 
 ## Tools and permissions
 
+`/tools` lists these in the TUI, plus the tools of the connected MCP servers.
+
 | Tool | Kind | Asks? |
 | ---- | ---- | ----- |
 | `read_file`, `list_files`, `grep`, `glob`, `get_current_datetime`, `search_mcp_tools`, `get_mcp_tool_details` | read | never |
@@ -242,9 +246,9 @@ In the TUI:
 | `call_mcp_tool` | mcp | yes |
 | `web_fetch` | network | yes; `a` (always) allows that domain for the session |
 | `web_search` | network | yes; `a` (always) allows every search for the session. Free: DuckDuckGo by default, the `ddgs` package if installed (`pip install "dostuff[search]"`), or your own SearXNG via `search.searxng_url` |
-| `delegate_to_subagent` | — | no; the subagent's own calls ask |
+| `agent`, `send_message`, `stop_agent` | — | no; each subagent's own calls ask, titled with the agent |
 | `read_settings` | read | never (MCP `env` / header values are shown as `<redacted>`) |
-| `edit_config`, `set_mcp_server`, `remove_mcp_server` | settings | **always, in every mode, with no "always" option** (shows the diff or the server's command) |
+| `edit_config`, `set_mcp_server`, `remove_mcp_server`, `create_agent_type` | settings | **always, in every mode, with no "always" option** (shows the diff or the server's command) |
 
 File tools writing under a `.dostuff` directory, and `bash_command` calls whose command or `cwd` names `.dostuff`, are
 settings changes too, so they always ask. That way auto mode can't quietly add a hook to `~/.dostuff/config.yaml`. Paths
@@ -344,6 +348,112 @@ paths). Directories older than 7 days are removed at startup.
 
 ---
 
+## Subagents
+
+A subagent is a separate agent with its own context, system prompt and tools. The main agent hands it a task with the
+`agent` tool and gets one report back, so the searching, reading and trial and error stay out of the main
+conversation. Several `agent` calls in one response run in parallel. The main agent follows up with `send_message`
+and can stop one with `stop_agent`.
+
+| Tool | What it does |
+|---|---|
+| `agent(description, prompt, subagent_type, model, run_in_background, isolation)` | Start an agent. `description` is 3–5 words for the UI; `prompt` is the whole task (the agent sees nothing else); `subagent_type` picks the type (default `general-purpose`); `model` overrides the type's; `isolation="worktree"` runs it in its own git worktree. The result is its report, ending with `agent_id: <id>` |
+| `send_message(to, message, run_in_background)` | Continue an agent. One that has ended runs again with its whole history plus the message; one still running reads it before its next step |
+| `stop_agent(agent_id)` | Stop a running agent; its shell jobs are killed and its worktree is closed out |
+
+A subagent can never start, message or stop agents, delete files, save memories, write the todo list or change
+settings, whatever its type asks for. At most `agents.max_concurrent` (4) run at once; more are queued.
+
+### Agent types
+
+| Type | Tools | For |
+|---|---|---|
+| `general-purpose` | every subagent tool | research and multi-step tasks, including changing files. The default |
+| `explore` | read-only (its `bash_command` only runs read-only commands) | finding code and answering where things are; model: `agents.explore_model` |
+| `plan` | read-only | investigating and returning a step-by-step plan |
+| `fork` | the main agent's | a copy of the main agent that inherits the whole conversation (same system prompt, so a Claude model reuses the prompt cache). Costly: only when the task needs the conversation. Always the main model |
+
+Your own types are Markdown files with YAML frontmatter. They are searched in this order, and the first file with a
+given `name` wins: `.dostuff/agents/` and `.claude/agents/` in the project, then `~/.dostuff/agents/` and
+`~/.claude/agents/`. `agents.read_claude_agents: false` skips both `.claude` folders. A file can replace a built-in
+type, except `fork`. Files are re-read when they change; `/agents reload` forces it.
+
+You can also ask the agent for one ("make a code-reviewer agent"): its `create_agent_type(name, description, prompt,
+tools, model, max_iterations, scope, replace)` tool writes the file to `.dostuff/agents/` (`scope="user"`:
+`~/.dostuff/agents/`) after showing it to you. Like the settings tools, it asks in every mode. The new type can be
+started at once.
+
+```markdown
+---
+name: code-reviewer
+description: Reviews a diff for bugs and missing tests. Use after a change.
+tools: Read, Grep, Glob, Bash   # omit for every subagent tool
+model: fast                     # inherit (default), an alias from agents.models, or a litellm model string
+max_iterations: 30              # optional; default agents.max_iterations
+---
+You are a code reviewer. Report findings as a list, most severe first.
+```
+
+`tools:` takes DoStuff names or Claude Code's, so Claude Code agent files work unchanged:
+
+| Claude Code | DoStuff |
+|---|---|
+| `Read` | `read_file` |
+| `Write` | `write_file` |
+| `Edit`, `MultiEdit` | `edit_file` |
+| `Glob` / `Grep` / `LS` | `glob` / `grep` / `list_files` |
+| `Bash` | `bash_command` (plus `bash_output`, `kill_shell`) |
+| `WebFetch` / `WebSearch` | `web_fetch` / `web_search` |
+| `mcp__*` | `search_mcp_tools`, `get_mcp_tool_details`, `call_mcp_tool` |
+
+Unknown and forbidden names are dropped with a warning naming the file; `/agents types` lists each type with its
+source, resolved model, tools and any warnings, and `/agents types <name>` shows one type's whole config: its
+system prompt, model, tools and max iterations (for `fork`, the task message it gets). `model:` aliases come from `agents.models`; Claude Code's `sonnet`,
+`opus` and `haiku` are looked up there too and fall back to the main model (with a warning in the report) when they
+aren't defined. The call's `model=` wins over the type's `model:`.
+
+### Background agents
+
+With `run_in_background=true` the call returns the `agent_id` at once and the main agent keeps working. When the agent
+ends, its report arrives as a `<background-agent id=… status=…>` message before the main agent's next model call, and
+the TUI shows `⚙ agent "<description>" (<type>) finished after 2m 10s`. If the TUI is idle it starts a turn for it
+(`agents.wake_on_end`, at most 3 automatic turns in a row together with background jobs). `Ctrl+B` moves running
+foreground agents to the background. Approval prompts from a background agent are titled
+`[agent: <description> · <type>]` and wait while you type. The status line shows `⚙ 2 agents` (or
+`⚠ 1 agent waiting` for approval); click it for `/agents`.
+
+`dostuff -p` waits for background agents and runs a turn on their reports before it prints the answer, for at most 3
+such turns; agents still running then are stopped and named on stderr. `--output-format stream-json` prints an
+`{"type": "agent", …}` event when an agent starts and when it ends.
+
+Quitting asks before it stops running agents. `/clear` and `/resume` keep background agents running in the new
+session.
+
+### Transcripts and `/agents`
+
+Every agent's steps are saved in the session database, apart from the main conversation. `/agents` lists this
+session's agents (id, status, runtime, description and type, tokens, cost); pick one to read its whole transcript,
+answer its approval prompt, stop it or show its type's system prompt and config. After a restart or `/resume` the agents come back as records (a run that was
+going is `interrupted`) that `send_message` can continue.
+
+### Hooks and config
+
+`SubagentStart` fires when a run starts and can add context to its task; `SubagentStop` fires on its final answer.
+Both match the agent type, and tool hooks inside an agent see `agent_id` and `agent_type`. See [Hooks](#hooks).
+
+```yaml
+agents:
+  max_iterations: 100       # model calls per run; default: the main agent's loop.max_iterations
+  max_concurrent: 4         # running or waiting for approval; more are queued
+  wake_on_end: true         # a finished background agent resumes the idle TUI
+  read_claude_agents: true  # also load .claude/agents/
+  explore_model: inherit    # model of the built-in explore type
+  models:                   # aliases for model: and model=
+    fast: anthropic/claude-haiku-5-5
+```
+
+---
+
 ## Hooks
 
 Hooks are shell commands DoStuff runs at fixed points of a session: block a tool call, feed a formatter's output back
@@ -362,7 +472,8 @@ matcher and tool argument names are renamed (see [the table below](#coming-from-
 | `PreToolUse` | Before each tool call, before any approval prompt | the tool name | `allow`, `deny` or `ask`; rewrite the arguments |
 | `PostToolUse` | After a tool call ran | the tool name | Append text to the result the model sees |
 | `Stop` | When the agent is about to give its final answer | — | Block, so the turn continues with your reason |
-| `SubagentStop` | Same, for a `delegate_to_subagent` run | — | Same |
+| `SubagentStart` | When a subagent run starts (an `agent` call, or a `send_message` that continues one) | the agent type | Add context to the run's task. Can't block |
+| `SubagentStop` | Same as `Stop`, for a subagent's final answer | the agent type | Same as `Stop` |
 
 ### Config
 
@@ -467,6 +578,9 @@ worktree), with no terminal. stdin is one JSON object:
 | `UserPromptSubmit` | `prompt` |
 | `SessionStart` | `source` |
 | `Stop`, `SubagentStop` | `last_assistant_message`, `stop_hook_active` (true once a Stop hook already continued this turn) |
+| `SubagentStart` | `agent_id`, `agent_type`, `background`, `prompt` |
+
+Inside a subagent, `PreToolUse`, `PostToolUse` and `SubagentStop` payloads also carry `agent_id` and `agent_type`.
 
 The environment adds `DOSTUFF_HOOK_EVENT`, `DOSTUFF_SESSION_ID`, `DOSTUFF_TURN_ID`, `DOSTUFF_PROJECT_ROOT` and
 `DOSTUFF_TURN_TYPE`. Output is capped at `loop.max_tool_output_chars`.
@@ -526,8 +640,8 @@ nesting are the same. Tool names and some argument names differ, so rename the m
 | `Grep` / `Glob` | `grep` / `glob` | per tool |
 | `mcp__<server>__<tool>` | `call_mcp_tool` | server and tool are inside `tool_input` |
 
-Not supported yet: `http`, `prompt` and `agent` hook types, and the `Notification`, `PreCompact`, `SessionEnd` and
-`SubagentStart` events.
+Not supported yet: `http`, `prompt` and `agent` hook types, and the `Notification`, `PreCompact` and `SessionEnd`
+events.
 
 ---
 
@@ -562,7 +676,6 @@ models:
 
 loop:
   max_iterations: 100
-  subagent_max_iterations: 25
   # context_window: 128000       # override when dostuff/litellm don't know the model
   max_tool_output_chars: 30000   # longer tool results keep head + tail
   max_retries: 6                 # retries on rate limits, timeouts, 5xx (0 = none)
@@ -574,6 +687,12 @@ memory:
 permissions:
   mode: ask                 # ask | allowlist | auto | plan
   allow: []
+
+agents:                     # see Subagents
+  max_iterations: 100       # model calls per run; default: loop.max_iterations (older: loop.subagent_max_iterations)
+  max_concurrent: 4
+  models:
+    fast: anthropic/claude-haiku-5-5
 ```
 
 See [`config.example.yaml`](https://github.com/kVarunkk/DoStuff/blob/package-structure/dostuff/templates/config.example.yaml) for a full template. `dostuff setup` writes it for you.
@@ -885,7 +1004,9 @@ dostuff/
 │   ├── web_fetch.py        # read a URL as text
 │   ├── web_search.py       # free web search (SearXNG / ddgs / DuckDuckGo)
 │   ├── todo_write.py       # visible task list
-│   └── delegate_to_subagent.py # bounded subagents (optionally in a worktree)
+│   ├── agent.py            # the agent tool (subagents: dostuff/agent/subagents/)
+│   ├── create_agent_type.py # write a new agent type file
+│   └── send_message.py, stop_agent.py # continue or stop an agent
 ├── cli.py                  # CLI typer entrypoints and doctor checkup utilities
 ├── cli_tui.py              # Textual TUI Application and adapter translates state
 ├── config.py               # layered config loader supporting project/global yaml and multi-model configuration

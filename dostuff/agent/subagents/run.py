@@ -7,8 +7,6 @@ from dostuff.helpers.tools.project_root import project_root
 from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.worktree import Worktree, WorktreeError, remove_worktree, worktree_changes
 
-DEFAULT_SUBAGENT_TOOLS = ["read_file", "list_files", "grep", "glob", "get_current_datetime", "web_fetch", "web_search","search_mcp_tools", "get_mcp_tool_details", "call_mcp_tool"]
-
 WRAP_UP_PROMPT = (
     "You have run out of steps. Do not call any more tools. Report what you found so far, "
     "what is still unknown, and what the next steps would be."
@@ -85,11 +83,14 @@ def _close_worktree(wt: Worktree) -> str:
 
 
 def resolve_subagent_tools(requested_tools: list[str] | None) -> tuple[list[str], list[str]]:
-    """Split requested tool names into (allowed, dropped). Restricted and unknown names are dropped."""
+    """Split requested tool names into (allowed, dropped). Restricted and unknown names are dropped.
+    None means every tool a subagent may have (D2: `tools:` omitted)."""
     from dostuff.tools.definitions import TOOL_MAP, with_shell_job_tools
+    if requested_tools is None:
+        requested_tools = [name for name in TOOL_MAP if name not in RESTRICTED_SUBAGENT_TOOLS]
     allowed: list[str] = []
     dropped: list[str] = []
-    for name in dict.fromkeys(requested_tools or DEFAULT_SUBAGENT_TOOLS):
+    for name in dict.fromkeys(requested_tools):
         if name in RESTRICTED_SUBAGENT_TOOLS or name not in TOOL_MAP:
             dropped.append(name)
         else:
@@ -109,8 +110,13 @@ async def run_agent_loop(
     allowed_tool_names: list[str],
     owner: str,
     max_iterations: int,
+    store: Any = None,
+    compaction_notes: str = "",
+    inbox: list[str] | None = None,
+    session_hook_context: dict[str, str] | None = None,
 ) -> tuple[str, RunOutcome]:
-    """The subagent's loop, plus a partial report if it stopped before a final answer."""
+    """The subagent's loop, plus a partial report if it stopped before a final answer. `store` is the run's
+    transcript (`AgentTranscript`), or None to keep its steps in memory only."""
     from dostuff.agent.loop import CANCELLED_TURN, MODEL_ERROR_PREFIX, loop
 
     subagent_result = await loop(
@@ -127,6 +133,10 @@ async def run_agent_loop(
         stream=False,
         max_iterations=max_iterations,
         owner=owner,
+        store=store,
+        compaction_notes=compaction_notes,
+        inbox=inbox,
+        session_hook_context=session_hook_context,  # a fork's: the main agent's SessionStart context (D11)
     )
     if subagent_result == CANCELLED_TURN:
         return subagent_result, "stopped"
