@@ -5,8 +5,8 @@ import pytest
 
 from dostuff.agent.permissions import _is_settings_path, has_unsafe_constructs
 from dostuff.helpers.tools.project_root import project_root
-from dostuff.tools import delegate_to_subagent as delegate_module
-from dostuff.tools.files.write_file import write_file
+from dostuff.agent import call_agent as call_agent_module
+from conftest import fake_response, fake_tool_call
 from dostuff.lib.worktree import (WorktreeError, create_worktree, detect_worktree, has_changes, remove_worktree,
                                   worktree_changes)
 
@@ -80,48 +80,49 @@ def test_settings_path_is_relative_to_cwd(tmp_path, monkeypatch):
     assert not _is_settings_path("src/main.py")
 
 
-def _delegate(monkeypatch, repo, writes: bool, isolation="worktree"):
-    """Run delegate_to_subagent with a fake loop that writes a file through the real write_file tool."""
+def _delegate(monkeypatch, repo, fake_model, start_subagent, writes: bool, isolation="worktree"):
+    """Start a subagent whose model writes a file through the real write_file tool when `writes`."""
+    from dostuff.agent.permissions import SessionPermissions
     seen = {}
+    fake = fake_model.acompletion
 
-    async def fake_loop(task, role, mcp_client, session_id, turn_id, adapter, permissions,
-                        instruction, working_history, tool_names, owner=None):
-        seen["root"] = project_root()
-        seen["instruction"] = instruction
-        if writes:
-            await asyncio.to_thread(write_file, "new.txt", "hi\n")  # threads see the subagent's root too
-        return "report"
+    async def spy(**kwargs):
+        seen["root"] = project_root()  # the subagent's root, also what its tool threads see
+        seen["instruction"] = kwargs["messages"][0]["content"]
+        return await fake(**kwargs)
 
+    monkeypatch.setattr(call_agent_module, "acompletion", spy)
+    if writes:
+        write = fake_tool_call("write_file", {"path": "new.txt", "content": "hi\n"})
+        fake_model.script("[W]", fake_response(tool_calls=[write]))
+    fake_model.script("[W]", fake_response("report"))
     monkeypatch.chdir(repo)
-    monkeypatch.setattr(delegate_module, "_run_subagent_loop", fake_loop)
-    result = asyncio.run(delegate_module._impl_delegate_to_subagent(
-        task="t", role="coder", mcp_client=object(), session_id="s", turn_id="t",  # type: ignore[arg-type]
-        requested_tools=["write_file"], isolation=isolation,
-    ))
+    result = asyncio.run(start_subagent("[W] t", tools=["write_file"], isolation=isolation,
+                                        permissions=SessionPermissions(mode="auto")))
     return result, seen
 
 
-def test_subagent_worktree_removed_when_unchanged(monkeypatch, repo):
-    result, seen = _delegate(monkeypatch, repo, writes=False)
+def test_subagent_worktree_removed_when_unchanged(monkeypatch, repo, fake_model, _start_subagent):
+    result, seen = _delegate(monkeypatch, repo, fake_model, _start_subagent, writes=False)
     assert seen["root"].parent == repo / ".dostuff" / "worktrees"
     assert "git worktree" in seen["instruction"]
     assert "changed no files" in result and not seen["root"].exists()
     assert project_root() == repo  # override reset after the subagent
 
 
-def test_subagent_worktree_kept_with_changes(monkeypatch, repo):
-    result, seen = _delegate(monkeypatch, repo, writes=True)
+def test_subagent_worktree_kept_with_changes(monkeypatch, repo, fake_model, _start_subagent):
+    result, seen = _delegate(monkeypatch, repo, fake_model, _start_subagent, writes=True)
     assert (seen["root"] / "new.txt").read_text() == "hi\n"
     assert not (repo / "new.txt").exists()  # the main checkout is untouched
     assert "changes are kept in .dostuff/worktrees/" in result and "new.txt" in result
 
 
-def test_subagent_isolation_errors(monkeypatch, repo, tmp_path):
-    result, _ = _delegate(monkeypatch, repo, writes=False, isolation="docker")
+def test_subagent_isolation_errors(monkeypatch, repo, tmp_path, fake_model, _start_subagent):
+    result, _ = _delegate(monkeypatch, repo, fake_model, _start_subagent, writes=False, isolation="docker")
     assert result.startswith("[error] Unknown isolation")
     plain = tmp_path / "plain"
     plain.mkdir()
-    result, seen = _delegate(monkeypatch, plain, writes=False)
+    result, seen = _delegate(monkeypatch, plain, fake_model, _start_subagent, writes=False)
     assert "not inside a git repository" in result and not seen
 
 

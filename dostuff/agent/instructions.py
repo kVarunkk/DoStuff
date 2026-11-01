@@ -5,7 +5,7 @@ from typing import Any
 
 from dostuff.config import get_config
 from dostuff.helpers.agent.constants import (
-    BACKGROUND_WAIT_HEADLESS, BACKGROUND_WAIT_INTERACTIVE, MEMORY_INSTRUCTIONS, SYSTEM_INSTRUCTIONS,
+    AGENT_BACKGROUND, BACKGROUND_WAIT_HEADLESS, BACKGROUND_WAIT_INTERACTIVE, MEMORY_INSTRUCTIONS, SYSTEM_INSTRUCTIONS,
 )
 from dostuff.helpers.agent.environment_context import build_environment_block
 from dostuff.helpers.agent.load_identity import load_identity
@@ -23,25 +23,47 @@ def _background_wait(interactive: bool) -> str:
     return BACKGROUND_WAIT_INTERACTIVE if get_config().jobs_wake_on_end else ""
 
 
+def skills_summary(skills: list[dict[str, Any]]) -> str:
+    """The skills list as the system prompt shows it."""
+    summary = "\n\n".join(
+        f"- name: {s['name']}\n  description: {s['description']}\n  location: {s['location']}"
+        for s in skills
+    )
+    return summary or "(none available)"
+
+
+def project_instructions_section(cwd: Path | None = None) -> str:
+    """`## Project Instructions` + every applicable AGENTS.md / CLAUDE.md, or "" when there are none."""
+    project_instructions = load_project_instructions(cwd)
+    return "## Project Instructions\n" + project_instructions if project_instructions else ""
+
+
+def agent_types_list() -> str:
+    """One `  - name: description` line per agent type, fork included (subagents spec D11, D13)."""
+    from dostuff.agent.subagents.definitions import current_definitions
+    from dostuff.agent.subagents.fork import FORK_DESCRIPTION, FORK_TYPE
+    descriptions = {name: d.description for name, d in current_definitions().types.items()}
+    descriptions[FORK_TYPE] = FORK_DESCRIPTION
+    return "\n".join(f"  - {name}: {descriptions[name]}" for name in sorted(descriptions))
+
+
 def build_base_instructions(interactive: bool = False) -> tuple[str, list[dict[str, Any]]]:
     """(identity + skills + project instructions, the skills found). Built once per session.
 
     `interactive`: the TUI, which wakes the agent when a background job ends; headless doesn't.
     """
     skills = discover_skills()
-    skills_summary = "\n\n".join(
-        f"- name: {s['name']}\n  description: {s['description']}\n  location: {s['location']}"
-        for s in skills
-    )
     instructions = SYSTEM_INSTRUCTIONS.format(
         dostuff_identity=load_identity(),
-        skills_summary=skills_summary or "(none available)",
+        skills_summary=skills_summary(skills),
         memory_section=MEMORY_INSTRUCTIONS if chroma.chroma_available() else "",
         background_wait=_background_wait(interactive),
+        agent_types=agent_types_list(),
+        agent_background=AGENT_BACKGROUND if interactive or get_config().agents_wake_on_end else "",
     )
-    project_instructions = load_project_instructions()
-    if project_instructions:
-        instructions += "\n\n## Project Instructions\n" + project_instructions
+    project = project_instructions_section()
+    if project:
+        instructions += "\n\n" + project
     return instructions, skills
 
 

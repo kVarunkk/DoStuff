@@ -5,6 +5,44 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-11-01
+
+Subagents rebuilt: typed agents defined in Markdown files (Claude Code's `.claude/agents/` work too), parallel and background agents you can message and stop, forks that share the conversation, per-agent models, stored transcripts and an `/agents` viewer. Also: a `/tools` command, argument hints for slash commands, and a faster TUI start.
+
+### Added
+- **`agent(description, prompt, subagent_type, model, run_in_background, isolation)`** tool replaces `delegate_to_subagent`. Every run is owned by a session registry with a 6-hex id; the result ends with `agent_id: <id> (send_message to continue)`. Several `agent` calls in one response run in parallel, at most `agents.max_concurrent` (default 4) at a time, with the rest queued.
+- **Agent types** from Markdown files with YAML frontmatter (`name`, `description`, `tools`, `model`, `max_iterations`, body = system prompt), searched in `.dostuff/agents/` and `.claude/agents/` in the project, then the same two under `~`. The first `name` found wins. `agents.read_claude_agents: false` skips the `.claude` folders. Claude Code tool names (`Read`, `Edit`, `Bash`, `mcp__*`, …) are mapped, and unknown or restricted ones are dropped with a warning. Files are re-read when they change. Built-in types: `general-purpose` (every subagent tool), `explore` and `plan` (read-only, and shell commands that aren't read-only are denied).
+- **`fork`** type: a subagent that starts from a copy of the current conversation with the main agent's system message byte-identical, so the prompt cache is reused. It always runs on the main model.
+- **Per-agent models**: the call's `model=`, then the type's `model:`, then the main model. Aliases come from `agents.models`. `sonnet`/`opus`/`haiku` fall back to the main model with a warning. `agents.explore_model` sets the built-in explore model. Cost, provider keys and the context window follow the agent's model.
+- **Background agents**: `run_in_background=true` returns at once, and a `<background-agent …>` notice with the report arrives when the agent ends. In the TUI that is a `⚙ agent "…" finished after 2m 10s` line plus a notification, and an idle TUI resumes the main agent for it (`agents.wake_on_end`, sharing the 3-turn limit with jobs). Running agents show as `⚙ 2 agents` / `⚠ 1 agent waiting` on the status line, carry over on `/clear` and `/resume`, and quitting asks before stopping them.
+- **Ctrl+B** also moves running or queued foreground agents to the background. Their call returns at once and Esc no longer stops them.
+- **`send_message(to, message)`**: queues a message for a running agent (read before its next step), or continues an ended agent on its full history with the same id (a new worktree if its old one was removed). **`stop_agent(agent_id)`**: stops an agent, kills its jobs and closes its worktree.
+- **`create_agent_type`** tool: the main agent can write a new agent type file (`.dostuff/agents/<name>.md`, or `~` with `scope="user"`) when asked. It always asks, with the whole file shown, and the type is usable at once.
+- **Transcripts**: each agent's steps and compactions are stored in the session DB (schema v4, `agent_runs` / `agent_steps`), never in the main history. After a restart or `/resume` the session's agents come back as records (`interrupted` if they were running) and can be continued with `send_message`.
+- **`/agents`** lists this session's agents (status, runtime, type, tokens, cost). Picking one opens its live transcript in place of the conversation, with Answer approval, Stop it and Show its type. `/agents types` lists the types, `/agents types <name>` shows one type's full config and system prompt, and `/agents reload` re-reads the files.
+- Approval prompts from subagents are titled `[agent: <description> · <type>]` and queue one at a time. A background agent's prompt waits while you're typing or a picker is open.
+- **Hooks**: new `SubagentStart` event (matcher = agent type; its output is added to the agent's prompt; it can't block). `PreToolUse`, `PostToolUse` and `SubagentStop` payloads inside an agent carry `agent_id` and `agent_type`, and `SubagentStop`'s matcher matches the agent type.
+- **Headless**: `dostuff -p` waits for background agents and runs a turn on their notices (at most 3, then `⚙ Not waiting for more agents…` and exit 0). It stops every running agent at the end and on Ctrl+C. `stream-json` prints `{"type": "agent", …}` events when an agent starts and ends, and text mode prints background agents' start and end lines on stderr.
+- **`agents:` config block**: `max_iterations` (default: `loop.max_iterations`), `max_concurrent`, `wake_on_end`, `read_claude_agents`, `explore_model`, `models`.
+- **`/tools`** lists every tool offered to the main agent, with when it asks in `ask` mode, whether subagents get it, and a one-line description, then each MCP server's tools.
+- Slash commands that take arguments show a dim hint after the name (`/rename <title>`, `/permissions [ask | allowlist | auto | plan]`). Tab from the `/` menu adds a space so the hint shows.
+- Every shortcut now reports what it did in the input's border hint: Esc with nothing to cancel, Ctrl+C with nothing selected (instead of Textual's quit toast), Ctrl+O and Ctrl+B.
+
+### Changed
+- The main system prompt lists the agent types and explains when to use explore / plan / general-purpose / fork, parallel calls, background agents, `send_message` follow-ups and not polling.
+- A subagent with no `tools:` gets every subagent tool, so `general-purpose` can write files.
+- Skills are deduplicated by name (the first one found wins, project before home), and a directory reached twice is scanned once.
+
+### Removed
+- `delegate_to_subagent`. Old sessions that used it still load, replay and render.
+
+### Fixed
+- The TUI no longer stays blank for seconds at startup when an agent file with a `tools:` line exists (parsing it imported litellm).
+- The project-hooks trust prompt and tool approvals no longer make the transcript jump when answered, and the first turn shows one loader instead of two.
+
+### Documentation
+- README "Subagents" section (tools, types and search order, frontmatter, Claude Code tool mapping, models, background agents, Ctrl+B, headless, `/agents`, transcripts, hooks, config). `SubagentStart` added to the Hooks tables, `/tools` and `/agents` added to the command table, and the `agents:` block documented in `templates/config.example.yaml`.
+
 ## [0.2.5] - 2026-11-01
 
 Background shell jobs: start long-running commands, read their output, stop them, and move a running command to the background with Ctrl+B. Also: config files edited by hand apply live, and queued prompts can be viewed, edited, run next or removed.

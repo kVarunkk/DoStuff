@@ -15,7 +15,7 @@ models:
 
 loop:
   max_iterations: 100  # max agent turns before forced exit; ESC cancels anytime
-  subagent_max_iterations: 25  # iteration cap for delegate_to_subagent
+  # subagent_max_iterations: 25  # older name for agents.max_iterations; still read when that isn't set
   prompt_caching: true  # Claude models: cache the system prompt and history between calls (cheaper, faster)
   # context_window: 128000     # override the model's context window (tokens) if dostuff/litellm can't tell
   max_tool_output_chars: 30000 # longer tool results keep head + tail with a truncation marker
@@ -50,6 +50,17 @@ jobs:
   # without a message from you). false: the agent hears about it with your next message. Headless runs
   # stop their jobs at the end, so this is TUI-only.
   wake_on_end: true
+
+agents:
+  # Subagents started with the `agent` tool. Agent types are Markdown files in .dostuff/agents/ and
+  # .claude/agents/ (project, then ~); see the README's Subagents section.
+  # max_iterations: 100     # model calls per run; default: the main agent's loop.max_iterations
+  max_concurrent: 4         # agents running or waiting for approval at once; more are queued
+  wake_on_end: true         # a background agent that ends resumes the idle TUI (at most 3 turns in a row)
+  read_claude_agents: true  # also load agent files from .claude/agents/
+  explore_model: inherit    # model of the built-in explore type; inherit = the main model
+  models:                   # aliases for an agent's `model:` and the agent tool's model=
+    # fast: anthropic/claude-haiku-5-5
 
 search:
   # web_search is free with no API key: DuckDuckGo by default (the `ddgs` package if installed,
@@ -110,6 +121,10 @@ permissions:
 #   Stop:                     # exit 2 (or "decision": "block") sends the reason back and the agent continues
 #     - hooks:
 #         - { type: command, name: tests, command: "python .dostuff/hooks/run_tests.py" }
-#   SubagentStop:             # the same, for a subagent's final answer
+#   SubagentStart:            # a subagent run starts; stdout is added to its task. Can't block
+#     - matcher: "explore"      # regex, full match against the agent type
+#       hooks:
+#         - { type: command, name: explore-context, command: "git log --oneline -5" }
+#   SubagentStop:             # the same as Stop, for a subagent's final answer; matcher: the agent type
 #     - hooks:
 #         - { type: command, name: subagent-check, command: "python .dostuff/hooks/check_subagent.py" }

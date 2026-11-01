@@ -3,6 +3,7 @@
 The callers fire UserPromptSubmit and the startup/resume/clear SessionStart themselves: they append the
 user step before calling loop(), so a hook inside loop() would be too late to keep a prompt out of history.
 """
+import logging
 import re
 from typing import Any
 
@@ -10,9 +11,14 @@ from dostuff.helpers.hooks.dispatch import report_outcome, run_hooks
 from dostuff.helpers.hooks.load_hooks import SESSION_START_SOURCES
 from dostuff.helpers.hooks.run_hook import payload_for
 
+logger = logging.getLogger(__name__)
+
 BLOCKED_PROMPT_MESSAGE = "Prompt blocked by a UserPromptSubmit hook: {reason}"
 STOP_NOTE = "[Stop hook {name}] {reason}"  # the user step a Stop block appends (REQ-2.3)
 _STOP_NOTE_RE = re.compile(r"\[Stop hook (.+?)\] (.*)", re.DOTALL)
+SUBAGENT_START_CONTEXT = "[Context from SubagentStart hooks]\n{context}"
+SUBAGENT_START_NO_BLOCK = ("SubagentStart hook '{name}' tried to block ({reason}); SubagentStart can't block, "
+                           "so the agent runs.")
 STOP_LIMIT_MESSAGE = ("{event} hook '{name}' blocked again after {limit} continuation(s) "
                       "(hooks.stop_block_limit); ending the turn.")
 
@@ -82,3 +88,23 @@ def session_context_suffix(holder: dict[str, str] | None) -> str:
         return ""
     joined = "\n".join(holder[s] for s in SESSION_START_SOURCES if holder.get(s))
     return f"\n\n[Session context from SessionStart hooks]\n{joined}" if joined else ""
+
+
+async def subagent_start(
+    *, session_id: str, turn_id: str, agent_id: str, agent_type: str, background: bool, prompt: str,
+    adapter: Any = None,
+) -> str:
+    """Run SubagentStart hooks for a run about to start (subagents spec D16); returns their context.
+
+    It can add context but cannot block: a block is reported as an error and ignored. Fail-open.
+    """
+    payload = payload_for("SubagentStart", session_id=session_id, turn_id=turn_id, turn_type="subagent_loop",
+                          agent_id=agent_id, agent_type=agent_type, background=background, prompt=prompt)
+    outcome = await run_hooks("SubagentStart", payload, adapter=adapter)
+    if outcome.decision == "deny":
+        message = SUBAGENT_START_NO_BLOCK.format(name=outcome.decided_by, reason=outcome.reason or "no reason given")
+        logger.warning("agent %s (%s): %s", agent_id, agent_type, message)
+        outcome.errors.append(message)
+    outcome.decision, outcome.reason, outcome.decided_by = "none", "", ""  # allow/ask mean nothing here either
+    await report_outcome("SubagentStart", outcome, adapter=adapter, target=agent_type)
+    return "" if outcome.cancelled else outcome.context

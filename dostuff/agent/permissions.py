@@ -231,6 +231,9 @@ def _describe_call(tool: str, args: dict[str, Any]) -> str:
         return f"Change dostuff settings ({args.get('scope') or 'user'} config.yaml)"
     if tool == "set_mcp_server":
         return f"Add or replace MCP server '{args.get('name', '')}' ({args.get('scope') or 'user'} mcp_config.json)"
+    if tool == "create_agent_type":
+        where = "~/.dostuff/agents" if args.get("scope") == "user" else ".dostuff/agents"
+        return f"Create agent type '{args.get('name', '')}' ({where})"
     if tool == "remove_mcp_server":
         return f"Remove MCP server '{args.get('name', '')}' ({args.get('scope') or 'user'} mcp_config.json)"
     if "path" in args:

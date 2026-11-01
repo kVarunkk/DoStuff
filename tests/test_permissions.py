@@ -329,7 +329,7 @@ def test_mode_cycle():
 
 def test_bg_tools_registered():
     from dostuff.tools.definitions import TOOL_MAP, default_tool_names
-    from dostuff.tools.delegate_to_subagent import resolve_subagent_tools
+    from dostuff.agent.subagents.run import resolve_subagent_tools
     for name in ("bash_output", "kill_shell"):
         assert TOOL_MAP[name].kind == "read" and TOOL_MAP[name].injected == frozenset({"owner"})
         assert name in default_tool_names()
@@ -338,7 +338,8 @@ def test_bg_tools_registered():
     allowed, _ = resolve_subagent_tools(["read_file", "bash_output", "kill_shell"])
     assert allowed == ["read_file"]
     assert resolve_subagent_tools(None)[0] == resolve_subagent_tools(None)[0]  # default set unchanged
-    assert "bash_output" not in resolve_subagent_tools(None)[0]
+    # tools omitted = every subagent tool (subagents spec D2/D3), so the shell and its job tools are in
+    assert "bash_output" in resolve_subagent_tools(None)[0]
 
 
 def test_bg_permissions(monkeypatch, tmp_path, registry):

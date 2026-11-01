@@ -10,7 +10,8 @@ from typing import Any, Literal
 
 import yaml
 
-EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SubagentStop")
+EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop")
+AGENT_EVENTS = ("SubagentStart", "SubagentStop")  # matcher: full match against agent_type (subagents spec D16)
 TOOL_EVENTS = ("PreToolUse", "PostToolUse")
 FAIL_CLOSED_EVENTS = ("PreToolUse", "UserPromptSubmit")  # the events where a hook can block before anything happens
 SESSION_START_SOURCES = ("startup", "resume", "clear", "compact")

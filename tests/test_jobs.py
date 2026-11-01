@@ -558,21 +558,23 @@ def _bg(cmd, job_id, call_id="c1"):
 
 # --- T5.1 owner token per loop() run -----------------------------------------------------------
 
-def test_loop_owner_token(registry, scripted, _py):
+def test_loop_owner_token(registry, scripted, _py, monkeypatch):
     sleeper = _py(_SLEEP)
     scripted([_msg(tool_calls=[_bg(sleeper, "srv")]), _msg("done")])
     _main_loop()
     assert [(j.owner, j.id) for j in registry.jobs()] == [("s1", "srv")]
 
     from dostuff.agent.permissions import SessionPermissions
-    from dostuff.tools.delegate_to_subagent import _impl_delegate_to_subagent
+    from dostuff.agent.subagents.definitions import BUILTIN_TYPES, AgentDef
+    from dostuff.tools.agent import agent
+    monkeypatch.setitem(BUILTIN_TYPES, "shell", AgentDef(name="shell", description="d", tools=("bash_command",)))
     scripted([_msg(tool_calls=[_bg(sleeper, "sub")]), _msg("sub done"),
               _msg(tool_calls=[_bg(sleeper, "sub")]), _msg("sub done")])
 
     async def delegate():
-        return await _impl_delegate_to_subagent(
-            task="t", role="r", mcp_client=None, session_id="s1", turn_id="t",  # type: ignore[arg-type]
-            requested_tools=["bash_command"], permissions=SessionPermissions(mode="auto"),
+        return await agent(
+            description="r", prompt="t", mcp_client=None, session_id="s1", turn_id="t",  # type: ignore[arg-type]
+            subagent_type="shell", permissions=SessionPermissions(mode="auto"),
         )
     for _ in range(2):
         assert "sub done" in asyncio.run(delegate())

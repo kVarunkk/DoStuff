@@ -4,7 +4,7 @@ from typing import Any
 
 from dostuff.helpers.agent.loop_emit import loop_emit
 from dostuff.helpers.hooks import trust
-from dostuff.helpers.hooks.load_hooks import TOOL_EVENTS, HookEntry
+from dostuff.helpers.hooks.load_hooks import AGENT_EVENTS, TOOL_EVENTS, HookEntry
 from dostuff.helpers.hooks.run_hook import FAILED_REASON, Decision, HookResult, run_hook
 
 SHELL_TOOLS = ("bash_command",)  # the tools an `if` pattern is searched in (tool_input.command)
@@ -37,7 +37,7 @@ class HookOutcome:
 
 def hook_line(data: dict[str, Any]) -> str:
     """How a `hook` event reads in the TUI and on headless stderr: `⚓ PreToolUse bash_command → deny (reason)`."""
-    prefix = f"[subagent: {data['subagent']}] " if data.get("subagent") else ""
+    prefix = f"[agent: {data['subagent']}] " if data.get("subagent") else ""
     target = f" {data['tool']}" if data.get("tool") else ""
     reason = f" ({data['reason']})" if data.get("reason") else ""
     return f"{prefix}⚓ {data.get('event', '')}{target} → {data.get('decision', '')}{reason}"
@@ -75,8 +75,10 @@ def _matches(entry: HookEntry, payload: dict[str, Any]) -> bool:
         target = payload.get("tool_name")
     elif event == "SessionStart":
         target = payload.get("source")
+    elif event in AGENT_EVENTS:
+        target = payload.get("agent_type")
     else:
-        return True  # UserPromptSubmit / Stop / SubagentStop have nothing to match against
+        return True  # UserPromptSubmit / Stop have nothing to match against
     if entry.matcher_re is not None and not entry.matcher_re.fullmatch(str(target)):
         return False
     if entry.if_re is not None and payload.get("tool_name") in SHELL_TOOLS:

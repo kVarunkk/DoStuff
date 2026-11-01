@@ -28,8 +28,11 @@ EVENT_KEYS: dict[str, tuple[str, ...]] = {
     "UserPromptSubmit": ("prompt",),
     "SessionStart": ("source",),
     "Stop": ("last_assistant_message", "stop_hook_active"),
+    "SubagentStart": ("agent_id", "agent_type", "background", "prompt"),
     "SubagentStop": ("last_assistant_message", "stop_hook_active"),
 }
+# Events whose payload gains the running subagent's agent_id / agent_type (subagents spec D16)
+_IN_AGENT_EVENTS = ("PreToolUse", "PostToolUse", "SubagentStop")
 # Claude Code's top-level `decision` spellings
 _DECISIONS: dict[str, Decision] = {"block": "deny", "approve": "allow", "allow": "allow", "deny": "deny", "ask": "ask"}
 _PERMISSION_DECISIONS: dict[str, Decision] = {"allow": "allow", "deny": "deny", "ask": "ask"}
@@ -53,10 +56,16 @@ def payload_for(event: str, *, session_id: str, turn_id: str, turn_type: str, **
     expected = set(EVENT_KEYS[event])
     if set(extra) != expected:
         raise TypeError(f"{event} payload needs {sorted(expected)}, got {sorted(extra)}")
-    return {
+    payload = {
         "hook_event_name": event, "session_id": session_id, "turn_id": turn_id,
         "cwd": str(project_root()), "turn_type": turn_type, **extra,
     }
+    if event in _IN_AGENT_EVENTS:
+        from dostuff.agent.subagents import current_agent  # lazy: the subagents package imports the hooks
+        run = current_agent.get()
+        if run is not None:
+            payload["agent_id"], payload["agent_type"] = run.id, run.agent_type
+    return payload
 
 
 def _env(payload: dict[str, Any]) -> dict[str, str]:

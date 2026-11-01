@@ -8,7 +8,13 @@ from dostuff.helpers.agent.file_mentions import strip_attachments
 from dostuff.helpers.memory.shell_step import parse_shell_step
 
 # PRAGMA user_version of the newest schema; bump and add a step to _migrate() to change it.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+# agent_runs columns, in table order (subagents spec D14)
+AGENT_RUN_COLUMNS = (
+    "id", "session_id", "agent_type", "description", "model", "status", "background", "worktree", "branch",
+    "started_at", "ended_at", "tokens", "cost_usd", "result", "compaction_notes",
+)
 
 
 class SessionStore(ABC):
@@ -68,6 +74,8 @@ class SQLiteSessionStore(SessionStore):
       session_steps  — append-only audit trail shown on resume
       working_steps  — what the model sees; compaction flags rows instead of rewriting them
       sessions       — per-session meta (cwd, token counters, compaction notes)
+      agent_runs     — one row per subagent, kept across its runs (subagents spec D14)
+      agent_steps    — a subagent's transcript; compaction flags rows, as in working_steps
     """
 
     def __init__(self, db_path: str = "sessions.db") -> None:
@@ -102,7 +110,8 @@ class SQLiteSessionStore(SessionStore):
             return
 
         # Every step is idempotent, so one pass takes any older DB to the newest schema.
-        # v0 → v1 covers DBs created by dostuff <= 0.1.6 (no user_version); v2 adds `title`, v3 `cost_usd`.
+        # v0 → v1 covers DBs created by dostuff <= 0.1.6 (no user_version); v2 adds `title`, v3 `cost_usd`,
+        # v4 the agent tables.
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS session_steps (
@@ -166,6 +175,27 @@ class SQLiteSessionStore(SessionStore):
                     [(session_id, seq, json.dumps(step)) for seq, step in enumerate(steps)],
                 )
             await db.execute("UPDATE sessions SET working_history = '' WHERE session_id = ?", (session_id,))
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_runs (
+                id TEXT PRIMARY KEY, session_id TEXT, agent_type TEXT, description TEXT, model TEXT,
+                status TEXT, background INTEGER, worktree TEXT, branch TEXT, started_at TEXT,
+                ended_at TEXT, tokens INTEGER, cost_usd REAL, result TEXT, compaction_notes TEXT
+            );
+            """
+        )
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_session ON agent_runs(session_id);")
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_steps (
+                agent_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                step_json TEXT NOT NULL,
+                compacted INTEGER DEFAULT 0,
+                PRIMARY KEY (agent_id, seq)
+            );
+            """
+        )
         await db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         await db.commit()
 
@@ -324,7 +354,7 @@ class SQLiteSessionStore(SessionStore):
         """Copy a session (steps, working history, notes, token counters, cost) into new_id.
 
         Without a title the fork is named "<source title or first prompt> (fork)". Undo
-        checkpoints and todos are keyed by session id and are not copied.
+        checkpoints, todos and agents are keyed by session id and are not copied (subagents OUT-003).
         """
         db = await self._conn()
         async with db.execute("SELECT title FROM sessions WHERE session_id = ?", (source_id,)) as cur:
@@ -375,10 +405,74 @@ class SQLiteSessionStore(SessionStore):
         await db.commit()
 
     async def delete_session(self, session_id: str) -> None:
-        """Remove a session's steps, working history and meta row."""
+        """Remove a session's steps, working history, meta row and its agents."""
         db = await self._conn()
-        for table in ("session_steps", "working_steps", "sessions"):
+        await db.execute(
+            "DELETE FROM agent_steps WHERE agent_id IN (SELECT id FROM agent_runs WHERE session_id = ?)", (session_id,))
+        for table in ("session_steps", "working_steps", "sessions", "agent_runs"):
             await db.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+        await db.commit()
+
+    # --- agents (subagents spec D14) -----------------------------------------------------------
+
+    async def upsert_agent_run(self, row: dict[str, Any]) -> None:
+        """Insert or replace an agent's row; `row` has every AGENT_RUN_COLUMNS key."""
+        db = await self._conn()
+        values = [int(row["background"]) if c == "background" else row[c] for c in AGENT_RUN_COLUMNS]
+        await db.execute(
+            f"INSERT OR REPLACE INTO agent_runs ({', '.join(AGENT_RUN_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in AGENT_RUN_COLUMNS)})",
+            values,
+        )
+        await db.commit()
+
+    async def load_agent_runs(self, session_id: str) -> list[dict[str, Any]]:
+        """The session's agents, oldest first."""
+        db = await self._conn()
+        async with db.execute(
+            f"SELECT {', '.join(AGENT_RUN_COLUMNS)} FROM agent_runs WHERE session_id = ? ORDER BY started_at, rowid",
+            (session_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        runs = [dict(zip(AGENT_RUN_COLUMNS, row)) for row in rows]
+        for run in runs:
+            run["background"] = bool(run["background"])
+            run["tokens"] = run["tokens"] or 0
+            run["cost_usd"] = run["cost_usd"] or 0.0
+            run["compaction_notes"] = run["compaction_notes"] or ""
+        return runs
+
+    async def append_agent_step(self, agent_id: str, step: dict[str, Any]) -> None:
+        db = await self._conn()
+        await db.execute(
+            "INSERT INTO agent_steps (agent_id, seq, step_json) "
+            "SELECT ?, COALESCE(MAX(seq), -1) + 1, ? FROM agent_steps WHERE agent_id = ?",
+            (agent_id, json.dumps(step), agent_id),
+        )
+        await db.commit()
+
+    async def load_agent_steps(self, agent_id: str, working: bool = False) -> list[dict[str, Any]]:
+        """An agent's transcript in order; `working` leaves out compacted steps (what its model sees)."""
+        db = await self._conn()
+        async with db.execute(
+            "SELECT step_json FROM agent_steps WHERE agent_id = ?" + (" AND compacted = 0" if working else "")
+            + " ORDER BY seq ASC",
+            (agent_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    async def compact_agent_steps(self, agent_id: str, keep_last: int, compaction_notes: str) -> None:
+        """compact_working_history for an agent: flag all but the newest `keep_last` steps, store the notes."""
+        db = await self._conn()
+        async with db.execute(
+            "SELECT seq FROM agent_steps WHERE agent_id = ? AND compacted = 0 ORDER BY seq DESC LIMIT 1 OFFSET ?",
+            (agent_id, max(keep_last, 0)),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is not None:
+            await db.execute("UPDATE agent_steps SET compacted = 1 WHERE agent_id = ? AND seq <= ?", (agent_id, row[0]))
+        await db.execute("UPDATE agent_runs SET compaction_notes = ? WHERE id = ?", (compaction_notes, agent_id))
         await db.commit()
 
     async def list(self) -> list[tuple[str, str, str | None]]:

@@ -22,6 +22,8 @@ MCP_CONNECT_TIMEOUT_S = 150.0
 OutputFormat = Literal["text", "json", "stream-json"]
 OUTPUT_FORMATS: tuple[str, ...] = ("text", "json", "stream-json")
 MAX_ITERATIONS_PREFIX = "Reached maximum iterations"  # loop()'s answer when it hits the cap
+AGENT_EVENT_KEYS = ("id", "agent_type", "description", "status", "background")  # stream-json `agent` events
+WAKE_LIMIT_MESSAGE = "⚙ Not waiting for more agents: {limit} automatic turns in a row."
 
 
 def _err(text: str) -> None:
@@ -46,6 +48,7 @@ class HeadlessAdapter:
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.cost_usd: float | None = None  # None while no call had a known price
         self.denied_without_terminal = 0
+        self._ask_lock = asyncio.Lock()  # parallel subagents ask one at a time (subagents spec D6)
 
     def _progress(self, text: str) -> None:
         if not self._quiet:
@@ -69,6 +72,8 @@ class HeadlessAdapter:
             self._stream({"type": "hook", **data})
         elif event_type == "job" and isinstance(data, dict):
             self._stream({"type": "job", **{k: data.get(k) for k in ("id", "status", "code")}})
+        elif event_type == "agent" and isinstance(data, dict):
+            self._stream({"type": "agent", **{k: data.get(k) for k in AGENT_EVENT_KEYS}})
 
     def emit(self, event_type: str, data: Any) -> None:
         self._stream_event(event_type, data)
@@ -95,15 +100,16 @@ class HeadlessAdapter:
         elif event_type == "hook" and isinstance(data, dict):
             self._progress(hook_line(data))
 
-    async def ask(self, message: str, always_label: str = "") -> ApprovalReply:
+    async def ask(self, message: str, always_label: str = "", background: bool = False) -> ApprovalReply:
         # No terminal → deny. Project hook trust follows the same rule (trust.headless_decision)
         if not self._interactive:
             self.denied_without_terminal += 1
             self._progress(f"✗ Denied (no terminal to ask): {message.splitlines()[0] if message else ''}")
             return ApprovalReply("no", feedback="Running non-interactively (dostuff -p); nobody can approve this call.")
-        _err(f"⚠ {message}")
-        choices = "[y]es / [a]lways" if always_label else "[y]es"
-        answer = await asyncio.to_thread(input, f"Allow? {choices} / [N]o: ")
+        async with self._ask_lock:
+            _err(f"⚠ {message}")
+            choices = "[y]es / [a]lways" if always_label else "[y]es"
+            answer = await asyncio.to_thread(input, f"Allow? {choices} / [N]o: ")
         reply = parse_answer(answer)
         return ApprovalReply("yes" if reply == "always" and not always_label else reply)
 
@@ -139,6 +145,72 @@ async def _stop_jobs(adapter: HeadlessAdapter) -> None:
             adapter.emit("job", {"id": job.id, "status": job.status, "code": job.exit_code})
         else:
             adapter._progress(f'⚙ stopped background job "{job.id}" (pid {job.pid}) at the end of the run')
+
+
+def _agent_events(adapter: HeadlessAdapter, session_id: str) -> Callable[[Any, str], None]:
+    """A registry listener: an `agent` event when one of this session's runs starts and when it ends
+    (stream-json), and the start / end lines of background runs on stderr (subagents spec D17)."""
+    from dostuff.helpers.agent.notices import agent_notice_line, fmt_agent_runtime
+    started: set[str] = set()
+
+    def on_event(run: Any, event: str) -> None:
+        if run.owner != session_id:
+            return
+        if event == "status" and run.status == "running" and run.id not in started:
+            started.add(run.id)
+            line = f'⚙ agent "{run.description}" ({run.agent_type}) started in the background'
+        elif event == "end":
+            started.discard(run.id)  # a send_message resume is a new run on the same id
+            runtime = fmt_agent_runtime((run.ended or time.time()) - (run.started or time.time()))
+            line = agent_notice_line(run.description, run.agent_type, run.status, runtime)
+        else:
+            return
+        if adapter._stream is not None:
+            adapter.emit("agent", {"id": run.id, "agent_type": run.agent_type, "description": run.description,
+                                   "status": run.status, "background": run.background})
+        elif run.background:
+            adapter._progress(line)
+    return on_event
+
+
+async def _agent_notices(session_id: str) -> bool:
+    """Wait while this session has agents running and no agent notice is queued; True once one is
+    (the next turn drains it), False when no agent is left to wait for (subagents spec D17)."""
+    from dostuff.agent.subagents.registry import ENDED_STATUSES, get_agent_registry
+    from dostuff.helpers.agent.notices import get_notice_queue
+    while True:
+        if get_notice_queue().pending(session_id, "agent"):
+            return True
+        waiting = [r.done for r in get_agent_registry().runs(session_id)
+                   if r.status not in ENDED_STATUSES and r.done is not None and not r.done.done()]
+        if not waiting:
+            return False
+        await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+
+
+def _agents_pending(session_id: str) -> bool:
+    """Any of this session's agents still running, or an agent notice not yet read."""
+    from dostuff.agent.subagents.registry import ENDED_STATUSES, get_agent_registry
+    from dostuff.helpers.agent.notices import get_notice_queue
+    return bool(get_notice_queue().pending(session_id, "agent")) or any(
+        r.status not in ENDED_STATUSES for r in get_agent_registry().runs(session_id))
+
+
+async def _stop_agents(adapter: HeadlessAdapter) -> None:
+    """Stop every agent still running; each is named on stderr (stream-json: its `agent` end event)."""
+    from dostuff.agent.subagents.registry import ENDED_STATUSES, get_agent_registry
+    registry = get_agent_registry()
+    running = [r for r in registry.runs() if r.status not in ENDED_STATUSES]
+    if not running:
+        return
+    try:
+        await registry.stop_all("session_end")
+    except Exception as e:
+        _err(f"Could not stop agents: {e}")
+        return
+    if adapter._stream is None:
+        for run in running:
+            adapter._progress(f'⚙ stopped agent "{run.description}" ({run.id}, {run.agent_type}) at the end of the run')
 
 
 async def run_headless(
@@ -188,6 +260,11 @@ async def run_headless(
     turn_id_var.set(turn_id)
     data_dir = config.get_data_dir()
     store = SQLiteSessionStore(db_path=str(data_dir / "sessions.db"))
+    from dostuff.agent.subagents.registry import get_agent_registry
+    from dostuff.helpers.agent.notices import WAKE_LIMIT
+    get_agent_registry().attach_store(store)  # agent rows and transcripts (subagents D14)
+    on_agent_event = _agent_events(adapter, session_id)
+    get_agent_registry().add_listener(on_agent_event)
     mcp_client = MCPClient(
         registration_store=MCPClientRegistrationStore(path=str(data_dir / "mcp_client_registrations.json")),
         tool_registry_store=make_tool_registry_store(),
@@ -212,6 +289,8 @@ async def run_headless(
             await _connect_mcp(mcp_client, servers, adapter)
         base, skills = build_base_instructions()
         meta = await store.get_session_meta(session_id) or {}
+        if meta:
+            await get_agent_registry().load(session_id, store)  # continuable with send_message (subagents D14)
         steps_history = await store.load(session_id)
         working_history = await store.load_working_history(session_id)
         current_session_history: list = []
@@ -233,22 +312,42 @@ async def run_headless(
             raise _Refused(blocked_prompt_message(blocked))
         await append_step({"role": "user", "content": content}, steps_history, working_history,
                           current_session_history, session_id, store, "interactive_loop")
-        instructions = await build_turn_instructions(base, prompt, get_semantic_store(), get_episodic_store(), config.get_user_id())
-        instructions = with_prompt_context(instructions, prompt_context)  # this turn only, never stored
-        result = await agent_loop(
-            session_id, turn_id, prompt, instructions, mcp_client, working_history, "interactive_loop",
-            current_session_history, steps_history, store,
-            adapter=adapter,
-            compaction_notes=meta.get("compaction_notes") or "",
-            session_prompt_tokens=meta.get("prompt_tokens") or 0,
-            session_completion_tokens=meta.get("completion_tokens") or 0,
-            session_total_tokens=meta.get("total_tokens") or 0,
-            last_input_tokens=meta.get("last_input_tokens") or 0,
-            stream=True,
-            max_iterations=max_turns or config.max_iterations,
-            permissions=SessionPermissions(mode=permission_mode, allow=list(allowed_tools or [])),
-            session_hook_context=session_hook_context,
-        )
+        turn_instructions = await build_turn_instructions(base, prompt, get_semantic_store(), get_episodic_store(), config.get_user_id())
+        permissions = SessionPermissions(mode=permission_mode, allow=list(allowed_tools or []))
+
+        async def turn(text: str, instructions: str, meta: dict[str, Any]) -> str:
+            return await agent_loop(
+                session_id, turn_id, text, instructions, mcp_client, working_history, "interactive_loop",
+                current_session_history, steps_history, store,
+                adapter=adapter,
+                compaction_notes=meta.get("compaction_notes") or "",
+                session_prompt_tokens=meta.get("prompt_tokens") or 0,
+                session_completion_tokens=meta.get("completion_tokens") or 0,
+                session_total_tokens=meta.get("total_tokens") or 0,
+                last_input_tokens=meta.get("last_input_tokens") or 0,
+                stream=True,
+                max_iterations=max_turns or config.max_iterations,
+                permissions=permissions,
+                session_hook_context=session_hook_context,
+            )
+        # UserPromptSubmit context is for this turn only, never stored
+        result = await turn(prompt, with_prompt_context(turn_instructions, prompt_context), meta)
+        # Background agents are waited for: each batch of their notices gets a turn, like the TUI's wake-up
+        # (subagents spec D17); past WAKE_LIMIT the rest are stopped in `finally`
+        wake_turns = 0
+        while not result.startswith(MAX_ITERATIONS_PREFIX):
+            if wake_turns >= WAKE_LIMIT:  # checked before waiting: an agent may never end on its own
+                if _agents_pending(session_id):
+                    _err(WAKE_LIMIT_MESSAGE.format(limit=WAKE_LIMIT))
+                break
+            if not await _agent_notices(session_id):
+                break
+            wake_turns += 1
+            turn_id = uuid.uuid4().hex
+            turn_id_var.set(turn_id)
+            meta = await store.get_session_meta(session_id) or {}
+            # No user step and no UserPromptSubmit: the loop drains the notices into history itself
+            result = await turn("", turn_instructions, meta)
         if result.startswith(MAX_ITERATIONS_PREFIX):
             code = 1
     except _Refused as e:
@@ -258,11 +357,14 @@ async def run_headless(
         _err(f"Error: {e}")
         code = 1
     finally:
+        await _stop_agents(adapter)  # first, so their own jobs die with them; also on Ctrl+C (subagents D17)
+        get_agent_registry().remove_listener(on_agent_event)
         await _stop_jobs(adapter)  # also on Ctrl+C: nothing outlives the run (background shell spec D8)
         try:
             await asyncio.wait_for(mcp_client.cleanup(), timeout=5.0)
         except Exception:
             pass
+        await get_agent_registry().flush()
         await store.close()
 
     if adapter.denied_without_terminal:

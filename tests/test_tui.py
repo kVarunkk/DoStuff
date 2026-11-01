@@ -1,5 +1,6 @@
 """Headless TUI smoke test: async turns, streaming, approval prompt, /clear, exit (REQ-4.x)."""
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -34,8 +35,9 @@ def tui(tmp_path, monkeypatch):
     from dostuff.lib.memory import chroma
     monkeypatch.setattr(chroma, "embedding_model_missing", lambda: False)  # no 80 MB download in tests
     monkeypatch.setattr(cli_tui, "get_model_token_limit", lambda: 100_000)
-    # A job ending while idle would start a turn of the fake loop below; the wake-up tests turn it on
+    # A job or agent ending while idle would start a turn of the fake loop below; the wake-up tests turn it on
     config_module.get_config().jobs_wake_on_end = False
+    config_module.get_config().agents_wake_on_end = False
 
     async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
                         current_session_history, steps_history, store, adapter=None, **kwargs):
@@ -100,6 +102,31 @@ def test_turn_clear_and_exit(tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+def test_emit_after_exit_is_dropped(tui):
+    """The emit shim keeps pointing at the adapter of an app that has exited; a worker thread's emit then
+    must be dropped before call_from_thread, which builds its coroutine and then fails on the closed loop
+    ("coroutine ... run_callback was never awaited")."""
+    import threading
+    from dostuff.helpers.ui import emit as emit_module
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="gone")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._cleanup_and_save_session()
+        return app
+
+    app = asyncio.run(scenario())  # closes the app's loop
+    assert emit_module._active_adapter is app.adapter
+    calls = []
+    app.call_from_thread = lambda *a, **k: calls.append(a)  # type: ignore[method-assign]
+    worker = threading.Thread(target=lambda: emit_module.emit("[worktree] created"))
+    worker.start()
+    worker.join()
+    assert calls == []
 
 
 async def _until(pilot, cond, tries=60):
@@ -301,7 +328,9 @@ def test_slash_menu_and_shell_command(tui):
             assert menu.option_count == 1 and menu.selected_command() == "/compact"
             await pilot.press("tab")
             await pilot.pause()
-            assert app.query_one("#input", cli_tui.EnterSubmits).text == "/compact"
+            # A space after a command taking arguments, so the argument hint shows
+            assert app.query_one("#input", cli_tui.EnterSubmits).text == "/compact "
+            assert app.query_one("#input", cli_tui.EnterSubmits).suggestion == "[auto <1-100 | off>]"
             await pilot.press("escape")
             app._clear_input()
 
@@ -310,7 +339,8 @@ def test_slash_menu_and_shell_command(tui):
             inp.focus()
             await pilot.press("/", "m", "o")
             await pilot.pause()
-            assert inp.suggestion == "del"
+            # The rest of the name, then a hint for its arguments (shown, never inserted)
+            assert inp.suggestion == "del [provider/model] [--active]" and inp.completion == "del"
             # Dimmer than typed text (the ansi theme's $text-muted is the plain foreground)
             ghost = inp.get_component_rich_style("text-area--suggestion").color
             assert ghost is not None and ghost.triplet is not None and ghost.triplet.hex == "#6a6a6a"
@@ -320,6 +350,14 @@ def test_slash_menu_and_shell_command(tui):
             await pilot.press("tab")
             await pilot.pause()
             assert inp.text == "/model --active" and inp.suggestion == ""
+            app._clear_input()
+            # Tab and Right never insert a bare argument hint
+            await pilot.press(*"/rename ")
+            await pilot.pause()
+            assert inp.suggestion == "<title>" and inp.completion == ""
+            await pilot.press("right")
+            await pilot.pause()
+            assert inp.text == "/rename " and inp.suggestion == "<title>"
             app._clear_input()
 
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("!echo shell-ok"))
@@ -983,7 +1021,7 @@ def test_skill_slash_command_runs_skill(tui):
             await pilot.press(*"/rel")
             await pilot.pause()
             assert menu.display and menu.selected_command() == "/release-notes"
-            assert inp.suggestion == "ease-notes"
+            assert inp.suggestion == "ease-notes [arguments]" and inp.completion == "ease-notes"
             app._clear_input()
 
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/help"))
@@ -1178,9 +1216,19 @@ def test_roadmap_021_commands_memory_context_doctor_history(tui, tmp_path, monke
             assert app.steps_history[0]["content"] == "Review src/app.py for bugs."
             assert any("Running command review" in t for t in _texts(app))
 
+            # Esc with text in the input has nothing to do: it says how to quit instead
+            inp.text = "draft"
+            await pilot.press("escape")
+            assert str(inp.border_title) == cli_tui.QUIT_HINT
+            app._clear_input()
+            await pilot.press("ctrl+o")
+            assert "expanded" in str(inp.border_title)
+            await pilot.press("ctrl+o")
+            assert "collapsed" in str(inp.border_title)
+
             # Esc Esc with an empty input takes the prompt back as typed and drops the turn
             await pilot.press("escape")
-            assert "Esc again" in str(inp.border_title)
+            assert "Esc again" in str(inp.border_title) and cli_tui.QUIT_HINT in str(inp.border_title)
             await pilot.press("escape")
             await _until(pilot, lambda: not app.steps_history)
             assert inp.text == "/review src/app.py"
@@ -1366,6 +1414,22 @@ def _write_project_hooks(hooks: dict) -> Path:
     path.write_text(yaml.safe_dump({"hooks": hooks}), encoding="utf-8")
     config_module.reset_config()
     return path
+
+
+def test_tools_command(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="tools-cmd")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/tools"))
+            await _until(pilot, lambda: any(t.startswith("Tools (") for t in _texts(app)))
+            text = next(t for t in _texts(app) if t.startswith("Tools ("))
+            assert "read_file" in text and "bash_command" in text and "MCP tools" in text
+            assert "/tools" in cli_tui.COMMAND_DESCRIPTIONS
+
+    asyncio.run(scenario())
 
 
 @pytest.fixture
@@ -1639,6 +1703,96 @@ def test_tui_quit_with_jobs(tui, registry, monkeypatch, _py, _alive, _wait_dead)
             await pilot.press("ctrl+q")
             await _until(pilot, lambda: bool(exited), tries=200)  # no prompt: unchanged quit path
     asyncio.run(no_jobs())
+
+
+def test_tui_quit_with_agents(tui, agents, fake_model, registry, _py, _alive, _wait_dead):
+    """Ctrl+Q with a background agent asks first; "No" keeps it, "Yes" stops every run (no notices), kills
+    its jobs and exits (subagents T4.10, CON-007)."""
+    from conftest import fake_response, fake_tool_call
+
+    from dostuff.agent.permissions import SessionPermissions
+    from dostuff.helpers.agent.notices import get_notice_queue
+    cli_tui = tui
+    sleeper = _py("import time; time.sleep(30)")
+    fake_model.script("[A]", fake_response(tool_calls=[fake_tool_call("bash_command", {
+        "command": sleeper, "run_in_background": True})]))
+    fake_model.gate("[A]", fake_response("never"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="aquit")
+        exited: list = []
+        app.exit = lambda *a, **k: exited.append(True)  # type: ignore[method-assign]
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            run = await agents.start(owner="aquit", agent_type="general-purpose", description="long one",
+                                     prompt="[A] x", background=True, adapter=app.adapter,
+                                     permissions=SessionPermissions(mode="auto"))
+            await _until(pilot, lambda: len(fake_model.calls_for("[A]")) == 2, tries=100)
+            [job] = [j for j in registry.jobs() if j.owner == f"aquit/sub/{run.id}"]
+            await pilot.press("ctrl+q")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            assert any('Quit and stop 1 agent? ("long one")' in t for t in _texts(app))
+            app.adapter.choose("no")
+            await _until(pilot, lambda: not app.adapter.has_pending_confirm())
+            await pilot.pause(0.2)
+            assert not exited and run.status == "running" and _alive(job.pid)
+
+            srv = await _start_bg(registry, "aquit", "srv", sleeper)
+            await pilot.press("ctrl+q")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            assert any('Quit and stop 1 background job and 1 agent? (srv, "long one")' in t for t in _texts(app))
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: bool(exited), tries=300)
+            assert run.status == "stopped" and run.stopped_by == "session_end"
+            assert _wait_dead(job.pid, 5) and _wait_dead(srv.pid, 5)
+            assert get_notice_queue().pending("aquit", "agent") == []
+
+    asyncio.run(scenario())
+
+
+def test_tui_clear_resume_with_agents(tui, agents, fake_model):
+    """Running background agents follow /clear and /resume into the new session: their end line, notice and
+    wake-up go there, and stop_agent from the new conversation works (subagents T4.11)."""
+    from conftest import fake_response
+
+    from dostuff.helpers.agent.notices import get_notice_queue
+    from dostuff.tools.stop_agent import stop_agent
+    cli_tui = tui
+    gate = fake_model.gate("[A]", fake_response("report A"))
+    fake_model.gate("[B]", fake_response("never"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="afirst")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+
+            async def bg(marker, description):
+                return await agents.start(owner=app.session_id, agent_type="explore", description=description,
+                                          prompt=f"{marker} x", background=True, adapter=app.adapter)
+            a = await bg("[A]", "find a")
+            await _until(pilot, lambda: bool(fake_model.calls_for("[A]")))
+            submit("/clear")
+            await _until(pilot, lambda: app.session_id != "afirst", tries=200)
+            await pilot.pause(0.2)
+            cleared = app.session_id
+            assert a.owner == cleared and agents.runs("afirst") == []
+            assert any('1 agent ("find a") kept running' in t for t in _texts(app))
+            gate.set()
+            await _until(pilot, lambda: a.status == "completed")
+            assert [n.id for n in get_notice_queue().pending(cleared)] == [a.id]
+
+            b = await bg("[B]", "hold b")
+            await app.store.append("aother", {"role": "user", "content": "x"})
+            submit("/resume aother")
+            await _until(pilot, lambda: app.session_id == "aother", tries=200)
+            await pilot.pause(0.2)
+            assert b.owner == "aother" and a.owner == cleared  # an ended run stays where it was
+            assert [n.id for n in get_notice_queue().pending("aother")] == [a.id]  # notices follow too
+            assert await stop_agent(agent_id=b.id, session_id="aother") == f'Stopped agent "{b.id}" (explore).'
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
 
 
 def test_tui_clear_resume_with_jobs(tui, registry, monkeypatch, _py, _alive, _wait_dead):
@@ -2036,6 +2190,213 @@ def test_job_notice_rendering(tui, registry, monkeypatch, _py):
     asyncio.run(scenario())
 
 
+def test_agent_notice_rendering(tui, agents, fake_model, monkeypatch):
+    """A background agent that ends shows one system line (also while idle) and a notification; its stored
+    notice step re-renders as that line on /resume, and Esc Esc's "previous prompt" skips it (subagents T4.3)."""
+    from conftest import fake_response
+
+    from dostuff.helpers.agent.notices import format_notices, get_notice_queue
+    cli_tui = tui
+    fake_model.script("[A]", fake_response("found it"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="agentn")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+            notified: list = []
+            monkeypatch.setattr(app, "_notify", lambda message, elapsed: notified.append(message))
+            line = '⚙ agent "find auth code" (explore) finished after'
+            await agents.start(owner="agentn", agent_type="explore", description="find auth code", prompt="[A] x",
+                               background=True, adapter=app.adapter)
+            await _until(pilot, lambda: any(line in t for t in _texts(app)), tries=100)
+            await pilot.pause(0.2)
+            assert sum(line in t for t in _texts(app)) == 1
+            assert any("find auth code" in m and "finished" in m for m in notified)
+
+            notice_step = format_notices(get_notice_queue().drain("agentn"))
+            for step in ({"role": "user", "content": "start it"}, {"role": "user", "content": notice_step}):
+                await app.store.append("other", step)
+            submit("/resume other")
+            await _until(pilot, lambda: app.session_id == "other", tries=200)
+            await pilot.pause(0.3)
+            texts = _texts(app)
+            resumed = texts[max(i for i, t in enumerate(texts) if "start it" in t):]
+            assert any(line in t for t in resumed)
+            assert not any("<background-agent" in t for t in resumed)
+            assert app.steps_history[app._last_prompt_index()]["content"] == "start it"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_background_approval_waits_for_input(tui, agents, fake_model):
+    """A background agent's approval prompt waits while the input has text or a picker is open; a
+    foreground agent's shows at once, as the main agent's does (subagents D8, T4.6)."""
+    from conftest import fake_response, fake_tool_call
+
+    from dostuff.agent.permissions import SessionPermissions
+    cli_tui = tui
+    for m in "ABC":
+        fake_model.script(f"[{m}]", fake_response(tool_calls=[fake_tool_call("write_file", {"path": f"{m}.txt",
+                                                                                       "content": "x"})]),
+                          fake_response(f"done {m}"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="bgask")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            perms = SessionPermissions(mode="ask")
+
+            async def start(marker, background):
+                return await agents.start(owner="bgask", agent_type="general-purpose", description=f"write {marker}",
+                                          prompt=f"[{marker}] x", background=background, adapter=app.adapter,
+                                          permissions=perms)
+
+            # typing: the background prompt waits, and shows once the input is cleared
+            inp.text = "ab"
+            run = await start("A", True)
+            await _until(pilot, lambda: run.status == "waiting_approval")
+            await pilot.pause(0.5)
+            assert not app.query("#permission-prompt") and inp.text == "ab"
+            inp.text = ""
+            await _until(pilot, lambda: bool(app.query("#permission-prompt")))
+            assert any("[agent: write A · general-purpose]" in t for t in _texts(app))
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: run.status == "completed")
+
+            # a picker open: same
+            async def chosen(value):
+                pass
+            app._show_picker("Pick one", [("a", "A"), ("b", "B")], chosen)
+            await pilot.pause()
+            run = await start("B", True)
+            await _until(pilot, lambda: run.status == "waiting_approval")
+            await pilot.pause(0.5)
+            assert not app.query("#permission-prompt")
+            app._close_picker()
+            await _until(pilot, lambda: bool(app.query("#permission-prompt")))
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: run.status == "completed")
+
+            # a foreground agent's prompt shows at once, text or not
+            inp.text = "typing"
+            run = await start("C", False)
+            await _until(pilot, lambda: bool(app.query("#permission-prompt")))
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: run.status == "completed")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def cli_tui_moved(agent_id: str) -> str:
+    return f"Agent \"{agent_id}\" moved to the background; you'll get its report as a notice."
+
+
+def test_ctrl_b_backgrounds_agent(tui, agents, fake_model, monkeypatch):
+    """While a foreground agent runs the loader offers Ctrl+B; pressing it returns the waiting call at once
+    with the "moved" text, the run keeps going and its end queues a notice. Idle, Ctrl+B is skipped (T4.8)."""
+    import time
+
+    from conftest import fake_response
+    from textual.actions import SkipAction
+
+    from dostuff.helpers.agent.notices import get_notice_queue
+    from dostuff.tools.agent import agent
+    cli_tui = tui
+    gate = fake_model.gate("[A]", fake_response("report A"))
+    results: list = []
+
+    async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        results.append((await agent(description="slow one", prompt="[A] x", mcp_client=object(),  # type: ignore[arg-type]
+                                    session_id=session_id, turn_id=turn_id, adapter=adapter), time.monotonic()))
+        return "handled"
+    monkeypatch.setattr(cli_tui, "agent_loop", fake_loop)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctrlbagent")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            try:
+                app.action_background_jobs()
+                raise AssertionError("expected SkipAction")
+            except SkipAction:
+                pass
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("go"))
+            await _until(pilot, lambda: bool(agents.runs()) and agents.runs()[0].status == "running", tries=100)
+            [run] = agents.runs()
+            await _until(pilot, lambda: app._loader_label == cli_tui.WORKING_LABEL_JOBS)
+            pressed = time.monotonic()
+            await pilot.press("ctrl+b")
+            await _until(pilot, lambda: bool(results))
+            text, returned = results[0]
+            assert text == cli_tui_moved(run.id)
+            assert returned - pressed < 0.5
+            assert run.background and run.status == "running"
+            await _until(pilot, lambda: not app._turn_in_progress)
+            gate.set()
+            await _until(pilot, lambda: run.status == "completed")
+            assert [n.id for n in get_notice_queue().pending("ctrlbagent")] == [run.id]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_agents_status_item(tui, agents, fake_model):
+    """`⚙ 2 agents` on the status line while agents run, `⚠ 1 agent waiting` while one waits for approval,
+    hidden at zero; it updates without a keypress and a click opens /agents (T4.9)."""
+    from conftest import fake_response, fake_tool_call
+
+    from dostuff.agent.permissions import SessionPermissions
+    cli_tui = tui
+    gates = [fake_model.gate(m, fake_response("done")) for m in ("[A]", "[B]")]
+    fake_model.script("[W]", fake_response(tool_calls=[fake_tool_call("write_file", {"path": "w.txt", "content": "x"})]),
+                      fake_response("wrote"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="abar")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bar = app.query_one("#agents-bar", cli_tui.AgentsBar)
+            assert not bar.display
+
+            async def bg(marker, **kwargs):
+                return await agents.start(owner="abar", agent_type="general-purpose", description=marker,
+                                          prompt=f"{marker} x", background=True, adapter=app.adapter, **kwargs)
+            a, b = await bg("[A]"), await bg("[B]")
+            await _until(pilot, lambda: bar.display and str(bar.render()) == "⚙ 2 agents")
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            inp.text = "typing"  # holds the background prompt back
+            w = await bg("[W]", permissions=SessionPermissions(mode="ask"))
+            await _until(pilot, lambda: str(bar.render()) == "⚠ 1 agent waiting")
+            for gate in gates:
+                gate.set()
+            await _until(pilot, lambda: a.status == b.status == "completed")
+            await _until(pilot, lambda: str(bar.render()) == "⚠ 1 agent waiting")
+            inp.text = ""
+            await _until(pilot, lambda: bool(app.query("#permission-prompt")))
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: w.status == "completed")
+            await _until(pilot, lambda: not bar.display)
+
+            gate = fake_model.gate("[C]", fake_response("done"))
+            c = await bg("[C]")
+            await _until(pilot, lambda: bar.display)
+            await pilot.click("#agents-bar")  # opens the /agents list (T5.7)
+            await _until(pilot, lambda: app._picker_open())
+            assert c.id in dict(app.query_one("#picker", cli_tui.PermissionPrompt)._options)
+            app._close_picker()
+            gate.set()
+            await _until(pilot, lambda: c.status == "completed")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_orphan_warning(tui, jobs_home, monkeypatch, tmp_path):
     import json
     import os
@@ -2212,6 +2573,79 @@ def test_job_wake_waits_for_user(tui, registry, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_agent_wake_up(tui, agents, fake_model, monkeypatch):
+    """A background agent that ends on its own while idle starts one wake turn; agents ending together share
+    one; a stopped one rides along; agents.wake_on_end off doesn't wake; the limit is shared with jobs (T4.7)."""
+    from conftest import fake_response
+
+    from dostuff.agent.subagents import registry as registry_module
+    from dostuff.helpers.agent.notices import get_notice_queue
+    cli_tui = tui
+    monkeypatch.setattr(cli_tui, "JOB_WAKE_DELAY_S", 0.3)
+    monkeypatch.setattr(registry_module, "STOP_GRACE_S", 0.1)
+    calls: list[tuple[str, list[str]]] = []
+
+    async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        calls.append((user_text, [n.id for n in get_notice_queue().drain(session_id)]))
+        return "handled"
+    monkeypatch.setattr(cli_tui, "agent_loop", fake_loop)
+    from dostuff.tools.bash.jobs import get_registry  # the agents fixture installs a fresh one
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="awake")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+
+            async def bg(description, marker="[Z]"):
+                return await agents.start(owner="awake", agent_type="explore", description=description,
+                                          prompt=f"{marker} x", background=True, adapter=app.adapter)
+
+            # agents.wake_on_end off: no wake-up (the tui fixture's default)
+            off = await bg("quiet one")
+            await _until(pilot, lambda: off.status == "completed")
+            await pilot.pause(0.8)
+            assert calls == []
+            app.config.agents_wake_on_end = True
+
+            # idle: the end starts a turn whose input is the notice (the earlier one rides along)
+            first = await bg("find a")
+            await _until(pilot, lambda: len(calls) == 1, tries=100)
+            text, ids = calls[0]
+            assert text.startswith(f'<background-agent id="{off.id}"') and ids == [off.id, first.id]
+            assert any('⚙ Resuming the agent: background agent "quiet one", "find a" ended' in t for t in _texts(app))
+            await _until(pilot, lambda: not app._turn_in_progress)
+
+            # two ending together: one turn
+            a, b = await bg("two a"), await bg("two b")
+            await _until(pilot, lambda: len(calls) == 2, tries=100)
+            assert sorted(calls[1][1]) == sorted([a.id, b.id])
+            await _until(pilot, lambda: not app._turn_in_progress)
+
+            # stopped by the user: no wake; it rides along with the next one
+            fake_model.gate("[G]", fake_response("never"))
+            held = await bg("held", "[G]")
+            await _until(pilot, lambda: bool(fake_model.calls_for("[G]")))
+            await agents.stop(held, "user")
+            await pilot.pause(0.8)
+            assert len(calls) == 2
+            last = await bg("last")
+            await _until(pilot, lambda: len(calls) == 3, tries=100)
+            assert calls[2][1] == [held.id, last.id]
+            await _until(pilot, lambda: not app._turn_in_progress)
+
+            # three wake-ups in a row: a job's end no longer wakes it (the limit is shared)
+            app.config.jobs_wake_on_end = True
+            await _start_bg(get_registry(), "awake", "j1", "exit 0")
+            await _until(pilot, lambda: any(f"{cli_tui.WAKE_LIMIT} automatic turns in a row" in t
+                                            for t in _texts(app)), tries=100)
+            assert len(calls) == 3
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_job_wake_limit(tui, registry, monkeypatch):
     cli_tui = tui
     from dostuff.tools.bash import jobs as jobs_module
@@ -2227,21 +2661,21 @@ def test_job_wake_limit(tui, registry, monkeypatch):
             await app._backend_ready.wait()
             app.config.jobs_wake_on_end = True
 
-            # every wake-up turn starts a job that ends at once: it stops after JOB_WAKE_LIMIT turns
+            # every wake-up turn starts a job that ends at once: it stops after WAKE_LIMIT turns
             await _start_bg(registry, "chain", "first", "exit 0")
             await _until(pilot, lambda: any("Not resuming the agent" in t for t in _texts(app)), tries=200)
-            assert len(calls) == cli_tui.JOB_WAKE_LIMIT
+            assert len(calls) == cli_tui.WAKE_LIMIT
             await pilot.pause(1.5)
-            assert len(calls) == cli_tui.JOB_WAKE_LIMIT
+            assert len(calls) == cli_tui.WAKE_LIMIT
             assert sum("Not resuming the agent" in t for t in _texts(app)) == 1
 
             # a message from the user resets the count
             chain["on"] = False
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("carry on"))
-            await _until(pilot, lambda: len(calls) == cli_tui.JOB_WAKE_LIMIT + 1, tries=100)
+            await _until(pilot, lambda: len(calls) == cli_tui.WAKE_LIMIT + 1, tries=100)
             assert calls[-1][0] == "carry on" and len(calls[-1][1]) == 1
             await _start_bg(registry, "chain", "again", "exit 0")
-            await _until(pilot, lambda: len(calls) == cli_tui.JOB_WAKE_LIMIT + 2, tries=100)
+            await _until(pilot, lambda: len(calls) == cli_tui.WAKE_LIMIT + 2, tries=100)
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -2329,4 +2763,307 @@ def test_prompt_queue(tui, monkeypatch):
             assert "/queue" in cli_tui.COMMAND_DESCRIPTIONS
             await app._cleanup_and_save_session()
 
+    asyncio.run(scenario())
+
+
+# --- subagents rebuild T1.3: a session that used delegate_to_subagent still renders on /resume ----
+
+def test_pin_old_delegate_history_renders(tui):
+    import json
+    cli_tui = tui
+    snapshot = json.loads((Path(__file__).parent / "snapshots" / "old_delegate_session.json").read_text("utf-8"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for step in snapshot:
+                await app.store.append("old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume old"))
+            await _until(pilot, lambda: app.session_id == "old", tries=200)
+            await pilot.pause(0.3)
+            texts = _texts(app)
+            idx = max(i for i, t in enumerate(texts) if "Where is auth handled?" in t)
+            resumed = texts[idx:]
+            assert any(t.startswith("● delegate_to_subagent(") for t in resumed)
+            assert any("auth/session.py:42 (verify_token)" in t for t in resumed)
+            agent_md = [w for w in app.query("#msg-container .msg-agent") if hasattr(w.content, "markup")]
+            assert any("Auth is handled in auth/session.py:42." in w.content.markup for w in agent_md)
+            assert not app.query("#msg-container .msg-error")
+            assert app.steps_history == snapshot
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- subagents rebuild T2.7: the input stays responsive while agents run (CON-004) ----------------
+
+def test_tui_responsive_during_agents(tui, monkeypatch, fake_model):
+    import time
+    cli_tui = tui
+    from conftest import fake_response
+    from dostuff.agent.subagents import registry as agents_module
+    reg = agents_module.AgentRegistry()
+    monkeypatch.setattr(agents_module, "_agent_registry", reg)
+    gates: list = []
+
+    async def agents_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                          current_session_history, steps_history, store, adapter=None, **kwargs):
+        runs = [await reg.start(owner=session_id, agent_type="general-purpose", description=f"a{m}",
+                                prompt=f"[{m}] x", adapter=adapter, turn_id=turn_id) for m in "AB"]
+        await asyncio.gather(*(r.done for r in runs))
+        return "done"
+    monkeypatch.setattr(cli_tui, "agent_loop", agents_loop)
+
+    async def scenario():
+        gates.extend(fake_model.gate(f"[{m}]", fake_response(f"r{m}")) for m in "AB")
+        app = cli_tui.DostuffTUI(session_id="responsive")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("go"))
+            await _until(pilot, lambda: len([r for r in reg.runs() if r.status == "running"]) == 2)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            inp.focus()
+            start = time.monotonic()
+            await pilot.press("a", "b", "c")
+            await _until(pilot, lambda: inp.text == "abc")
+            assert time.monotonic() - start < 0.2 * 3 + 0.5  # three keypresses, each well under 0.2 s
+            assert all(r.status == "running" for r in reg.runs())
+            for gate in gates:
+                gate.set()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_agents_types_command(tui, monkeypatch):
+    """/agents types: every type with its source, model and tools, then the loader warnings (subagents T3.9)."""
+    cli_tui = tui
+    from dostuff.agent.subagents import definitions as defs_module
+    from dostuff.config import get_config
+    monkeypatch.setattr(defs_module, "_cache", None)
+    folder = Path.cwd() / ".dostuff" / "agents"
+    folder.mkdir(parents=True)
+    rev = folder / "rev.md"
+    rev.write_text("---\nname: code-reviewer\ndescription: Reviews diffs\ntools: Read, Grep, Frobnicate\n"
+                   "model: fast\n---\nReview.", encoding="utf-8")
+    (folder / "broken.md").write_text("no frontmatter", encoding="utf-8")
+    get_config().agents_models = {"fast": "anthropic/claude-haiku-5-5"}
+    assert "/agents" in cli_tui.COMMAND_DESCRIPTIONS
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="agents")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+            submit("/agents types")
+            await _until(pilot, lambda: any("code-reviewer" in t for t in _texts(app)))
+            text = [t for t in _texts(app) if "code-reviewer" in t][-1]
+            assert str(rev) in text and "anthropic/claude-haiku-5-5" in text and "read_file, grep" in text
+            assert "general-purpose" in text and "built-in" in text and "openai/gpt-4o-mini" in text
+            assert "explore" in text and "read-only shell" in text
+            assert "fork  ·  built-in" in text and "always the main model" in text  # (T6.2)
+            assert "Frobnicate" in text and "broken.md" in text  # the warnings
+
+            (folder / "second.md").write_text("---\nname: second\ndescription: d\n---\nb", encoding="utf-8")
+            submit("/agents reload")
+            await _until(pilot, lambda: any("Reloaded" in t and "agent types" in t for t in _texts(app)))
+            reloaded = [t for t in _texts(app) if "Reloaded" in t][-1]
+            assert "5 agent types" in reloaded  # general-purpose, explore, plan, code-reviewer, second
+
+            assert "/agents types <name>" in text  # the hint
+
+            submit("/agents types code-reviewer")  # one type's config and system prompt
+            await _until(pilot, lambda: any("System prompt:" in t and "code-reviewer" in t for t in _texts(app)))
+            detail = [t for t in _texts(app) if "System prompt:" in t][-1]
+            assert str(rev) in detail and "anthropic/claude-haiku-5-5 (from `fast`)" in detail
+            assert "max iterations:" in detail and detail.rstrip().endswith("Review.")
+            submit("/agents types explore")
+            await _until(pilot, lambda: any("You locate code quickly" in t for t in _texts(app)))
+            submit("/agents types fork")
+            await _until(pilot, lambda: any("You are a fork of the main agent" in t for t in _texts(app)))
+            submit("/agents types nosuch")
+            await _until(pilot, lambda: any("No agent type 'nosuch'" in t for t in _texts(app)))
+
+            submit("/agents nope")
+            await _until(pilot, lambda: any("Usage: /agents" in t for t in _texts(app)))
+            submit("/agents reload extra")
+            await _until(pilot, lambda: sum("Usage: /agents" in t for t in _texts(app)) == 2)
+    asyncio.run(scenario())
+
+
+def _agent_texts(app):
+    """The Markdown source of the agent's messages."""
+    return [w.content.markup for w in app.query("#msg-container .msg-agent") if hasattr(w.content, "markup")]
+
+
+def _view_texts(app):
+    return [str(getattr(w, "content", getattr(w, "renderable", ""))) for w in app.query("#agent-view-msgs Static")]
+
+
+def _view_agent_texts(app):
+    return [w.content.markup for w in app.query("#agent-view-msgs .msg-agent") if hasattr(w.content, "markup")]
+
+
+def test_agents_command(tui, agents, fake_model):
+    """/agents lists the session's agents (running first); picking one shows its transcript in the agent view (in
+    place of the conversation, never in it) and offers Stop it (running) or Answer approval (waiting); loaded
+    interrupted agents are listed too (subagents T5.7)."""
+    from conftest import fake_response, fake_tool_call
+
+    from dostuff.agent.permissions import SessionPermissions
+    from dostuff.helpers.agent.notices import get_notice_queue
+    cli_tui = tui
+    fake_model.script("[D]", fake_response(tool_calls=[fake_tool_call("get_current_datetime", {}, "c1")]),
+                      fake_response("report D"))
+    fake_model.gate("[R]", fake_response("never"))
+    fake_model.script("[W]", fake_response(tool_calls=[fake_tool_call("write_file", {"path": "w.txt", "content": "x"})]),
+                      fake_response("wrote"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="alist")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
+            picker = app.query_one("#picker", cli_tui.PermissionPrompt)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            submit("/agents")
+            await _until(pilot, lambda: any("No agents in this session." in t for t in _texts(app)))
+
+            async def start(marker, **kwargs):
+                return await agents.start(owner="alist", agent_type="general-purpose", description=f"do {marker}",
+                                          prompt=f"[{marker}] x", adapter=app.adapter, **kwargs)
+            done = await start("D")
+            await done.done
+            running = await start("R", background=True)
+            inp.text = "typing"  # holds W's approval prompt back
+            waiting = await start("W", background=True, permissions=SessionPermissions(mode="ask"))
+            await _until(pilot, lambda: waiting.status == "waiting_approval" and running.status == "running")
+
+            submit("/agents")
+            await _until(pilot, app._picker_open)
+            inp.text = "typing"  # submitting cleared it
+            assert [v for v, _ in picker._options] == [running.id, waiting.id, done.id]
+            labels = dict(picker._options)
+            for part in (done.id, "do D", "general-purpose", "completed", "tokens", "$", "foreground"):
+                assert part in labels[done.id], (part, labels[done.id])
+            assert "background" in labels[running.id] and "waiting for approval" in labels[waiting.id]
+
+            # a finished agent: its transcript in the agent view, rendered like the conversation
+            main_before = _texts(app)
+            await app._picker_callback(done.id)
+            await _until(pilot, lambda: any("report D" in t for t in _view_agent_texts(app)))
+            assert any(t.startswith("● ") and "get_current_datetime" in t for t in _view_texts(app))
+            assert any("[D] x" in t for t in _view_texts(app))
+            assert not app.query_one("#conversation").display
+            assert _texts(app) == main_before  # nothing of the agent's lands in the conversation
+            assert [v for v, _ in picker._options] == ["type", "back"]
+            await app._picker_callback("back")
+            await _until(pilot, lambda: [v for v, _ in picker._options] == [running.id, waiting.id, done.id])
+            assert not app._agent_view_open() and app.query_one("#conversation").display
+
+            # a running agent's view fills in live, and Esc closes it
+            await app._picker_callback(running.id)
+            await _until(pilot, lambda: any("[R] x" in t for t in _view_texts(app)))
+            app._close_picker()
+            await app.action_cancel()
+            await pilot.pause()
+            assert not app._agent_view_open() and app.query_one("#conversation").display
+            assert _texts(app) == main_before
+            submit("/agents")
+            await _until(pilot, lambda: app._picker_open() and running.id in dict(picker._options))
+            inp.text = "typing"
+
+            # a running one: Stop it → stopped, a notice without a wake-up
+            await app._picker_callback(running.id)
+            assert [v for v, _ in picker._options] == ["stop", "type", "back"]
+            await app._picker_callback("stop")
+            await _until(pilot, lambda: running.status == "stopped")
+            [notice] = [n for n in get_notice_queue().pending("alist") if n.id == running.id]
+            assert notice.status == "stopped" and not notice.wake
+
+            # a waiting one: Answer approval shows its prompt now, although the input has text
+            assert waiting.status == "waiting_approval"  # still held back: the input has text
+            submit("/agents")
+            await _until(pilot, lambda: app._picker_open() and waiting.id in dict(picker._options))
+            inp.text = "typing"
+            await app._picker_callback(waiting.id)
+            assert [v for v, _ in picker._options] == ["answer", "stop", "type", "back"]
+            await app._picker_callback("answer")
+            await _until(pilot, lambda: bool(app.query("#permission-prompt")))
+            assert inp.text == "typing"
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: waiting.status == "completed")
+
+            # an agent loaded from the store as interrupted is listed, and its transcript shows
+            row = {"id": "old123", "session_id": "alist", "agent_type": "explore", "description": "old one",
+                   "model": "m", "status": "running", "background": True, "worktree": None, "branch": None,
+                   "started_at": "2026-11-01T10:00:00", "ended_at": None, "tokens": 3, "cost_usd": 0.0,
+                   "result": None, "compaction_notes": ""}
+            await app.store.upsert_agent_run(row)
+            await app.store.append_agent_step("old123", {"role": "user", "content": "task of old one"})
+            await agents.load("alist", app.store)
+            submit("/agents")
+            await _until(pilot, lambda: app._picker_open() and "old123" in dict(picker._options))
+            assert "interrupted" in dict(picker._options)["old123"]
+            await app._picker_callback("old123")
+            await _until(pilot, lambda: any("task of old one" in t for t in _view_texts(app)))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_trust_prompt_does_not_bounce(tui, fresh_trust, hook_cmd):
+    """Answering the session-start hook trust prompt doesn't move the transcript down and back up: the rows
+    the prompt frees are held under the loader for the turn, and one loader stays up from submit to the end."""
+    cli_tui = tui
+
+    async def quick_loop(session_id, turn_id, user_text, instructions, *a, adapter=None, **kw):
+        await asyncio.sleep(0.2)
+        adapter.emit("partial", "ok")
+        adapter.emit("stream_end", None)
+        return "ok"
+    cli_tui.agent_loop = quick_loop
+    _write_project_hooks({"SessionStart": [{"hooks": [{"type": "command", "name": "hello",
+                                                       "command": hook_cmd("print('BANANA')")}]}]})
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="bounce")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            loaders: set[int] = set()
+
+            def look() -> None:
+                loaders.update(id(w) for w in app.query(".msg-loader"))
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("hi"))
+            # Fine-grained polling (to see every loader) with a time limit, not an iteration count:
+            # 200 x 5 ms was too short for a slow Windows CI runner to reach the trust prompt
+            deadline = time.monotonic() + 20
+            while not app.adapter.has_pending_confirm() and time.monotonic() < deadline:
+                await pilot.pause(0.005)
+                look()
+            assert app.adapter.has_pending_confirm()
+            await pilot.pause(0.05)
+            details = next(w for w in app.query("#msg-container Static") if "This project defines hooks" in str(w.content))
+            assert app.query_one("#messages", cli_tui.VerticalScroll).max_scroll_y > 0  # the prompt made it overflow
+            y = details.region.y
+            app.adapter.choose("yes")
+            ys = []
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0)
+                ys.append(details.region.y)
+                await pilot.pause(0.005)
+                ys.append(details.region.y)
+                look()
+                if any(t.startswith("⚓ SessionStart") for t in _texts(app)):
+                    break
+            await pilot.pause(0.05)
+            ys.append(details.region.y)
+            assert all(v <= y for v in ys), ys  # never dropped when the input came back
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert len(loaders) == 1  # "Loading model libraries..." relabelled, not swapped for another loader
+            assert app.query_one("#msg-container").styles.inline.min_height is None  # released at the end
+            await app._cleanup_and_save_session()
     asyncio.run(scenario())

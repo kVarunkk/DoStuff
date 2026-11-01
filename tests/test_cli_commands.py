@@ -504,3 +504,149 @@ def test_headless_ctrl_c_kills_jobs(env, headless_jobs, _wait_dead):
     with pytest.raises(KeyboardInterrupt):
         asyncio.run(run_headless("serve", interactive=False, quiet=True))
     assert _wait_dead(started[-1].pid, 5) and started[-1].status == "killed"
+
+
+# --- subagents rebuild T2.7: parallel runs never ask on the terminal at the same time ----------------
+
+def test_headless_ask_lock(monkeypatch):
+    import asyncio
+    import builtins
+    import threading
+    import time
+
+    from dostuff.headless import HeadlessAdapter
+    log: list[str] = []
+    lock = threading.Lock()
+
+    def fake_input(prompt=""):
+        with lock:
+            log.append("enter")
+        time.sleep(0.1)
+        with lock:
+            log.append("exit")
+        return "y"
+    monkeypatch.setattr(builtins, "input", fake_input)
+    adapter = HeadlessAdapter(interactive=True, quiet=True)
+
+    async def go():
+        return await asyncio.gather(adapter.ask("[agent: a] Run x?"), adapter.ask("[agent: b] Run y?"))
+    replies = asyncio.run(go())
+    assert [r.answer for r in replies] == ["yes", "yes"]
+    assert log == ["enter", "exit", "enter", "exit"]
+
+
+# --- subagents rebuild T7.3–T7.5: headless agents (plan/2026-11-01-subagents/spec.md D17) ----------
+
+@pytest.fixture
+def headless_agents(env, agents, fake_model, monkeypatch):
+    """`run_headless` with the real loop and a fake model (main agent and subagents); returns the FakeModel."""
+    from dostuff.helpers.mcp import load_mcp_config as mcp_module
+    from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+    from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
+
+    async def no_memories(self, *args, **kwargs):
+        return []
+    monkeypatch.setattr(SemanticMemoryStore, "query", no_memories)
+    monkeypatch.setattr(EpisodicMemoryStore, "query", no_memories)
+    monkeypatch.setattr(mcp_module, "load_mcp_config", lambda: {})
+    return fake_model
+
+
+def _agent_call(marker: str, description: str, call_id: str, background: bool = False):
+    from conftest import fake_tool_call
+    return fake_tool_call("agent", {"description": description, "prompt": f"[{marker}] {description}",
+                                    "subagent_type": "general-purpose", "run_in_background": background}, call_id)
+
+
+def _run_headless(prompt: str, **kw) -> int:
+    from dostuff.headless import run_headless
+    kw.setdefault("interactive", False)
+    return asyncio.run(run_headless(prompt, **kw))
+
+
+def test_headless_parallel_agents(env, headless_agents, agents, capsys):
+    from conftest import FakeStep, fake_response, fake_tool_call
+    fm = headless_agents
+    fm.script("[M]", fake_response(tool_calls=[_agent_call(m, f"job {m}", f"c{m}") for m in "ABC"]),
+              fake_response("all three done"))
+    fm.script("[A]", fake_response(tool_calls=[fake_tool_call("write_file", {"path": "x.txt", "content": "x"})]),
+              FakeStep(fake_response("report A"), delay=0.6))
+    for m in "BC":
+        fm.script(f"[{m}]", FakeStep(fake_response(f"report {m}"), delay=0.6))
+    code = _run_headless("[M] fan out")
+    out, err = capsys.readouterr()
+    assert code == 0 and out.strip() == "all three done"
+    runs = agents.runs()
+    assert len(runs) == 3 and max(r.started for r in runs) < min(r.ended for r in runs)  # they overlapped
+    # the approval prompt (denied: no terminal) names the agent
+    assert "✗ Denied (no terminal to ask): [agent: job A" in err
+
+    fm.script("[M]", fake_response(tool_calls=[_agent_call(m, f"job {m}", f"c{m}") for m in "BC"]),
+              fake_response("two done"))
+    code = _run_headless("[M] again", quiet=True, output_format="stream-json")
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    agent_events = [e for e in events if e["type"] == "agent"]
+    assert sorted((e["description"], e["status"]) for e in agent_events) == [
+        ("job B", "completed"), ("job B", "running"), ("job C", "completed"), ("job C", "running")]
+    assert all(e["agent_type"] == "general-purpose" and e["background"] is False and e["id"] for e in agent_events)
+    assert events[-1]["type"] == "result" and events[-1]["result"] == "two done"
+
+
+@pytest.mark.parametrize("wake_on_end", [True, False])
+def test_headless_waits_for_background(env, headless_agents, capsys, wake_on_end):
+    from conftest import FakeStep, fake_response
+    from dostuff import config as config_module
+    from dostuff.helpers.agent.constants import AGENT_BACKGROUND
+    if not wake_on_end:
+        (env["home"] / ".dostuff" / "config.yaml").write_text("agents:\n  wake_on_end: false\n", encoding="utf-8")
+        config_module.reset_config()
+    fm = headless_agents
+    fm.script("[M]", fake_response(tool_calls=[_agent_call("BG", "dig", "c1", background=True)]),
+              fake_response("it is running"), fake_response("final: 42"))
+    fm.script("[BG]", FakeStep(fake_response("bg report 42"), delay=0.3))
+    code = _run_headless("[M] start it")
+    out, err = capsys.readouterr()
+    assert code == 0 and out.strip() == "final: 42"
+    assert '⚙ agent "dig" (general-purpose) finished after' in err
+    main_calls = fm.calls_for("[M]")
+    assert len(main_calls) == 3
+    assert "bg report 42" in str(main_calls[2]["messages"][-1]["content"])
+    system = main_calls[0]["messages"][0]["content"]
+    assert (AGENT_BACKGROUND.strip()[:40] in system) is wake_on_end  # D13: guidance only with the switch on
+
+
+def test_headless_limit_stops_agents(env, headless_agents, agents, capsys):
+    from conftest import FakeStep, fake_response
+    from dostuff.helpers.agent.notices import WAKE_LIMIT
+    fm = headless_agents
+    for turn in range(WAKE_LIMIT + 1):  # the first turn, then one per wake-up: each starts another agent
+        fm.script("[M]", fake_response(tool_calls=[_agent_call(f"B{turn}", f"bg{turn}", f"c{turn}", True)]),
+                  fake_response(f"turn {turn} ends"))
+    for turn in range(WAKE_LIMIT):
+        fm.script(f"[B{turn}]", FakeStep(fake_response(f"report {turn}"), delay=0.1))
+    fm.gate(f"[B{WAKE_LIMIT}]", fake_response("never"))  # still running when the limit is hit
+    code = _run_headless("[M] keep going")
+    out, err = capsys.readouterr()
+    assert code == 0
+    assert len(fm.calls_for("[M]")) == 2 * (WAKE_LIMIT + 1)
+    last = next(r for r in agents.runs() if r.description == f"bg{WAKE_LIMIT}")
+    assert last.status == "stopped"
+    assert f'stopped agent "bg{WAKE_LIMIT}"' in err and f"{WAKE_LIMIT} automatic turns" in err
+
+
+def test_headless_ctrl_c_stops_agents(env, headless_agents, agents, registry, _py, _wait_dead):
+    from conftest import FakeStep, fake_response, fake_tool_call
+    fm = headless_agents
+    sleeper = _py("import time; time.sleep(30)")
+    fm.script("[M]", fake_response(tool_calls=[_agent_call("K", "keeper", "c1", background=True)]),
+              FakeStep(KeyboardInterrupt(), delay=1.0))  # once the agent's job is running
+    fm.script("[K]", fake_response(tool_calls=[fake_tool_call(
+        "bash_command", {"command": sleeper, "run_in_background": True, "background_id": "srv"})]))
+    gate = fm.gate("[K]", fake_response("never"))
+    with pytest.raises(KeyboardInterrupt):
+        _run_headless("[M] go", permission_mode="auto", quiet=True)
+    run = next(r for r in agents.runs() if r.description == "keeper")
+    assert run.status == "stopped" and run.task.done()
+    assert not gate.is_set()
+    jobs = registry.jobs()
+    assert jobs and all(_wait_dead(j.pid, 5) for j in jobs)

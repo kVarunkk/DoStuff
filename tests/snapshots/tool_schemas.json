@@ -1,4 +1,44 @@
 {
+  "agent": {
+    "function": {
+      "description": "Start a subagent: a separate agent loop that works on one task with its own tools and returns a report.",
+      "name": "agent",
+      "parameters": {
+        "properties": {
+          "description": {
+            "description": "3-5 words saying what the agent does, shown to the user (e.g. \"find auth code\").",
+            "type": "string"
+          },
+          "isolation": {
+            "description": "\"worktree\" runs the agent in a new git worktree (a separate checkout of HEAD on its own branch), so its file changes don't touch the working tree. Use it for agents that write files. It does not see uncommitted changes. If it changes nothing the worktree is removed; otherwise the result says where the changes are. Leave empty to work in the project directory.",
+            "type": "string"
+          },
+          "model": {
+            "description": "A model for this agent: an alias from agents.models or a full model name. Empty uses the type's model, which by default is the session's. A fork always uses the session's model.",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "The task. A typed agent cannot see this conversation, so include every path, constraint and goal it needs, and say what its report should contain. For a fork, just the task.",
+            "type": "string"
+          },
+          "run_in_background": {
+            "description": "True starts the agent and returns its agent_id at once, so you can keep working; its report arrives later in a <background-agent> message. Use it for independent, long work whose result you don't need yet. Don't poll or wait for it.",
+            "type": "boolean"
+          },
+          "subagent_type": {
+            "description": "Which agent type to start; the system prompt lists them. \"fork\" starts a copy of you that inherits this conversation.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "description",
+          "prompt"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
   "bash_command": {
     "function": {
       "description": "Run a shell command and return its output as a single string.\n\nThe shell is not sandboxed: commands that are not read-only require user approval.\nCommands get no stdin and are killed when they time out, so never run interactive or\nlong-running programs (servers, GUI apps, watchers) in the foreground: start them with\nrun_in_background=true, then read their output with bash_output and stop them with kill_shell.\n\nCommands run in <shell>.",
@@ -90,17 +130,52 @@
     },
     "type": "function"
   },
-  "delegate_to_subagent": {
+  "create_agent_type": {
     "function": {
-      "description": "Executes a subagent task in an isolated context loop.",
-      "name": "delegate_to_subagent",
+      "description": "Defines a new subagent type (an agent file) that `agent` can start right away with\nsubagent_type=<name>. Use it when the user asks for a new kind of agent (e.g. \"make a code-reviewer\nagent\") or a role is needed again and again; for a one-off task, just call `agent` with a built-in type.\nThe user is always asked first.",
+      "name": "create_agent_type",
       "parameters": {
         "properties": {
-          "isolation": {
-            "description": "\"worktree\" runs the subagent in a new git worktree (a separate checkout of HEAD on its own branch), so its file changes don't touch the working tree. Use it for subagents that write files. It does not see uncommitted changes. If it changes nothing the worktree is removed; otherwise the result says where the changes are. Leave empty to work in the project directory.",
+          "description": {
+            "description": "One sentence on what it does and when to use it; it is how you pick the type later.",
             "type": "string"
           },
-          "requested_tools": {
+          "max_iterations": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Its tool-loop cap. Leave out for the configured agents.max_iterations."
+          },
+          "model": {
+            "description": "An alias from agents.models or a full model name. Empty uses the session's model.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The type's name, used as subagent_type: lowercase letters, digits and hyphens, e.g. \"code-reviewer\".",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "The type's system prompt: its role, how it works and what its report should contain. It is added to the standard subagent rules; it never sees this conversation.",
+            "type": "string"
+          },
+          "replace": {
+            "description": "True replaces an existing file of the same name in that scope.",
+            "type": "boolean"
+          },
+          "scope": {
+            "description": "'project' for ./.dostuff/agents (this project), 'user' for ~/.dostuff/agents (every project).",
+            "enum": [
+              "project",
+              "user"
+            ],
+            "type": "string"
+          },
+          "tools": {
             "anyOf": [
               {
                 "items": {
@@ -112,20 +187,13 @@
                 "type": "null"
               }
             ],
-            "description": "List of tool names the subagent may use. If omitted, defaults to read-only tools. delegate_to_subagent and delete_file are never granted."
-          },
-          "role": {
-            "description": "Role framing descriptor used to specialize the subagent's system prompt.",
-            "type": "string"
-          },
-          "task": {
-            "description": "Self-contained instructions detailing what the subagent must accomplish.",
-            "type": "string"
+            "description": "The tools it may use, e.g. [\"read_file\", \"grep\", \"glob\"]. Leave out for every tool a subagent may have. Claude Code names (Read, Edit, Bash...) work too; agent, todo_write, settings and memory tools are never given to subagents."
           }
         },
         "required": [
-          "task",
-          "role"
+          "name",
+          "description",
+          "prompt"
         ],
         "type": "object"
       }
@@ -515,6 +583,34 @@
     },
     "type": "function"
   },
+  "send_message": {
+    "function": {
+      "description": "Send a follow-up to an agent you started. It keeps everything from its earlier work, so ask for more\ninstead of starting a new agent on the same task.",
+      "name": "send_message",
+      "parameters": {
+        "properties": {
+          "message": {
+            "description": "What to tell or ask it, self-contained like a prompt.",
+            "type": "string"
+          },
+          "run_in_background": {
+            "description": "For an agent that has finished: True continues it in the background and returns at once; its report arrives later in a <background-agent> message. Ignored while the agent is running.",
+            "type": "boolean"
+          },
+          "to": {
+            "description": "The agent_id an `agent` call returned.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "to",
+          "message"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
   "set_mcp_server": {
     "function": {
       "description": "Adds an MCP server, or replaces the one with this name, and connects it right away.\nGive either `command` (a local stdio server) or `url` (an HTTP server). Take the package or\nURL from the server's official docs; never use a placeholder. Most hosted servers sign in with\nOAuth in the browser when they connect, so give only `url` and no `headers` unless the docs\nrequire an API key. The user is always asked first. To keep an existing secret, pass\n\"<redacted>\" as its value.",
@@ -600,6 +696,25 @@
         },
         "required": [
           "name"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "stop_agent": {
+    "function": {
+      "description": "Stop a running subagent that you started. Its shell jobs are killed and an unchanged worktree is removed.",
+      "name": "stop_agent",
+      "parameters": {
+        "properties": {
+          "agent_id": {
+            "description": "The agent_id the `agent` call returned.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id"
         ],
         "type": "object"
       }
