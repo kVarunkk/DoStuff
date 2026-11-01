@@ -434,8 +434,11 @@ def test_detach_foreground(agents, fake_model):
     async def go():
         parent = FakeAdapter()
         call = asyncio.create_task(_agent(prompt="[A] x", adapter=parent))
+        # The second call starts only once [A] holds the one slot: each call reloads definitions in a worker
+        # thread first, so two calls started together reach the registry in either order (macOS CI saw [Q] win)
+        await _until(lambda: bool(fake_model.calls_for("[A]")))
         queued_call = asyncio.create_task(_agent(prompt="[Q] x", description="later", adapter=parent))
-        await _until(lambda: len(agents.runs()) == 2 and bool(fake_model.calls_for("[A]")))
+        await _until(lambda: len(agents.runs()) == 2)
         run, queued = sorted(agents.runs(), key=lambda r: r.description != "find x")
         assert queued.status == "queued"
         moved = agents.detach_foreground("s1")

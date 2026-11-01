@@ -1,5 +1,6 @@
 """Headless TUI smoke test: async turns, streaming, approval prompt, /clear, exit (REQ-4.x)."""
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -3036,18 +3037,21 @@ def test_trust_prompt_does_not_bounce(tui, fresh_trust, hook_cmd):
             def look() -> None:
                 loaders.update(id(w) for w in app.query(".msg-loader"))
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("hi"))
-            for _ in range(200):
+            # Fine-grained polling (to see every loader) with a time limit, not an iteration count:
+            # 200 x 5 ms was too short for a slow Windows CI runner to reach the trust prompt
+            deadline = time.monotonic() + 20
+            while not app.adapter.has_pending_confirm() and time.monotonic() < deadline:
                 await pilot.pause(0.005)
                 look()
-                if app.adapter.has_pending_confirm():
-                    break
+            assert app.adapter.has_pending_confirm()
             await pilot.pause(0.05)
             details = next(w for w in app.query("#msg-container Static") if "This project defines hooks" in str(w.content))
             assert app.query_one("#messages", cli_tui.VerticalScroll).max_scroll_y > 0  # the prompt made it overflow
             y = details.region.y
             app.adapter.choose("yes")
             ys = []
-            for _ in range(200):
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
                 await asyncio.sleep(0)
                 ys.append(details.region.y)
                 await pilot.pause(0.005)
