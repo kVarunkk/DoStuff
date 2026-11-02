@@ -131,3 +131,222 @@ def test_tool_schema_shape():
     for absent in ("preview", "answers", "adapter"):
         assert f"'{absent}'" not in blob, absent
     assert "ask_user" in schema["function"]["description"]
+
+
+# --- T1.3 cleaning and clamping (REQ-1.2, D4) ----------------------------------------------------
+
+def _clean(questions):
+    import dostuff.tools.ask_user as ask_user_module
+    return ask_user_module._clean_questions(questions)
+
+
+def test_cleaning_clamps():
+    cleaned = _clean([{
+        "question": "  Which   database\n should I  use? ",
+        "header": "A" * 30,
+        "options": [
+            {"label": "L" * 90, "description": "D" * 400},
+            {"label": "Short", "description": "  one   line  "},
+        ],
+    }])
+    assert len(cleaned) == 1
+    q = cleaned[0]
+    assert q["question"] == "Which database should I use?"
+    assert q["header"] == "A" * 12  # hard cut, no ellipsis: it is a fixed-width tab strip
+    assert len(q["options"][0]["label"]) == 60 and q["options"][0]["label"].endswith("…")
+    assert len(q["options"][0]["description"]) == 200 and q["options"][0]["description"].endswith("…")
+    assert q["options"][1] == {"label": "Short", "description": "one line"}
+    assert q["multi_select"] is False
+
+
+def test_cleaning_drops_and_numbers():
+    cleaned = _clean([
+        {"question": "   "},                       # no question text: dropped, and it doesn't count for Q<n>
+        {"options": [{"label": "a"}, {"label": "b"}]},   # no question text either
+        {"question": "Second kept?", "header": "   "},   # blank header → Q1 (it is the first kept question)
+        {"question": "Third kept?", "options": [
+            {"label": "   "},                      # no label: dropped
+            "not a dict",                          # not an option: dropped
+            {"label": "Fine"},
+        ]},
+    ])
+    assert [q["question"] for q in cleaned] == ["Second kept?", "Third kept?"]
+    assert [q["header"] for q in cleaned] == ["Q1", "Q2"]
+    assert cleaned[1]["options"] == [{"label": "Fine"}]
+
+
+def test_cleaning_ignores_unknown_keys():
+    cleaned = _clean([{
+        "question": "Q?", "preview": "x", "answers": {"Q?": "a"},
+        "options": [{"label": "a", "preview": "y", "style": "dim"}, {"label": "b"}],
+    }])
+    assert set(cleaned[0]) == {"question", "header", "options", "multi_select"}
+    assert set(cleaned[0]["options"][0]) == {"label"}
+
+
+def test_cleaning_multi_select_defaults_and_survives():
+    cleaned = _clean([{"question": "One?", "options": [{"label": "a"}, {"label": "b"}], "multi_select": True}])
+    assert cleaned[0]["multi_select"] is True
+    cleaned = _clean([{"question": "One?", "options": [{"label": "a"}, {"label": "b"}]}])
+    assert cleaned[0]["multi_select"] is False
+
+
+def test_cleaned_questions_reach_the_adapter(ask_script):
+    """The cleaning happens in the tool, so the adapter sees the clamped values, not the raw ones."""
+    import asyncio
+    from dostuff.tools.ask_user import ask_user
+
+    adapter = ask_script([("Which database should I use?", "Postgres")])
+    asyncio.run(ask_user([{
+        "question": "  Which   database\n should I  use? ",
+        "header": "A" * 30,
+        "options": [{"label": "L" * 90}, {"label": "Short"}],
+    }], adapter=adapter))
+    assert adapter.questions == [[{
+        "question": "Which database should I use?",
+        "header": "A" * 12,
+        "options": [{"label": "L" * 59 + "…"}, {"label": "Short"}],
+        "multi_select": False,
+    }]]
+
+
+def test_raw_json_arguments_tolerated():
+    """`questions` as a JSON string (a fake model, an old transcript) is parsed; a non-list is the D4 refusal."""
+    import asyncio
+    import json
+
+    from dostuff.helpers.ui.ask_answers import parse_answers
+    from dostuff.tools.ask_user import ask_user
+
+    from conftest import AskScript
+
+    pairs = [("Which db?", "SQLite")]
+    adapter = AskScript(pairs)
+    text = asyncio.run(ask_user(json.dumps([{"question": "Which db?", "options": [{"label": "a"}, {"label": "b"}]}]),
+                               adapter=adapter))
+    assert parse_answers(text) == pairs
+    assert adapter.questions[0][0]["question"] == "Which db?"
+
+    for bad in (None, "x", 5, {"question": "q"}):
+        assert asyncio.run(ask_user(bad, adapter=AskScript(pairs))).startswith("error: ")
+
+
+# --- T1.4 structural refusals (REQ-1.2, D4) ------------------------------------------------------
+
+def _refused(questions, adapter):
+    import asyncio
+    from dostuff.tools.ask_user import ask_user
+    result = asyncio.run(ask_user(questions, adapter=adapter))
+    assert adapter.calls == 0, "a refused call must not reach the adapter"
+    return result
+
+
+def test_refusals(ask_script):
+    adapter = ask_script([])
+    two_options = [{"label": "Postgres"}, {"label": "SQLite"}]
+
+    assert _refused([], adapter) == "error: ask_user needs at least one question with text."
+    assert _refused([{"question": "  "}], adapter) == "error: ask_user needs at least one question with text."
+    assert _refused([{"question": f"Q{i}?"} for i in range(5)], adapter) == (
+        "error: ask_user takes 1-4 questions, got 5. Split them across calls."
+    )
+    assert _refused([{"question": "Which db?", "options": [{"label": f"o{i}"} for i in range(5)]}], adapter) == (
+        'error: question "Which db?" has 5 options; the limit is 4.'
+    )
+    assert _refused([{"question": "Which db?", "options": [{"label": "Postgres"}]}], adapter) == (
+        'error: question "Which db?" has one option. Give it 2-4, or leave options out for a free-text answer.'
+    )
+    assert _refused([{"question": "Which db?", "options": [{"label": "Postgres"}, {"label": "Postgres"}]}],
+                    adapter) == 'error: question "Which db?" repeats the option "Postgres".'
+    assert _refused([{"question": "Which db?", "options": two_options},
+                     {"question": "Which db? ", "options": two_options}], adapter) == (
+        'error: ask_user repeats the question "Which db?".'
+    )
+    assert _refused([{"question": "Which db?", "multi_select": True}], adapter) == (
+        'error: question "Which db?" is multi_select but has no options.'
+    )
+
+
+def test_refusal_order(ask_script):
+    """The first fault in D4's order wins: the question count, then each question's options."""
+    adapter = ask_script([])
+    both_wrong = [{"question": "Which db?", "options": [{"label": "one"}]} for _ in range(5)]
+    assert _refused(both_wrong, adapter) == "error: ask_user takes 1-4 questions, got 5. Split them across calls."
+    # Two faulty questions: the first one's fault is reported
+    assert _refused([{"question": "First?", "options": [{"label": "a"}]},
+                     {"question": "Second?", "options": [{"label": "a"}, {"label": "a"}]}], adapter) == (
+        'error: question "First?" has one option. Give it 2-4, or leave options out for a free-text answer.'
+    )
+
+
+def test_refusal_never_raises(ask_script):
+    """Five malformed shapes all return an `error: ` string, never an exception."""
+    adapter = ask_script([])
+    for bad in (None, "x", [{}], [{"question": 5}], [{"question": "q", "options": "Postgres"}]):
+        assert _refused(bad, adapter).startswith("error: ")
+
+
+# --- T1.5 results: answers, cancelled, unavailable (REQ-1.4, D5) ---------------------------------
+
+def test_answers_result(ask_script):
+    import asyncio
+    from dostuff.helpers.ui.ask_answers import format_answers
+    from dostuff.tools.ask_user import ask_user
+
+    pairs = [("Which database should I use?", "Postgres")]
+    adapter = ask_script(pairs)
+    result = asyncio.run(ask_user([{"question": "Which database should I use?",
+                                    "options": [{"label": "Postgres"}, {"label": "SQLite"}]}], adapter=adapter))
+    assert result == format_answers(pairs)
+
+
+def test_cancelled_result(ask_script):
+    import asyncio
+    from dostuff.helpers.ui.ask_answers import CANCELLED_ASK_RESULT
+    from dostuff.tools.ask_user import ask_user
+
+    assert asyncio.run(ask_user([{"question": "Which db?"}], adapter=ask_script(None))) == CANCELLED_ASK_RESULT
+
+
+def test_unavailable_result(ask_script):
+    import asyncio
+    from types import SimpleNamespace
+
+    from dostuff.helpers.ui.ask_answers import NoUserAvailable, UNAVAILABLE_ASK_RESULT
+    from dostuff.tools.ask_user import ask_user
+
+    questions = [{"question": "Which db?"}]
+    assert asyncio.run(ask_user(questions)) == UNAVAILABLE_ASK_RESULT
+    assert asyncio.run(ask_user(questions, adapter=SimpleNamespace(emit=lambda *a: None))) == UNAVAILABLE_ASK_RESULT
+    assert asyncio.run(ask_user(questions, adapter=ask_script(raise_exc=NoUserAvailable()))) == UNAVAILABLE_ASK_RESULT
+
+
+def test_adapter_exception_is_a_result(ask_script):
+    import asyncio
+    from dostuff.tools.ask_user import ask_user
+
+    result = asyncio.run(ask_user([{"question": "Which db?"}], adapter=ask_script(raise_exc=RuntimeError("boom"))))
+    assert result.startswith("error: ask_user could not ask")
+    assert "boom" in result
+
+
+def test_answers_are_one_line_each(ask_script):
+    import asyncio
+    from dostuff.helpers.ui.ask_answers import parse_answers
+    from dostuff.tools.ask_user import ask_user
+
+    adapter = ask_script([("Which db?", "line one\nline two")])
+    result = asyncio.run(ask_user([{"question": "Which db?"}], adapter=adapter))
+    assert parse_answers(result) == [("Which db?", "line one line two")]
+    assert "\nline two" not in result
+
+
+def test_length_mismatch_is_cancelled(ask_script):
+    """An adapter that answers fewer pairs than it was asked is a cancelled call, not an IndexError."""
+    import asyncio
+    from dostuff.helpers.ui.ask_answers import CANCELLED_ASK_RESULT
+    from dostuff.tools.ask_user import ask_user
+
+    result = asyncio.run(ask_user([{"question": "First?"}, {"question": "Second?"}],
+                                  adapter=ask_script([("First?", "a")])))
+    assert result == CANCELLED_ASK_RESULT
