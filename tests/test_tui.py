@@ -955,7 +955,7 @@ def test_turn_summary_timer_format_and_jump_to_bottom(tui):
             await pilot.pause()
             assert any(t.startswith("✻ Worked for 1m 5s · $0.01 · done ") for t in _texts(app))
 
-            # Scrolling up shows the bar; clicking it goes back to the bottom and hides it
+            # Scrolling up shows the bar; clicking the centered button goes back to the bottom and hides it
             jump = app.query_one("#jump-bottom", cli_tui.JumpToBottom)
             for i in range(40):
                 app._append(f"line {i}", msg_type="system")
@@ -964,7 +964,11 @@ def test_turn_summary_timer_format_and_jump_to_bottom(tui):
             assert not jump.display
             messages.scroll_home(animate=False)
             await _until(pilot, lambda: jump.display)
-            await pilot.click("#jump-bottom")
+            # The bar spans the conversation so it can center a small button (not a full-width band)
+            label = app.query_one("#jump-bottom-label", cli_tui.Static)
+            assert label.region.width < jump.region.width
+            assert abs(label.region.x + label.region.width / 2 - (jump.region.x + jump.region.width / 2)) <= 1
+            await pilot.click("#jump-bottom-label")
             await _until(pilot, lambda: messages.is_vertical_scroll_end and not jump.display)
             await app._cleanup_and_save_session()
 
