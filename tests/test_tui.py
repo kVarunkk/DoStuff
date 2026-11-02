@@ -3158,3 +3158,136 @@ def test_picker_keeps_a_scrolled_up_transcript_in_place(tui):
             assert messages.scroll_y == 10
             await app._cleanup_and_save_session()
     asyncio.run(scenario())
+
+
+# --- ask_user Phase 0: the approval contract is pinned before anything changes (CON-005) ---------
+
+def _params(fn):
+    """(name, default) per parameter (without `self`); None means required."""
+    import inspect
+    return [(p.name, None if p.default is inspect.Parameter.empty else p.default)
+            for p in inspect.signature(fn).parameters.values() if p.name != "self"]
+
+
+def test_pin_approval_surface(tui):
+    """ask_user is a new, separate channel: the approval surface keeps its signatures and behaviour."""
+    import dataclasses
+    cli_tui = tui
+    from dostuff.agent.permissions import ApprovalReply
+    from dostuff.headless import HeadlessAdapter
+
+    assert _params(cli_tui.TuiAdapter.ask) == [("message", None), ("always_label", ""), ("background", False)]
+    assert _params(cli_tui.TuiAdapter.ask_batch) == [
+        ("messages", None), ("always_label", ""), ("background", False)]
+    assert _params(cli_tui.TuiAdapter.ask_trust) == [("message", None)]
+    assert _params(cli_tui.TuiAdapter.confirm) == [
+        ("details", None), ("question", None), ("yes", None), ("no", None)]
+    assert _params(HeadlessAdapter.ask) == [("message", None), ("always_label", ""), ("background", False)]
+
+    assert [f.name for f in dataclasses.fields(ApprovalReply)] == ["answer", "feedback"]
+    assert dataclasses.fields(ApprovalReply)[1].default == ""
+    assert cli_tui.PermissionPrompt.SHORTCUTS == {"y": "yes", "a": "always", "n": "no"}
+    assert cli_tui.PermissionPrompt.ALLOW_SELECT is False
+
+    # has_pending_confirm() stays approval-only once a second prompt type exists (asserted again in T3.1)
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin-approval")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.adapter.has_pending_confirm() is False
+            replies = []
+
+            async def ask():
+                replies.append(await app.adapter.ask("Write a.txt", always_label="file writes"))
+            app.run_worker(ask())
+            await _until(pilot, lambda: app.adapter.has_pending_confirm())
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: replies)
+            assert replies == [ApprovalReply("yes")]
+            assert app.adapter.has_pending_confirm() is False
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_pin_approval_prompt_still_picks(tui):
+    """test_permission_selector's behaviour, once through the pin name: a Phase 4 panel change that
+    touched the approval widget fails here first."""
+    cli_tui = tui
+    from dostuff.agent.permissions import ApprovalReply
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin-picks")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            replies = []
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+
+            async def ask():
+                replies.append(await app.adapter.ask("Write a.txt", always_label="file writes"))
+
+            # A number key picks that option at once
+            app.run_worker(ask())
+            await _until(pilot, lambda: app.query("#permission-prompt"))
+            assert not inp.display
+            await pilot.press("1")
+            await _until(pilot, lambda: replies)
+            assert replies[-1] == ApprovalReply("yes")
+            assert inp.display
+
+            # y allows, n asks for feedback that goes back with the denial
+            app.run_worker(ask())
+            await _until(pilot, lambda: app.query("#permission-prompt"))
+            await pilot.press("y")
+            await _until(pilot, lambda: len(replies) == 2)
+            assert replies[-1] == ApprovalReply("yes")
+
+            app.run_worker(ask())
+            await _until(pilot, lambda: app.query("#permission-prompt"))
+            await pilot.press("n")
+            await _until(pilot, lambda: inp.has_class("feedback-mode"))
+            inp.text = "use edit_file instead"
+            await pilot.press("enter")
+            await _until(pilot, lambda: len(replies) == 3)
+            assert replies[-1] == ApprovalReply("no", feedback="use edit_file instead")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def _message_lines(app) -> list[str]:
+    """Every message widget's rendered plain text, one per message (wrapped lines joined with a space)."""
+    lines = []
+    for w in app.query("#msg-container Static"):
+        rendered = w.render() if hasattr(w, "render") else getattr(w, "content", "")
+        text = rendered.plain if hasattr(rendered, "plain") else str(rendered)
+        lines.append(text.replace("\n", " "))
+    return lines
+
+
+def test_pin_transcript_without_ask_user(tui):
+    """CON-007: a stored session with no ask_user step renders byte-identically after Phase 5.
+
+    The message lines are pinned to `snapshots/transcript_no_ask_user.txt` (one per message, written from
+    today's output)."""
+    import json
+    cli_tui = tui
+    snapshot = json.loads((Path(__file__).parent / "snapshots" / "old_delegate_session.json").read_text("utf-8"))
+    expected_file = Path(__file__).parent / "snapshots" / "transcript_no_ask_user.txt"
+
+    async def scenario() -> list[str]:
+        app = cli_tui.DostuffTUI(session_id="pin-transcript")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            for step in snapshot:
+                await app.store.append("old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume old"))
+            await _until(pilot, lambda: app.session_id == "old", tries=200)
+            await pilot.pause(0.3)
+            lines = _message_lines(app)
+            idx = max(i for i, t in enumerate(lines) if "Where is auth handled?" in t)
+            await app._cleanup_and_save_session()
+            return lines[idx:]
+
+    lines = asyncio.run(scenario())
+    assert lines == expected_file.read_text(encoding="utf-8").splitlines()
