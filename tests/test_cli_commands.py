@@ -781,3 +781,19 @@ def test_headless_ask_line_parsing():
     assert _parse_ask_line("my own db", options) == "my own db"
     assert _parse_ask_line("", options) == "(no answer)"
     assert _parse_ask_line("", []) == "(no answer)"
+
+
+def test_print_mode_ask_user_end_to_end(monkeypatch):
+    """Phase 3 exit check (D13): the tool through the real headless adapter, exactly as the loop calls it:
+    the terminal answers, and the result is the D5 block the model reads next."""
+    import asyncio
+
+    from dostuff.headless import HeadlessAdapter
+    from dostuff.helpers.ui.ask_answers import parse_answers
+    from dostuff.tools.ask_user import ask_user
+
+    _scripted_input(monkeypatch, ["2", "Tiger"])
+    adapter = HeadlessAdapter(interactive=True, quiet=True)
+    result = asyncio.run(ask_user([{"question": "Which db?", "options": [{"label": "SQLite"}, {"label": "Postgres"}]},
+                                   {"question": "Name?"}], adapter=adapter))
+    assert parse_answers(result) == [("Which db?", "Postgres"), ("Name?", "Tiger")]

@@ -878,10 +878,11 @@ class TuiAdapter:
       adapter.ask(message)              → TUI shows a selector; returns an ApprovalReply
                                           ("yes" | "always" | "no", plus feedback for "no")
       adapter.ask_batch(messages)       → one selector for several calls; adds "each"
+      adapter.ask_user(questions)       → the ask_user tool: every answer in order, or None when cancelled
 
     TUI calls:
       adapter.choose(value)             → an option was picked in the selector
-      adapter.got_input(text)           → typed reply (feedback after "No", or y/a/n)
+      adapter.got_input(text)           → typed reply (feedback after "No", or the answer to a question)
     """
 
     def __init__(self, app: "DostuffTUI"):
