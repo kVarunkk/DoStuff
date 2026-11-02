@@ -359,6 +359,15 @@ class FakeTui:
     def _hide_ask_panel(self) -> None:
         self.calls.append(("_hide_ask_panel", ()))
 
+    def _show_permission_prompt(self, question: str, options: list) -> None:
+        self.calls.append(("_show_permission_prompt", (question, options)))
+
+    def _hide_permission_prompt(self, restore_input: bool = True) -> None:
+        self.calls.append(("_hide_permission_prompt", (restore_input,)))
+
+    def _flash_input_hint(self, text: str, seconds: float = 2) -> None:
+        self.calls.append(("_flash_input_hint", (text,)))
+
     def _hand_input_over(self, placeholder: str = "") -> None:
         self.calls.append(("_hand_input_over", (placeholder,)))
 

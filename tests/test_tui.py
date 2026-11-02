@@ -3291,3 +3291,122 @@ def test_pin_transcript_without_ask_user(tui):
 
     lines = asyncio.run(scenario())
     assert lines == expected_file.read_text(encoding="utf-8").splitlines()
+
+
+# --- ask-user T3.2: the input answers a question, and the three gates (REQ-3.1, D7) ----------------
+
+def _ask_question(app, questions):
+    """Start an `ask_user` call the way the tool does, and return its task."""
+    return asyncio.ensure_future(app.adapter.ask_user(questions))
+
+
+def test_typed_text_answers_the_question(tui):
+    """A free-text question takes the input: typed text is the answer, never a new prompt."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert not app._turn_in_progress
+            task = _ask_question(app, [{"question": "Name the app?", "options": [], "header": "Q1"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            assert app.query_one("#input", cli_tui.EnterSubmits).has_class("feedback-mode")
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("Tiger"))
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Name the app?", "Tiger")]
+            assert not app._turn_in_progress  # no turn started under the question
+            assert not app.adapter.has_pending_ask()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            assert not inp.has_class("feedback-mode") and inp.placeholder == ""
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_empty_enter_keeps_the_question(tui):
+    """Open point 4: an empty Enter records nothing; Esc is the way out."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-empty")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            task = _ask_question(app, [{"question": "Name the app?"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(""))
+            await pilot.pause()
+            assert app.adapter.has_pending_ask() and not task.done()
+            assert "type an answer" in (app.query_one("#input", cli_tui.EnterSubmits).border_title or "")
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            assert task.result() is None
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_esc_cancels_question(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-esc")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            task = _ask_question(app, [{"question": "Name the app?"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await app.action_cancel()
+            await _until(pilot, lambda: task.done())
+            assert task.result() is None
+            assert not app.adapter.has_pending_ask()
+            assert app.adapter._cancelled  # Esc still ends the turn, as on an approval
+            assert app._title_state != "waiting"
+            app.adapter._cancelled = False
+            app.adapter._cancel_event.clear()
+            # idle again: Esc goes back to the "nothing to cancel" path
+            await app.action_cancel()
+            await _until(pilot, lambda: str(app.query_one("#input", cli_tui.EnterSubmits).border_title) == cli_tui.QUIT_HINT)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_r_blocked_during_question(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-ctrlr")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            task = _ask_question(app, [{"question": "Name the app?"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            app.action_history_search()
+            await pilot.pause()
+            assert not app._picker_open()  # no history picker on top of the question
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_gate_is_approval_only(tui, monkeypatch):
+    """`has_pending_confirm()` keeps its approval-only meaning; the app asks `has_pending_prompt()`."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-gate")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            task = _ask_question(app, [{"question": "Name the app?"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            assert app.adapter.has_pending_prompt() and not app.adapter.has_pending_confirm()
+            seen = []
+            monkeypatch.setattr(app.adapter, "has_pending_prompt", lambda: seen.append(1) or True)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("Tiger"))
+            assert seen, "the input gate must ask has_pending_prompt()"
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Name the app?", "Tiger")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

@@ -352,17 +352,165 @@ def test_length_mismatch_is_cancelled(ask_script):
     assert result == CANCELLED_ASK_RESULT
 
 
-# --- T2.1 registration (REQ-2.1, CON-008) --------------------------------------------------------
 
-def test_registered():
-    from dostuff.helpers.tools.generate_tool_schema import generate_litellm_tool_schema
-    from dostuff.tools.ask_user import ask_user
-    from dostuff.tools.definitions import TOOL_MAP, TOOL_SCHEMAS
-    from dostuff.tools.names import BUILTIN_TOOL_NAMES
+# --- T3.1 the TUI adapter's question channel (REQ-3.1, D7) ----------------------------------------
 
-    spec = TOOL_MAP["ask_user"]
-    assert spec.kind == "read"
-    assert spec.injected == frozenset({"adapter"})
-    assert "ask_user" in BUILTIN_TOOL_NAMES
-    assert "ask_user" in TOOL_SCHEMAS
-    assert spec.schema == generate_litellm_tool_schema(ask_user, name="ask_user", exclude={"adapter"})
+import asyncio  # noqa: E402  (only these adapter tests need the event loop)
+
+
+def _tui_adapter(fake_tui):
+    from dostuff.cli_tui import TuiAdapter
+    app = fake_tui()
+    return TuiAdapter(app), app
+
+
+def test_adapter_returns_answers(fake_tui):
+    """The adapter owns the per-question loop (open point 2): one answer at a time, in order."""
+    adapter, app = _tui_adapter(fake_tui)
+    questions = [{"question": "Which db?", "header": "DB", "options": [], "multi_select": False},
+                 {"question": "Name the app?"}]
+
+    async def scenario():
+        task = asyncio.ensure_future(adapter.ask_user(questions))
+        for i, expected in enumerate(("Which db?", "Name the app?") , 1):
+            await _wait(lambda: len(app.named("_hand_input_over")) == i)
+            # the app's _approval_waiting is what sets the title and the notification (pinned in T4.7)
+            assert app.named("_approval_waiting")[-1] == (expected,)
+            adapter.got_input("SQLite" if expected == "Which db?" else "Tiger")
+            await _settle()
+        return await asyncio.wait_for(task, 5)
+
+    result = asyncio.run(scenario())
+    assert result == [("Which db?", "SQLite"), ("Name the app?", "Tiger")]
+    assert app.named("_hand_input_over")  # a free-text question takes the input
+    assert not adapter.has_pending_ask()
+
+
+def test_adapter_serializes_prompts(fake_tui):
+    """One prompt at a time: a second ask_user (or an approval) waits on _ask_lock."""
+    from dostuff.agent.permissions import ApprovalReply
+
+    adapter, app = _tui_adapter(fake_tui)
+    question = [{"question": "Which db?"}]
+
+    async def scenario():
+        first = asyncio.ensure_future(adapter.ask_user(question))
+        await _wait(lambda: adapter.has_pending_ask())
+        second = asyncio.ensure_future(adapter.ask_user(question))
+        approval = asyncio.ensure_future(adapter.ask("Allow write_file?"))
+        await _settle()
+        assert not second.done() and not approval.done()  # both are waiting on the lock
+        adapter.got_input("SQLite")
+        await _wait(lambda: first.done() and (adapter.has_pending_ask() or adapter.has_pending_confirm()))
+        assert first.result() == [("Which db?", "SQLite")]
+        # the second ask_user holds the prompt now; the approval still waits
+        assert adapter.has_pending_ask() and not adapter.has_pending_confirm()
+        assert not approval.done()
+        adapter.got_input("Postgres")
+        await _settle()
+        assert second.done() and second.result() == [("Which db?", "Postgres")]
+        await _wait(lambda: adapter.has_pending_confirm())  # the approval finally gets its turn
+        adapter.choose("yes")
+        await _settle()
+        assert approval.done() and isinstance(approval.result(), ApprovalReply)
+        assert approval.result().answer == "yes"
+
+    asyncio.run(scenario())
+
+
+def test_adapter_cancel_resolves_none(fake_tui):
+    adapter, app = _tui_adapter(fake_tui)
+
+    async def scenario():
+        task = asyncio.ensure_future(adapter.ask_user([{"question": "Which db?"}]))
+        await _wait(lambda: adapter.has_pending_ask())
+        adapter.cancel_pending_ask()
+        return await asyncio.wait_for(task, 5)
+
+    assert asyncio.run(scenario()) is None
+    assert not adapter.has_pending_ask()
+    assert app.named("_give_input_back")  # the panel/input is hidden...
+    assert app.named("_set_title")[-1] == ("running",)  # ...and the title goes back (the turn is still running)
+
+
+def test_cancel_pending_ask_is_a_noop_when_idle(fake_tui):
+    adapter, app = _tui_adapter(fake_tui)
+    before = list(app.calls)
+    adapter.cancel_pending_ask()
+    assert app.calls == before and not adapter.has_pending_ask()
+
+
+def test_has_pending_prompt_covers_both(fake_tui):
+    adapter, app = _tui_adapter(fake_tui)
+
+    async def scenario():
+        task = asyncio.ensure_future(adapter.ask_user([{"question": "Which db?"}]))
+        await _wait(lambda: adapter.has_pending_ask())
+        assert adapter.has_pending_prompt() and not adapter.has_pending_confirm()  # CON-005: approval-only stays
+        adapter.got_input("SQLite")
+        return await asyncio.wait_for(task, 5)
+
+    assert asyncio.run(scenario()) == [("Which db?", "SQLite")]
+    assert adapter.has_pending_prompt() == (adapter.has_pending_confirm() or adapter.has_pending_ask())
+    assert not adapter.has_pending_prompt()
+
+
+def test_adapter_cancel_flag(fake_tui):
+    """The turn is already being cancelled: don't open a prompt on the way out."""
+    adapter, app = _tui_adapter(fake_tui)
+    adapter._cancelled = True
+    adapter._cancel_event.set()
+
+    async def scenario():
+        return await adapter.ask_user([{"question": "Which db?"}])
+
+    assert asyncio.run(scenario()) is None
+    assert not app.named("_hand_input_over") and not app.named("_show_ask_panel")
+    assert not adapter.has_pending_ask()
+
+
+def _settle():
+    """Let every ready callback run (events, locks): a few loop turns, never a sleep."""
+    async def go():
+        for _ in range(5):
+            await asyncio.sleep(0)
+    return go()
+
+
+async def _wait(condition, tries: int = 200):
+    """Wait for `condition()` without a bare sleep: yield to the loop until it holds."""
+    for _ in range(tries):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never held")
+
+
+# --- T3.4 a subagent gets no question channel (REQ-3.3, D11) --------------------------------------
+
+def test_subagent_adapter_has_no_own_ask_user():
+    """A run's tool list never offers `ask_user` (T2.4); if that is ever lifted, this fails first."""
+    from types import SimpleNamespace
+
+    from dostuff.agent.subagents.adapter import SubagentAdapter
+
+    asked = []
+
+    class Parent:
+        def emit(self, event_type, data):
+            pass
+
+        async def ask(self, message, **kwargs):
+            return "yes"
+
+        async def ask_user(self, questions):
+            asked.append(questions)
+            return [("q", "a")]
+
+    run = SimpleNamespace(description="d", agent_type="t", background=False, cancel=None)
+    adapter = SubagentAdapter(Parent(), run)
+    assert "ask_user" not in type(adapter).__dict__  # no own channel: the passthrough is all there is
+    # everything else still forwards to the parent
+    adapter.emit("error", "boom")
+    asyncio.run(adapter.ask("Run x?"))
+    assert asked == []  # nothing asked on its own

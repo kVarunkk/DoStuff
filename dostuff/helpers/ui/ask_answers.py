@@ -40,6 +40,22 @@ def one_line(text: object) -> str:
     return " ".join(str(text).split())
 
 
+def pick_options(text: str, options: list[dict]) -> str | None:
+    """`"2"` or `"1,3"` (or `"1 3"`) → the matching option labels joined in **option order** (D5), or None
+    when the text is not a list of numbers (`"my own thing"` is a free answer, and so is `"9"` out of range).
+
+    Shared by the TUI adapter and the headless one, so both read a number the same way (D13).
+    """
+    parts = [part for part in re.split(r"[,\s]+", str(text).strip()) if part]
+    if not parts or not all(part.isdigit() for part in parts):
+        return None
+    indexes = {int(part) for part in parts}
+    if any(not 1 <= i <= len(options) for i in indexes):
+        return None
+    labels = [one_line(option.get("label", "")) for i, option in enumerate(options, 1) if i in indexes]
+    return ", ".join(label for label in labels if label) or None
+
+
 def format_answers(pairs: list[tuple[str, str]]) -> str:
     """The tool's result text for `pairs` (question, answer) — D5, one pair per numbered block."""
     n = len(pairs)

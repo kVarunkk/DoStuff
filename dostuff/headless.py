@@ -16,8 +16,10 @@ from dostuff.agent.permissions import ApprovalReply, PermissionMode, SessionPerm
 from dostuff.helpers.hooks import trust
 from dostuff.helpers.hooks.dispatch import hook_line, untrusted_notice_given
 from dostuff.helpers.hooks.events import blocked_prompt_message, session_start, user_prompt_submit, with_prompt_context
+from dostuff.helpers.ui.ask_answers import NoUserAvailable, one_line, pick_options
 
 PREVIEW_LINES = 4
+NO_ANSWER = "(no answer)"  # D13: an empty line is still an answer, and must not vanish
 MCP_CONNECT_TIMEOUT_S = 150.0
 OutputFormat = Literal["text", "json", "stream-json"]
 OUTPUT_FORMATS: tuple[str, ...] = ("text", "json", "stream-json")
@@ -28,6 +30,15 @@ WAKE_LIMIT_MESSAGE = "⚙ Not waiting for more agents: {limit} automatic turns i
 
 def _err(text: str) -> None:
     print(text, file=sys.stderr, flush=True)
+
+
+def _parse_ask_line(answer: str, options: list[dict]) -> str:
+    """One line of stdin as the answer to one question (D13): `2` / `1,3` pick options in option order,
+    anything else is the answer as typed, and an empty line is `(no answer)`."""
+    picked = pick_options(answer, options)
+    if picked:
+        return picked
+    return one_line(answer) or NO_ANSWER
 
 
 class _Refused(Exception):
@@ -112,6 +123,35 @@ class HeadlessAdapter:
             answer = await asyncio.to_thread(input, f"Allow? {choices} / [N]o: ")
         reply = parse_answer(answer)
         return ApprovalReply("yes" if reply == "always" and not always_label else reply)
+
+    async def ask_user(self, questions: list[dict]) -> list[tuple[str, str]] | None:
+        """The questions on stderr, one line per answer on stdin (D13); None when stdin closes first.
+
+        A number (or `1,3`) picks options, anything else is free text, empty is `(no answer)`. Each line is
+        the submission for its question: a terminal reading one line has no way back, so there is no submit
+        row here. Ctrl+C lands in the main thread and ends the whole run, as for approvals; an EOF reaches
+        the worker and cancels the call.
+        """
+        if not self._interactive:
+            raise NoUserAvailable()
+        pairs: list[tuple[str, str]] = []
+        async with self._ask_lock:
+            for question in questions:
+                text = one_line(question.get("question", ""))
+                options = question.get("options") or []
+                if not self._quiet:
+                    _err(f"⚠ {text}")
+                    for i, option in enumerate(options, 1):
+                        label = one_line(option.get("label", ""))
+                        description = one_line(option.get("description", ""))
+                        _err(f"  {i}. {label}" + (f"  {description}" if description else ""))
+                prompt = f"Answer ({'1-%d or text' % len(options) if options else 'text'}): "
+                try:
+                    line = await asyncio.to_thread(input, prompt)
+                except EOFError:
+                    return None  # stdin closed (Ctrl+Z/Ctrl+D): cancelled, like Esc in the TUI
+                pairs.append((text, _parse_ask_line(line, options)))
+        return pairs
 
 
 async def _connect_mcp(mcp_client: Any, servers: dict[str, Any], adapter: HeadlessAdapter) -> None:

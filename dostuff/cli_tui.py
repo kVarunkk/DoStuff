@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 from textual.app import App, ComposeResult
 from textual.geometry import Region
 from textual.message import Message
@@ -58,6 +58,7 @@ from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
+from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, pick_options
 from dostuff.helpers.agent.slash_suggestion import slash_arg_hint, slash_suggestion
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
 from dostuff.helpers.hooks.dispatch import hook_line
@@ -474,6 +475,14 @@ class CommandMenu(OptionList):
         return self.get_option_at_index(self.highlighted).id
 
 
+def pick_answer(text: str, options: list[dict]) -> str | None:
+    """What the input's text means for a question (ask-user D13): `2` / `1,3` pick options, anything else is
+    the typed answer. Empty text is no answer, so the question stays unanswered (open point 4)."""
+    if not text.strip():
+        return None
+    return pick_options(text, options) or _one_line_answer(text)
+
+
 def _confirm_text(details: str) -> Text:
     """Approval details in the confirm color, with diff lines colored like the diff view."""
     text = Text()
@@ -882,6 +891,12 @@ class TuiAdapter:
         self._confirm_reply: ApprovalReply | None = None
         self._feedback_mode = False  # "No" was picked; the input now takes feedback for the model
         self._feedback_on_no = True  # whether "No" asks for that feedback (not for the hook trust prompt)
+        # The question channel (ask-user spec D7), beside the approval one and sharing its lock
+        self._waiting_for_ask = False
+        self._ask_event: asyncio.Event | None = None
+        self._ask_answer: str | None = None
+        self._ask_question: dict | None = None  # the question the input is answering right now
+        self._other_mode = False  # the input takes the answer to the current question (or its "Other")
         self._ask_lock = asyncio.Lock()  # one prompt at a time
         self._last_turn_usage: dict = {}
         self._session_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -1013,11 +1028,22 @@ class TuiAdapter:
                 return
             self._ask_lock.release()  # the user started typing while it waited for the lock
 
+    @contextlib.asynccontextmanager
+    async def _hold_prompt(self, background: bool = False) -> AsyncIterator[None]:
+        """Hold the one-prompt lock for the duration of a prompt and put the title back when it resolves,
+        so an approval and a question restore `running`/`done` in exactly one place (ask-user D7)."""
+        await self._acquire_prompt(background)
+        try:
+            yield
+        finally:
+            # a background agent's prompt can come while idle
+            self._app._set_title("running" if self._app._turn_in_progress else "done")
+            self._ask_lock.release()
+
     async def _prompt(self, details: str, question: str, options: list[tuple[str, str]],
                       feedback: bool = True, background: bool = False) -> ApprovalReply:
         # Runs on the UI loop (turns are async workers), so widgets can be touched directly
-        await self._acquire_prompt(background)
-        try:
+        async with self._hold_prompt(background):
             self._waiting_for_confirm = True
             self._feedback_mode = False
             self._feedback_on_no = feedback
@@ -1034,13 +1060,72 @@ class TuiAdapter:
                 self._feedback_mode = False
                 self._confirm_event = None
                 self._app._hide_permission_prompt()
-                # a background agent's prompt can come while idle
-                self._app._set_title("running" if self._app._turn_in_progress else "done")
             reply = self._confirm_reply or ApprovalReply("no")
             self._confirm_reply = None
             return reply
+
+    # ── The question channel (ask-user spec D7) ────────────────────────────────
+
+    async def ask_user(self, questions: list[dict]) -> list[tuple[str, str]] | None:
+        """Ask each question in turn; every answer in question order, or None when the user cancelled.
+
+        The per-question loop lives here (tasks.md open point 2): a panel renders one question and posts one
+        Submit, and never talks to the tool. Emotionally this is the sibling of `_prompt`; it shares the lock.
+        """
+        if self._cancelled or self._cancel_event.is_set():
+            return None  # the turn is being cancelled: don't open a prompt on the way out
+        pairs: list[tuple[str, str]] = []
+        async with self._hold_prompt():
+            for question in questions:
+                answer = await self._ask_one(question)
+                if answer is None:
+                    return None  # cancelled: the tool records the D5 cancel text
+                pairs.append((_one_line_answer(question.get("question", "")), answer))
+        return pairs
+
+    async def _ask_one(self, question: dict) -> str | None:
+        """One question, resolved by `got_input` (or `cancel_pending_ask`): the answer, or None.
+
+        T4.1 puts `AskUserPanel` in front of the option questions; until it lands the input takes every
+        answer, so a number, `1,3` or typed text all work (ask-user T3.1 note)."""
+        text = _one_line_answer(question.get("question", ""))
+        options = question.get("options") or []
+        placeholder = text if not options else (f"{text}  ·  " + " · ".join(
+            f"{i}. {_one_line_answer(o.get('label', ''))}" for i, o in enumerate(options, 1)) + "  (a number, or type your own)")
+        self._waiting_for_ask = True
+        self._other_mode = True
+        self._ask_answer = None
+        self._ask_question = question
+        evt = asyncio.Event()
+        self._ask_event = evt
+        try:
+            self._app._approval_waiting(text)  # title + notification, as an approval does
+            self._app._hand_input_over(placeholder)
+            await evt.wait()
+            return self._ask_answer
         finally:
-            self._ask_lock.release()
+            self._waiting_for_ask = False
+            self._other_mode = False
+            self._ask_event = None
+            self._ask_question = None
+            self._app._give_input_back()
+
+    def _resolve_ask(self, answer: str | None) -> None:
+        if self._waiting_for_ask and self._ask_event is not None:
+            self._ask_answer = answer
+            self._ask_event.set()
+
+    def cancel_pending_ask(self) -> None:
+        """Esc, Ctrl+Q or /exit while a question is open: resolve it as cancelled. A no-op when idle (D7)."""
+        self._resolve_ask(None)
+
+    def has_pending_ask(self) -> bool:
+        return self._waiting_for_ask
+
+    def has_pending_prompt(self) -> bool:
+        """The app's one gate (D7): a prompt of either kind owns the input. `has_pending_confirm` stays
+        approval-only, so the approval paths are untouched (CON-005)."""
+        return self._waiting_for_confirm or self._waiting_for_ask
 
     def _resolve(self, reply: ApprovalReply) -> None:
         if self._waiting_for_confirm and self._confirm_event is not None:
@@ -1060,7 +1145,14 @@ class TuiAdapter:
         self._resolve(ApprovalReply(value))  # type: ignore[arg-type]
 
     def got_input(self, text: str) -> None:
-        if self._feedback_mode:
+        if self._other_mode:
+            # the input is answering a question (ask-user D7): a number picks options, anything else is text
+            answer = pick_answer(text, (self._ask_question or {}).get("options") or [])
+            if answer is None:  # open point 4: an empty Enter records nothing; Esc is the way out
+                self._app._flash_input_hint("type an answer (Esc cancels the questions)")
+                return
+            self._resolve_ask(answer)
+        elif self._feedback_mode:
             self._resolve(ApprovalReply("no", feedback=text))
         else:
             self._resolve(ApprovalReply(parse_answer(text)))
@@ -2725,8 +2817,8 @@ class DostuffTUI(App):
 
     def on_enter_submits_submitted(self, event: EnterSubmits.Submitted) -> None:
         text = event.text
-        # A pending approval prompt consumes the input (empty Enter after "No" = deny without feedback)
-        if self.adapter.has_pending_confirm():
+        # A pending approval or question consumes the input (empty Enter after "No" = deny without feedback)
+        if self.adapter.has_pending_prompt():
             self.adapter.got_input(self._pastes.inline(text))
             self._clear_input()
             return
@@ -2916,15 +3008,41 @@ class DostuffTUI(App):
 
     def _ask_denial_feedback(self) -> None:
         """After "No": the input (yellow border) takes an optional note for the model."""
+        self._hand_input_over("Tell the model what to do instead (Enter to send, empty Enter to just deny)")
+
+    def _hand_input_over(self, placeholder: str) -> None:
+        """Give the input to a prompt (ask-user D7): hide the prompt widget, yellow border, a new placeholder,
+        and the draft set aside until `_give_input_back` restores it. Used by the denial flow and by a
+        question, so the save/restore exists once."""
         if self.query("#permission-prompt"):
             self._hold_transcript()
         self._hide_permission_prompt(restore_input=False)
+        menu = self.query("#command-menu")
+        if menu:  # not every hand-over has the menu mounted (a bare adapter in a unit test)
+            menu.first().display = False
         inp = self.query_one("#input", EnterSubmits)
-        self._draft_before_feedback = inp.text
+        if not inp.has_class("feedback-mode"):
+            self._draft_before_feedback = inp.text  # a second hand-over keeps the draft it was given
         inp.text = ""
         if hasattr(inp, "placeholder"):
-            inp.placeholder = "Tell the model what to do instead (Enter to send, empty Enter to just deny)"
+            inp.placeholder = placeholder
         inp.add_class("feedback-mode")
+        inp.display = True
+        inp.focus()
+
+    def _give_input_back(self) -> None:
+        """The undo of `_hand_input_over` (and the approval prompt's restore): the draft comes back and the
+        input is a prompt input again."""
+        try:
+            inp = self.query_one("#input", EnterSubmits)
+        except Exception:
+            return  # shutting down
+        if inp.has_class("feedback-mode"):
+            inp.remove_class("feedback-mode")
+            if hasattr(inp, "placeholder"):
+                inp.placeholder = ""
+            inp.text = self._draft_before_feedback
+            self._draft_before_feedback = ""
         inp.display = True
         inp.focus()
 
@@ -2958,18 +3076,7 @@ class DostuffTUI(App):
             widget.remove()
         if not restore_input:
             return
-        try:
-            inp = self.query_one("#input", EnterSubmits)
-        except Exception:
-            return  # shutting down
-        if inp.has_class("feedback-mode"):
-            inp.remove_class("feedback-mode")
-            if hasattr(inp, "placeholder"):
-                inp.placeholder = ""
-            inp.text = self._draft_before_feedback
-            self._draft_before_feedback = ""
-        inp.display = True
-        inp.focus()
+        self._give_input_back()
 
     def on_permission_prompt_chosen(self, event: PermissionPrompt.Chosen) -> None:
         if event.source_id == "picker":
@@ -3486,7 +3593,7 @@ class DostuffTUI(App):
         if self._agent_view_open():
             self._close_agent_view()
             return
-        if not self._turn_in_progress and not self.adapter.has_pending_confirm():
+        if not self._turn_in_progress and not self.adapter.has_pending_prompt():
             # Nothing to cancel (a stale flag would cancel the next turn's first step); Esc Esc
             # with an empty input takes back the last prompt
             self._escape_when_idle()
@@ -3494,6 +3601,7 @@ class DostuffTUI(App):
         self.adapter._cancelled = True
         self.adapter._cancel_event.set()
         self.adapter.deny_pending_confirm()
+        self.adapter.cancel_pending_ask()  # a question resolves as cancelled before the flag is polled (D7)
         self._loader_label = "Cancelling..."
         self._render_loader()
 
@@ -3684,7 +3792,7 @@ class DostuffTUI(App):
 
     def action_history_search(self) -> None:
         """Ctrl+R: pick a past prompt from this directory's history (type to filter) to put in the input."""
-        if self._settings_open() or self._picker_open() or self.adapter.has_pending_confirm():
+        if self._settings_open() or self._picker_open() or self.adapter.has_pending_prompt():
             return
         inp = self.query_one("#input", EnterSubmits)
         prompts = list(dict.fromkeys(reversed(inp.prompt_history)))[:HISTORY_SEARCH_MAX]  # newest first, no repeats
