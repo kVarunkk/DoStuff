@@ -73,8 +73,11 @@ _GIT_SAFE_ARGS: dict[str, set[str]] = {
 # `env` / `printenv` are intentionally absent: they dump secrets into the transcript.
 
 _FORBIDDEN_SUBSTRINGS = (
-    ">", "<", "`", "$(", "${", "out-file", "set-content", "add-content", "env:", ".env", ".dostuff",
+    ">", "<", "`", "$(", "${", "out-file", "set-content", "add-content", "env:", ".env",
 )
+# A `.dostuff` path (`.dostuff/config.yaml`, `~/.dostuff`, cwd=".dostuff"), not a dotted attribute such
+# as `cli_tui.DostuffTUI` — that is ordinary code, and treating it as one denied reads in plan mode.
+_DOSTUFF_REF = re.compile(r"(?<![\w-])\.dostuff(?![\w-])", re.IGNORECASE)
 # Flags that make otherwise read-only commands write, delete or execute (find -exec, rg --pre, git --output …).
 _FORBIDDEN_FLAGS = re.compile(
     r"(?<![\w-])(-delete|-exec\w*|-ok\w*|-fprint\w*|-fls|--output|--pre)(?![\w-])",
@@ -141,6 +144,7 @@ def has_unsafe_constructs(command: str) -> bool:
         lowered = _WORKTREES_PREFIX.sub("", lowered)
     return (
         any(s in lowered for s in _FORBIDDEN_SUBSTRINGS)
+        or bool(_DOSTUFF_REF.search(lowered))
         or bool(_FORBIDDEN_FLAGS.search(command))
         or bool(_ENV_EXPANSION.search(command))
     )
@@ -268,11 +272,11 @@ def _plan_denies(kind: ToolKind, args: dict[str, Any]) -> bool:
 
 
 def _mentions_dostuff_dir(text: str) -> bool:
-    """`.dostuff` named in a shell command or cwd, other than a path into a subagent worktree."""
+    """`.dostuff` named as a path in a shell command or cwd, other than a path into a subagent worktree."""
     lowered = text.lower()
     if ".." not in lowered:  # same worktree exemption as has_unsafe_constructs
         lowered = _WORKTREES_PREFIX.sub("", lowered)
-    return ".dostuff" in lowered
+    return bool(_DOSTUFF_REF.search(lowered))
 
 
 def effective_kind(kind: ToolKind, args: dict[str, Any]) -> ToolKind:
@@ -280,6 +284,7 @@ def effective_kind(kind: ToolKind, args: dict[str, Any]) -> ToolKind:
 
     So does a shell command naming `.dostuff` (in `command` or `cwd`): otherwise auto mode would let
     `echo … >> ~/.dostuff/config.yaml` add a user hook, which no trust check covers, without a prompt.
+    Only a `.dostuff` path counts — `cli_tui.DostuffTUI` is a dotted attribute, not a settings path.
     A heuristic: a name built indirectly (`.dost''uff`, a variable holding it) is not caught here.
     """
     if kind == "write" and _is_settings_path(str(args.get("path") or "")):

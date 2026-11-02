@@ -290,13 +290,30 @@ class Transcript(VerticalScroll):
         return super()._get_scrollable_region(region)
 
 
-class JumpToBottom(Static):
-    """Shown while the conversation is scrolled up; a click goes back to the latest message."""
+class _JumpToBottomLabel(Static):
+    """The pill inside `JumpToBottom`; a click goes back to the latest message."""
+
+    ALLOW_SELECT = False  # a click with a little mouse movement would start a selection instead
 
     def on_click(self) -> None:
         messages = self.app.query_one("#messages", VerticalScroll)
         messages.anchor()  # scroll_end inside also re-attaches a released anchor
-        self.display = False
+        if isinstance(self.parent, JumpToBottom):
+            self.parent.display = False
+
+
+class JumpToBottom(Horizontal):
+    """Shown while the conversation is scrolled up.
+
+    The widget itself is a full-width row so it can center a small pill (`#jump-bottom-label`)
+    over the conversation instead of banding the whole width; only the pill is clickable."""
+
+    def __init__(self, label: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._label = label
+
+    def compose(self) -> ComposeResult:
+        yield _JumpToBottomLabel(self._label, id="jump-bottom-label")
 
 
 class JobsBar(Static):
@@ -1112,10 +1129,13 @@ class DostuffTUI(App):
     #queue-bar { height: auto; display: none; padding: 0 1; margin-top: 1; }
     #queue-bar:hover { background: #2c2c2c; }
     #jump-bottom {
-        dock: bottom; display: none; width: 100%; height: 1;
+        dock: bottom; display: none; width: 100%; height: 1; align-horizontal: center;
+    }
+    #jump-bottom-label {
+        width: auto; height: 1; padding: 0 2;
         text-align: center; color: #8ab4f8; text-style: bold; background: #2c2c2c;
     }
-    #jump-bottom:hover { background: #3a3a3a; }
+    #jump-bottom-label:hover { background: #3a3a3a; }
     #agent-view { height: 1fr; }
     #agent-view-title { height: auto; padding: 0 1; color: #8ab4f8; text-style: bold; }
     #agent-view-scroll { height: 1fr; border: round #4a4a4a; }

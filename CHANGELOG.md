@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - The TUI no longer bounces the conversation when a selector takes the input's place or gives it back (approvals, `/model`, `/resume`, `/jobs`, `/queue`, Ctrl+R). Textual pins an anchored scrollbox using `container_size`, which it only writes back after arranging, so the first frame after the height change used the old viewport height and drew the transcript a few rows off before snapping into place. `#messages` is now a `Transcript`, which hands the compositor the size it is laying out.
+- The jump-to-bottom button is a small centered pill instead of a full-width bar, so it no longer
+  bands the conversation with its background, and only the pill itself is clickable.
+- Plan mode no longer treats `cli_tui.DostuffTUI` (or any other dotted attribute) as a `.dostuff`
+  path: only a `.dostuff` that stands alone as a path counts as a settings change.
 
 ## [0.2.6] - 2026-11-01
 
