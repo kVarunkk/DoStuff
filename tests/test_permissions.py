@@ -10,6 +10,7 @@ from dostuff.agent.permissions import (
     PermissionConfig,
     SessionPermissions,
     check,
+    has_unsafe_constructs,
     is_read_only_shell,
     parse_answer,
 )
@@ -87,6 +88,8 @@ AUTO = PermissionConfig(mode="auto")
     (r"Add-Content C:\Users\me\.dostuff\config.yaml 'x'", ""),
     ("cp evil.yaml config.yaml", str(Path.home() / ".dostuff")),
     ("cat .dostuff/worktrees/../config.yaml", ""),
+    ("cd .dostuff && rm -rf config.yaml", ""),  # a bare path is still a settings change
+    ("./.dostuff/config.yaml", ""),
 ])
 def test_shell_touching_dostuff_asks_in_every_mode(command, cwd):
     """A shell command naming .dostuff is a settings change: it asks even in auto mode, with no "always"."""
@@ -95,6 +98,26 @@ def test_shell_touching_dostuff_asks_in_every_mode(command, cwd):
     session = SessionPermissions(allow=["bash_command"])
     assert check("bash_command", "shell", {"command": command, "cwd": cwd}, session, ASK).action == "ask"
     assert shell(command, cfg=PLAN, cwd=cwd) == "deny"
+
+
+@pytest.mark.parametrize("command", [
+    'grep -rn "cli_tui.DostuffTUI" tests/',
+    "rm tests/test_tui.py",  # any other shell command stays a plain shell call
+])
+def test_dotted_attribute_is_not_a_settings_change(command):
+    """`cli_tui.DostuffTUI` is code, not a `.dostuff` path: a literal substring match asked (and in plan
+    mode denied) greps for the TUI class out of a repo that is itself named dostuff."""
+    assert check("bash_command", "shell", {"command": command}, None, AUTO).action == "allow"
+    assert check("write_file", "write", {"path": "dostuff/agent/permissions.py", "content": ""}, None, AUTO).action == "allow"
+
+
+def test_grep_for_the_tui_class_is_read_only():
+    """The dotted name must not be a forbidden construct either, or plan mode denies the search."""
+    command = 'grep -rn "cli_tui.DostuffTUI" tests/'
+    assert not has_unsafe_constructs(command)
+    assert is_read_only_shell(command)
+    assert shell(command) == "allow"
+    assert shell(command, cfg=PLAN) == "allow"
 
 
 def test_shell_in_subagent_worktree_is_not_settings():
