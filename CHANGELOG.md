@@ -5,6 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The TUI no longer bounces the conversation when a selector takes the input's place or gives it back (approvals, `/model`, `/resume`, `/jobs`, `/queue`, Ctrl+R). Textual pins an anchored scrollbox using `container_size`, which it only writes back after arranging, so the first frame after the height change used the old viewport height and drew the transcript a few rows off before snapping into place. `#messages` is now a `Transcript`, which hands the compositor the size it is laying out.
+
 ## [0.2.6] - 2026-11-01
 
 Subagents rebuilt: typed agents defined in Markdown files (Claude Code's `.claude/agents/` work too), parallel and background agents you can message and stop, forks that share the conversation, per-agent models, stored transcripts and an `/agents` viewer. Also: a `/tools` command, argument hints for slash commands, and a faster TUI start.

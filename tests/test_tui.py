@@ -3067,3 +3067,90 @@ def test_trust_prompt_does_not_bounce(tui, fresh_trust, hook_cmd):
             assert app.query_one("#msg-container").styles.inline.min_height is None  # released at the end
             await app._cleanup_and_save_session()
     asyncio.run(scenario())
+
+
+def test_picker_does_not_bounce_the_transcript(tui):
+    """Opening or closing a selector must not move the transcript, not even for the frame that lays out
+    the new height: Textual pins an anchored scrollbox with `container_size`, which it only writes back
+    after arranging, so the first frame after the input/picker swap used the previous viewport height
+    and drew the conversation a few rows off (the bounce). Every painted frame stays flush."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="bounce")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for i in range(25):  # enough to overflow the viewport
+                app._append(f"row{i:02d} " + "-" * 30, msg_type="user")
+            await pilot.pause()
+            await pilot.pause()
+            messages = app.query_one("#messages")
+            assert isinstance(messages, cli_tui.Transcript)
+            off_bottom: list[int] = []
+            original_display = app._display
+
+            def display(screen, renderable):
+                """Check what is actually painted, before it goes to the terminal."""
+                rows = [strip.text.rstrip() for strip in
+                        app.screen._compositor.render_strips()[:messages.region.height]]
+                occupied = [y for y, row in enumerate(rows) if row]
+                if occupied:  # empty viewport: nothing to be flush with
+                    off_bottom.append(messages.region.height - 1 - occupied[-1])
+                return original_display(screen, renderable)
+            app._display = display  # type: ignore[method-assign]
+
+            for cursor in (0, 3, 5):  # as if arrowing through the options: the picker can change height
+                app._show_picker("Pick", [(f"v{i}", f"o{i}") for i in range(6)], app._switch_session)
+                await pilot.pause()
+                await pilot.pause()
+                for _ in range(cursor):
+                    await pilot.press("down")
+                await pilot.pause()
+                app._close_picker()
+                await pilot.pause()
+                await pilot.pause()
+
+            # An approval prompt (mounted, not just shown) opens and closes the same way
+            task = asyncio.get_running_loop().create_task(app.adapter.ask("Allow write_file?"))
+            deadline = time.monotonic() + 20
+            while not app.query("#permission-prompt") and time.monotonic() < deadline:
+                await pilot.pause(0.01)
+            await pilot.pause(0.1)
+            app.adapter.choose("yes")
+            await task
+            await pilot.pause(0.1)
+            app._display = original_display  # type: ignore[method-assign]
+
+            assert off_bottom, "no frame was measured"
+            assert max(off_bottom) <= 0, f"the transcript drifted off the bottom: {off_bottom}"
+            await app._cleanup_and_save_session()
+    asyncio.run(scenario())
+
+
+def test_picker_keeps_a_scrolled_up_transcript_in_place(tui):
+    """The anchoring fix must not drag a transcript the user scrolled up back to the bottom."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="scrolled")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for i in range(25):
+                app._append(f"row{i:02d} " + "-" * 30, msg_type="user")
+            await pilot.pause()
+            messages = app.query_one("#messages", cli_tui.Transcript)
+            messages.scroll_to(y=10, animate=False)
+            await pilot.pause()
+            await pilot.pause()
+            assert messages.scroll_y == 10
+
+            app._show_picker("Pick", [("a", "a")], app._switch_session)
+            await pilot.pause()
+            await pilot.pause()
+            assert messages.scroll_y == 10
+            app._close_picker()
+            await pilot.pause()
+            await pilot.pause()
+            assert messages.scroll_y == 10
+            await app._cleanup_and_save_session()
+    asyncio.run(scenario())

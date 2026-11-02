@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Literal
 from textual.app import App, ComposeResult
+from textual.geometry import Region
 from textual.message import Message
 from textual.timer import Timer
 from textual.widget import Widget
@@ -266,6 +267,27 @@ class ToolResult(Static):
         if self.screen.get_selected_text():
             return  # the end of a mouse selection, not a click
         self.set_expanded(not self.expanded)
+
+
+class Transcript(VerticalScroll):
+    """The conversation viewport.
+
+    Textual pins an anchored scrollbox in the same layout pass it arranges it (`_compositor`):
+    `total_region.bottom - (container_size.height - scrollbar_size_horizontal)`. It reads
+    `container_size`, which the compositor only writes back *after* the pass, so the first frame
+    after the viewport changes height is pinned for the *previous* height. Swapping the input for
+    the picker (or a taller approval prompt, or giving the rows back when it closes) changes
+    `#messages`' height by itself, so that frame kept the old scroll offset and the transcript was
+    drawn a few rows off — the bounce you see as the selectors come in and go out.
+
+    `_get_scrollable_region` runs just before that arithmetic inside the pass, so setting the
+    container size there makes the anchor use the size being laid out. Textual stores the same
+    value afterwards, so nothing else changes.
+    """
+
+    def _get_scrollable_region(self, region: Region) -> Region:
+        self._container_size = region.size
+        return super()._get_scrollable_region(region)
 
 
 class JumpToBottom(Static):
@@ -1208,7 +1230,7 @@ class DostuffTUI(App):
     def compose(self) -> ComposeResult:
         # Not focusable: clicking the conversation keeps focus in the input (see _keep_input_focus)
         with Vertical(id="conversation"):
-            with VerticalScroll(id="messages", can_focus=False):
+            with Transcript(id="messages", can_focus=False):
                 yield Vertical(id="msg-container")
                 yield JumpToBottom("↓ Jump to bottom", id="jump-bottom")
             yield CommandMenu(id="command-menu")
