@@ -4,6 +4,7 @@ from typing import Any, Callable
 from dostuff.agent.permissions import ToolKind
 from dostuff.helpers.tools.generate_tool_schema import generate_litellm_tool_schema
 from dostuff.tools.agent import agent
+from dostuff.tools.ask_user import ask_user
 from dostuff.tools.create_agent_type import create_agent_type
 from dostuff.tools.send_message import send_message
 from dostuff.tools.stop_agent import stop_agent
@@ -68,6 +69,9 @@ _TOOLS = [
     ToolSpec("web_search", web_search, "network"),
     # Planning only: never asks, and the TUI shows the list in full
     ToolSpec("todo_write", todo_write, "read", frozenset({"session_id"})),
+    # The model's one channel to the user (ask-user spec D1/D2): a read tool, so it never asks permission
+    # and plan mode allows it — asking "may I ask you?" would be absurd. `adapter` is where the panel lives.
+    ToolSpec("ask_user", ask_user, "read", frozenset({"adapter"})),
     # Memory saves never ask; each one is shown in the TUI and listed by /memories.
     ToolSpec("save_memory", save_memory, "read"),
     ToolSpec("save_episode", save_episode, "read", frozenset({"session_id"})),

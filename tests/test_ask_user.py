@@ -350,3 +350,19 @@ def test_length_mismatch_is_cancelled(ask_script):
     result = asyncio.run(ask_user([{"question": "First?"}, {"question": "Second?"}],
                                   adapter=ask_script([("First?", "a")])))
     assert result == CANCELLED_ASK_RESULT
+
+
+# --- T2.1 registration (REQ-2.1, CON-008) --------------------------------------------------------
+
+def test_registered():
+    from dostuff.helpers.tools.generate_tool_schema import generate_litellm_tool_schema
+    from dostuff.tools.ask_user import ask_user
+    from dostuff.tools.definitions import TOOL_MAP, TOOL_SCHEMAS
+    from dostuff.tools.names import BUILTIN_TOOL_NAMES
+
+    spec = TOOL_MAP["ask_user"]
+    assert spec.kind == "read"
+    assert spec.injected == frozenset({"adapter"})
+    assert "ask_user" in BUILTIN_TOOL_NAMES
+    assert "ask_user" in TOOL_SCHEMAS
+    assert spec.schema == generate_litellm_tool_schema(ask_user, name="ask_user", exclude={"adapter"})

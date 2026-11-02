@@ -483,3 +483,25 @@ def test_agent_call_model_applied(agents, fake_model, main_model):
     assert a.startswith("a done")
     assert [c["model"] for c in fake_model.calls_for("[B]")] == ["openai/m-main"]
     assert b.startswith("[warning] `sonnet` isn't in agents.models") and "b done" in b
+
+
+# --- ask_user is restricted (plan/2026-11-02-ask-user T2.4, D10, D11) -------------------------------
+
+def test_subagent_restrictions():
+    from dostuff.agent.subagents import RESTRICTED_SUBAGENT_TOOLS
+    from dostuff.agent.subagents.definitions import CLAUDE_TOOL_NAMES, map_tools
+    from dostuff.agent.subagents.run import resolve_subagent_tools
+
+    assert "ask_user" in RESTRICTED_SUBAGENT_TOOLS
+    assert "ask_user" not in resolve_subagent_tools(None)[0]
+
+    tools, warnings = map_tools("ask_user, read_file", "a.md")
+    assert tools == ("read_file",) and len(warnings) == 1 and "ask_user" in warnings[0]
+    assert "not available to subagents" in warnings[0]
+
+    # Claude Code's name is known, so it is reported as restricted rather than unknown
+    assert CLAUDE_TOOL_NAMES["AskUserQuestion"] == ("ask_user",)
+    tools, warnings = map_tools("AskUserQuestion", "b.md")
+    assert tools == () and len(warnings) == 1
+    assert "AskUserQuestion" in warnings[0] and "restricted" not in warnings[0]
+    assert "not available to subagents" in warnings[0]

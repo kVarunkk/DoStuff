@@ -399,3 +399,24 @@ def test_bg_permissions(monkeypatch, tmp_path, registry):
     assert tail.action == "allow"
     dev = check("bash_command", "shell", {"command": "npm run dev", "run_in_background": True, "background_id": "dev"}, None, plan)
     assert dev.action == "deny" and dev.reason.startswith('Plan mode: not run (Run shell command (background job "dev"):)')
+
+
+# --- ask_user never asks permission (plan/2026-11-02-ask-user T2.3, D2, CON-005) -------------------
+
+def test_ask_user_never_needs_permission():
+    args = {"questions": [{"question": "Which db?", "options": [{"label": "SQLite"}, {"label": "Postgres"}]}]}
+    for mode in ("ask", "allowlist", "auto", "plan"):
+        decision = check("ask_user", "read", args, None, PermissionConfig(mode=mode))  # type: ignore[arg-type]
+        assert decision.action == "allow", mode
+    # an empty session allow-list changes nothing: it is a read tool, so it never asks in the first place
+    assert check("ask_user", "read", args, SessionPermissions(allow=set()), ASK).action == "allow"
+
+
+def test_ask_user_allowed_in_plan_mode():
+    """The point of D2: the model interviews the user *before* writing the plan."""
+    from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION
+
+    args = {"questions": [{"question": "Which db?"}]}
+    assert check("ask_user", "read", args, None, PLAN).action == "allow"
+    assert "ask_user" in PLAN_MODE_INSTRUCTION
+    assert "before" in PLAN_MODE_INSTRUCTION.split("ask_user")[0][-80:]

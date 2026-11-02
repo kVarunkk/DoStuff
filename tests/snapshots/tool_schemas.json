@@ -39,6 +39,65 @@
     },
     "type": "function"
   },
+  "ask_user": {
+    "function": {
+      "description": "Ask the user a question (or up to 4 at once) with `ask_user`, and get their answer back.\n\nUse it when the answer changes what you build and you can't find it in the repo: a choice between\nlibraries, a product decision, a name, a trade-off the user has opinions about. Don't use it to\nconfirm a plan, to ask permission (the approval prompt does that), or for anything grep and\nread_file can answer. Ask everything you need in one call instead of several turns. Give 2-4\nconcrete options with the trade-off, one line each, or leave `options` out for a free-text answer.",
+      "name": "ask_user",
+      "parameters": {
+        "properties": {
+          "questions": {
+            "description": "The questions, 1 to 4 of them.",
+            "items": {
+              "properties": {
+                "header": {
+                  "description": "Short tab label, up to 12 chars.",
+                  "type": "string"
+                },
+                "multi_select": {
+                  "description": "Allow several picks; needs options. Default false.",
+                  "type": "boolean"
+                },
+                "options": {
+                  "description": "2-4 choices; omit for a free-text answer.",
+                  "items": {
+                    "properties": {
+                      "description": {
+                        "description": "The trade-off, one line.",
+                        "type": "string"
+                      },
+                      "label": {
+                        "description": "What the user picks, 1-5 words.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "label"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "question": {
+                  "description": "The question, one sentence, ending with '?'.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "question"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "questions"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
   "bash_command": {
     "function": {
       "description": "Run a shell command and return its output as a single string.\n\nThe shell is not sandboxed: commands that are not read-only require user approval.\nCommands get no stdin and are killed when they time out, so never run interactive or\nlong-running programs (servers, GUI apps, watchers) in the foreground: start them with\nrun_in_background=true, then read their output with bash_output and stop them with kill_shell.\n\nCommands run in <shell>.",
