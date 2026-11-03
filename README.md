@@ -360,34 +360,41 @@ The questions arrive as a panel in place of the input:
 ```
  DB ✓ · Auth ▸
  ⚠ Which auth methods should the API support?
-  1. JWT      stateless, no extra service
-  2. OAuth    a provider to configure, but no password handling
-  3. Other (type your own)
-   ─────────────────────────────────────────────────────────
- ✔ Submit answers
+❯   1. JWT   stateless, no extra service
+    2. OAuth   a provider to configure
+    3. Other (type your own)
+   ────────────────────────────────────────────────────────
+   ✔ Submit answers  (answer every question first)
  ↑/↓ select · Enter confirm · ←/→ change question · Esc cancel
 ```
+
+`DB ✓` means the first question is answered; `Auth ▸` is where you are. The submit row is dim until every
+question has an answer, then it brightens and the parenthetical hint goes away.
 
 - **Nothing submits on one key.** A pick records the answer and moves to the next question; `✔ Submit answers` is
   the only thing that sends, and it stays inert (`answer every question first`) until every question has one.
   `←`/`Shift+Tab` goes back, so an earlier answer can be changed before submitting.
 - **`2-4` options, one line each**, with the trade-off where it matters. A multi-select question toggles with
   `space` or its number, and the joined answer comes back in option order.
-- **`Other`** is always the last row: pick it and the input takes a typed answer (a pasted block is collapsed to
-  one line). A question with no options skips the panel and takes the input directly.
+- **`Other`** is always the last row, numbered after the options: pick it and the input takes a typed answer (a
+  pasted block is collapsed to one line). A question with no options shows as just that row, so it still appears
+  in the tab strip; a call where *every* question is free text skips the panel entirely and the input takes each
+  answer in turn, with the last Enter as the submission.
 - **Esc** cancels the questions and ends the turn, like Esc on an approval prompt. **Ctrl+Q** / `/exit` with a
   question open cancel it first and then quit.
 - Up to 4 questions per call. The prompt tells the model when to ask: when the answer changes what it builds and
   the repo can't tell it; never to confirm a plan, to ask permission, or for anything `grep` / `read_file` answers.
 
-The answers reach the model as one tool result and stay readable in the transcript, live and after `/resume`:
+The answers reach the model as one tool result, and the transcript shows the same pairs as one block — live and
+after `/resume`:
 
 ```
   ⎿  Which database should I use? → Postgres
      Which auth methods should the API support? → JWT, OAuth
 ```
 
-That is exactly `format_answers`' output:
+Nothing is truncated and Ctrl+O has nothing to expand, unlike an ordinary tool result: reading back what you
+answered is the point. What the model actually receives is `format_answers`' output:
 
 ```text
 Asked the user 2 questions; they answered:
@@ -397,12 +404,13 @@ Asked the user 2 questions; they answered:
    → JWT, OAuth
 ```
 
-A cancelled, refused or unavailable call renders as an ordinary tool result with the model told what to do
-(state the assumption and continue). `/export` writes it as text, unescaped.
+A cancelled, refused or unavailable call renders as an ordinary tool result, with the model told what to do
+(state the assumption and continue). `/export` writes the result text verbatim.
 
-**`dostuff -p`** asks on the terminal when there is one on both ends: each question and its numbered options go to
-stderr and it reads one line per question (`2`, `1,3`, or free text; an empty line is `(no answer)`). With piped
-stdin the tool is still listed but reports "no user is available" and the model carries on with an assumption.
+**`dostuff -p`** asks on the terminal when both stdin and stderr are a TTY: each question and its numbered options
+go to stderr, and it reads one line per question (`2`, `1,3`, or free text; an empty line is `(no answer)`). There
+is no submit row, because a line reader has no way back. With piped stdin (or stderr redirected to a file) the tool
+is still listed but answers "No user is available in this run", and the model states an assumption and carries on.
 
 ---
 
