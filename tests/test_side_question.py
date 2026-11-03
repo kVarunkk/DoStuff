@@ -321,3 +321,21 @@ def test_usage_dict_shared(fork_ctx, side_call, monkeypatch):
 def test_no_emit_no_store():
     params = set(inspect.signature(answer_side_question).parameters)
     assert params == {"snap", "exchanges", "question", "plan_mode"}
+
+
+# --- T5.3 the README ---------------------------------------------------------------------------------------------
+
+def test_readme_mentions_btw():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    features = text[text.index("## Features"):text.index("## Install")]
+    assert any("`/btw`" in line for line in features.splitlines() if line.startswith("- "))
+    controls = text[text.index("## TUI controls"):text.index("## Tools and permissions")]
+    assert any(line.startswith("| `/btw <question>`") for line in controls.splitlines())
+    coming = text[text.index("### Coming from Claude Code"):text.index("## Configuration")]
+    assert any(line.startswith("| `/btw`") for line in coming.splitlines())
+    section = text[text.index("## Side questions (`/btw`)"):text.index("## Subagents")]
+    # the sketch is a real render: its footer is the panel's own footer text
+    from dostuff.helpers.agent.side_question import BTW_MAX_EXCHANGES
+    assert "Esc/Enter/Space close · f fork out · c copy" in section
+    assert "No tools run." in section and "Nothing is written." in section and "No follow-up turns." in section
+    assert f"the last {BTW_MAX_EXCHANGES}" in section and "Fork out (`f`)" in section and "dostuff -p" in section

@@ -467,7 +467,9 @@ def side_call(monkeypatch):
     def install(*responses, **kwargs) -> SideCall:
         fake = SideCall(*responses, **kwargs)
         module = sys.modules.get("dostuff.agent.call_agent")
-        if module is not None:
+        if getattr(module, "_side_call_stub", False):  # this test's own stub, from an earlier install
+            monkeypatch.setattr(module, "call_agent", fake)
+        elif module is not None:
             # loop.py binds `call_agent` by name on import: imported after this patch, a subagent's loop would get
             # the fake. litellm is loaded already, so importing it now costs nothing.
             import dostuff.agent.loop  # noqa: F401
@@ -475,6 +477,7 @@ def side_call(monkeypatch):
         else:
             stub = types.ModuleType("dostuff.agent.call_agent")
             stub.call_agent = fake  # type: ignore[attr-defined]
+            stub._side_call_stub = True  # type: ignore[attr-defined]
             monkeypatch.setitem(sys.modules, "dostuff.agent.call_agent", stub)
         return fake
     return install
