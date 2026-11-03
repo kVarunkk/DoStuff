@@ -1,6 +1,7 @@
 """Headless TUI smoke test: async turns, streaming, approval prompt, /clear, exit (REQ-4.x)."""
 import asyncio
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -4555,6 +4556,972 @@ def test_tab_strip_pads_and_marks_the_current_question(tui):
 
             app.adapter.cancel_pending_ask()
             await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- /btw Phase 3: the command and the overlay (plan/2026-11-03-btw/tasks.md T3.x) --------------------------------
+
+from conftest import fake_response  # noqa: E402
+
+class HeldTurn:
+    """A fake `agent_loop` that publishes a real snapshot (as `loop()` does) and holds until `release()`.
+    `systems` records the system string each turn would have sent, composed as the loop composes it."""
+
+    def __init__(self):
+        self.gate: asyncio.Event | None = None
+        self.systems: list[str] = []
+        self.snapshots: list = []
+        self.hold = True
+
+    def release(self):
+        if self.gate is not None:
+            self.gate.set()
+
+    async def __call__(self, session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                       current_session_history, steps_history, store, adapter=None, **kwargs):
+        from dostuff.agent.subagents.fork import ForkContext
+        from dostuff.helpers.agent import side_question
+        from dostuff.helpers.agent.append_step import append_step
+        notes = kwargs.get("compaction_notes") or ""
+        context = kwargs.get("session_hook_context")
+        with side_question.published_snapshot(session_id):
+            snap = ForkContext(system_instruction=instructions, compaction_notes=notes,
+                               history=[dict(s) for s in working_history], tool_names=["read_file", "bash"],
+                               session_hook_context=dict(context) if context is not None else None)
+            side_question.publish_snapshot(session_id, snap)
+            self.snapshots.append(side_question.snapshot(session_id))
+            self.systems.append(side_question.compose_system_instruction(
+                instructions, side_question.plan_mode_on(kwargs.get("permissions")), notes, context))
+            if self.hold:
+                self.gate = asyncio.Event()
+                await self.gate.wait()
+            if adapter is not None and adapter._cancelled:
+                return "[Cancelled]"
+            step = {"role": "assistant", "content": f"answer to {user_text}"}
+            await append_step(step, steps_history, working_history, current_session_history, session_id, store,
+                              turn_type)
+            return step["content"]
+
+
+@pytest.fixture
+def btw_tui(tui, monkeypatch, side_call):
+    """(cli_tui, HeldTurn, side_call): turns are held until released; the side call is a `SideCall`."""
+    import dostuff.agent.call_agent  # noqa: F401  the real module, so side_call patches it rather than stubbing it
+    from dostuff.helpers.agent import side_question
+    side_question._reset_registry()
+    held = HeldTurn()
+    monkeypatch.setattr(tui, "agent_loop", held)
+    yield tui, held, side_call
+    held.release()
+    side_question._reset_registry()
+
+
+def _submit(app, cli_tui, text):
+    app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))
+
+
+async def _btw_answered(pilot, app):
+    panel = app._btw_panel()
+    await _until(pilot, lambda: panel.display and panel.answer is not None and app.focused is panel)
+    return panel
+
+
+async def _state(app):
+    """Everything a side question must leave alone (CON-004, CON-005), by value."""
+    import copy
+    import sqlite3
+    meta = await app.store.get_session_meta(app.session_id) or {}
+    counts = {}
+    with sqlite3.connect(app.store.db_path) as db:
+        for table in ("session_steps", "working_steps", "agent_runs"):
+            try:
+                counts[table] = db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            except sqlite3.OperationalError:
+                counts[table] = None
+    return {
+        "steps": copy.deepcopy(app.steps_history), "current": copy.deepcopy(app.current_session_history),
+        "working": await app.store.load_working_history(app.session_id), "queue": list(app._prompt_queue),
+        "meta": {k: meta.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens", "cost_usd",
+                                          "compaction_notes", "last_input_tokens")},
+        "counts": counts, "usage": dict(app.adapter._session_usage), "cost": app.adapter._session_cost,
+    }
+
+
+def test_btw_registered(tui):
+    from dostuff.helpers.agent.constants import COMMAND_ARGS, COMMAND_DESCRIPTIONS, COMMAND_FLAGS
+    cli_tui = tui
+    assert "/btw" in COMMAND_DESCRIPTIONS and COMMAND_ARGS["/btw"] == "<question>" and "/btw" not in COMMAND_FLAGS
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-help")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/help")
+            await _until(pilot, lambda: any("/btw" in t for t in _texts(app)))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_usage_when_empty(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    call = side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-usage")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for text in ("/btw", "/btw   "):
+                _submit(app, cli_tui, text)
+                await pilot.pause()
+            assert sum(t == cli_tui.BTW_USAGE for t in _texts(app)) == 2
+            assert call.calls == [] and app._prompt_queue == [] and not app._btw_open()
+            _submit(app, cli_tui, "/btwx hello")  # not the command: an ordinary prompt
+            await _until(pilot, lambda: held.gate is not None)
+            assert call.calls == []
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_mid_turn(btw_tui):
+    """Mid-turn: not queued, the turn keeps running, the live snapshot is what is sent, and nothing about the
+    session changes (REQ-3.1, REQ-3.2, CON-004/005/006)."""
+    from dostuff.helpers.agent.side_question import SIDE_QUESTION_PROMPT
+    cli_tui, held, side_call = btw_tui
+    usage = types.SimpleNamespace(prompt_tokens=1200, completion_tokens=340, total_tokens=1540,
+                                  prompt_tokens_details=types.SimpleNamespace(cached_tokens=1100))
+    call = side_call(fake_response("It edited a.py.", usage=usage))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-mid")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: held.gate is not None)
+            before = await _state(app)
+            lines_before = _message_lines(app)
+            status_before = str(app.query_one("#status", cli_tui.Static).render())
+            _submit(app, cli_tui, "/btw which file did it edit?")
+            panel = await _btw_answered(pilot, app)
+            assert app._turn_in_progress and app._prompt_queue == []
+            assert len(call.calls) == 1
+            assert call.calls[0]["steps_history"] == held.snapshots[0].history + [
+                {"role": "user", "content": SIDE_QUESTION_PROMPT.format(question="which file did it edit?")}]
+            assert call.calls[0]["system_instruction"] == held.systems[0]
+            assert call.calls[0]["tool_names"] == ["read_file", "bash"]
+            assert panel.body_text == "It edited a.py."
+            footer = str(panel.query_one("#btw-footer", cli_tui.Static).render())
+            assert footer.startswith("Esc/Enter/Space close · f fork out · c copy · ↑1.2k (1.1k cached) ↓340")
+            assert await _state(app) == before
+            assert _message_lines(app) == lines_before  # nothing in the transcript
+            assert str(app.query_one("#status", cli_tui.Static).render()) == status_before
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert [s["role"] for s in app.steps_history] == ["user", "assistant"]
+            assert not any("which file" in str(s.get("content")) for s in await app.store.load(app.session_id))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_expands_pastes(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    call = side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-paste")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            marker = app._pastes.add("line one\nline two\nline three")
+            _submit(app, cli_tui, f"/btw what does this mean? {marker}")
+            await _btw_answered(pilot, app)
+            assert "line one\nline two\nline three" in call.calls[0]["steps_history"][-1]["content"]
+            assert marker not in call.calls[0]["steps_history"][-1]["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_not_reached_under_prompt(tui, side_call):
+    """D6: with an approval waiting, the input belongs to it, so `/btw` never reaches the dispatch."""
+    import dostuff.agent.call_agent  # noqa: F401
+    cli_tui = tui
+    call = side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-prompt")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "hello")  # the tui fixture's loop asks for approval
+            await _until(pilot, app.adapter.has_pending_confirm)
+            _submit(app, cli_tui, "/btw x")
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert call.calls == [] and not app._btw_open()
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_idle_uses_kept_parts_and_store(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    held.hold = False
+    call = side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-idle")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            _submit(app, cli_tui, "/btw what did I ask?")
+            await _btw_answered(pilot, app)
+            stored = await app.store.load_working_history(app.session_id)
+            assert call.calls[0]["steps_history"][:-1] == stored  # the finished turn, from the store
+            assert call.calls[0]["system_instruction"] == held.systems[0]  # byte-equal: the cache stays warm
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_idle_after_compact(btw_tui, monkeypatch):
+    """tasks.md open point 2: an idle /compact rewrites the notes; the side call reads them from the store."""
+    cli_tui, held, side_call = btw_tui
+    held.hold = False
+    call = side_call()
+
+    async def fake_compact(history, budget, notes, *args, **kwargs):
+        return history[-1:], "NEW NOTES"
+    monkeypatch.setattr(cli_tui, "compact_context", fake_compact)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-compact")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            _submit(app, cli_tui, "/compact")
+            await _until(pilot, lambda: any("Context compacted" in t for t in _texts(app)))
+            _submit(app, cli_tui, "/btw what did I ask?")
+            await _btw_answered(pilot, app)
+            system = call.calls[0]["system_instruction"]
+            assert system.endswith("[Summary of earlier conversation]: NEW NOTES")
+            assert system.startswith(held.snapshots[0].system_instruction)
+            assert len(call.calls[0]["steps_history"]) == 2  # the compacted history + the question
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_cold_session(btw_tui, monkeypatch):
+    """No turn in this process: the system prompt is built now, with the default tools."""
+    from dostuff.tools.definitions import default_tool_names
+    cli_tui, held, side_call = btw_tui
+    call = side_call()
+    built = []
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-cold")
+        original = app._build_instructions
+
+        async def build(text):
+            built.append(text)
+            return await original(text)
+        app._build_instructions = build  # type: ignore[method-assign]
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw anything yet?")
+            await _btw_answered(pilot, app)
+            assert built == ["anything yet?"]
+            assert "<environment>" in call.calls[0]["system_instruction"]
+            assert call.calls[0]["tool_names"] == default_tool_names()
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_panel_composed_hidden(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-compose")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            panels = app.query("#btw-panel")
+            assert len(panels) == 1 and panels.first().display is False
+            ids = [w.id for w in app.screen.children]
+            assert ids.index("queue-bar") < ids.index("btw-panel") < ids.index("picker")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_panel_asking_then_answer(btw_tui, monkeypatch):
+    from dostuff.helpers.agent import model_cost
+    cli_tui, held, side_call = btw_tui
+    monkeypatch.setattr(model_cost, "call_cost", lambda model, usage: None)  # an unpriced model (Ollama)
+    gate = asyncio.Event()
+    usage = types.SimpleNamespace(prompt_tokens=50, completion_tokens=7, total_tokens=57)
+    side_call(fake_response("**Short** answer.", usage=usage), gate=gate)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-asking")
+        async with app.run_test(size=(80, 30)) as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw  a\n  long   question")
+            panel = app._btw_panel()
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            title = str(panel.query_one("#btw-title", cli_tui.Static).render())
+            assert title == "/btw — a long question"
+            assert panel.body_text == "Asking…"
+            assert str(panel.query_one("#btw-footer", cli_tui.Static).render()) == "Esc close"
+            gate.set()
+            await _btw_answered(pilot, app)
+            assert panel.body_text == "**Short** answer."
+            # no cost (unpriced) and no cached tokens: both parts are left out
+            assert str(panel.query_one("#btw-footer", cli_tui.Static).render()) == (
+                "Esc/Enter/Space close · f fork out · c copy · ↑50 ↓7")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_usage_footer_with_cost(tui):
+    cli_tui = tui
+    app = cli_tui.DostuffTUI(session_id="btw-cost")
+    assert app._format_side_usage({"prompt_tokens": 1200, "completion_tokens": 340, "cached_tokens": 1100,
+                                   "cost": 0.002}) == "↑1.2k (1.1k cached) ↓340 · $0.0020"
+    assert app._format_side_usage(None) == ""
+
+
+def test_btw_panel_not_in_transcript_or_export(btw_tui, tmp_path):
+    cli_tui, held, side_call = btw_tui
+    held.hold = False
+    side_call(fake_response("SIDE-ANSWER-TEXT"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-export")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            lines = _message_lines(app)
+            _submit(app, cli_tui, "/btw SIDE-QUESTION-TEXT")
+            await _btw_answered(pilot, app)
+            assert _message_lines(app) == lines
+            await pilot.press("escape")
+            out = tmp_path / "export.md"
+            _submit(app, cli_tui, f"/export {out}")
+            await _until(pilot, out.exists)
+            text = out.read_text(encoding="utf-8")
+            assert "fix the bug" in text
+            assert "SIDE-QUESTION-TEXT" not in text and "SIDE-ANSWER-TEXT" not in text
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_panel_leaves_conversation_visible(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response("\n\n".join(f"paragraph {i}" for i in range(60))))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-visible")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw long?")
+            panel = await _btw_answered(pilot, app)
+            await pilot.pause()
+            assert app.query_one("#conversation").display and app.query_one("#conversation").size.height > 0
+            assert panel.size.height + 2 <= 40 // 2 + 2  # max-height 50vh (border included)
+            for _ in range(5):  # the body scrolls with the keys
+                await pilot.press("down")
+            assert panel.query_one("#btw-scroll").scroll_y > 0
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_rapid_reopen(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    call = side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-rapid")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for question in ("a", "b", "c"):
+                _submit(app, cli_tui, f"/btw {question}")
+                await _btw_answered(pilot, app)
+                await pilot.press("escape")
+                await pilot.pause()
+            assert len(app.query("#btw-panel")) == 1 and not app._btw_open()
+            assert len(call.calls) == 3
+            assert len(app._side_exchanges) == 3  # the thread replays: the third saw the first two
+            assert len(call.calls[2]["steps_history"]) == len(call.calls[0]["steps_history"]) + 4
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_panel_does_not_bounce_the_transcript(btw_tui):
+    """Opening and closing the side answer leaves every painted frame flush at the bottom, like the picker and
+    the ask panel (`test_ask_panel_does_not_bounce_the_transcript`)."""
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response("one\n\ntwo\n\nthree"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-bounce")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for i in range(25):
+                app._append(f"row{i:02d} " + "-" * 30, msg_type="user")
+            await pilot.pause()
+            await pilot.pause()
+            messages = app.query_one("#messages")
+            off_bottom: list[int] = []
+            original_display = app._display
+
+            def display(screen, renderable):
+                rows = [strip.text.rstrip() for strip in
+                        app.screen._compositor.render_strips()[:messages.region.height]]
+                occupied = [y for y, row in enumerate(rows) if row]
+                if occupied:
+                    off_bottom.append(messages.region.height - 1 - occupied[-1])
+                return original_display(screen, renderable)
+            app._display = display  # type: ignore[method-assign]
+            _submit(app, cli_tui, "/btw q")
+            await _btw_answered(pilot, app)
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause()
+            app._display = original_display  # type: ignore[method-assign]
+            assert off_bottom, "no frame was measured"
+            assert max(off_bottom) <= 0, f"the transcript drifted off the bottom: {off_bottom}"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_takes_focus_and_gives_it_back(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-focus")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            _submit(app, cli_tui, "/btw q")
+            inp.text = "half-typed draft"
+            panel = await _btw_answered(pilot, app)
+            assert app.focused is panel and inp.text == "half-typed draft"
+            await pilot.press("escape")
+            await _until(pilot, lambda: app.focused is inp)
+            assert not app._btw_open() and inp.text == "half-typed draft"
+            for key in ("enter", "space"):
+                _submit(app, cli_tui, "/btw again")  # clears the input, as sending it would
+                inp.text = f"draft before {key}"
+                await _btw_answered(pilot, app)
+                await pilot.press(key)
+                await _until(pilot, lambda: not app._btw_open() and app.focused is inp)
+                # the key closed the panel and nothing else: the input was neither sent nor edited
+                assert inp.text == f"draft before {key}" and not app._turn_in_progress
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_esc_does_not_cancel_turn(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-esc")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: held.gate is not None)
+            _submit(app, cli_tui, "/btw q")
+            await _btw_answered(pilot, app)
+            await pilot.press("escape")
+            await _until(pilot, lambda: not app._btw_open())
+            assert app.adapter._cancelled is False and app._turn_in_progress
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert app.steps_history[-1] == {"role": "assistant", "content": "answer to fix the bug"}
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_esc_idle_no_recall(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    held.hold = False
+    side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-recall")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "first prompt")
+            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            _submit(app, cli_tui, "/btw q")
+            await _btw_answered(pilot, app)
+            app._last_escape = 0.0
+            await pilot.press("escape")
+            await _until(pilot, lambda: not app._btw_open())
+            await pilot.press("escape")  # one more: had the first been an idle Esc, this would recall the prompt
+            await pilot.pause(0.2)
+            assert app.query_one("#input", cli_tui.EnterSubmits).text == ""
+            assert len(app.steps_history) == 2
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_copy(btw_tui, monkeypatch):
+    from dostuff.helpers.agent.side_question import TOOL_CALL_NOTE
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response('Run {"name": "read_file", "arguments": {}}'))
+    copied = []
+    monkeypatch.setattr(cli_tui, "_copy_to_clipboard", lambda app, text: copied.append(text))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-copy")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw the question")
+            await _btw_answered(pilot, app)
+            await pilot.press("c")
+            await _until(pilot, lambda: copied)
+            assert copied == [f'Run {{"name": "read_file", "arguments": {{}}}}\n\n{TOOL_CALL_NOTE}']
+            assert app._btw_open()
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_keys_inert_while_asking(btw_tui, monkeypatch):
+    cli_tui, held, side_call = btw_tui
+    gate = asyncio.Event()
+    side_call(gate=gate)
+    copied = []
+    monkeypatch.setattr(cli_tui, "_copy_to_clipboard", lambda app, text: copied.append(text))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-inert")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw q")
+            panel = app._btw_panel()
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            forked = []
+            app.on_btw_panel_fork_out = lambda event: forked.append(event)  # type: ignore[attr-defined]
+            await pilot.press("c")
+            await pilot.press("f")
+            await pilot.pause()
+            assert copied == [] and forked == [] and app._btw_open()
+            gate.set()
+            await _btw_answered(pilot, app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("prompt", ["approval", "ask_user"])
+def test_btw_prompt_wins_focus(btw_tui, prompt):
+    """An approval or a question opened while the side answer is up takes the focus and the first Esc; the
+    next Esc closes the side answer (D6)."""
+    cli_tui, held, side_call = btw_tui
+    side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id=f"btw-{prompt}")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: held.gate is not None)
+            _submit(app, cli_tui, "/btw q")
+            panel = await _btw_answered(pilot, app)
+            if prompt == "approval":
+                task = asyncio.ensure_future(app.adapter.ask("Allow write_file?"))
+                await _until(pilot, lambda: bool(app.query("#permission-prompt"))
+                             and app.focused is app.query_one("#permission-prompt"))
+            else:
+                task = _ask_questions(app, [DB_QUESTION])
+                ask_panel = app._ask_panel()
+                await _until(pilot, lambda: ask_panel.display and app.focused is ask_panel)
+            assert panel.display
+            await pilot.press("escape")
+            await _until(pilot, task.done)
+            if prompt == "approval":
+                assert task.result().answer == "no"
+            else:
+                assert task.result() is None
+            assert app._btw_open()
+            app.adapter._cancelled = False  # that Esc also cancelled the turn; this test is about the panel
+            app.adapter._cancel_event.clear()
+            await pilot.press("escape")
+            await _until(pilot, lambda: not app._btw_open())
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_error_in_panel(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    side_call(raise_exc=RuntimeError("rate limited"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-error")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: held.gate is not None)
+            lines = _message_lines(app)
+            _submit(app, cli_tui, "/btw q")
+            panel = app._btw_panel()
+            await _until(pilot, lambda: panel.display and panel.error)
+            assert "rate limited" in panel.body_text
+            assert _message_lines(app) == lines and not any("Turn error" in t for t in _texts(app))
+            assert app._side_exchanges == [] and app._turn_in_progress
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert app.steps_history[-1]["content"] == "answer to fix the bug"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_second_refused(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    gate = asyncio.Event()
+    call = side_call(gate=gate)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-second")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw first")
+            await _until(pilot, lambda: len(call.calls) == 1)
+            _submit(app, cli_tui, "/btw second")
+            await pilot.pause()
+            assert app.query_one("#input", cli_tui.EnterSubmits).border_title == cli_tui.BTW_BUSY
+            assert len(call.calls) == 1 and app._btw_panel().question == "first"
+            gate.set()
+            await _btw_answered(pilot, app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_answer_survives_turn_cancel(btw_tui):
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response("kept"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-cancel")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: held.gate is not None)
+            _submit(app, cli_tui, "/btw q")
+            panel = await _btw_answered(pilot, app)
+            app.adapter._cancelled = True  # cancel the turn directly, not with Esc (that closes the panel)
+            app.adapter._cancel_event.set()
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert panel.display and panel.body_text == "kept"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- /btw Phase 4: fork-out (plan/2026-11-03-btw/tasks.md T4.x) ---------------------------------------------------
+
+def test_btw_fork_out_starts_fork(btw_tui, monkeypatch):
+    from conftest import FakeAgentRegistry
+    from dostuff.helpers.agent.side_question import BTW_FORK_DESCRIPTION, TOOL_CALL_NOTE
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response('Probably a.py. {"name": "read_file", "arguments": {}}'))
+    fake = FakeAgentRegistry()
+    monkeypatch.setattr(cli_tui, "_agent_registry", lambda: fake)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-fork")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: held.gate is not None)
+            _submit(app, cli_tui, "/btw which file?")
+            panel = await _btw_answered(pilot, app)
+            used = panel.snapshot
+            assert used is held.snapshots[0]  # the live snapshot the side call read
+            await pilot.press("f")
+            await _until(pilot, lambda: not app._btw_open())
+            [kwargs] = fake.started
+            assert kwargs["owner"] == "btw-fork" and kwargs["agent_type"] == "fork"
+            assert kwargs["background"] is True and kwargs["description"] == BTW_FORK_DESCRIPTION
+            answer = f'Probably a.py. {{"name": "read_file", "arguments": {{}}}}\n\n{TOOL_CALL_NOTE}'
+            assert kwargs["prompt"] == f"which file?\n\nMy answer without tools was:\n{answer}\n\nGo and check it."
+            assert kwargs["fork"] is used  # not re-resolved at `f` time
+            assert cli_tui.BTW_HANDED_OFF in _texts(app)
+            assert app._turn_in_progress  # the main turn is untouched
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_twice(btw_tui, monkeypatch):
+    from conftest import FakeAgentRegistry
+    cli_tui, held, side_call = btw_tui
+    side_call()
+    gate = asyncio.Event()
+
+    class SlowRegistry(FakeAgentRegistry):
+        async def start(self, **kwargs):
+            self.started.append(kwargs)
+            await gate.wait()
+            return types.SimpleNamespace(id="r1")
+    fake = SlowRegistry()
+    monkeypatch.setattr(cli_tui, "_agent_registry", lambda: fake)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-twice")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw q")
+            await _btw_answered(pilot, app)
+            await pilot.press("f")
+            await _until(pilot, lambda: len(fake.started) == 1)
+            await pilot.press("f")
+            await pilot.pause(0.1)
+            assert len(fake.started) == 1
+            gate.set()
+            await _until(pilot, lambda: not app._btw_open())
+            assert len(fake.started) == 1 and not app._btw_forking
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_error_stays_open(btw_tui, monkeypatch):
+    from conftest import FakeAgentRegistry
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response("the answer"))
+    fake = FakeAgentRegistry(raise_exc=ValueError("a fork needs the main agent's conversation"))
+    monkeypatch.setattr(cli_tui, "_agent_registry", lambda: fake)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-fork-error")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw q")
+            panel = await _btw_answered(pilot, app)
+            for exc in (ValueError("a fork needs the main agent's conversation"), RuntimeError("queue full")):
+                fake.raise_exc = exc
+                await pilot.press("f")
+                await _until(pilot, lambda: str(exc) in panel.body_text)
+                assert app._btw_open() and not app._btw_forking
+                assert panel.body_text.startswith("the answer")  # the answer stays above the reason
+            assert len(fake.started) == 2  # the guard was reset after each failure
+            assert cli_tui.BTW_HANDED_OFF not in _texts(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_report_wakes(tui, agents, fake_model, side_call, monkeypatch):
+    """REQ-4.2: the real registry and the untouched notice path — the fork's report wakes the idle session and
+    arrives as a `<background-agent>` user step."""
+    from dostuff.helpers.agent.notices import get_notice_queue
+    import dostuff.agent.call_agent  # noqa: F401
+    cli_tui = tui
+    monkeypatch.setattr(cli_tui, "JOB_WAKE_DELAY_S", 0.3)
+    side_call(fake_response("my guess [F]"))
+    fake_model.script("[F]", fake_response("checked: it is a.py"))
+    woke: list[tuple[str, list[str]]] = []
+
+    async def wake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        woke.append((user_text, [n.id for n in get_notice_queue().drain(session_id)]))
+        return "handled"
+    monkeypatch.setattr(cli_tui, "agent_loop", wake_loop)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-wake")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            app.config.agents_wake_on_end = True
+            _submit(app, cli_tui, "/btw which file? [F]")
+            await _btw_answered(pilot, app)
+            await pilot.press("f")
+            await _until(pilot, lambda: bool(agents.runs("btw-wake")))
+            [run] = agents.runs("btw-wake")
+            await _until(pilot, lambda: run.status == "completed", tries=100)
+            await _until(pilot, lambda: bool(woke), tries=100)
+            text, ids = woke[0]
+            assert text.startswith(f'<background-agent id="{run.id}"') and ids == [run.id]
+            assert "checked: it is a.py" in text
+            fork_call = fake_model.calls_for("[F]")[0]["messages"]
+            assert "My answer without tools was:\nmy guess [F]" in fork_call[-1]["content"]
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_survives_esc(btw_tui, agents, fake_model):
+    """Esc on the main turn cancels foreground runs only: the fork-out keeps going (D8)."""
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response("guess [S]"))
+    gate = fake_model.gate("[S]", fake_response("report"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-esc-fork")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: held.gate is not None)
+            _submit(app, cli_tui, "/btw q [S]")
+            await _btw_answered(pilot, app)
+            await pilot.press("f")
+            await _until(pilot, lambda: bool(fake_model.calls_for("[S]")), tries=100)
+            [run] = agents.runs("btw-esc-fork")
+            await pilot.press("escape")  # the panel is closed: this cancels the main turn
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert run.status == "running"
+            gate.set()
+            await _until(pilot, lambda: run.status == "completed", tries=100)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- /btw Phase 5: session boundaries (plan/2026-11-03-btw/tasks.md T5.x) -----------------------------------------
+
+@pytest.mark.parametrize("switch", ["clear", "resume", "fork"])
+def test_btw_thread_cleared_on_switch(btw_tui, switch):
+    from dostuff.helpers.agent.side_question import kept_prompt
+    cli_tui, held, side_call = btw_tui
+    held.hold = False
+    call = side_call(fake_response("answer A"), fake_response("answer B"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id=f"btw-{switch}")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            old = app.session_id
+            assert kept_prompt(old) is not None
+            _submit(app, cli_tui, "/btw QUESTION-A")
+            await _btw_answered(pilot, app)  # left open: the switch must close it
+            if switch == "clear":
+                await app._clear_session()
+            elif switch == "resume":
+                await app._switch_session("btw-elsewhere")
+            else:
+                await app._fork_session("")
+            await pilot.pause()
+            assert app.session_id != old
+            assert not app._btw_open() and app._side_exchanges == []
+            assert kept_prompt(old) is None
+            _submit(app, cli_tui, "/btw QUESTION-B")
+            await _btw_answered(pilot, app)
+            sent = call.calls[1]["steps_history"]
+            assert not any("QUESTION-A" in str(s.get("content")) or s.get("content") == "answer A" for s in sent)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_carried_on_clear(tui, agents, fake_model, side_call, monkeypatch):
+    """A running fork-out moves to the new session with /clear (`_carry_background`) and wakes it there."""
+    from dostuff.helpers.agent.notices import get_notice_queue
+    import dostuff.agent.call_agent  # noqa: F401
+    cli_tui = tui
+    monkeypatch.setattr(cli_tui, "JOB_WAKE_DELAY_S", 0.3)
+    side_call(fake_response("guess [C]"))
+    gate = fake_model.gate("[C]", fake_response("carried report"))
+    woke: list[tuple[str, str]] = []
+
+    async def wake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        get_notice_queue().drain(session_id)
+        woke.append((session_id, user_text))
+        return "handled"
+    monkeypatch.setattr(cli_tui, "agent_loop", wake_loop)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-carry")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            app.config.agents_wake_on_end = True
+            _submit(app, cli_tui, "/btw q [C]")
+            await _btw_answered(pilot, app)
+            await pilot.press("f")
+            await _until(pilot, lambda: bool(fake_model.calls_for("[C]")), tries=100)
+            [run] = agents.runs("btw-carry")
+            await app._clear_session()
+            new = app.session_id
+            assert run.owner == new
+            gate.set()
+            await _until(pilot, lambda: bool(woke), tries=100)
+            assert woke[0][0] == new and "carried report" in woke[0][1]
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("which", ["fork-out", "model fork", "none"])
+def test_fork_warns_about_running_fork_out(tui, agents, fake_model, side_call, monkeypatch, which):
+    from dostuff.agent.subagents.fork import ForkContext
+    import dostuff.agent.call_agent  # noqa: F401
+    cli_tui = tui
+    side_call(fake_response("guess [W]"))
+    gate = fake_model.gate("[W]", fake_response("never mind"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-strand")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _submit(app, cli_tui, "hello")  # the tui fixture's loop: approve, then it answers
+            await _until(pilot, app.adapter.has_pending_confirm)
+            _submit(app, cli_tui, "y")
+            await _until(pilot, lambda: not app._turn_in_progress)
+            if which == "fork-out":
+                _submit(app, cli_tui, "/btw q [W]")
+                await _btw_answered(pilot, app)
+                await pilot.press("f")
+            elif which == "model fork":
+                snap = ForkContext(system_instruction="s", compaction_notes="", history=[], tool_names=[])
+                await agents.start(owner="btw-strand", agent_type="fork", description="something else",
+                                   prompt="[W] x", background=True, fork=snap, adapter=app.adapter)
+            if which != "none":
+                await _until(pilot, lambda: bool(fake_model.calls_for("[W]")), tries=100)
+            await app._fork_session("")
+            await pilot.pause()
+            warned = cli_tui.BTW_FORK_STRANDED.format(old="btw-strand") in _texts(app)
+            assert warned is (which == "fork-out")
+            gate.set()
+            await _until(pilot, lambda: all(r.ended is not None for r in agents.runs()), tries=100)
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

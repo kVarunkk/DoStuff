@@ -441,3 +441,248 @@ def test_four_shapes_one_tool_step(monkeypatch):
     # non-interactive: no adapter to ask
     _, content = run(None)
     assert content == UNAVAILABLE_ASK_RESULT
+
+
+# --- /btw pins (plan/2026-11-03-btw/tasks.md Phase 0): what the loop sends, before anything is extracted ---
+
+def _interactive(monkeypatch, responses, *, dispatch=None, on_call=None, **loop_kw):
+    """Run an `interactive_loop` turn on scripted responses, hooks off; returns (result, working, calls) where
+    each call is a dict of what `call_agent` was given."""
+    from dostuff.helpers.hooks import HookOutcome
+    calls: list[dict] = []
+
+    async def fake_call_agent(steps_history, system_instruction, tool_names=None, stream=False):
+        calls.append({"history": [dict(s) for s in steps_history], "system": system_instruction,
+                      "tool_names": tool_names})
+        if on_call is not None:
+            on_call(len(calls))
+        item = responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item, None
+
+    async def no_hooks(*args, **kwargs):
+        return HookOutcome()
+
+    monkeypatch.setattr(loop_module, "call_agent", fake_call_agent)
+    monkeypatch.setattr(loop_module, "run_hooks", no_hooks)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+    if dispatch is not None:
+        monkeypatch.setattr(loop_module, "dispatch_tool", dispatch)
+    working = loop_kw.pop("working", None)
+    working = working if working is not None else [{"role": "user", "content": "hi"}]
+    loop_kw.setdefault("dynamic_system_instruction", "sys")
+    loop_kw.setdefault("session_id", "s1")
+    result = asyncio.run(loop(
+        turn_id="t1", user_text="hi", mcp_client=None, working_history=working,
+        turn_type=loop_kw.pop("turn_type", "interactive_loop"), stream=False, max_iterations=5, **loop_kw,
+    ))
+    return result, working, calls
+
+
+# The four T0.2 cases: (plan mode, notes, hook context) → the system string the loop sends
+SYSTEM_PIN_CASES = [
+    (True, "N", {"startup": "ctx"}),
+    (False, "N", {"startup": "ctx"}),
+    (True, "", {"startup": "ctx"}),
+    (True, "N", None),
+]
+
+
+@pytest.mark.parametrize("plan, notes, context", SYSTEM_PIN_CASES)
+def test_pin_loop_system_instruction(monkeypatch, plan, notes, context):
+    from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, SessionPermissions
+    from dostuff.helpers.hooks.events import session_context_suffix
+    permissions = SessionPermissions(mode="plan" if plan else "auto")
+    _, _, calls = _interactive(monkeypatch, [_msg(content="ok")], dynamic_system_instruction="D",
+                               compaction_notes=notes, session_hook_context=context, permissions=permissions)
+    expected = ("D" + (f"\n\n{PLAN_MODE_INSTRUCTION}" if plan else "")
+                + (f"\n\n[Summary of earlier conversation]: {notes}" if notes else "")
+                + session_context_suffix(context))
+    assert calls[0]["system"] == expected
+    if context:
+        assert session_context_suffix(context).endswith("ctx")
+
+
+def test_pin_loop_usage_dict(monkeypatch):
+    from dostuff.helpers.agent import model_cost
+    monkeypatch.setattr(model_cost, "call_cost", lambda model, usage: 0.5)
+    details = SimpleNamespace(cached_tokens=80)
+    usage = SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120, prompt_tokens_details=details)
+    response = _msg(content="ok")
+    response.usage = usage
+    adapter = Adapter()
+    _interactive(monkeypatch, [response], adapter=adapter)
+    assert [d for e, d in adapter.events if e == "usage"] == [
+        {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120, "cached_tokens": 80, "cost": 0.5}]
+
+    response = _msg(content="ok")
+    response.usage = SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3)
+    adapter = Adapter()
+    _interactive(monkeypatch, [response], adapter=adapter)
+    assert [d["cached_tokens"] for e, d in adapter.events if e == "usage"] == [0]
+
+
+def test_pin_fork_context_shape(monkeypatch):
+    seen = []
+
+    async def dispatch(name, args, **kw):
+        seen.append(kw.get("fork_context"))
+        return "started"
+
+    call = _tc("agent", json.dumps({"description": "d", "prompt": "p", "subagent_type": "fork"}), "c1")
+    _, working, calls = _interactive(monkeypatch, [_msg(tool_calls=[call]), _msg(content="ok")],
+                                     dispatch=dispatch, dynamic_system_instruction="D", compaction_notes="N",
+                                     tool_names=["agent", "read_file"])
+    fork = seen[0]
+    assert fork.system_instruction == "D"  # undecorated: no plan mode, no notes, no hook context
+    assert fork.compaction_notes == "N"
+    assert fork.history == calls[0]["history"]  # what the model saw, without the in-flight assistant step
+    assert not any(s.get("tool_calls") for s in fork.history)
+    assert fork.tool_names == ["agent", "read_file"]
+
+
+# --- /btw Phase 2: the loop publishes its snapshot (plan/2026-11-03-btw/tasks.md T2.x) ---
+
+@pytest.fixture
+def btw():
+    from dostuff.helpers.agent import side_question
+    side_question._reset_registry()
+    yield side_question
+    side_question._reset_registry()
+
+
+def test_publishes_each_iteration(monkeypatch, btw):
+    seen = []
+
+    async def dispatch(name, args, **kw):
+        return "file text"
+
+    call = _tc("read_file", json.dumps({"path": "a.py"}), "c1")
+    _, _, calls = _interactive(monkeypatch, [_msg(tool_calls=[call]), _msg(content="ok")], dispatch=dispatch,
+                               on_call=lambda n: seen.append(btw.snapshot("s1")))
+    assert len(seen) == 2 and seen[0] is not seen[1]
+    assert seen[0].history == calls[0]["history"] and seen[0].history[-1] == {"role": "user", "content": "hi"}
+    assert seen[1].history == calls[1]["history"] and seen[1].history[-1]["role"] == "tool"
+    for snap in seen:  # never the assistant step the call is producing
+        assert snap.history[-1]["role"] != "assistant"
+
+
+def test_publish_after_notices(monkeypatch, btw):
+    from dostuff.helpers.agent.notices import AgentNotice, NoticeQueue
+    queue = NoticeQueue()
+    monkeypatch.setattr(loop_module, "get_notice_queue", lambda: queue)
+    monkeypatch.setattr(loop_module, "format_notices", lambda notices, max_chars=None: "<background-agent>r</background-agent>")
+    queue.put("s1", AgentNotice(id="r1", agent_type="fork", description="d", status="completed", runtime=1.0,
+                                tokens=10, report="r"))
+    seen = []
+    _interactive(monkeypatch, [_msg(content="ok")], on_call=lambda n: seen.append(btw.snapshot("s1")))
+    assert seen[0].history[-1]["content"] == "<background-agent>r</background-agent>"
+
+
+def test_subagent_turn_does_not_publish(monkeypatch, btw, fork_ctx):
+    btw.publish_snapshot("s1", fork_ctx())
+    live = btw.snapshot("s1")
+    seen = []
+    _interactive(monkeypatch, [_msg(content="ok")], turn_type="subagent_loop",
+                 on_call=lambda n: seen.append(btw.snapshot("s1")))
+    assert seen == [live] and btw.snapshot("s1") is live  # neither replaced nor demoted (open point 1)
+
+
+def test_demoted_after_return(monkeypatch, btw):
+    _interactive(monkeypatch, [_msg(content="ok")], dynamic_system_instruction="D", compaction_notes="N",
+                 tool_names=["read_file"], session_hook_context={"startup": "c"})
+    assert btw.snapshot("s1") is None
+    kept = btw.kept_prompt("s1")
+    assert kept is not None and kept.history == []
+    assert (kept.system_instruction, kept.compaction_notes, kept.tool_names, kept.session_hook_context) == (
+        "D", "N", ["read_file"], {"startup": "c"})
+
+
+def test_demoted_after_raise(monkeypatch, btw):
+    result, _, _ = _interactive(monkeypatch, [litellm.AuthenticationError("bad key", "openai", "m")])
+    assert result.startswith("Model call failed")
+    assert btw.snapshot("s1") is None and btw.kept_prompt("s1") is not None
+
+    def explode(interaction):  # outside the model call's try: escapes loop() instead of becoming an error result
+        raise RuntimeError("boom")
+    monkeypatch.setattr(loop_module, "build_usage_dict", explode)
+    with pytest.raises(RuntimeError):
+        _interactive(monkeypatch, [_msg(content="ok")], session_id="s2")
+    assert btw.snapshot("s2") is None and btw.kept_prompt("s2") is not None
+
+
+def test_demoted_after_cancel(monkeypatch, btw):
+    adapter = Adapter()
+
+    async def dispatch(name, args, **kw):
+        return "x"
+
+    def cancel_on_first(n):
+        if n == 1:
+            adapter._cancelled = True
+    call = _tc("read_file", json.dumps({"path": "a.py"}), "c1")
+    result, _, calls = _interactive(monkeypatch, [_msg(tool_calls=[call]), _msg(content="ok")], adapter=adapter,
+                                    dispatch=dispatch, on_call=cancel_on_first)
+    assert result == loop_module.CANCELLED_TURN and len(calls) == 1
+    assert btw.snapshot("s1") is None and btw.kept_prompt("s1") is not None
+
+
+def test_subagent_exit_keeps_main_live(monkeypatch, btw, fork_ctx):
+    btw.publish_snapshot("s1", fork_ctx())
+    live = btw.snapshot("s1")
+    _interactive(monkeypatch, [_msg(content="ok")], turn_type="subagent_loop")
+    assert btw.snapshot("s1") is live and btw.kept_prompt("s1") is None
+
+
+def test_overflow_compaction_republishes(monkeypatch, btw):
+    async def fake_compact(steps, keep_budget, notes, limit):
+        return steps[-1:], "SUMMARY"
+    monkeypatch.setattr(loop_module, "compact_context", fake_compact)
+    seen = []
+    working = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "old answer"},
+               {"role": "user", "content": "hi"}]
+    overflow = litellm.ContextWindowExceededError("too long", "m", "openai")
+    _, _, calls = _interactive(monkeypatch, [overflow, _msg(content="ok")], working=working,
+                               on_call=lambda n: seen.append(btw.snapshot("s1")))
+    assert len(seen) == 2
+    assert seen[0].compaction_notes == "" and len(seen[0].history) == 3
+    assert seen[1].compaction_notes == "SUMMARY" and seen[1].history == [{"role": "user", "content": "hi"}]
+    assert seen[1].history == calls[1]["history"]
+
+
+def test_compaction_noop_does_not_republish(monkeypatch, btw):
+    async def no_compact(steps, keep_budget, notes, limit):
+        return steps, ""
+    monkeypatch.setattr(loop_module, "compact_context", no_compact)
+    seen = []
+
+    async def watch(*a, **k):
+        seen.append(btw.snapshot("s1"))
+        return await no_compact(*a, **k)
+    monkeypatch.setattr(loop_module, "compact_context", watch)
+    published = []
+    monkeypatch.setattr(loop_module, "publish_snapshot",
+                        lambda sid, ctx: (published.append(ctx), btw.publish_snapshot(sid, ctx)))
+    overflow = litellm.ContextWindowExceededError("too long", "m", "openai")
+    result, _, _ = _interactive(monkeypatch, [overflow])
+    assert result.startswith("Model call failed")
+    assert len(published) == 1  # the iteration's publish only; the no-op compaction published nothing
+
+
+def test_loop_and_side_call_send_the_same_string(monkeypatch, btw):
+    """REQ-1.2: for the snapshot of iteration n, the side call composes the string the loop sent at n.
+    Here rather than in tests/test_side_question.py, which must not import the loop (litellm)."""
+    from dostuff.agent.permissions import SessionPermissions
+    seen = []
+
+    async def dispatch(name, args, **kw):
+        return "x"
+    call = _tc("read_file", json.dumps({"path": "a.py"}), "c1")
+    permissions = SessionPermissions(mode="plan")
+    _, _, calls = _interactive(monkeypatch, [_msg(tool_calls=[call]), _msg(content="ok")], dispatch=dispatch,
+                               compaction_notes="N", session_hook_context={"startup": "c"},
+                               permissions=permissions, on_call=lambda n: seen.append(btw.snapshot("s1")))
+    for snap, sent in zip(seen, calls):
+        assert btw.compose_system_instruction(snap.system_instruction, btw.plan_mode_on(permissions),
+                                              snap.compaction_notes, snap.session_hook_context) == sent["system"]

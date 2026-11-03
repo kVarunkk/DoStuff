@@ -1,7 +1,6 @@
 from dostuff.helpers.agent.loop_check_cancelled import CANCELLED_TURN, is_cancelled, loop_check_cancelled
 from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
-from dostuff.helpers.agent.model_cost import call_cost
-from dostuff.lib.model import current_session_id, get_litellm_model
+from dostuff.lib.model import current_session_id
 from dostuff.helpers.agent.loop_emit import loop_emit
 from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.tracing import content_attr, tracer
@@ -14,20 +13,21 @@ import asyncio
 import inspect
 import random
 from dataclasses import dataclass
-from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, SessionPermissions
+from dostuff.agent.permissions import SessionPermissions
 from dostuff.agent.run_tool import (
     CANCELLED_RESULT, authorize_batch, authorize_tool, dispatch_tool, post_tool_use, pre_tool_use,
 )
 from dostuff.helpers.hooks import HookOutcome, run_hooks
 from dostuff.helpers.hooks.dispatch import report_outcome
-from dostuff.helpers.hooks.events import (
-    STOP_LIMIT_MESSAGE, STOP_NOTE, session_context_suffix, session_start, stop_event_for,
-)
+from dostuff.helpers.hooks.events import STOP_LIMIT_MESSAGE, STOP_NOTE, session_start, stop_event_for
 from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
 from dostuff.tools.definitions import TOOL_MAP, default_tool_names
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
+from dostuff.helpers.agent.side_question import (
+    compose_system_instruction, plan_mode_on, publish_snapshot, published_snapshot, usage_dict as build_usage_dict,
+)
 from dostuff.tools.bash.jobs import Job, JobEvent, get_registry
 from typing import Any, Iterator, Literal
 import contextlib
@@ -234,6 +234,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             except Exception as e:
                 await loop_emit("error", f"Could not save compaction: {e}", adapter=adapter)
         await loop_emit("system", f"{reason} Context compacted. Notes: {compaction_notes}", adapter=adapter)
+        publish_snapshot(session_id, fork_context())  # /btw must not read the history that just overflowed
         if session_hook_context is not None and turn_type == "interactive_loop":  # a fork carries the main's
             # Earlier SessionStart context may be stale now; refresh it under its own key (REQ-2.4)
             await session_start("compact", session_hook_context, session_id=session_id, turn_id=turn_id,
@@ -265,7 +266,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     if context_token_threshold is not None and last_input_tokens > context_token_threshold:
         await compact("Token threshold exceeded.", keep_recent_token_budget)
 
-    with tracer.start_as_current_span("turn") as turn_span, _job_events(owner, adapter):
+    with tracer.start_as_current_span("turn") as turn_span, _job_events(owner, adapter), \
+            published_snapshot(session_id, enabled=turn_type == "interactive_loop"):
         turn_span.set_attribute("session_id", session_id)
         turn_span.set_attribute("turn_type", turn_type)
         turn_span.set_attribute("turn_id", turn_id)
@@ -288,6 +290,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     await append_note(format_notices(notices, max_tool_output_chars))
                 while inbox:  # send_message to this running subagent, oldest first (D10)
                     await append_note(inbox.pop(0))
+                # What a /btw side question reads while this turn runs (btw spec D3); main agent only
+                publish_snapshot(session_id, fork_context())
 
                 # Model call with classified retries and exponential backoff
                 interaction = None
@@ -299,13 +303,11 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     progress = StreamProgress()
                     try:
                         # Read per call: the mode can change mid-turn (Shift+Tab)
-                        plan_mode = ((permissions.mode if permissions else None) or getattr(config, "permission_mode", "ask")) == "plan"
+                        plan_mode = plan_mode_on(permissions, config)
                         interaction, model_span = await call_agent(
                             steps_history=working_history,
-                            system_instruction=dynamic_system_instruction
-                            + (f"\n\n{PLAN_MODE_INSTRUCTION}" if plan_mode else "")
-                            + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else "")
-                            + session_context_suffix(session_hook_context),
+                            system_instruction=compose_system_instruction(
+                                dynamic_system_instruction, plan_mode, compaction_notes, session_hook_context),
                             tool_names=tool_names,
                             stream=stream,
                         )
@@ -342,23 +344,11 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 if interaction is None:
                     return CANCELLED_TURN
 
-                usage_dict = None
-                usage = getattr(interaction, "usage", None)
+                usage_dict = build_usage_dict(interaction)  # None when the response has no usage
                 choices = getattr(interaction, "choices", None)
                 message = choices[0].message if choices else None
                 tool_calls = getattr(message, "tool_calls", None) if message else None
                 content = getattr(message, "content", None) if message else None
-
-                if usage:
-                    usage_dict = {
-                        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-                        # Prompt tokens read from the provider's prompt cache (0 if none / unsupported)
-                        "cached_tokens": getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0) or 0,
-                    }
-                    # USD from litellm's price table; None if unknown (the TUI then hides the cost)
-                    usage_dict["cost"] = call_cost(get_litellm_model(), usage_dict)
 
                 # close model_span exactly once, here, before any continue/return below
                 if model_span is not None and model_span.is_recording():

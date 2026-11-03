@@ -36,6 +36,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Project instructions** — `AGENTS.md` / `CLAUDE.md` from `~/.dostuff/`, the repo root and every folder down to the current one, combined
 - **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
 - **`ask_user`** — the agent asks you a real question — up to 4, with 2–4 options each, multi-select and a free-text "Other" — instead of guessing; the answers come back to it as one result and stay readable in `/resume`. See [Asking the user](#asking-the-user)
+- **`/btw` side questions** — ask about the conversation while a turn runs (or idle) without stopping or queuing it: one model call, no tools run, answered in a panel above the input and never added to the history; `f` hands the question to a background agent that can check it with tools. See [Side questions](#side-questions-btw)
 - **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
 - **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
@@ -194,6 +195,7 @@ In the TUI:
 | `/worktree [name]` / `/worktree exit` | Move the session into a new git worktree on branch `dostuff/<name>` / leave it (removed if unchanged, otherwise keep or remove) |
 | `/permissions [mode]` | Show or change the permission mode for this session (`ask`, `allowlist`, `auto`, `plan`) |
 | `/copy`       | Copy the model's last answer to the clipboard |
+| `/btw <question>` | Ask a side question about the conversation, even while a turn runs: answered in a panel above the input, without tools, never added to the history. See [Side questions](#side-questions-btw) |
 | `/notifications [on\|off\|bell\|osc9]` | Turn turn-finished / approval notifications on or off for this session (default from `ui.notifications`) |
 | `/model [<provider/model>] [--active]` | Pick a model: your saved ones (`models:` in config.yaml) first, then "More <provider> models…" for each provider's list (type to filter; Enter on no match uses what you typed). A model that isn't saved yet is added to `~/.dostuff/config.yaml`. A plain `/model` switch lasts only for this session; add `--active` (e.g. `/model --active`, or `/model anthropic/claude-sonnet-5-5 --active`) to make it the default that new sessions start with |
 | `/config [mcp] [project]` | Edit a settings file right in the TUI: pick `config.yaml` or the MCP servers, user (`~/.dostuff`) or project (`./.dostuff`), or name one (`/config mcp project`). `Ctrl+S` checks the file, saves it and applies it without a restart (an invalid file stays open with the error); `Esc` closes, twice if there are unsaved changes. A new file starts with every option commented out. `.env` files aren't offered |
@@ -413,6 +415,51 @@ A cancelled, refused or unavailable call renders as an ordinary tool result, wit
 go to stderr, and it reads one line per question (`2`, `1,3`, or free text; an empty line is `(no answer)`). There
 is no submit row, because a line reader has no way back. With piped stdin (or stderr redirected to a file) the tool
 is still listed but answers "No user is available in this run", and the model states an assumption and carries on.
+
+---
+
+## Side questions (`/btw`)
+
+A turn can run for minutes, and halfway through you may want to know something *about* it: which file it just
+edited, whether a test already exists, what you asked for. Typed into the input, that question would wait in the
+queue until the turn ends; `Esc` would stop the work. `/btw <question>` answers it now, while the turn keeps running:
+
+```
+╭──────────────────────────────────────────────────────────────────────────────────╮
+│ /btw — where does the retry happen?                                              │
+│ The retry loop is in call_agent, wrapped by classify_model_error; loop.py        │
+│ decides whether to compact or back off from its return value.                    │
+│ Esc/Enter/Space close · f fork out · c copy · ↑18.4k (18.2k cached) ↓61 ·        │
+│ $0.0021                                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────╯
+```
+
+The panel sits above the input and the conversation stays visible underneath. It shows `Asking…` until the answer
+arrives; `↑`/`↓` scroll a long one.
+
+- **No tools run.** The model sees the conversation up to the last completed step and answers from that alone, in
+  one response. If it asks for a tool or writes out a tool call instead, nothing runs and a note under the answer
+  says so.
+- **Nothing is written.** The question and the answer never enter the transcript, the session history, `/export` or
+  the next compaction, and their cost is not added to the session: it is shown in the panel's footer instead, with
+  the prompt-cache hits: the side call sends the turn's own system prompt and tools, so a provider with prompt
+  caching can serve most of it from the cache. Hooks don't fire for it either.
+- **No follow-up turns.** One question, one answer. Later `/btw`s in the same session see the earlier side questions
+  and answers (the last 20); `/clear`, `/resume` and `/fork` start a fresh side thread.
+
+Keys while the panel has focus: `Esc`, `Enter` or `Space` close it (Esc closes the panel, it does **not** cancel the
+turn), `c` copies the answer, and `f` forks it out. One side question at a time; a second `/btw` while one is still
+asking is refused. If an approval prompt or an `ask_user` question opens while the panel is up, the prompt takes the
+focus and the first `Esc`.
+
+**Fork out (`f`).** When the conversation isn't enough to answer, `f` starts a background `fork` agent with the
+question, the answer to check and the same view of the conversation the side question had. It runs with the main
+agent's tools in its own slot (`/agents` shows it), costs what any background agent costs, and its report comes back
+into the conversation like every background agent's. `Esc` on the main turn doesn't stop it. It is carried to the new
+session by `/clear` and `/resume`; `/fork` leaves it with the original session and says so.
+
+With no turn running, `/btw` works from the stored conversation and the last turn's system prompt. `dostuff -p` has
+no `/btw` (only skills and custom commands run there), so `/btw` in a `-p` prompt is ordinary text for the model.
 
 ---
 
@@ -708,6 +755,7 @@ nesting are the same. Tool names and some argument names differ, so rename the m
 | `Grep` / `Glob` | `grep` / `glob` | per tool |
 | `AskUserQuestion` | `ask_user` | `multiSelect` → `multi_select`; the answers come back as the tool's result |
 | `mcp__<server>__<tool>` | `call_mcp_tool` | server and tool are inside `tool_input` |
+| `/btw` | `/btw` | not a tool: a side question fires no hook (no `UserPromptSubmit`, `PreToolUse` or `Stop`) |
 
 Not supported yet: `http`, `prompt` and `agent` hook types, and the `Notification`, `PreCompact` and `SessionEnd`
 events.

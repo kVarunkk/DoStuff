@@ -393,3 +393,111 @@ class FakeTui:
 def fake_tui():
     """A `FakeTui` recording stub for the adapter's no-widget tests."""
     return FakeTui
+
+
+# --- /btw (plan/2026-11-03-btw/tasks.md) --------------------------------------------------------
+
+def make_fork_ctx(**overrides):
+    """A small `ForkContext`: a user step, an assistant tool call with its result, then an assistant answer."""
+    from dostuff.agent.subagents.fork import ForkContext
+    fields = dict(
+        system_instruction="SYS", compaction_notes="", tool_names=["read_file", "bash"], session_hook_context=None,
+        history=[
+            {"role": "user", "content": "fix the retry bug"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "name": "read_file", "tool_call_id": "c1", "content": "def retry(): ..."},
+            {"role": "assistant", "content": "Found it in a.py."},
+        ],
+    )
+    fields.update(overrides)
+    return ForkContext(**fields)
+
+
+@pytest.fixture
+def fork_ctx():
+    """`fork_ctx(**overrides) -> ForkContext`."""
+    return make_fork_ctx
+
+
+class FakeSpan:
+    def __init__(self, recording: bool = True):
+        self.recording = recording
+        self.ended = 0
+
+    def is_recording(self) -> bool:
+        return self.recording
+
+    def end(self) -> None:
+        self.ended += 1
+
+
+class SideCall:
+    """A scripted `call_agent` for the side call: records what it was given (deep-copied) and returns
+    `(response, span)` (`responses` in order, then `fake_response("ok")`), or raises `raise_exc`.
+    `gate` (an asyncio.Event) holds every call until it is set."""
+
+    def __init__(self, *responses, raise_exc=None, recording: bool = True, gate=None):
+        self.responses = list(responses)
+        self.raise_exc = raise_exc
+        self.recording = recording
+        self.gate = gate
+        self.calls: list[dict] = []
+        self.spans: list[FakeSpan] = []
+
+    async def __call__(self, steps_history, system_instruction, tool_names=None, stream=False):
+        import copy
+        self.calls.append({"steps_history": copy.deepcopy(steps_history), "system_instruction": system_instruction,
+                           "tool_names": copy.deepcopy(tool_names), "stream": stream})
+        if self.gate is not None:
+            await self.gate.wait()
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        span = FakeSpan(self.recording)
+        self.spans.append(span)
+        return (self.responses.pop(0) if self.responses else fake_response("ok")), span
+
+
+@pytest.fixture
+def side_call(monkeypatch):
+    """`side_call(*responses, raise_exc=…)`: install a `SideCall` where `answer_side_question` imports
+    `call_agent` from, and return it. A stub module in `sys.modules`, so the unit tests never load litellm."""
+    import types
+
+    def install(*responses, **kwargs) -> SideCall:
+        fake = SideCall(*responses, **kwargs)
+        module = sys.modules.get("dostuff.agent.call_agent")
+        if getattr(module, "_side_call_stub", False):  # this test's own stub, from an earlier install
+            monkeypatch.setattr(module, "call_agent", fake)
+        elif module is not None:
+            # loop.py binds `call_agent` by name on import: imported after this patch, a subagent's loop would get
+            # the fake. litellm is loaded already, so importing it now costs nothing.
+            import dostuff.agent.loop  # noqa: F401
+            monkeypatch.setattr(module, "call_agent", fake)
+        else:
+            stub = types.ModuleType("dostuff.agent.call_agent")
+            stub.call_agent = fake  # type: ignore[attr-defined]
+            stub._side_call_stub = True  # type: ignore[attr-defined]
+            monkeypatch.setitem(sys.modules, "dostuff.agent.call_agent", stub)
+        return fake
+    return install
+
+
+class FakeAgentRegistry:
+    """`start(**kwargs)` records the kwargs and returns a run with id `r1`, or raises `raise_exc`. Everything
+    else (listeners, `runs`) is the real registry's, so the app around it keeps working."""
+
+    def __init__(self, raise_exc=None):
+        self.raise_exc = raise_exc
+        self.started: list[dict] = []
+
+    def __getattr__(self, name):
+        from dostuff.agent.subagents.registry import get_agent_registry
+        return getattr(get_agent_registry(), name)
+
+    async def start(self, **kwargs):
+        from types import SimpleNamespace
+        self.started.append(kwargs)
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return SimpleNamespace(id="r1", run_id="r1")
