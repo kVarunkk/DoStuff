@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Side questions: `/btw <question>` asks about the conversation while a turn runs, without stopping or queuing it — one model call, no tools, answered in a panel above the input and never added to the history; `f` hands it to a background agent that can check with tools.
+
+### Added
+- **`/btw <question>`** works mid-turn and when idle. It is never queued and it does not interrupt the running turn. The model sees the conversation up to the last completed step, with the turn's own system prompt and tools, and answers in one response. No tool runs: if the model asks for one, a note under the answer says so.
+- **The panel** sits above the input and leaves the conversation visible. It shows `Asking…` until the answer arrives, and `↑`/`↓`/`PgUp`/`PgDn` scroll a long answer. The footer shows the call's tokens, prompt-cache hits and cost. `Esc`, `Enter` or `Space` close it (Esc closes the panel and does **not** cancel the turn), and `c` copies the answer. Only one side question runs at a time, and a second `/btw` while one is still asking is refused. An approval prompt or `ask_user` question that opens meanwhile takes the focus and the first `Esc`.
+- **Fork out (`f`)** starts a background `fork` agent with the question, the answer to check and the same view of the conversation. `/agents` shows it, and its report comes back into the conversation like any background agent's. `Esc` on the main turn does not stop it. `/clear` and `/resume` carry it to the new session; `/fork` leaves it with the original session and prints a line saying so.
+- Later `/btw`s in a session see the last 20 side questions and answers. `/clear`, `/resume` and `/fork` start a fresh side thread.
+- `/help` and the command menu list `/btw <question>`.
+
+### Changed
+- A side question never touches the session: its question and answer stay out of the transcript, the stored history, `/export` and compaction, and its cost is not added to the session total. Hooks do not fire for it (no `UserPromptSubmit`, `PreToolUse` or `Stop`).
+
+### Documentation
+- README "Side questions (`/btw`)" section (panel sketch, the keys, what the model sees, fork-out, `-p` has no `/btw`), a Features bullet, a TUI-controls row and a row in the hooks "Coming from Claude Code" table.
+
 ## [0.2.8] - 2026-11-03
 
 Structured questions: the agent can stop and ask you instead of guessing — up to 4 questions per call, 2–4 options each, multi-select and free text, answered in a panel in place of the input and returned as one parseable result.
