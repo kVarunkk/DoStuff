@@ -708,7 +708,6 @@ class AskUserPanel(Static, can_focus=True):
         self.submit_focused = False
         if self.is_mounted:
             self._render_panel()
-        self._land_on(0)  # a first question with no options takes the input at once (D6)
 
     def _options(self, index: int) -> list[dict]:
         return self.questions[index].get("options") or []
@@ -769,11 +768,10 @@ class AskUserPanel(Static, can_focus=True):
         self.submit_focused = True
 
     def _land_on(self, index: int) -> None:
-        """The cursor arrives at a question; a question with no options skips the panel and takes the input
-        at once (D6), so the user is never asked to press Enter on a bare `Other` row."""
+        """The cursor arrives at a question. A question with no options shows its single `Other` row rather
+        than taking the input: the panel came up with all the answers on screen, so moving onto one (or
+        landing on it after a pick) must never swallow them. Enter on that row asks for the input (D6)."""
         self.cursor_question, self.cursor_row, self.submit_focused = index, 0, False
-        if not self._options(index):
-            self.post_message(self.NeedsInput(index))
 
     # ── Rendering ──────────────────────────────────────────────────────────────
 
@@ -831,12 +829,20 @@ class AskUserPanel(Static, can_focus=True):
         line, style = self._submit_line()
         text.append("\n" + line, style=Style(color="#8ab4f8", bold=True) + Style(meta={"ask-submit": True})
                     if style.startswith("bold") else Style(dim=True, meta={"ask-submit": True}))
-        text.append("\n " + ASK_HINT, style="dim")
+        text.append("\n " + self._hint(), style="dim")
         self.update(text)
 
     def _render_quietly(self) -> None:
         if self.is_mounted:
             self._render_panel()
+
+    def _hint(self) -> str:
+        """The keys line. A free-text question's only row is `Other`, so say how to take the input from it;
+        the generic hint would leave Enter unexplained on that row."""
+        index = self.cursor_question
+        if not self.submit_focused and not self._options(index):
+            return "Enter or o types the answer · ←/→ change question · Esc cancel"
+        return ASK_HINT
 
     # ── Keys and clicks (D6 table) ─────────────────────────────────────────────
 
@@ -923,6 +929,12 @@ class AskUserPanel(Static, can_focus=True):
         elif key == "space" and self._multi(self.cursor_question):
             self.submit_focused = False  # a toggle is a row pick, from the submit row too
             self._record_row(self.cursor_row)
+        elif key == "o" and not self.submit_focused and self.cursor_row >= self._other_row(self.cursor_question):
+            # `o` is the deliberate way into a typed answer, for a free-text question whose panel is just
+            # its Other row. It always asks for the input — never the Enter row's toggle-off, which would
+            # throw a typed answer away when the user meant to edit it.
+            self.cursor_row = self._other_row(self.cursor_question)
+            self.post_message(self.NeedsInput(self.cursor_question))
         elif key.isdigit():
             number = int(key)
             if 1 <= number <= len(self._options(self.cursor_question)):
@@ -1576,6 +1588,10 @@ class DostuffTUI(App):
     #input > .text-area--cursor-line { background: transparent; }
     /* Ghost text: the theme's $text-muted is the terminal's plain foreground under ansi-dark */
     #input > .text-area--suggestion { color: #6a6a6a; }
+    /* The placeholder is where a handed-over input puts the question (ask-user D7) and where the denial
+       note asks for text. Textual's default is `$text 40%`, which an ANSI theme cannot blend, so it paints
+       plain white and reads as a real prompt. Dim it to the ghost text's grey, one step quieter than text. */
+    #input > .text-area--placeholder { color: #6a6a6a; }
     #status-row { height: 1; }
     #status { width: auto; height: 1; color: #8a8a8a; padding: 0 1; }
     #jobs-bar { width: auto; height: 1; display: none; padding: 0 1; }
@@ -3420,8 +3436,13 @@ class DostuffTUI(App):
         """The `Other` row: the input takes the typed answer and the panel waits for it (D6/REQ-4.3)."""
         question = self._ask_panel().questions[event.index]
         self.adapter.begin_other(event.index)
-        hint = _one_line_answer(question.get("question", "")) or "Type your answer (Enter sends, Esc cancels)"
-        self._hand_input_over(f"{ASK_OTHER_LABEL}: {hint}")
+        prompt = _one_line_answer(question.get("question", ""))
+        if not (question.get("options") or []):
+            # A free-text question's one row *is* "Other", so naming it in the placeholder would read
+            # "Other (type your own): Name the app?" — the question alone is clearer.
+            self._hand_input_over(prompt or "Type your answer (Enter sends, Esc cancels)")
+            return
+        self._hand_input_over(f"{ASK_OTHER_LABEL}: {prompt or 'Type your answer (Enter sends, Esc cancels)'}")
 
     def on_ask_user_panel_inert(self, event: AskUserPanel.Inert) -> None:
         panel = self._ask_panel()

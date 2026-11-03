@@ -378,8 +378,9 @@ question has an answer, then it brightens and the parenthetical hint goes away.
   `space` or its number, and the joined answer comes back in option order.
 - **`Other`** is always the last row, numbered after the options: pick it and the input takes a typed answer (a
   pasted block is collapsed to one line). A question with no options shows as just that row, so it still appears
-  in the tab strip; a call where *every* question is free text skips the panel entirely and the input takes each
-  answer in turn, with the last Enter as the submission.
+  in the tab strip; **Enter** (or `o`) on it takes the input, and `←`/`Tab` still move between questions — so
+  landing on a free-text question never traps you in the input. A call where *every* question is free text skips
+  the panel entirely and the input takes each answer in turn, with the last Enter as the submission.
 - **Esc** cancels the questions and ends the turn, like Esc on an approval prompt. **Ctrl+Q** / `/exit` with a
   question open cancel it first and then quit.
 - Up to 4 questions per call. The prompt tells the model when to ask: when the answer changes what it builds and
