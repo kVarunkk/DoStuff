@@ -358,20 +358,21 @@ the one tool that talks to you, it never needs approval, and subagents never get
 The questions arrive as a panel in place of the input:
 
 ```
- DB ✓ · Auth ▸
- ⚠ Which auth methods should the API support?
+ ✓ DB · ▌ Auth ·   Name
+   Which auth methods should the API support?
 ❯   1. JWT   stateless, no extra service
     2. OAuth   a provider to configure
     3. Other (type your own)
    ────────────────────────────────────────────────────────
-   ✔ Submit answers  (answer every question first)
+   Submit answers  (answer every question first)
  ↑/↓ select · Enter confirm · ←/→ change question · Esc cancel
 ```
 
-`DB ✓` means the first question is answered; `Auth ▸` is where you are. The submit row is dim until every
-question has an answer, then it brightens and the parenthetical hint goes away.
+The top line is the tab strip: `▌` marks the question you are on (bold and orange), `✓` marks one you have
+answered, and both sit in the same slot so the tabs never shift as you answer. The submit row is dim until
+every question has an answer, then it brightens and the parenthetical hint goes away.
 
-- **Nothing submits on one key.** A pick records the answer and moves to the next question; `✔ Submit answers` is
+- **Nothing submits on one key.** A pick records the answer and moves to the next question; `Submit answers` is
   the only thing that sends, and it stays inert (`answer every question first`) until every question has one.
   `←`/`Shift+Tab` goes back, so an earlier answer can be changed before submitting.
 - **`2-4` options, one line each**, with the trade-off where it matters. A multi-select question toggles with

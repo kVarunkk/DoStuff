@@ -3450,13 +3450,13 @@ def test_ask_panel_render(tui):
             assert app.focused is panel  # the panel owns the input while a question is open
             await pilot.pause()
             lines = str(panel.content).split("\n")
-            assert lines[0].strip() == "DB ▸ · Auth"
-            assert lines[1].strip() == "⚠ Which database should I use?"
+            assert lines[0].strip() == "▌ DB ·   Auth"
+            assert lines[1].strip() == "Which database should I use?"
             assert "1. Postgres" in lines[2] and "battle-tested" in lines[2]
             assert "2. SQLite" in lines[3] and "zero setup" in lines[3]
             assert lines[4].strip() == "3. Other (type your own)"
             assert set(lines[5].strip()) == {"─"}
-            assert "✔ Submit answers" in lines[6] and "answer every question first" in lines[6]
+            assert "Submit answers" in lines[6] and "answer every question first" in lines[6]
             assert "Esc cancel" in lines[7] and "Enter confirm" in lines[7]
             app.adapter.cancel_pending_ask()
             await _until(pilot, lambda: task.done())
@@ -3581,7 +3581,8 @@ def test_pick_records_and_advances(tui):
             assert panel.display and app.adapter.has_pending_ask()  # nothing submitted
             assert not task.done()
             assert panel.cursor_question == 1  # the next unanswered question
-            assert "DB ✓" in str(panel.content)  # the tab strip is the review
+            assert "✓ DB" in str(panel.content)  # the tab strip is the review
+            assert "▌ Auth" in str(panel.content)  # ...and marks where the cursor went
             await pilot.press("1")  # multi-select: a toggle, and the cursor stays for the next pick
             await pilot.pause()
             assert panel.answers()[1] == "JWT"
@@ -4486,6 +4487,63 @@ def test_o_key_takes_the_input_from_the_other_row(tui):
             await _until(pilot, lambda: inp.display)
             assert inp.display and not panel.display
             assert panel.answers() == ["Tiger", "SAML"], "o must not toggle the typed answer off"
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tab_strip_pads_and_marks_the_current_question(tui):
+    """The tab strip is the only thing that says which question you are on, so the current one is marked
+    twice: a few spaces of padding and the answer mark's slot are reserved on every tab so the tabs stay
+    aligned, and the mark itself is bold + orange. `✓` (a plain glyph, not an emoji) still means answered."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-tabs")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            three = [
+                {"question": "Which database?", "header": "DB",
+                 "options": [{"label": "SQLite"}, {"label": "Postgres"}]},
+                {"question": "Which auth?", "header": "Auth", "multi_select": True,
+                 "options": [{"label": "JWT"}, {"label": "OAuth"}]},
+                {"question": "Name the app?", "header": "Name"},
+            ]
+            task = _ask_questions(app, three)
+            await _until(pilot, lambda: panel.display)
+
+            first = str(panel.content).split("\n")[0]
+            assert first.strip() == "▌ DB ·   Auth ·   Name"
+            # the mark sits in a fixed slot before the label, so every tab is the same width
+            assert first.index("▌") < first.index("DB")
+            assert "▌ Auth" not in first  # the mark belongs to DB, not Auth
+
+            await pilot.press("tab")  # onto Auth without answering
+            await pilot.pause()
+            second = str(panel.content).split("\n")[0]
+            assert second.strip() == "DB · ▌ Auth ·   Name"
+            assert second.index("▌") > second.index("DB")
+            assert len(second) == len(first), (repr(second), repr(first))
+
+            # answering DB puts a ✓ in DB's slot, and the widths still do not change
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            await pilot.press("1")
+            await pilot.pause()
+            answered = str(panel.content).split("\n")[0]
+            assert answered.strip() == "✓ DB · ▌ Auth ·   Name", answered
+            assert len(answered) == len(first), (repr(answered), repr(first))
+
+            # No emoji: `⚠` (U+26A0) on the question line and `✔` (U+2714) on the submit row both have
+            # Emoji_Presentation, so terminals painted them in colour. `✓`/`▌`/`❯` are text glyphs and stay.
+            body = str(panel.content)
+            for emoji in ("\u26a0", "\u2714"):
+                assert emoji not in body, f"{emoji!r} is still in the panel"
+            assert not [ch for ch in body if ord(ch) >= 0x1F000], "a pictographic emoji slipped in"
+
             app.adapter.cancel_pending_ask()
             await _until(pilot, lambda: task.done())
             await app._cleanup_and_save_session()

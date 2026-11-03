@@ -578,7 +578,8 @@ def test_readme_documents_ask_user():
     assert "AskUserQuestion" in coming and "multi_select" in coming
     # (d) a section with the panel sketch and a real format_answers block, so docs and grammar cannot drift
     section = text[text.index("## Asking the user"):text.index("## Subagents")]
-    assert "✔ Submit answers" in section and "Other (type your own)" in section
+    assert "Submit answers" in section and "Other (type your own)" in section
+    assert "\u2714" not in section and "\u26a0" not in section  # no colour emoji in the sketch
     real = format_answers([("Which database should I use?", "Postgres"),
                            ("Which auth methods should the API support?", "JWT, OAuth")])
     for line in real.splitlines():

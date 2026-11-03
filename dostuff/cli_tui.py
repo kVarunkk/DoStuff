@@ -107,11 +107,14 @@ HISTORY_SEARCH_MAX = 500  # Ctrl+R: newest prompts offered
 SKILL_MENU_DESCRIPTION_CHARS = 100  # skill descriptions can be paragraphs; the "/" menu shows the start
 TODO_RESULT_PREFIX = "todo_write: "  # loop() emits results as "<tool>: <result>"
 ASK_RESULT_PREFIX = "ask_user: "  # its result is a few short "question → answer" lines, shown in full
-ASK_SUBMIT_LABEL = "✔ Submit answers"
+ASK_SUBMIT_LABEL = "Submit answers"
 ASK_HINT = "↑/↓ select · Enter confirm · ←/→ change question · Esc cancel"
 ASK_INERT_HINT = "answer every question first"
 ASK_OTHER_LABEL = "Other (type your own)"
 ASK_EMPTY_INPUT_HINT = "type an answer (Esc cancels the questions)"
+# The current question's tab: bold orange, plus the solid bar `_tabs` puts in front of it. No background:
+# under the ansi-dark theme a hex `on` colour snaps to black, which is invisible on a dark terminal.
+ASK_CURRENT_TAB = "bold #e5c07b"
 # Gemini sends reasoning as whole summary paragraphs ~1 s apart; each new chunk is typed out
 # over THOUGHT_REVEAL_TICKS ticks so it reads like streaming instead of popping in as a block
 THOUGHT_REVEAL_INTERVAL_S = 0.03
@@ -667,7 +670,7 @@ class AskUserPanel(Static, can_focus=True):
     it never talks to the adapter or to the tool (tasks.md open point 2).
 
     Nothing submits on a single keystroke: a pick only records the answer and moves on, and the call is
-    submitted from the `✔ Submit answers` row, which is inert until every question has an answer.
+    submitted from the `Submit answers` row, which is inert until every question has an answer.
     """
 
     class Submit(Message):
@@ -778,16 +781,28 @@ class AskUserPanel(Static, can_focus=True):
     def on_mount(self) -> None:
         self._render_panel()
 
-    def _tabs(self) -> str:
-        chips = []
+    def _tabs(self) -> Text:
+        """The tab strip (D6): one tab per question, the current one unmistakable.
+
+        The strip is the only thing that says which question you are on, so the current tab is bold orange
+        and carries a solid bar; an answered one carries `✓` in the same slot, so every tab is the same
+        width and the strip does not re-flow as answers land. Plain glyphs, never emoji: this line shares
+        its marks with the option rows' own `❯`/`✓`."""
+        text = Text()
         for i, question in enumerate(self.questions):
-            chip = _one_line_answer(question.get("header") or f"Q{i + 1}")
-            if self.answered(i):
-                chip += " ✓"
-            if i == self.cursor_question and not self.submit_focused:
-                chip += " ▸"
-            chips.append(chip)
-        return " " + " · ".join(chips)
+            if i:
+                text.append(" · ", style="dim")
+            here = i == self.cursor_question and not self.submit_focused
+            if here:
+                mark, mark_style = "▌ ", ASK_CURRENT_TAB
+            elif self.answered(i):
+                mark, mark_style = "✓ ", "bold #98c379"
+            else:
+                mark, mark_style = "  ", ""
+            text.append(mark, style=mark_style)
+            label = _one_line_answer(question.get("header") or f"Q{i + 1}")
+            text.append(label, style=ASK_CURRENT_TAB if here else "")
+        return text
 
     def _submit_line(self) -> tuple[str, str]:
         """(text, style) of the submit row: bright when it can submit, dim with the hint until then (D6)."""
@@ -820,8 +835,8 @@ class AskUserPanel(Static, can_focus=True):
             return
         width = max((self.content_size.width or self.app.size.width) - 4, 20)
         index = min(self.cursor_question, len(self.questions) - 1)
-        text = Text(self._tabs(), style="#8ab4f8")
-        text.append("\n ⚠ " + _one_line_answer(self.questions[index].get("question", "")), style="bold")
+        text = self._tabs()
+        text.append("\n   " + _one_line_answer(self.questions[index].get("question", "")), style="bold")
         rows = self._row_texts(index, width)
         start, end = _option_window(len(rows), min(self.cursor_row, len(rows) - 1))
         _append_option_rows(text, rows, self.cursor_row if not self.submit_focused else -1, start, end)
@@ -1514,7 +1529,7 @@ class TuiAdapter:
             self._resolve(ApprovalReply(parse_answer(text)))
 
     def got_ask_submit(self, answers: list[str]) -> None:
-        """The panel's `✔ Submit answers`: every question is answered, so the call resolves (D6)."""
+        """The panel's `Submit answers` row: every question is answered, so the call resolves (D6)."""
         self._resolve_ask(list(answers))
 
     def begin_other(self, index: int) -> None:
