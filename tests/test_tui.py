@@ -5243,3 +5243,169 @@ def test_btw_answer_survives_turn_cancel(btw_tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- /btw Phase 4: fork-out (plan/2026-11-03-btw/tasks.md T4.x) ---------------------------------------------------
+
+def test_btw_fork_out_starts_fork(btw_tui, monkeypatch):
+    from conftest import FakeAgentRegistry
+    from dostuff.helpers.agent.side_question import BTW_FORK_DESCRIPTION, TOOL_CALL_NOTE
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response('Probably a.py. {"name": "read_file", "arguments": {}}'))
+    fake = FakeAgentRegistry()
+    monkeypatch.setattr(cli_tui, "_agent_registry", lambda: fake)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-fork")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: held.gate is not None)
+            _submit(app, cli_tui, "/btw which file?")
+            panel = await _btw_answered(pilot, app)
+            used = panel.snapshot
+            assert used is held.snapshots[0]  # the live snapshot the side call read
+            await pilot.press("f")
+            await _until(pilot, lambda: not app._btw_open())
+            [kwargs] = fake.started
+            assert kwargs["owner"] == "btw-fork" and kwargs["agent_type"] == "fork"
+            assert kwargs["background"] is True and kwargs["description"] == BTW_FORK_DESCRIPTION
+            answer = f'Probably a.py. {{"name": "read_file", "arguments": {{}}}}\n\n{TOOL_CALL_NOTE}'
+            assert kwargs["prompt"] == f"which file?\n\nMy answer without tools was:\n{answer}\n\nGo and check it."
+            assert kwargs["fork"] is used  # not re-resolved at `f` time
+            assert cli_tui.BTW_HANDED_OFF in _texts(app)
+            assert app._turn_in_progress  # the main turn is untouched
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_twice(btw_tui, monkeypatch):
+    from conftest import FakeAgentRegistry
+    cli_tui, held, side_call = btw_tui
+    side_call()
+    gate = asyncio.Event()
+
+    class SlowRegistry(FakeAgentRegistry):
+        async def start(self, **kwargs):
+            self.started.append(kwargs)
+            await gate.wait()
+            return types.SimpleNamespace(id="r1")
+    fake = SlowRegistry()
+    monkeypatch.setattr(cli_tui, "_agent_registry", lambda: fake)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-twice")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw q")
+            await _btw_answered(pilot, app)
+            await pilot.press("f")
+            await _until(pilot, lambda: len(fake.started) == 1)
+            await pilot.press("f")
+            await pilot.pause(0.1)
+            assert len(fake.started) == 1
+            gate.set()
+            await _until(pilot, lambda: not app._btw_open())
+            assert len(fake.started) == 1 and not app._btw_forking
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_error_stays_open(btw_tui, monkeypatch):
+    from conftest import FakeAgentRegistry
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response("the answer"))
+    fake = FakeAgentRegistry(raise_exc=ValueError("a fork needs the main agent's conversation"))
+    monkeypatch.setattr(cli_tui, "_agent_registry", lambda: fake)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-fork-error")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/btw q")
+            panel = await _btw_answered(pilot, app)
+            for exc in (ValueError("a fork needs the main agent's conversation"), RuntimeError("queue full")):
+                fake.raise_exc = exc
+                await pilot.press("f")
+                await _until(pilot, lambda: str(exc) in panel.body_text)
+                assert app._btw_open() and not app._btw_forking
+                assert panel.body_text.startswith("the answer")  # the answer stays above the reason
+            assert len(fake.started) == 2  # the guard was reset after each failure
+            assert cli_tui.BTW_HANDED_OFF not in _texts(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_report_wakes(tui, agents, fake_model, side_call, monkeypatch):
+    """REQ-4.2: the real registry and the untouched notice path — the fork's report wakes the idle session and
+    arrives as a `<background-agent>` user step."""
+    from dostuff.helpers.agent.notices import get_notice_queue
+    import dostuff.agent.call_agent  # noqa: F401
+    cli_tui = tui
+    monkeypatch.setattr(cli_tui, "JOB_WAKE_DELAY_S", 0.3)
+    side_call(fake_response("my guess [F]"))
+    fake_model.script("[F]", fake_response("checked: it is a.py"))
+    woke: list[tuple[str, list[str]]] = []
+
+    async def wake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        woke.append((user_text, [n.id for n in get_notice_queue().drain(session_id)]))
+        return "handled"
+    monkeypatch.setattr(cli_tui, "agent_loop", wake_loop)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-wake")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            app.config.agents_wake_on_end = True
+            _submit(app, cli_tui, "/btw which file? [F]")
+            await _btw_answered(pilot, app)
+            await pilot.press("f")
+            await _until(pilot, lambda: bool(agents.runs("btw-wake")))
+            [run] = agents.runs("btw-wake")
+            await _until(pilot, lambda: run.status == "completed", tries=100)
+            await _until(pilot, lambda: bool(woke), tries=100)
+            text, ids = woke[0]
+            assert text.startswith(f'<background-agent id="{run.id}"') and ids == [run.id]
+            assert "checked: it is a.py" in text
+            fork_call = fake_model.calls_for("[F]")[0]["messages"]
+            assert "My answer without tools was:\nmy guess [F]" in fork_call[-1]["content"]
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_survives_esc(btw_tui, agents, fake_model):
+    """Esc on the main turn cancels foreground runs only: the fork-out keeps going (D8)."""
+    cli_tui, held, side_call = btw_tui
+    side_call(fake_response("guess [S]"))
+    gate = fake_model.gate("[S]", fake_response("report"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-esc-fork")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: held.gate is not None)
+            _submit(app, cli_tui, "/btw q [S]")
+            await _btw_answered(pilot, app)
+            await pilot.press("f")
+            await _until(pilot, lambda: bool(fake_model.calls_for("[S]")), tries=100)
+            [run] = agents.runs("btw-esc-fork")
+            await pilot.press("escape")  # the panel is closed: this cancels the main turn
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert run.status == "running"
+            gate.set()
+            await _until(pilot, lambda: run.status == "completed", tries=100)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

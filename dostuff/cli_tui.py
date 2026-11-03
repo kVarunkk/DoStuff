@@ -26,6 +26,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.actions import SkipAction
 from textual.binding import Binding
 from textual.worker import Worker, WorkerState
+from rich.console import Group
 from rich.style import Style
 from rich.text import Text
 from rich.markdown import Markdown as RichMarkdown
@@ -56,7 +57,8 @@ from dostuff.helpers.agent.model_cost import format_cost
 from dostuff.helpers.agent.notices import WAKE_LIMIT, agent_notice_line, fmt_agent_runtime, format_notices, get_notice_queue, parse_notices
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
 from dostuff.helpers.agent.side_question import (
-    add_exchange, answer_side_question, kept_prompt, plan_mode_on, snapshot as live_side_snapshot,
+    BTW_FORK_DESCRIPTION, BTW_FORK_PROMPT, add_exchange, answer_side_question, kept_prompt, plan_mode_on,
+    snapshot as live_side_snapshot,
 )
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
@@ -1023,6 +1025,14 @@ class BtwPanel(Vertical, can_focus=True):
         self.query_one("#btw-footer", Static).update(
             BTW_ANSWER_FOOTER + (f" · {usage_text}" if usage_text else ""))
 
+    def show_fork_error(self, message: str) -> None:
+        """A fork-out that could not start: said under the answer, which stays (REQ-4.1)."""
+        self.error = message
+        self.body_text = f"{self.answer.text}\n\n{message}" if self.answer is not None else message
+        self.query_one("#btw-body", Static).update(
+            Group(RichMarkdown(self.answer.text), Text(""), Text(message, style="#e06c75"))
+            if self.answer is not None else Text(message, style="#e06c75"))
+
     def show_error(self, message: str) -> None:
         """A failed call or fork-out: said here, never as a turn error in the transcript (D6)."""
         self.error = self.body_text = message
@@ -1833,6 +1843,7 @@ class DostuffTUI(App):
         # /btw (btw spec D5): this session's side thread as sent (question step, answer), and the call in flight
         self._side_exchanges: list[tuple[str, str]] = []
         self._btw_worker: Worker | None = None
+        self._btw_forking = False  # an `f` is starting its fork; a second press does nothing (D8)
 
     # ── Compose UI ─────────────────────────────────────────────────────────────
 
@@ -3800,6 +3811,31 @@ class DostuffTUI(App):
 
     def on_btw_panel_close(self, event: BtwPanel.Close) -> None:
         self._close_btw()
+
+    def on_btw_panel_fork_out(self, event: BtwPanel.ForkOut) -> None:
+        panel = self._btw_panel()
+        if self._btw_forking or panel.answer is None:
+            return
+        self._btw_forking = True
+        self._start_worker(self._btw_fork_out(panel.question, panel.answer.text, panel.snapshot), name="btw_fork")
+
+    async def _btw_fork_out(self, question: str, answer: str, snap: ForkContext | None) -> None:
+        """`f`: the same question, the answer to check and the *same* snapshot to a background `fork` agent. Its
+        report comes back by the ordinary notice path, as a user step in the transcript (D8)."""
+        panel = self._btw_panel()
+        try:
+            await _agent_registry().start(
+                owner=self.session_id, agent_type="fork", background=True, description=BTW_FORK_DESCRIPTION,
+                prompt=BTW_FORK_PROMPT.format(question=question, answer=answer), fork=snap,
+                mcp_client=self.mcp_client, adapter=self.adapter, permissions=self.permissions,
+            )
+        except Exception as e:  # ValueError for a missing snapshot, anything else from start: the panel stays
+            panel.show_fork_error(f"Could not hand it to a background agent: {e}")
+            return
+        finally:
+            self._btw_forking = False
+        self._close_btw()
+        self._append(BTW_HANDED_OFF, msg_type="system")
 
     def on_btw_panel_copy(self, event: BtwPanel.Copy) -> None:
         answer = self._btw_panel().answer

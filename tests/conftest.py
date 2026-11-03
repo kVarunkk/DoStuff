@@ -468,6 +468,9 @@ def side_call(monkeypatch):
         fake = SideCall(*responses, **kwargs)
         module = sys.modules.get("dostuff.agent.call_agent")
         if module is not None:
+            # loop.py binds `call_agent` by name on import: imported after this patch, a subagent's loop would get
+            # the fake. litellm is loaded already, so importing it now costs nothing.
+            import dostuff.agent.loop  # noqa: F401
             monkeypatch.setattr(module, "call_agent", fake)
         else:
             stub = types.ModuleType("dostuff.agent.call_agent")
@@ -478,11 +481,16 @@ def side_call(monkeypatch):
 
 
 class FakeAgentRegistry:
-    """`start(**kwargs)` records the kwargs and returns a run with id `r1`, or raises `raise_exc`."""
+    """`start(**kwargs)` records the kwargs and returns a run with id `r1`, or raises `raise_exc`. Everything
+    else (listeners, `runs`) is the real registry's, so the app around it keeps working."""
 
     def __init__(self, raise_exc=None):
         self.raise_exc = raise_exc
         self.started: list[dict] = []
+
+    def __getattr__(self, name):
+        from dostuff.agent.subagents.registry import get_agent_registry
+        return getattr(get_agent_registry(), name)
 
     async def start(self, **kwargs):
         from types import SimpleNamespace

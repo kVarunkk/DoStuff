@@ -23,6 +23,7 @@ from dostuff.agent.subagents.fork import ForkContext
 
 BTW_MAX_EXCHANGES = 20  # past side questions replayed into the next one (D5); oldest dropped
 BTW_FORK_DESCRIPTION = "answer a side question"  # a fork-out's run description; tells it from a model-started fork
+BTW_FORK_PROMPT = "{question}\n\nMy answer without tools was:\n{answer}\n\nGo and check it."  # `f` on the panel (D8)
 
 SIDE_QUESTION_PROMPT = (
     "[Side question from the user, asked while you work. It is not a new task: answer it and nothing else.]\n"
