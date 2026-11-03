@@ -130,6 +130,15 @@ def test_emit_after_exit_is_dropped(tui):
 
 
 async def _until(pilot, cond, tries=60):
+    """Poll until `cond` holds, pausing between tries.
+
+    For a prompt taking the input (approval, ask-user panel) wait for `widget.display and app.focused is
+    widget`, never `widget.display` alone: `_show_ask_panel` sets `display` synchronously but focuses it in
+    `call_after_refresh`, because a widget cannot take focus before it is laid out. Between the two there is
+    a real frame where the prompt is on screen and the (hidden) input still has focus — on a slow runner
+    that frame is long enough to observe, and keys pressed in it go nowhere. `test_ask_panel_render` failed
+    exactly there on CI's windows/3.11 while passing locally.
+    """
     for _ in range(tries):
         await pilot.pause(0.05)
         if cond():
@@ -3446,7 +3455,7 @@ def test_ask_panel_render(tui):
             assert panel.is_mounted and not panel.display  # composed hidden, never mounted per question
             assert len(app.query("#ask-panel")) == 1
             task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             assert app.focused is panel  # the panel owns the input while a question is open
             await pilot.pause()
             lines = str(panel.content).split("\n")
@@ -3478,7 +3487,7 @@ def test_ask_panel_keys(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             task = _ask_questions(app, [many, AUTH_QUESTION, DB_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.pause()
 
             # the list is longer than the panel: the markers and the cursor window are the picker's
@@ -3546,12 +3555,12 @@ def test_ask_panel_reused_hides_and_shows(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             first = _ask_questions(app, [DB_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("1", "tab", "enter")
             await _until(pilot, lambda: first.done())
             assert not panel.display and app.query_one("#input", cli_tui.EnterSubmits).display
             second = _ask_questions(app, [AUTH_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             assert app.query_one("#ask-panel", cli_tui.AskUserPanel) is panel  # never mounted again
             assert panel.answers() == [None]  # the previous call's answers are gone
             assert "DB" not in str(panel.content)  # ...and its tab strip too
@@ -3574,7 +3583,7 @@ def test_pick_records_and_advances(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("1")
             await pilot.pause()
             assert panel.answers()[0] == "Postgres"
@@ -3604,7 +3613,7 @@ def test_submit_row_inert_until_answered(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("1")  # only question 1 answered: auto-advance put the cursor on question 2
             await pilot.pause()
             await pilot.press("tab")  # past the last question: the submit row
@@ -3639,7 +3648,7 @@ def test_change_an_answer_before_submitting(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             task = _ask_questions(app, [DB_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("1")
             await pilot.pause()
             assert panel.answers() == ["Postgres"]
@@ -3673,7 +3682,7 @@ def test_single_question_still_needs_submit(tui):
                 captures.append(result)
                 return result
             task = asyncio.ensure_future(ask())
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("1")
             await pilot.pause()
             assert not captures and not task.done()  # 0 resolutions after the pick
@@ -3697,7 +3706,7 @@ def test_submit_row_click(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             task = _ask_questions(app, [DB_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.pause()
             # the submit row is 4 rows down from the panel's top: border, tabs, question, 3 rows, separator
             await pilot.click("#ask-panel", offset=(6, 7))
@@ -3723,7 +3732,7 @@ def test_multi_select_toggles(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             task = _ask_questions(app, [AUTH_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("2")  # OAuth first...
             await pilot.pause()
             assert panel.answers() == ["OAuth"]
@@ -3762,7 +3771,7 @@ def test_multi_select_with_other(tui):
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
             task = _ask_questions(app, [AUTH_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("1")  # JWT
             await pilot.pause()
             await pilot.press("3")  # the Other row
@@ -3779,7 +3788,7 @@ def test_multi_select_with_other(tui):
 
             # Other alone is just the typed text (open point 3)
             panel_task = _ask_questions(app, [AUTH_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("3")
             await pilot.pause()
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("saml"))
@@ -3804,7 +3813,7 @@ def test_other_takes_the_input(tui):
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
             task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("3")
             await pilot.pause()
             assert not panel.display and inp.display and app.focused is inp
@@ -3875,7 +3884,7 @@ def test_mixed_call_hands_the_input_over(tui):
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
             task = _ask_questions(app, [DB_QUESTION, {"question": "Name the app?", "header": "Name"}])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("1")  # Postgres → advance to the free-text question, panel still up
             await pilot.pause()
             assert panel.display and not inp.display
@@ -3906,7 +3915,7 @@ def test_empty_input_keeps_the_question(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             task = _ask_questions(app, [DB_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("3")  # Other
             await pilot.pause()
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("   "))
@@ -3951,7 +3960,7 @@ def test_esc_mid_question(tui):
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
             task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("1")
             await pilot.pause()
             assert panel.answers()[0] == "Postgres"
@@ -3979,7 +3988,7 @@ def test_esc_while_typing_other(tui):
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
             task = _ask_questions(app, [DB_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("3")
             await pilot.pause()
             assert inp.display and inp.has_class("feedback-mode")
@@ -4008,7 +4017,7 @@ def test_ctrl_q_mid_question(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             task = _ask_questions(app, [DB_QUESTION])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("ctrl+q")
             await _until(pilot, lambda: bool(exited), tries=200)
             assert task.done() and task.result() is None  # resolved, not cancelled by the event loop
@@ -4384,7 +4393,7 @@ def test_free_text_question_does_not_take_the_input_by_surprise(tui):
             inp = app.query_one("#input", cli_tui.EnterSubmits)
             question = {"question": "Name the app?", "header": "Name"}
             task = _ask_questions(app, [DB_QUESTION, question])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
 
             # Tab onto it without answering: the panel stays, the input stays hidden
             await pilot.press("tab")
@@ -4430,7 +4439,7 @@ def test_auto_advance_onto_a_free_text_question_keeps_the_panel(tui):
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
             task = _ask_questions(app, [DB_QUESTION, {"question": "Name the app?", "header": "Name"}])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
             await pilot.press("1")  # Postgres, then the advance must not take the input
             await pilot.pause()
             assert panel.display and not inp.display
@@ -4456,7 +4465,7 @@ def test_o_key_takes_the_input_from_the_other_row(tui):
             multi = {"question": "Which auth?", "header": "Auth", "multi_select": True,
                      "options": [{"label": "JWT"}, {"label": "OAuth"}]}
             task = _ask_questions(app, [{"question": "Name the app?", "header": "Name"}, multi])
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
 
             # a free-text question: o takes the input, Enter records it, the panel comes back
             await pilot.press("o")
@@ -4513,7 +4522,7 @@ def test_tab_strip_pads_and_marks_the_current_question(tui):
                 {"question": "Name the app?", "header": "Name"},
             ]
             task = _ask_questions(app, three)
-            await _until(pilot, lambda: panel.display)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
 
             first = str(panel.content).split("\n")[0]
             assert first.strip() == "▌ DB ·   Auth ·   Name"
