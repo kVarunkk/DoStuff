@@ -130,6 +130,15 @@ def test_emit_after_exit_is_dropped(tui):
 
 
 async def _until(pilot, cond, tries=60):
+    """Poll until `cond` holds, pausing between tries.
+
+    For a prompt taking the input (approval, ask-user panel) wait for `widget.display and app.focused is
+    widget`, never `widget.display` alone: `_show_ask_panel` sets `display` synchronously but focuses it in
+    `call_after_refresh`, because a widget cannot take focus before it is laid out. Between the two there is
+    a real frame where the prompt is on screen and the (hidden) input still has focus — on a slow runner
+    that frame is long enough to observe, and keys pressed in it go nowhere. `test_ask_panel_render` failed
+    exactly there on CI's windows/3.11 while passing locally.
+    """
     for _ in range(tries):
         await pilot.pause(0.05)
         if cond():
@@ -3157,4 +3166,1395 @@ def test_picker_keeps_a_scrolled_up_transcript_in_place(tui):
             await pilot.pause()
             assert messages.scroll_y == 10
             await app._cleanup_and_save_session()
+    asyncio.run(scenario())
+
+
+# --- ask_user Phase 0: the approval contract is pinned before anything changes (CON-005) ---------
+
+def _params(fn):
+    """(name, default) per parameter (without `self`); None means required."""
+    import inspect
+    return [(p.name, None if p.default is inspect.Parameter.empty else p.default)
+            for p in inspect.signature(fn).parameters.values() if p.name != "self"]
+
+
+def test_pin_approval_surface(tui):
+    """ask_user is a new, separate channel: the approval surface keeps its signatures and behaviour."""
+    import dataclasses
+    cli_tui = tui
+    from dostuff.agent.permissions import ApprovalReply
+    from dostuff.headless import HeadlessAdapter
+
+    assert _params(cli_tui.TuiAdapter.ask) == [("message", None), ("always_label", ""), ("background", False)]
+    assert _params(cli_tui.TuiAdapter.ask_batch) == [
+        ("messages", None), ("always_label", ""), ("background", False)]
+    assert _params(cli_tui.TuiAdapter.ask_trust) == [("message", None)]
+    assert _params(cli_tui.TuiAdapter.confirm) == [
+        ("details", None), ("question", None), ("yes", None), ("no", None)]
+    assert _params(HeadlessAdapter.ask) == [("message", None), ("always_label", ""), ("background", False)]
+
+    assert [f.name for f in dataclasses.fields(ApprovalReply)] == ["answer", "feedback"]
+    assert dataclasses.fields(ApprovalReply)[1].default == ""
+    assert cli_tui.PermissionPrompt.SHORTCUTS == {"y": "yes", "a": "always", "n": "no"}
+    assert cli_tui.PermissionPrompt.ALLOW_SELECT is False
+
+    # has_pending_confirm() stays approval-only once a second prompt type exists (asserted again in T3.1)
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin-approval")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.adapter.has_pending_confirm() is False
+            replies = []
+
+            async def ask():
+                replies.append(await app.adapter.ask("Write a.txt", always_label="file writes"))
+            app.run_worker(ask())
+            await _until(pilot, lambda: app.adapter.has_pending_confirm())
+            app.adapter.choose("yes")
+            await _until(pilot, lambda: replies)
+            assert replies == [ApprovalReply("yes")]
+            assert app.adapter.has_pending_confirm() is False
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_pin_approval_prompt_still_picks(tui):
+    """test_permission_selector's behaviour, once through the pin name: a Phase 4 panel change that
+    touched the approval widget fails here first."""
+    cli_tui = tui
+    from dostuff.agent.permissions import ApprovalReply
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin-picks")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            replies = []
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+
+            async def ask():
+                replies.append(await app.adapter.ask("Write a.txt", always_label="file writes"))
+
+            # A number key picks that option at once
+            app.run_worker(ask())
+            await _until(pilot, lambda: app.query("#permission-prompt"))
+            assert not inp.display
+            await pilot.press("1")
+            await _until(pilot, lambda: replies)
+            assert replies[-1] == ApprovalReply("yes")
+            assert inp.display
+
+            # y allows, n asks for feedback that goes back with the denial
+            app.run_worker(ask())
+            await _until(pilot, lambda: app.query("#permission-prompt"))
+            await pilot.press("y")
+            await _until(pilot, lambda: len(replies) == 2)
+            assert replies[-1] == ApprovalReply("yes")
+
+            app.run_worker(ask())
+            await _until(pilot, lambda: app.query("#permission-prompt"))
+            await pilot.press("n")
+            await _until(pilot, lambda: inp.has_class("feedback-mode"))
+            inp.text = "use edit_file instead"
+            await pilot.press("enter")
+            await _until(pilot, lambda: len(replies) == 3)
+            assert replies[-1] == ApprovalReply("no", feedback="use edit_file instead")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def _message_lines(app) -> list[str]:
+    """Every message widget's rendered plain text, one per message (wrapped lines joined with a space)."""
+    lines = []
+    for w in app.query("#msg-container Static"):
+        rendered = w.render() if hasattr(w, "render") else getattr(w, "content", "")
+        text = rendered.plain if hasattr(rendered, "plain") else str(rendered)
+        lines.append(text.replace("\n", " "))
+    return lines
+
+
+def test_pin_transcript_without_ask_user(tui):
+    """CON-007: a stored session with no ask_user step renders byte-identically after Phase 5.
+
+    The message lines are pinned to `snapshots/transcript_no_ask_user.txt` (one per message, written from
+    today's output)."""
+    import json
+    cli_tui = tui
+    snapshot = json.loads((Path(__file__).parent / "snapshots" / "old_delegate_session.json").read_text("utf-8"))
+    expected_file = Path(__file__).parent / "snapshots" / "transcript_no_ask_user.txt"
+
+    async def scenario() -> list[str]:
+        app = cli_tui.DostuffTUI(session_id="pin-transcript")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            for step in snapshot:
+                await app.store.append("old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume old"))
+            await _until(pilot, lambda: app.session_id == "old", tries=200)
+            await pilot.pause(0.3)
+            lines = _message_lines(app)
+            idx = max(i for i, t in enumerate(lines) if "Where is auth handled?" in t)
+            await app._cleanup_and_save_session()
+            return lines[idx:]
+
+    lines = asyncio.run(scenario())
+    assert lines == expected_file.read_text(encoding="utf-8").splitlines()
+
+
+# --- ask-user T3.2: the input answers a question, and the three gates (REQ-3.1, D7) ----------------
+
+def _ask_question(app, questions):
+    """Start an `ask_user` call the way the tool does, and return its task."""
+    return asyncio.ensure_future(app.adapter.ask_user(questions))
+
+
+def test_typed_text_answers_the_question(tui):
+    """A free-text question takes the input: typed text is the answer, never a new prompt."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert not app._turn_in_progress
+            task = _ask_question(app, [{"question": "Name the app?", "options": [], "header": "Q1"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            assert app.query_one("#input", cli_tui.EnterSubmits).has_class("feedback-mode")
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("Tiger"))
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Name the app?", "Tiger")]
+            assert not app._turn_in_progress  # no turn started under the question
+            assert not app.adapter.has_pending_ask()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            assert not inp.has_class("feedback-mode") and inp.placeholder == ""
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_empty_enter_keeps_the_question(tui):
+    """Open point 4: an empty Enter records nothing; Esc is the way out."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-empty")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            task = _ask_question(app, [{"question": "Name the app?"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(""))
+            await pilot.pause()
+            assert app.adapter.has_pending_ask() and not task.done()
+            assert "type an answer" in (app.query_one("#input", cli_tui.EnterSubmits).border_title or "")
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            assert task.result() is None
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_esc_cancels_question(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-esc")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            task = _ask_question(app, [{"question": "Name the app?"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await app.action_cancel()
+            await _until(pilot, lambda: task.done())
+            assert task.result() is None
+            assert not app.adapter.has_pending_ask()
+            assert app.adapter._cancelled  # Esc still ends the turn, as on an approval
+            assert app._title_state != "waiting"
+            app.adapter._cancelled = False
+            app.adapter._cancel_event.clear()
+            # idle again: Esc goes back to the "nothing to cancel" path
+            await app.action_cancel()
+            await _until(pilot, lambda: str(app.query_one("#input", cli_tui.EnterSubmits).border_title) == cli_tui.QUIT_HINT)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_r_blocked_during_question(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-ctrlr")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            task = _ask_question(app, [{"question": "Name the app?"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            app.action_history_search()
+            await pilot.pause()
+            assert not app._picker_open()  # no history picker on top of the question
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_gate_is_approval_only(tui, monkeypatch):
+    """`has_pending_confirm()` keeps its approval-only meaning; the app asks `has_pending_prompt()`."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-gate")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            task = _ask_question(app, [{"question": "Name the app?"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            assert app.adapter.has_pending_prompt() and not app.adapter.has_pending_confirm()
+            seen = []
+            monkeypatch.setattr(app.adapter, "has_pending_prompt", lambda: seen.append(1) or True)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("Tiger"))
+            assert seen, "the input gate must ask has_pending_prompt()"
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Name the app?", "Tiger")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- ask-user Phase 4: the panel (REQ-4.1 - REQ-4.4, D6) -----------------------------------------
+
+def _ask_questions(app, questions):
+    """An `ask_user` call as the tool makes it; the panel it drives is `#ask-panel`."""
+    return asyncio.ensure_future(app.adapter.ask_user(questions))
+
+
+DB_QUESTION = {
+    "question": "Which database should I use?",
+    "header": "DB",
+    "options": [{"label": "Postgres", "description": "battle-tested, but another service to run"},
+                {"label": "SQLite", "description": "zero setup, single file, no concurrent writers"}],
+}
+AUTH_QUESTION = {
+    "question": "Which auth methods?",
+    "header": "Auth",
+    "multi_select": True,
+    "options": [{"label": "JWT"}, {"label": "OAuth"}],
+}
+
+
+def test_ask_panel_render(tui):
+    """`#ask-panel` is composed once and hidden; shown, it is the tab strip, the question, the numbered
+    options with one-row descriptions, `Other` last, the separator, the submit row and the hint."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-render")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            assert panel.is_mounted and not panel.display  # composed hidden, never mounted per question
+            assert len(app.query("#ask-panel")) == 1
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            assert app.focused is panel  # the panel owns the input while a question is open
+            await pilot.pause()
+            lines = str(panel.content).split("\n")
+            assert lines[0].strip() == "▌ DB ·   Auth"
+            assert lines[1].strip() == "Which database should I use?"
+            assert "1. Postgres" in lines[2] and "battle-tested" in lines[2]
+            assert "2. SQLite" in lines[3] and "zero setup" in lines[3]
+            assert lines[4].strip() == "3. Other (type your own)"
+            assert set(lines[5].strip()) == {"─"}
+            assert "Submit answers" in lines[6] and "answer every question first" in lines[6]
+            assert "Esc cancel" in lines[7] and "Enter confirm" in lines[7]
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ask_panel_keys(tui):
+    """`↓`/`j`/`↑`/`k` move and wrap; `1`-`9` pick; `Tab`/`→` next question or the submit row;
+    `Shift+Tab`/`←` back; a click picks the row; long lists scroll with the picker's markers."""
+    cli_tui = tui
+    many = {"question": "Pick one", "header": "Many",
+            "options": [{"label": f"option {i}"} for i in range(1, 13)]}
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-keys")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [many, AUTH_QUESTION, DB_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.pause()
+
+            # the list is longer than the panel: the markers and the cursor window are the picker's
+            assert "↓ 3 more" in str(panel.content)  # 13 rows, the picker's 10 visible
+            assert "↑ " not in str(panel.content)  # nothing has scrolled off the top yet
+            for _ in range(7):
+                await pilot.press("down")
+            assert panel.cursor_row == 7 and "↑ 2 more" in str(panel.content)
+            await pilot.press("up", "up")
+            assert panel.cursor_row == 5
+            await pilot.press("k")
+            assert panel.cursor_row == 4
+            await pilot.press("j")
+            assert panel.cursor_row == 5
+
+            # wrap at both ends, counting the `Other` row
+            panel.cursor_row = 0
+            await pilot.press("up")
+            assert panel.cursor_row == len(many["options"])  # the Other row, wrapped from the top
+            await pilot.press("down")
+            assert panel.cursor_row == 0
+
+            # a number picks that row (single-select records and auto-advances)
+            await pilot.press("2")
+            await pilot.pause()
+            assert panel.answers()[0] == "option 2"
+            assert panel.cursor_question == 1  # the next unanswered question
+
+            # Tab / right move on, shift+tab / left come back, Tab on the last one goes to the submit row
+            await pilot.press("tab")
+            assert panel.cursor_question == 2
+            await pilot.press("shift+tab")
+            assert panel.cursor_question == 1
+            await pilot.press("right")
+            assert panel.cursor_question == 2
+            await pilot.press("left")
+            assert panel.cursor_question == 1
+            await pilot.press("2", "right", "right")
+            assert panel.submit_focused  # past the last question
+            await pilot.press("left")
+            assert panel.cursor_question == 2 and not panel.submit_focused
+
+            # a click picks the row under the pointer (one border row above the tab strip, then the question)
+            app._show_ask_panel([DB_QUESTION])
+            await pilot.pause()
+            await _until(pilot, lambda: panel.cursor_question == 0 and not panel.answers()[0])
+            await pilot.click("#ask-panel", offset=(6, 4))  # the second option's row
+            await pilot.pause()
+            assert panel.answers() == ["SQLite"]
+
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ask_panel_reused_hides_and_shows(tui):
+    """Two consecutive calls use the same widget instance, and it is hidden in between."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-reuse")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            first = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1", "tab", "enter")
+            await _until(pilot, lambda: first.done())
+            assert not panel.display and app.query_one("#input", cli_tui.EnterSubmits).display
+            second = _ask_questions(app, [AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            assert app.query_one("#ask-panel", cli_tui.AskUserPanel) is panel  # never mounted again
+            assert panel.answers() == [None]  # the previous call's answers are gone
+            assert "DB" not in str(panel.content)  # ...and its tab strip too
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: second.done())
+            assert first.result() == [("Which database should I use?", "Postgres")]
+            assert second.result() is None
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_pick_records_and_advances(tui):
+    """A pick records the answer and stays open: the cursor moves to the next unanswered question (D6)."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-pick")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")
+            await pilot.pause()
+            assert panel.answers()[0] == "Postgres"
+            assert panel.display and app.adapter.has_pending_ask()  # nothing submitted
+            assert not task.done()
+            assert panel.cursor_question == 1  # the next unanswered question
+            assert "✓ DB" in str(panel.content)  # the tab strip is the review
+            assert "▌ Auth" in str(panel.content)  # ...and marks where the cursor went
+            await pilot.press("1")  # multi-select: a toggle, and the cursor stays for the next pick
+            await pilot.pause()
+            assert panel.answers()[1] == "JWT"
+            assert panel.cursor_question == 1 and not task.done()
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_submit_row_inert_until_answered(tui):
+    """The submit row is dim with the hint until every question is answered; Enter there only flashes it."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-inert")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")  # only question 1 answered: auto-advance put the cursor on question 2
+            await pilot.pause()
+            await pilot.press("tab")  # past the last question: the submit row
+            await pilot.pause()
+            assert panel.submit_focused
+            assert "answer every question first" in str(panel.content)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not task.done() and app.adapter.has_pending_ask()  # Enter resolved nothing
+            hint = app.query_one("#input", cli_tui.EnterSubmits).border_title or ""
+            assert "answer every question first" in hint or "answer every" in str(hint)
+            await pilot.press("1")  # answer question 2 from the submit row
+            await pilot.pause()
+            assert panel.all_answered()
+            assert "answer every question first" not in str(panel.content)
+            await pilot.press("tab", "enter")
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Which database should I use?", "Postgres"), ("Which auth methods?", "JWT")]
+            assert not panel.display
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_change_an_answer_before_submitting(tui):
+    """`←` back to a question and pick again: single-select replaces, and the result carries one pair."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-change")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")
+            await pilot.pause()
+            assert panel.answers() == ["Postgres"]
+            await pilot.press("left")  # back to the only question
+            await pilot.pause()
+            assert panel.cursor_question == 0 and not panel.submit_focused
+            await pilot.press("2")
+            await pilot.pause()
+            assert panel.answers() == ["SQLite"]  # replaced, not appended
+            await pilot.press("tab", "enter")
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Which database should I use?", "SQLite")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_single_question_still_needs_submit(tui):
+    """One question, one pick: the call is not resolved until the submit row (open question: no auto-submit)."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-single")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            captures: list = []
+
+            async def ask():
+                result = await app.adapter.ask_user([DB_QUESTION])
+                captures.append(result)
+                return result
+            task = asyncio.ensure_future(ask())
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")
+            await pilot.pause()
+            assert not captures and not task.done()  # 0 resolutions after the pick
+            assert panel.submit_focused  # the only question is answered, so the cursor is on the submit row
+            await pilot.press("enter")
+            await _until(pilot, lambda: bool(captures))
+            assert len(captures) == 1  # 1 after the submit
+            assert captures[0] == [("Which database should I use?", "Postgres")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_submit_row_click(tui):
+    """Clicking the submit row (bright, every question answered) submits; clicking it while inert does not."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-click-submit")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.pause()
+            # the submit row is 4 rows down from the panel's top: border, tabs, question, 3 rows, separator
+            await pilot.click("#ask-panel", offset=(6, 7))
+            await pilot.pause()
+            assert not task.done()  # inert: no question answered yet
+            await pilot.press("1")  # auto-advance puts the cursor on the submit row
+            await pilot.pause()
+            await pilot.click("#ask-panel", offset=(6, 7))
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Which database should I use?", "Postgres")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_multi_select_toggles(tui):
+    """`space` and the number key toggle (not replace); submit joins in option order, never pick order."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-multi")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("2")  # OAuth first...
+            await pilot.pause()
+            assert panel.answers() == ["OAuth"]
+            await pilot.press("1")  # ...then JWT: still option order
+            await pilot.pause()
+            assert panel.answers() == ["JWT, OAuth"]
+            assert panel.cursor_question == 0 and not panel.submit_focused  # a toggle stays put
+            # the rows show the toggles in place, and the order never changes
+            rows = [line for line in str(panel.content).split("\n") if "1. JWT" in line or "2. OAuth" in line]
+            assert "✓ 1. JWT" in rows[0] and "✓ 2. OAuth" in rows[1]
+            # a second press toggles it off, with space too
+            await pilot.press("1")
+            await pilot.pause()
+            assert panel.answers() == ["OAuth"]
+            panel.cursor_row = 1
+            await pilot.press("space")
+            await pilot.pause()
+            assert panel.answers() == [None]
+            await pilot.press("2", "1", "tab", "enter")
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Which auth methods?", "JWT, OAuth")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_multi_select_with_other(tui):
+    """`JWT` + a typed `my own` → `JWT, my own` (typed last, D5); toggling Other off drops it; Other alone is
+    just the typed text."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-multi-other")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            task = _ask_questions(app, [AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")  # JWT
+            await pilot.pause()
+            await pilot.press("3")  # the Other row
+            await pilot.pause()
+            assert not panel.display and inp.display and inp.has_class("feedback-mode")
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("my own"))
+            await pilot.pause()
+            assert panel.display and not inp.display and app.focused is panel
+            assert panel.answers() == ["JWT, my own"]
+            assert "✓ 3. Other (type your own)" in str(panel.content)
+            await pilot.press("3", "tab", "enter")  # Other off again
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Which auth methods?", "JWT")]
+
+            # Other alone is just the typed text (open point 3)
+            panel_task = _ask_questions(app, [AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("3")
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("saml"))
+            await pilot.pause()
+            assert panel.answers() == ["saml"]
+            await pilot.press("enter")  # the cursor is on the submit row
+            await _until(pilot, lambda: panel_task.done())
+            assert panel_task.result() == [("Which auth methods?", "saml")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_other_takes_the_input(tui):
+    """Picking `Other` hides the panel and shows the input; Enter records the text and the panel comes back."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-other")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("3")
+            await pilot.pause()
+            assert not panel.display and inp.display and app.focused is inp
+            assert "Type your answer" in inp.placeholder or "Which database" in inp.placeholder
+            assert inp.has_class("feedback-mode")  # the yellow prompt border
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("DuckDB"))
+            await pilot.pause()
+            assert panel.display and not inp.display
+            assert panel.answers() == ["DuckDB", None]
+            await pilot.press("left")  # back to question 1: the typed answer is shown in place
+            await pilot.pause()
+            assert "✓ 3. Other (type your own): DuckDB" in str(panel.content)
+            await pilot.press("right")  # back to the unanswered question
+            await pilot.pause()
+            assert panel.cursor_question == 1
+            # a paste is inlined, as the input already does for a prompt
+            await pilot.press("3")
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(app._pastes.inline("JWT,\n  OAuth")))
+            await pilot.pause()
+            assert panel.answers()[1] == "JWT, OAuth"
+            await pilot.press("enter")  # the cursor is on the submit row
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Which database should I use?", "DuckDB"), ("Which auth methods?", "JWT, OAuth")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_free_text_only_skips_the_panel(tui):
+    """No question with options never shows the panel: each Enter is one answer, the last one is the submission."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-free")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            task = _ask_questions(app, [{"question": "Name the app?", "header": "Name"},
+                                        {"question": "Who is it for?", "header": "Who"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            assert not panel.display  # nothing to submit separately
+            assert inp.display and inp.has_class("feedback-mode")
+            assert inp.placeholder == "Name the app?"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("Tiger"))
+            await pilot.pause()
+            assert not task.done() and app.adapter.has_pending_ask()
+            assert inp.placeholder == "Who is it for?"  # the next question, same input
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("me"))
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Name the app?", "Tiger"), ("Who is it for?", "me")]
+            assert not inp.has_class("feedback-mode") and inp.placeholder == ""
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mixed_call_hands_the_input_over(tui):
+    """Some option questions, some free text: the panel is used, and the free-text question's Enter
+    takes the input (it never grabs it — see `test_free_text_question_does_not_take_the_input_by_surprise`)."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-mixed")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            task = _ask_questions(app, [DB_QUESTION, {"question": "Name the app?", "header": "Name"}])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")  # Postgres → advance to the free-text question, panel still up
+            await pilot.pause()
+            assert panel.display and not inp.display
+            assert panel.cursor_question == 1
+            await pilot.press("enter")  # asking for the typed answer is one deliberate key
+            await _until(pilot, lambda: inp.display)
+            assert not panel.display and inp.has_class("feedback-mode")
+            assert "Name the app?" in inp.placeholder
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("Tiger"))
+            await pilot.pause()
+            assert panel.display and not inp.display
+            assert panel.answers() == ["Postgres", "Tiger"]
+            await pilot.press("enter")  # every question answered: the cursor is on the submit row
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Which database should I use?", "Postgres"), ("Name the app?", "Tiger")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_empty_input_keeps_the_question(tui):
+    """Open point 4: an empty Enter records nothing and flashes the hint; the question stays open."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-empty-panel")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("3")  # Other
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("   "))
+            await pilot.pause()
+            assert panel.answers() == [None] and app.adapter.has_pending_ask() and not task.done()
+            hint = app.query_one("#input", cli_tui.EnterSubmits).border_title or ""
+            assert "type an answer" in hint
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_free_text_answer_is_one_line(tui):
+    """A pasted two-line answer is collapsed before it is recorded, so the result still parses."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-oneline")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            task = _ask_questions(app, [{"question": "Describe it?"}])
+            await _until(pilot, app.adapter.has_pending_ask)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("line one\n   line two"))
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Describe it?", "line one line two")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_esc_mid_question(tui):
+    """Esc on a call, the first question already answered: the whole call is cancelled, and the input is
+    usable again with its draft."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-esc-panel")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")
+            await pilot.pause()
+            assert panel.answers()[0] == "Postgres"
+            await app.action_cancel()
+            await _until(pilot, lambda: task.done())
+            assert task.result() is None  # cancelled, not partially answered (open point 7)
+            assert not panel.display and inp.display
+            assert not inp.has_class("feedback-mode") and inp.placeholder == ""
+            assert app.adapter._cancelled  # Esc still ends the turn, as on an approval
+            app.adapter._cancelled = False
+            app.adapter._cancel_event.clear()
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_esc_while_typing_other(tui):
+    """Esc during the `Other` input cancels the call: the typed draft is not sent, and the input is normal."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-esc-other")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("3")
+            await pilot.pause()
+            assert inp.display and inp.has_class("feedback-mode")
+            inp.text = "half-typed"
+            await app.action_cancel()
+            await _until(pilot, lambda: task.done())
+            assert task.result() is None
+            assert not panel.display and inp.display and not inp.has_class("feedback-mode")
+            assert "half-typed" not in inp.text  # the prompt input's draft, not the cancelled answer
+            app.adapter._cancelled = False
+            app.adapter._cancel_event.clear()
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_q_mid_question(tui):
+    """Ctrl+Q with a question open resolves it as cancelled first, then follows the normal quit path."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-quit")
+        exited: list = []
+        app.exit = lambda *a, **k: exited.append(True)  # type: ignore[method-assign]
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("ctrl+q")
+            await _until(pilot, lambda: bool(exited), tries=200)
+            assert task.done() and task.result() is None  # resolved, not cancelled by the event loop
+            assert not app.adapter.has_pending_ask()
+
+    asyncio.run(scenario())
+
+
+def test_exit_command_mid_question(tui):
+    """/exit behaves as Ctrl+Q: the question is resolved as cancelled before the app leaves."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-exit")
+        exited: list = []
+        app.exit = lambda *a, **k: exited.append(True)  # type: ignore[method-assign]
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, app.adapter.has_pending_ask)
+            # /exit can only be typed in the input, which the panel has taken: Esc is the panel's way out,
+            # and the command still works while a question is open through the adapter's cancel
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            assert task.result() is None
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/exit"))
+            await _until(pilot, lambda: bool(exited), tries=200)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_call_costs_one_step(tui, monkeypatch, hook_cmd, tmp_path):
+    """After Esc the turn summary says `Cancelled after …`, and a `PostToolUse` hook sees the cancel text."""
+    import json
+    from types import SimpleNamespace
+    from dostuff.agent import loop as loop_module
+    cli_tui = tui
+
+    async def real_loop(*args, **kwargs):
+        return await loop_module.loop(*args, **kwargs)
+    monkeypatch.setattr(cli_tui, "agent_loop", real_loop)
+
+    def msg(content=None, tool_calls=None):
+        message = SimpleNamespace(content=content, tool_calls=tool_calls)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
+
+    raw = json.dumps({"questions": [{"question": "Which database should I use?",
+                                     "options": [{"label": "Postgres"}, {"label": "SQLite"}]}]})
+    tc = SimpleNamespace(id="c1", type="function", function=SimpleNamespace(name="ask_user", arguments=raw))
+    tc.model_dump = lambda: {"id": "c1", "type": "function", "function": {"name": "ask_user", "arguments": raw}}
+    responses: list = [msg(tool_calls=[tc])]
+
+    async def fake_call_agent(steps_history, system_instruction, tool_names=None, stream=False):
+        if not responses:
+            return msg("done"), None
+        return responses.pop(0), None
+    monkeypatch.setattr(loop_module, "call_agent", fake_call_agent)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+
+    log = tmp_path / "post.log"
+    post = hook_cmd(f"import json, sys\nopen({str(log)!r}, 'w').write(json.load(sys.stdin)['tool_response'])\n"
+                    f"print('hook-ran')")
+    _write_hooks({"PostToolUse": [{"hooks": [{"type": "command", "name": "see", "command": post}]}]})
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-step")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("build it"))
+            await _until(pilot, app.adapter.has_pending_ask, tries=200)
+            await pilot.press("escape")
+            await _until(pilot, lambda: not app._turn_in_progress, tries=300)
+            texts = _texts(app)
+            assert any(t.startswith("✻ Cancelled after") for t in texts)
+            tool_steps = [s for s in app.steps_history if s.get("role") == "tool"]
+            assert tool_steps and "cancelled the questions" in tool_steps[0]["content"]
+            # The hook ran on the cancelled call and saw the D5 cancel text (spec D7: accepted, pinned)
+            assert log.exists() and "cancelled the questions" in log.read_text()
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- ask-user T4.6: the panel does not bounce the transcript (REQ-4.1) ----------------------------
+
+def test_ask_panel_does_not_bounce_the_transcript(tui):
+    """Opening the questions panel, arrowing through questions of different height and closing it must leave
+    every painted frame flush at the bottom, like the /resume picker and the approval prompt before it
+    (`test_picker_does_not_bounce_the_transcript`). The panel is taller than the input it replaces."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-bounce")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for i in range(25):  # enough to overflow the viewport
+                app._append(f"row{i:02d} " + "-" * 30, msg_type="user")
+            await pilot.pause()
+            await pilot.pause()
+            messages = app.query_one("#messages")
+            assert isinstance(messages, cli_tui.Transcript)
+            off_bottom: list[int] = []
+            original_display = app._display
+
+            def display(screen, renderable):
+                """Measure what is actually painted, before it goes to the terminal."""
+                rows = [strip.text.rstrip() for strip in
+                        app.screen._compositor.render_strips()[:messages.region.height]]
+                occupied = [y for y, row in enumerate(rows) if row]
+                if occupied:  # empty viewport: nothing to be flush with
+                    off_bottom.append(messages.region.height - 1 - occupied[-1])
+                return original_display(screen, renderable)
+            app._display = display  # type: ignore[method-assign]
+
+            # As if the user arrows through the questions: the panel changes height with the option count
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await pilot.pause()
+            for key in ("tab", "right", "shift+tab", "left", "tab"):
+                await pilot.press(key)
+                await pilot.pause()
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await pilot.pause()
+            await pilot.pause()
+            app._display = original_display  # type: ignore[method-assign]
+
+            assert off_bottom, "no frame was measured"
+            assert max(off_bottom) <= 0, f"the transcript drifted off the bottom: {off_bottom}"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ask_panel_keeps_a_scrolled_up_transcript_in_place(tui):
+    """`_hold_transcript` must not drag a transcript the user scrolled up back to the bottom either."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-scrolled")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for i in range(25):
+                app._append(f"row{i:02d} " + "-" * 30, msg_type="user")
+            await pilot.pause()
+            messages = app.query_one("#messages", cli_tui.Transcript)
+            messages.scroll_to(y=10, animate=False)
+            await pilot.pause()
+            await pilot.pause()
+            assert messages.scroll_y == 10
+
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await pilot.pause()
+            await pilot.pause()
+            assert messages.scroll_y == 10  # the panel opening did not scroll the conversation
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await pilot.pause()
+            await pilot.pause()
+            assert messages.scroll_y == 10  # nor did it closing
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- ask-user T4.7: title and notification (REQ-4.6, D7) ------------------------------------------
+
+def test_question_notifies(tui):
+    """An open question puts the title on `waiting` and notifies a terminal that is in the background;
+    answering it puts the title back, exactly as an approval prompt does."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-notify")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            written: list[str] = []
+            app._write_terminal = written.append  # type: ignore[method-assign]
+            app._notify_kind = "osc9"
+            app.app_focus = False
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await pilot.pause()
+            assert app._title_state == "waiting"
+            assert any("Which database should I use?" in w for w in written), written
+            assert any("approval needed" in w for w in written)  # open point 10: one voice for both prompts
+
+            written.clear()
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await pilot.pause()
+            assert app._title_state == "done"  # idle again, not `running`: no turn is going
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_question_notifies_after_the_wait(tui):
+    """A question left open past `ui.notify_after_seconds` notifies even while the terminal is focused
+    (`should_notify`, the rule approvals already use)."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-notify-late")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            written: list[str] = []
+            app._write_terminal = written.append  # type: ignore[method-assign]
+            app._notify_kind = "osc9"
+            app.app_focus = True
+            app.config.notify_after_seconds = 30
+            app._turn_start_time = time.time() - 60  # the turn has been waiting over the threshold
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await pilot.pause()
+            assert any("Which database should I use?" in w for w in written), written
+            app._turn_start_time = None
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- ask-user T5.1: the result renders as answers (REQ-4.5, D9) -------------------------------------
+
+ASK_RESULT_TEXT = (
+    "Asked the user 2 questions; they answered:\n"
+    "1. Which database should I use?\n"
+    "   → Postgres\n"
+    "2. Which auth methods?\n"
+    "   → JWT, OAuth"
+)
+
+
+def test_ask_result_block(tui):
+    """A live result renders as one ⎿ block with one row per answer, in full — not as a raw
+    `ask_user: Asked the user 2 questions…` line, and not cut to the preview height."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-result")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.adapter.emit("tool_result", f"ask_user: {ASK_RESULT_TEXT}")
+            await pilot.pause()
+            text = "\n".join(_message_lines(app))
+            assert "Which database should I use? → Postgres" in text
+            assert "Which auth methods? → JWT, OAuth" in text
+            assert "ask_user:" not in text  # the raw prefix is gone
+            # not a truncated ToolResult: the block is a plain message, so Ctrl+O has nothing to expand
+            assert not app.query(cli_tui.ToolResult) or all(
+                "asked the user" not in str(w.content).lower() for w in app.query(cli_tui.ToolResult))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ask_result_label_is_short(tui):
+    """The call line is `● ask_user("Which database should I use?" +2 more)`, not a JSON blob."""
+    cli_tui = tui
+    label = cli_tui.format_call_label("ask_user", '{"questions": [{"question": "Which database should I use?"},'
+                                                 ' {"question": "Which auth?"}, {"question": "Which cache?"}]}')
+    assert label == 'ask_user("Which database should I use?" +2 more)'
+
+
+def test_ask_result_replays(tui):
+    """A stored session renders the same call label and answer block on /resume as it did live."""
+    cli_tui = tui
+    call = {"id": "c1", "type": "function", "function": {
+        "name": "ask_user",
+        "arguments": '{"questions": [{"question": "Which database should I use? methods"},'
+                     ' {"question": "Which cache?"}]}',
+    }}
+    steps = [
+        {"role": "user", "content": "build it"},
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "tool", "name": "ask_user", "tool_call_id": "c1", "content": ASK_RESULT_TEXT},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-replay")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            for step in steps:
+                await app.store.append("ask-old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume ask-old"))
+            await _until(pilot, lambda: app.session_id == "ask-old", tries=200)
+            await pilot.pause(0.3)
+            lines = _message_lines(app)
+            await app._cleanup_and_save_session()
+            return lines
+
+    lines = asyncio.run(scenario())
+    call_lines = [t for t in lines if t.startswith("●")]
+    assert any('ask_user("Which database should I use? methods" +1 more)' in t for t in call_lines), call_lines
+    # one ⎿ block, a row per pair (the message contains the newlines; _message_lines joins them)
+    block = next(t for t in lines if t.lstrip().startswith("⎿"))
+    assert "Which database should I use? → Postgres" in block
+    assert "Which auth methods? → JWT, OAuth" in block
+    assert not any(t.startswith("ask_user: ") for t in lines)
+
+
+def test_cancelled_result_renders_as_tool_result(tui):
+    """The cancel, unavailable and refusal texts render as ordinary ⎿ results: no answer block, no lost text —
+    live and on /resume (T5.3, CON-007)."""
+    cli_tui = tui
+    from dostuff.helpers.ui.ask_answers import CANCELLED_ASK_RESULT, UNAVAILABLE_ASK_RESULT, parse_answers
+    assert parse_answers(CANCELLED_ASK_RESULT) is None
+    assert parse_answers(UNAVAILABLE_ASK_RESULT) is None
+    assert parse_answers("error: too many questions") is None
+    stored = [
+        {"role": "user", "content": "build it"},
+        {"role": "tool", "name": "ask_user", "tool_call_id": "c1", "content": UNAVAILABLE_ASK_RESULT},
+    ]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-plain")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.adapter.emit("tool_result", f"ask_user: {CANCELLED_ASK_RESULT}")
+            await pilot.pause()
+            live = "\n".join(_message_lines(app))
+            for step in stored:
+                await app.store.append("ask-plain-old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume ask-plain-old"))
+            await _until(pilot, lambda: app.session_id == "ask-plain-old", tries=200)
+            await pilot.pause(0.3)
+            replayed = "\n".join(_message_lines(app))
+            await app._cleanup_and_save_session()
+            return live, replayed
+
+    live, replayed = asyncio.run(scenario())
+    assert "cancelled the questions" in live and "→" not in live
+    assert "No user is available" in replayed
+
+
+def test_placeholder_is_dimmed(tui):
+    """The "Other"/free-text questions put their text in the input's placeholder, which Textual paints at
+    `$text 40%` — plain white under the ansi-dark theme, so it reads as a real prompt rather than a hint.
+    The input overrides it to a dim grey, and that is the single place both callers go through."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-placeholder-dim")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            style = inp.get_visual_style("text-area--placeholder")
+            color = style.foreground
+            assert color is not None, "the placeholder has no colour"
+            assert getattr(color, "a", 1.0) == 1.0, f"still blended: {color!r}"
+            # #6a6a6a — the same grey the ghost suggestion text uses
+            assert (color.r, color.g, color.b) == (0x6A, 0x6A, 0x6A), color
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_free_text_question_does_not_take_the_input_by_surprise(tui):
+    """A mixed call's free-text question must not swallow the panel: arrowing onto it (or Tab, or the
+    automatic advance after a pick) leaves the question on screen, and Enter — or `o` — takes the input.
+    Only Esc gives up the whole call from there, so the input must be reachable but not a trap."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-free-in-panel")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            question = {"question": "Name the app?", "header": "Name"}
+            task = _ask_questions(app, [DB_QUESTION, question])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+
+            # Tab onto it without answering: the panel stays, the input stays hidden
+            await pilot.press("tab")
+            await pilot.pause()
+            assert panel.display and not inp.display
+            assert panel.cursor_question == 1
+            # and back again
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert panel.display and panel.cursor_question == 0
+
+            # Tab to it again, then Enter takes the input deliberately
+            await pilot.press("tab")
+            await pilot.pause()
+            await pilot.press("enter")
+            await _until(pilot, lambda: inp.display)
+            assert not panel.display and inp.has_class("feedback-mode")
+            assert inp.placeholder == "Name the app?"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("Tiger"))
+            await pilot.pause()
+            # recorded, and the panel is back
+            assert panel.display and not inp.display
+            assert panel.answers() == [None, "Tiger"]
+            # the free-text answer did not answer the option question, so submit stays inert
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.adapter.has_pending_ask() and not task.done()
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_auto_advance_onto_a_free_text_question_keeps_the_panel(tui):
+    """The advance after a pick lands on a free-text question instead of hiding the panel."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-advance-free")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            task = _ask_questions(app, [DB_QUESTION, {"question": "Name the app?", "header": "Name"}])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")  # Postgres, then the advance must not take the input
+            await pilot.pause()
+            assert panel.display and not inp.display
+            assert panel.cursor_question == 1 and panel.answers() == ["Postgres", None]
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_o_key_takes_the_input_from_the_other_row(tui):
+    """`o` is the one-key way in — and it edits rather than toggling a typed Other off, which is what
+    Enter on that row does for a multi-select question."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-o-key")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            multi = {"question": "Which auth?", "header": "Auth", "multi_select": True,
+                     "options": [{"label": "JWT"}, {"label": "OAuth"}]}
+            task = _ask_questions(app, [{"question": "Name the app?", "header": "Name"}, multi])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+
+            # a free-text question: o takes the input, Enter records it, the panel comes back
+            await pilot.press("o")
+            await _until(pilot, lambda: inp.display)
+            assert not panel.display and inp.placeholder == "Name the app?"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("Tiger"))
+            await pilot.pause()
+            assert panel.display and panel.answers() == ["Tiger", None]
+
+            # a multi-select question with a typed Other: o re-opens the input, it does not clear it
+            await pilot.pause()
+            assert panel.cursor_question == 1  # the advance already landed on the multi-select
+            await pilot.press("down")
+            await pilot.press("down")  # JWT → OAuth → the Other row
+            await pilot.press("o")
+            await _until(pilot, lambda: inp.display)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("SAML"))
+            await pilot.pause()
+            assert panel.answers() == ["Tiger", "SAML"]
+            # recording it advanced to the submit row; go back to the Other row
+            assert panel.submit_focused
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.press("down")  # JWT → OAuth → the Other row
+            assert panel.cursor_row == panel._other_row(panel.cursor_question)
+            await pilot.press("o")  # the cursor is on the Other row: edit, do not clear
+            await _until(pilot, lambda: inp.display)
+            assert inp.display and not panel.display
+            assert panel.answers() == ["Tiger", "SAML"], "o must not toggle the typed answer off"
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tab_strip_pads_and_marks_the_current_question(tui):
+    """The tab strip is the only thing that says which question you are on, so the current one is marked
+    twice: a few spaces of padding and the answer mark's slot are reserved on every tab so the tabs stay
+    aligned, and the mark itself is bold + orange. `✓` (a plain glyph, not an emoji) still means answered."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-tabs")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            three = [
+                {"question": "Which database?", "header": "DB",
+                 "options": [{"label": "SQLite"}, {"label": "Postgres"}]},
+                {"question": "Which auth?", "header": "Auth", "multi_select": True,
+                 "options": [{"label": "JWT"}, {"label": "OAuth"}]},
+                {"question": "Name the app?", "header": "Name"},
+            ]
+            task = _ask_questions(app, three)
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+
+            first = str(panel.content).split("\n")[0]
+            assert first.strip() == "▌ DB ·   Auth ·   Name"
+            # the mark sits in a fixed slot before the label, so every tab is the same width
+            assert first.index("▌") < first.index("DB")
+            assert "▌ Auth" not in first  # the mark belongs to DB, not Auth
+
+            await pilot.press("tab")  # onto Auth without answering
+            await pilot.pause()
+            second = str(panel.content).split("\n")[0]
+            assert second.strip() == "DB · ▌ Auth ·   Name"
+            assert second.index("▌") > second.index("DB")
+            assert len(second) == len(first), (repr(second), repr(first))
+
+            # answering DB puts a ✓ in DB's slot, and the widths still do not change
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            await pilot.press("1")
+            await pilot.pause()
+            answered = str(panel.content).split("\n")[0]
+            assert answered.strip() == "✓ DB · ▌ Auth ·   Name", answered
+            assert len(answered) == len(first), (repr(answered), repr(first))
+
+            # No emoji: `⚠` (U+26A0) on the question line and `✔` (U+2714) on the submit row both have
+            # Emoji_Presentation, so terminals painted them in colour. `✓`/`▌`/`❯` are text glyphs and stay.
+            body = str(panel.content)
+            for emoji in ("\u26a0", "\u2714"):
+                assert emoji not in body, f"{emoji!r} is still in the panel"
+            assert not [ch for ch in body if ord(ch) >= 0x1F000], "a pictographic emoji slipped in"
+
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
     asyncio.run(scenario())

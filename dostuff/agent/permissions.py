@@ -40,7 +40,8 @@ MODE_CYCLE: tuple[str, ...] = ("ask", "auto", "plan", "allowlist")
 PLAN_MODE_INSTRUCTION = (
     "## Plan mode\nPlan mode is on: you can read files, search and run read-only commands, but file "
     "changes, other shell commands and settings changes are denied. Investigate, then reply with a "
-    "concrete step-by-step plan. Don't make the changes until the user leaves plan mode (Shift+Tab or /permissions)."
+    "concrete step-by-step plan. In plan mode, ask what you need *before* writing the plan, with "
+    "`ask_user` — not after. Don't make the changes until the user leaves plan mode (Shift+Tab or /permissions)."
 )
 
 

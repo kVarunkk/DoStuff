@@ -259,3 +259,185 @@ def test_call_label_clips_long_arguments():
     assert format_call_label("write_file", json.dumps({"path": "game.py", "content": content})) == label
     assert format_call_label("read_file", '{"path": "a"}') == 'read_file(path="a")'
     assert format_call_label("x", "{bad json") == "x({bad json)"
+
+
+# --- ask_user in the loop (plan/2026-11-02-ask-user, T2.2 / T2.6) ---------------------------------
+
+def test_ask_user_batch_is_sequential(monkeypatch):
+    """A batch of read_file + ask_user never overlaps: the panel must not open while output streams in."""
+    spans = []
+
+    async def dispatch(name, args, **kw):
+        spans.append(("enter", name))
+        await asyncio.sleep(0.05)
+        spans.append(("exit", name))
+        return "ok"
+
+    calls = [_tc("read_file", json.dumps({"path": "a"}), "c1"),
+             _tc("ask_user", json.dumps({"questions": [{"question": "Which db?"}]}), "c2")]
+    _, working, _ = _run(monkeypatch, [_msg(tool_calls=calls), _msg(content="done")], dispatch=dispatch)
+    assert spans.index(("exit", "read_file")) < spans.index(("enter", "ask_user"))
+    tool_steps = [s for s in working if s["role"] == "tool"]
+    assert [s["name"] for s in tool_steps] == ["read_file", "ask_user"]
+
+
+def test_ask_user_is_untimed(monkeypatch):
+    """A user may think for minutes: ask_user is exempt from TOOL_TIMEOUT_S, read_file is not."""
+    monkeypatch.setattr(loop_module, "TOOL_TIMEOUT_S", 0.01)
+
+    async def dispatch(name, args, **kw):
+        await asyncio.sleep(0.05)
+        return "Asked the user 1 question; they answered:\n1. Which db?\n   → SQLite"
+
+    result, working, _ = _run(monkeypatch, [_msg(tool_calls=[_tc("ask_user", json.dumps({"questions": [{"question": "Which db?"}]}), "c1")]), _msg(content="done")], dispatch=dispatch)
+    assert "timed out" not in next(s for s in working if s["role"] == "tool")["content"]
+
+    calls = [_tc("read_file", json.dumps({"path": "a"}), "c1")]
+    _, working, _ = _run(monkeypatch, [_msg(tool_calls=calls), _msg(content="done")], dispatch=dispatch)
+    assert "timed out" in next(s for s in working if s["role"] == "tool")["content"]
+
+
+def test_second_ask_gets_cancelled_step(monkeypatch):
+    """Esc on the first ask_user ends the turn; the second never starts and still gets its one step."""
+    adapter = Adapter()
+    calls = [_tc("ask_user", json.dumps({"questions": [{"question": "One?"}]}), "c1"),
+             _tc("ask_user", json.dumps({"questions": [{"question": "Two?"}]}), "c2")]
+
+    async def dispatch(name, args, **kw):
+        await asyncio.sleep(0.01)  # let the task start, as a real adapter would before the user Escapes
+        adapter._cancelled = True
+        return "The user cancelled the questions; no answers.\nUse your best judgement and say what you assumed."
+
+    result, working, _ = _run(monkeypatch, [_msg(tool_calls=calls)], adapter=adapter, dispatch=dispatch)
+    assert result == "Cancelled by user."
+    tool_steps = [s for s in working if s["role"] == "tool"]
+    assert len(tool_steps) == 2
+    assert "cancelled the questions" in tool_steps[0]["content"]
+    assert tool_steps[1]["content"] == CANCELLED_RESULT
+
+
+def test_ask_user_call_label():
+    from dostuff.helpers.agent.tool_output import format_call_label
+
+    three = {"questions": [{"question": "Which database should I use?"}, {"question": "Which auth?"}, {"question": "Name?"}]}
+    assert format_call_label("ask_user", three) == 'ask_user("Which database should I use?" +2 more)'
+    one = {"questions": [{"question": "Which database should I use?"}]}
+    assert format_call_label("ask_user", one) == 'ask_user("Which database should I use?")'
+    for garbage in ({}, {"questions": []}, {"questions": "nope"}, {"questions": [{}]}):
+        label = format_call_label("ask_user", garbage)  # falls back to the generic shape
+        assert label.startswith("ask_user(") and "more" not in label, label
+        assert len(label) <= 200
+    long = {"questions": [{"question": "Q" * 400}]}
+    assert len(format_call_label("ask_user", long)) <= 200
+
+
+def test_call_labels_are_names_only():
+    from dostuff.helpers.agent.tool_output import format_call_label
+
+    args = {"questions": [{"question": "Which db?"}]}
+    mapped = format_call_label("ask_user", args)
+    assert format_call_label("ask_user", args, labels={}) == f"ask_user(questions={json.dumps(args['questions'])})"
+    assert mapped != format_call_label("ask_user", args, labels={})  # mapping disabled → the generic shape
+    assert format_call_label("ask_user", args, labels={"ask_user": lambda a: "custom"}) == "ask_user(custom)"
+
+
+def test_tool_output_imports_no_tools():
+    """CON-010: the TUI's pre-first-frame path must not pull in a tool module (it once cost 27 s)."""
+    import subprocess
+    import sys
+    code = (
+        "import sys\n"
+        "from dostuff.helpers.agent.tool_output import format_call_label\n"
+        "assert format_call_label('ask_user', {'questions': [{'question': 'Which db?'}]})\n"
+        "assert not [m for m in sys.modules if m == 'dostuff.tools' or m.startswith('dostuff.tools.')], "
+        "[m for m in sys.modules if m.startswith('dostuff.tools')]\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+
+
+def test_ask_user_answers_are_in_the_next_call(monkeypatch):
+    """T2.6 / WS-2 acceptance: the model calls ask_user, the adapter answers, the next call sees them."""
+    from tests.conftest import FakeAdapter
+    from dostuff.helpers.ui.ask_answers import format_answers
+
+    pairs = [("Which database should I use?", "SQLite"), ("Which auth methods?", "JWT, OAuth")]
+    adapter = FakeAdapter()
+    adapter.ask_answers = pairs
+    questions = [{"question": pairs[0][0], "options": [{"label": "SQLite"}, {"label": "Postgres"}]},
+                 {"question": pairs[1][0], "options": [{"label": "JWT"}, {"label": "OAuth"}]}]
+    calls = [_tc("ask_user", json.dumps({"questions": questions}), "c1")]
+    _, working, calls_seen = _run(monkeypatch, [_msg(tool_calls=calls), _msg(content="done")], adapter=adapter)
+
+    assistant = next(s for s in working if s["role"] == "assistant" and s.get("tool_calls"))
+    assert assistant["tool_calls"][0]["function"]["name"] == "ask_user"
+    tool_steps = [s for s in working if s["role"] == "tool"]
+    assert len(tool_steps) == 1
+    assert tool_steps[0]["content"] == format_answers(pairs)  # the D5 block, not a JSON blob
+    assert adapter.asked and adapter.asked[0][0]["options"][0]["label"] == "SQLite"
+    # the second model call is the one that sees the answers
+    assert any(s["role"] == "tool" and s["content"] == format_answers(pairs) for s in calls_seen[1])
+
+
+def test_ask_user_refusal_is_a_normal_step(monkeypatch):
+    from tests.conftest import FakeAdapter
+
+    adapter = FakeAdapter()
+    calls = [_tc("ask_user", json.dumps({"questions": []}), "c1")]
+    result, working, calls_seen = _run(monkeypatch, [_msg(tool_calls=calls), _msg(content="done")], adapter=adapter)
+    tool_steps = [s for s in working if s["role"] == "tool"]
+    assert len(tool_steps) == 1 and tool_steps[0]["content"].startswith("error: ")
+    assert result == "done" and not adapter.asked  # the adapter was never touched
+    assert "error: " in calls_seen[1][-1]["content"]
+
+
+def test_ask_user_without_adapter_in_the_loop(monkeypatch):
+    from dostuff.helpers.ui.ask_answers import UNAVAILABLE_ASK_RESULT
+
+    calls = [_tc("ask_user", json.dumps({"questions": [{"question": "Which db?"}]}), "c1")]
+    result, working, _ = _run(monkeypatch, [_msg(tool_calls=calls), _msg(content="done")], adapter=None)
+    assert result == "done"
+    tool_steps = [s for s in working if s["role"] == "tool"]
+    assert len(tool_steps) == 1 and tool_steps[0]["content"] == UNAVAILABLE_ASK_RESULT
+
+
+def test_four_shapes_one_tool_step(monkeypatch):
+    """T6.4 / CON-006: cancelled, refused, non-interactive and answered — each is exactly one `role: "tool"`
+    step, and the model's next call sees it. Pinned together so a change to any one shape is deliberate."""
+    from tests.conftest import FakeAdapter
+    from dostuff.helpers.ui.ask_answers import UNAVAILABLE_ASK_RESULT, format_answers
+
+    question = json.dumps({"questions": [{"question": "Which db?",
+                                          "options": [{"label": "SQLite"}, {"label": "Postgres"}]}]})
+    call = lambda cid="c1": [_tc("ask_user", question, cid)]  # noqa: E731
+
+    def run(adapter, extra=None):
+        responses = [_msg(tool_calls=call()), _msg(content="done")] + (extra or [])
+        result, working, _ = _run(monkeypatch, responses, adapter=adapter)
+        steps = [s for s in working if s["role"] == "tool"]
+        assert len(steps) == 1, [s.get("content") for s in steps]
+        assert steps[0]["name"] == "ask_user" and steps[0]["tool_call_id"] == "c1"
+        return result, steps[0]["content"]
+
+    # answered
+    adapter = FakeAdapter()
+    adapter.ask_answers = [("Which db?", "SQLite")]
+    _, content = run(adapter)
+    assert content == format_answers([("Which db?", "SQLite")])
+
+    # cancelled
+    adapter = FakeAdapter()
+    adapter.ask_answers = None  # the scripted adapter's way of saying "Esc"
+    _, content = run(adapter)
+    from dostuff.helpers.ui.ask_answers import CANCELLED_ASK_RESULT
+    assert content == CANCELLED_ASK_RESULT
+
+    # refused: the model's arguments, not the user, were wrong
+    responses = [_msg(tool_calls=[_tc("ask_user", json.dumps({"questions": []}), "c1")]), _msg(content="done")]
+    _, working, _ = _run(monkeypatch, responses, adapter=FakeAdapter())
+    steps = [s for s in working if s["role"] == "tool"]
+    assert len(steps) == 1 and steps[0]["content"].startswith("error: ")
+
+    # non-interactive: no adapter to ask
+    _, content = run(None)
+    assert content == UNAVAILABLE_ASK_RESULT

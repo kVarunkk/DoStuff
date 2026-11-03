@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Structured questions: the agent can stop and ask you instead of guessing — up to 4 questions per call, 2–4 options each, multi-select and free text, answered in a panel in place of the input and returned as one parseable result.
+
+### Added
+- **`ask_user` tool**: `questions` is 1–4 questions, each with 2–4 `options` (`label`, optional `description`) or no options at all for a free-text answer, an optional `header` (the tab label) and `multi_select`. The result is a fixed block — `Asked the user N questions; they answered:`, then `1. <question>` / `   → <answer>` — written and parsed by one helper, so the tool, the transcript and `/export` cannot drift apart. A malformed call is refused with an `error:` result naming the first fault (too many questions, too few or too many options, duplicate labels, duplicate questions) before anything is shown; over-long text is clamped, not refused.
+- **The panel**: it renders in place of the input, one tab per question, `▌` on the question you are on and `✓` on an answered one — both in the same two-column slot, so the strip does not re-flow as you answer. `←`/`→`/`Shift+Tab` move between questions, `↑`/`↓`/a number picks, `space` toggles a multi-select question (the answer comes back in option order), and `Submit answers` is the only thing that sends: it stays dim and inert until every question has an answer. Picking an option never submits on its own.
+- **`Other`** is the last row of every question: it takes the input for a typed answer (collapsed to one line). A call whose questions are *all* free text skips the panel and the input takes each answer in turn, with the last Enter as the submission.
+- **Esc** cancels the questions and ends the turn, like Esc on an approval; Ctrl+Q and `/exit` cancel them first and then quit. Every cancel path still leaves exactly one tool step, so the transcript and `/resume` stay honest.
+- **Headless `dostuff -p`** asks on the terminal when stdin and stderr are both a TTY: each question and its numbered options go to stderr, and it reads one line per question (`2`, `1,3`, free text; an empty line is `(no answer)`). With piped stdin or redirected stderr it answers "No user is available in this run" and the model states an assumption instead of failing.
+- The answers render as one `⎿` block, a row per question → answer, live and on `/resume`; nothing is truncated, because reading back what you answered is the point. Ctrl+O has nothing to expand there.
+- A waiting question sets the window title to `waiting` and fires the usual approval notification, and the call label in the transcript is the first question plus `+N more`.
+
+### Changed
+- The system prompt gains an `## Asking the user` section: ask when the answer changes what you build and the repo can't tell you, never to confirm a plan or to ask permission, everything you need in one call, and leave `options` out for free text.
+- Plan mode now tells the model to ask what it needs *before* writing the plan.
+- `ask_user` never asks permission (it is a read tool) and is never timed out or dispatched beside another call, so a question can't race a streaming result or time out while you think.
+- Subagents never get it: it is in the restricted set, and `map_tools` now re-checks the restriction *after* mapping Claude Code's names, so an agent file listing `AskUserQuestion` no longer slips past it.
+- `/tools` says which tool talks to you.
+
+### Fixed
+- A cancelled batch no longer skips `PostToolUse` for a call that returned on its own: Esc on a question resolves it synchronously, so the hook sees the cancel text it was meant to see.
+- The sequential pass checks the cancel flag before starting a call, so an `ask_user` cancelled by the batch just finished no longer leaves an unawaited coroutine.
+
+### Documentation
+- README "Asking the user" section (panel sketch, the keys, multi-select and `Other`, Esc, the transcript block and the exact text the model receives, headless), plus a Features bullet, the tools-table row and the `AskUserQuestion` → `ask_user` mapping with `multiSelect` → `multi_select`.
+
 ## [0.2.7] - 2026-11-02
 
 Polish for the TUI's conversation view: the transcript no longer shifts when a selector takes the input's place, the jump-to-bottom button is a centered pill, and plan mode stops mistaking dotted attribute paths for `.dostuff` settings edits.

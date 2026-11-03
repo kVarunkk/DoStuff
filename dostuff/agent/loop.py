@@ -1,4 +1,4 @@
-from dostuff.helpers.agent.loop_check_cancelled import is_cancelled, loop_check_cancelled
+from dostuff.helpers.agent.loop_check_cancelled import CANCELLED_TURN, is_cancelled, loop_check_cancelled
 from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
 from dostuff.helpers.agent.model_cost import call_cost
 from dostuff.lib.model import current_session_id, get_litellm_model
@@ -39,11 +39,15 @@ from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_
 TOOL_TIMEOUT_S = 120.0
 RETRY_BASE_DELAY_S = 1.0
 CANCELLED_RUNNING_RESULT = "Cancelled by user (may still be running)"
-CANCELLED_TURN = "Cancelled by user."  # what loop() returns when the user cancelled
+# CANCELLED_TURN (what loop() returns when the user cancelled) is imported from loop_check_cancelled
 MODEL_ERROR_PREFIX = "Model call failed: "  # what loop() returns, + the error, when the model call failed
 # Tools exempt from TOOL_TIMEOUT_S: a subagent is bounded by its iteration cap, each of its own
-# tool calls has the normal timeout, and its approval prompts must not count against a deadline
-_UNTIMED_TOOLS = frozenset({"agent"})
+# tool calls has the normal timeout, and its approval prompts must not count against a deadline;
+# ask_user waits on a human who may think for minutes (ask-user spec D8)
+_UNTIMED_TOOLS = frozenset({"agent", "ask_user"})
+# Never dispatched side by side, whatever its kind (ask-user spec D8): a question opens a panel, and
+# the transcript must not interleave a dialog with other results streaming in.
+_NEVER_PARALLEL = frozenset({"ask_user"})
 _FORK_TOOLS = frozenset({"agent", "send_message"})  # get the fork_context harness param (subagents spec D11)
 
 _RETRYABLE_ERRORS: tuple[type[BaseException], ...] = (
@@ -134,6 +138,9 @@ def _call_label(call: _ToolCall) -> str:
 
 
 def _runs_in_parallel(name: str) -> bool:
+    """Read-only calls go in the parallel batch — except the ones that talk to the user (D8)."""
+    if name in _NEVER_PARALLEL:
+        return False
     spec = TOOL_MAP.get(name)
     return spec is not None and spec.kind == "read"
 
@@ -498,9 +505,12 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                             call.result = f"Error: {exc}"
                         else:
                             call.result = str(task.result())
-                        if not was_cancelled:
+                        if not task.cancelled():
                             # PostToolUse runs here, after the dispatch task and outside TOOL_TIMEOUT_S, so the
-                            # parallel read-only batch stays intact and its context reaches the tool step (D5)
+                            # parallel read-only batch stays intact and its context reaches the tool step (D5).
+                            # A call that returned on its own still fires it in a cancelled batch: Esc on an
+                            # `ask_user` resolves the question, so the tool returns the cancel text rather
+                            # than being cancelled (ask-user D7 — the hook sees that text).
                             call.result, _ = await post_tool_use(call.name, call.args, call.result, tool_use_id=call.id, **hook_ids)
                         await loop_emit("tool_result", f"{call.name}: {call.result}", adapter=adapter)
                     return was_cancelled
@@ -512,7 +522,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     if parallel:
                         cancelled = await run_batch(parallel)
                     for call in (c for c in runnable if not _runs_in_parallel(c.name)):
-                        if cancelled:
+                        # The cancel flag can be set by the batch just finished (Esc on an ask_user):
+                        # don't schedule a call that would only be cancelled before it starts
+                        if cancelled or is_cancelled(adapter):
+                            cancelled = True
                             break
                         cancelled = await run_batch([call])
 

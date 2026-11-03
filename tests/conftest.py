@@ -202,15 +202,21 @@ def fake_model(monkeypatch):
 
 class FakeAdapter:
     """A parent adapter. `ask` waits on a future the test resolves (`answer(i, value)`), unless `auto` is set;
-    prompts are recorded in order in `asks` as (title, future)."""
+    prompts are recorded in order in `asks` as (title, future). `ask_user` returns `ask_answers` (scripted)."""
 
-    def __init__(self, auto=None):
+    def __init__(self, auto=None, ask_answers=None):
         import asyncio
         self.events: list = []
         self.asks: list = []
         self.auto = auto
+        self.ask_answers = ask_answers  # scripted [[(question, answer), …]] for ask_user (ask-user T2.6)
+        self.asked: list = []  # what ask_user was given, per call
         self._cancelled = False
         self._cancel_event = asyncio.Event()
+
+    async def ask_user(self, questions, **kwargs):
+        self.asked.append(questions)
+        return self.ask_answers
 
     def emit(self, event_type, data):
         self.events.append((event_type, data))
@@ -294,3 +300,96 @@ def agent_type(monkeypatch):
         monkeypatch.setitem(BUILTIN_TYPES, name, agent_def)
         return agent_def
     return register
+
+
+# --- ask_user (plan/2026-11-02-ask-user/tasks.md) -----------------------------------------------
+
+class AskScript:
+    """A scripted `ask_user` adapter: records the cleaned questions it was given and returns the next
+    scripted answer list (`[("Which db?", "SQLite")]`), or `None` for a cancelled call.
+
+    `raise_exc=` makes it raise, to prove the tool never lets an adapter exception escape (T1.5).
+    """
+
+    def __init__(self, answers=None, raise_exc=None):
+        self.answers = answers  # a list of pairs, or None for a cancelled call
+        self.raise_exc = raise_exc
+        self.questions: list = []  # every call's questions, in order
+        self.calls = 0
+
+    async def ask_user(self, questions, **kwargs):
+        self.calls += 1
+        self.questions.append(questions)
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.answers
+
+
+@pytest.fixture
+def ask_script():
+    """`AskScript(answers)` for the tool-level tests (no widgets, no app)."""
+    return AskScript
+
+
+class FakeTui:
+    """The app calls `TuiAdapter` makes for a question, for the no-widget adapter tests of Phase 3.
+
+    A recording stub, not a Textual app: the real widget behaviour is the Phase 4 pilot tests' business.
+    """
+
+    def __init__(self):
+        self.calls: list = []  # (method name, args) in order
+        self._pending_ui: list = []
+        self.turn_in_progress = True
+
+    def ui(self, fn):
+        self.calls.append(("ui", ()))
+        self._pending_ui.append(fn)
+
+    def flush(self) -> None:
+        while self._pending_ui:
+            self._pending_ui.pop(0)()
+
+    def _mount_message(self, widget) -> None:
+        self.calls.append(("_mount_message", (widget,)))
+
+    def _show_ask_panel(self, panel_state) -> None:
+        self.calls.append(("_show_ask_panel", (panel_state,)))
+
+    def _hide_ask_panel(self) -> None:
+        self.calls.append(("_hide_ask_panel", ()))
+
+    def _show_permission_prompt(self, question: str, options: list) -> None:
+        self.calls.append(("_show_permission_prompt", (question, options)))
+
+    def _hide_permission_prompt(self, restore_input: bool = True) -> None:
+        self.calls.append(("_hide_permission_prompt", (restore_input,)))
+
+    def _flash_input_hint(self, text: str, seconds: float = 2) -> None:
+        self.calls.append(("_flash_input_hint", (text,)))
+
+    def _hand_input_over(self, placeholder: str = "") -> None:
+        self.calls.append(("_hand_input_over", (placeholder,)))
+
+    def _give_input_back(self) -> None:
+        self.calls.append(("_give_input_back", ()))
+
+    def _approval_waiting(self, question: str = "") -> None:
+        self.calls.append(("_approval_waiting", (question,)))
+
+    def _set_title(self, state: str) -> None:
+        self.calls.append(("_set_title", (state,)))
+
+    @property
+    def _turn_in_progress(self) -> bool:
+        return self.turn_in_progress
+
+    def named(self, name: str) -> list:
+        """Every call of one method, in order."""
+        return [args for method, args in self.calls if method == name]
+
+
+@pytest.fixture
+def fake_tui():
+    """A `FakeTui` recording stub for the adapter's no-widget tests."""
+    return FakeTui

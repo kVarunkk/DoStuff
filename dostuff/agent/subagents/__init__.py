@@ -24,6 +24,8 @@ RESTRICTED_SUBAGENT_TOOLS = frozenset({
     "save_episode",
     # The todo list belongs to the parent; a subagent would overwrite it
     "todo_write",
+    # The question channel is the main agent's: it holds the conversation with the user (ask-user D11)
+    "ask_user",
     # Settings are the user's to change, from the main conversation
     "read_settings",
     "edit_config",

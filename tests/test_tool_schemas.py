@@ -117,3 +117,19 @@ def test_types_and_exclusions():
     assert props["c"]["type"] == "object"
     assert set(props) == {"a", "b", "c", "d"}
     assert schema["function"]["parameters"]["required"] == ["a", "b", "c"]
+
+
+# --- ask_user registration (plan/2026-11-02-ask-user T2.1, REQ-2.1, CON-008) -----------------------
+
+def test_ask_user_registered():
+    """`TOOL_MAP`'s entry and the direct generation agree; the snapshot above pins the shape."""
+    from dostuff.tools.ask_user import ask_user
+    from dostuff.tools.definitions import TOOL_MAP
+    from dostuff.tools.names import BUILTIN_TOOL_NAMES
+
+    spec = TOOL_MAP["ask_user"]
+    assert spec.kind == "read"
+    assert spec.injected == frozenset({"adapter"})
+    assert "ask_user" in BUILTIN_TOOL_NAMES and "ask_user" in TOOL_SCHEMAS
+    assert spec.schema == generate_litellm_tool_schema(ask_user, name="ask_user", exclude={"adapter"})
+    assert TOOL_SCHEMAS["ask_user"]["function"]["parameters"]["required"] == ["questions"]

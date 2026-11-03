@@ -650,3 +650,190 @@ def test_headless_ctrl_c_stops_agents(env, headless_agents, agents, registry, _p
     assert not gate.is_set()
     jobs = registry.jobs()
     assert jobs and all(_wait_dead(j.pid, 5) for j in jobs)
+
+
+# --- ask-user T3.3: headless asks when there is someone to ask (REQ-3.2, D13) ---------------------
+
+def _scripted_input(monkeypatch, answers, log=None):
+    """`builtins.input` returns `answers` in order, recording each prompt (the test_headless_ask_lock shape)."""
+    import builtins
+    import threading
+    lock = threading.Lock()
+
+    def fake_input(prompt=""):
+        with lock:
+            if log is not None:
+                log.append(prompt)
+            answer = answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+    monkeypatch.setattr(builtins, "input", fake_input)
+
+
+def test_headless_ask_user_interactive(monkeypatch, capsys):
+    import asyncio
+    from dostuff.headless import HeadlessAdapter
+
+    written: list[str] = []
+    _scripted_input(monkeypatch, ["2", "jwt, oauth", ""], written)
+    adapter = HeadlessAdapter(interactive=True, quiet=False)
+    questions = [
+        {"question": "Which db?", "options": [{"label": "SQLite"}, {"label": "Postgres"}]},
+        {"question": "Which auth?", "options": [{"label": "JWT"}, {"label": "OAuth"}], "multi_select": True},
+        {"question": "Name?"},
+    ]
+    assert asyncio.run(adapter.ask_user(questions)) == [
+        ("Which db?", "Postgres"),              # a number picks that option
+        ("Which auth?", "jwt, oauth"),          # free text is taken as typed (no numbers, so no pick)
+        ("Name?", "(no answer)"),               # one line per question: empty is an answer too
+    ]
+    err = capsys.readouterr().err + "".join(written)  # the questions go to stderr, the prompts to input()
+    assert "Which db?" in err and "Postgres" in err and "OAuth" in err
+    assert "1. SQLite" in err and "2. Postgres" in err  # numbered options, so a number means something
+
+
+def test_headless_ask_user_picks_in_option_order(monkeypatch):
+    import asyncio
+    from dostuff.headless import HeadlessAdapter
+
+    _scripted_input(monkeypatch, ["3,1"])
+    adapter = HeadlessAdapter(interactive=True, quiet=True)
+    question = [{"question": "Which auth?", "multi_select": True,
+                 "options": [{"label": "JWT"}, {"label": "OAuth"}, {"label": "Basic"}]}]
+    assert asyncio.run(adapter.ask_user(question)) == [("Which auth?", "JWT, Basic")]  # option order, not 3,1
+
+
+def test_headless_ask_user_non_interactive(monkeypatch):
+    import asyncio
+
+    from dostuff.helpers.ui.ask_answers import NoUserAvailable, UNAVAILABLE_ASK_RESULT
+    from dostuff.headless import HeadlessAdapter
+    from dostuff.tools.ask_user import ask_user
+
+    def no_input(prompt=""):
+        raise AssertionError("must not read stdin without a terminal")
+    import builtins
+    monkeypatch.setattr(builtins, "input", no_input)
+    adapter = HeadlessAdapter(interactive=False, quiet=True)
+    try:
+        asyncio.run(adapter.ask_user([{"question": "Which db?"}]))
+    except NoUserAvailable:
+        pass
+    else:
+        raise AssertionError("non-interactive ask_user must raise NoUserAvailable")
+    assert adapter.denied_without_terminal == 0  # a question is not a denial
+    result = asyncio.run(ask_user([{"question": "Which db?"}], adapter=adapter))
+    assert result == UNAVAILABLE_ASK_RESULT
+
+
+def test_headless_ask_user_lock(monkeypatch):
+    import asyncio
+    import builtins
+    import threading
+    import time
+
+    from dostuff.headless import HeadlessAdapter
+    log: list[str] = []
+    lock = threading.Lock()
+
+    def fake_input(prompt=""):
+        with lock:
+            log.append("enter")
+        time.sleep(0.05)
+        with lock:
+            log.append("exit")
+        return "1"
+    monkeypatch.setattr(builtins, "input", fake_input)
+    adapter = HeadlessAdapter(interactive=True, quiet=True)
+    question = [{"question": "Which db?", "options": [{"label": "SQLite"}, {"label": "Postgres"}]}]
+
+    async def go():
+        return await asyncio.gather(adapter.ask_user(question), adapter.ask_user(question))
+    assert asyncio.run(go()) == [[("Which db?", "SQLite")], [("Which db?", "SQLite")]]
+    assert log == ["enter", "exit", "enter", "exit"]  # never overlapping
+
+
+def test_headless_eof_cancels_question(monkeypatch):
+    import asyncio
+    from dostuff.headless import HeadlessAdapter
+
+    _scripted_input(monkeypatch, [EOFError()])
+    adapter = HeadlessAdapter(interactive=True, quiet=True)
+    assert asyncio.run(adapter.ask_user([{"question": "Which db?"}])) is None  # cancelled, not an exception
+
+
+def test_headless_ask_user_offered():
+    from dostuff.headless import HeadlessAdapter  # noqa: F401  (the tool list is the same in both modes)
+    from dostuff.tools.definitions import default_tool_names
+
+    assert "ask_user" in default_tool_names()
+
+
+def test_headless_ask_line_parsing():
+    """The pure helper behind `ask_user`, so the numbering rules are testable without `input`."""
+    from dostuff.headless import _parse_ask_line
+
+    options = [{"label": "SQLite"}, {"label": "Postgres"}]
+    assert _parse_ask_line("2", options) == "Postgres"
+    assert _parse_ask_line(" 1 , 2 ", options) == "SQLite, Postgres"
+    assert _parse_ask_line("9", options) == "9"            # out of range: free text
+    assert _parse_ask_line("my own db", options) == "my own db"
+    assert _parse_ask_line("", options) == "(no answer)"
+    assert _parse_ask_line("", []) == "(no answer)"
+
+
+def test_print_mode_ask_user_end_to_end(monkeypatch):
+    """Phase 3 exit check (D13): the tool through the real headless adapter, exactly as the loop calls it:
+    the terminal answers, and the result is the D5 block the model reads next."""
+    import asyncio
+
+    from dostuff.headless import HeadlessAdapter
+    from dostuff.helpers.ui.ask_answers import parse_answers
+    from dostuff.tools.ask_user import ask_user
+
+    _scripted_input(monkeypatch, ["2", "Tiger"])
+    adapter = HeadlessAdapter(interactive=True, quiet=True)
+    result = asyncio.run(ask_user([{"question": "Which db?", "options": [{"label": "SQLite"}, {"label": "Postgres"}]},
+                                   {"question": "Name?"}], adapter=adapter))
+    assert parse_answers(result) == [("Which db?", "Postgres"), ("Name?", "Tiger")]
+
+
+def test_export_keeps_the_grammar(env):
+    """`/export` writes the ask_user answers as text — the `→` arrow and one question per row, no escaping —
+    and the exported session re-reads as the same steps (T5.3: a store round trip, no second copy of the data)."""
+    from dostuff.helpers.ui.ask_answers import format_answers, parse_answers
+    from dostuff.lib.memory.session_store import SQLiteSessionStore
+
+    pairs = [("Which database should I use?", "Postgres"), ("Which auth methods?", "JWT, OAuth")]
+    result_text = format_answers(pairs)
+
+    async def seed():
+        store = SQLiteSessionStore(db_path=str(env["home"] / ".dostuff" / "data" / "sessions.db"))
+        await store.append("aac333", {"role": "user", "content": "build it"})
+        await store.append("aac333", {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "function": {"name": "ask_user", "arguments": '{"questions": [{"question": "x"}]}'}}]})
+        await store.append("aac333", {"role": "tool", "name": "ask_user", "tool_call_id": "c1", "content": result_text})
+        await store.close()
+
+    asyncio.run(seed())
+    result = runner.invoke(env["app"], ["export", "aac333", "-o", "-"])
+    assert result.exit_code == 0, result.output
+    md = result.output
+    # the grammar survives markdown verbatim: the arrow and the question/answer rows, unescaped
+    assert "Which database should I use?" in md and "Postgres" in md
+    assert "Which auth methods?" in md and "JWT, OAuth" in md
+    assert "→ Postgres" in md and "→ JWT, OAuth" in md
+    assert "&#8594;" not in md and "\\u2192" not in md
+
+    async def reread() -> list[dict]:
+        store = SQLiteSessionStore(db_path=str(env["home"] / ".dostuff" / "data" / "sessions.db"))
+        try:
+            return await store.load("aac333")
+        finally:
+            await store.close()
+
+    steps = asyncio.run(reread())
+    tool_steps = [s for s in steps if s.get("role") == "tool"]
+    assert len(tool_steps) == 1 and tool_steps[0]["content"] == result_text
+    assert parse_answers(tool_steps[0]["content"]) == pairs  # read back as the same pairs

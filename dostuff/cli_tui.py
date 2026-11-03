@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 from textual.app import App, ComposeResult
 from textual.geometry import Region
 from textual.message import Message
@@ -49,6 +49,7 @@ from dostuff.lib.worktree import Worktree, WorktreeError, create_worktree, detec
 from dostuff.lib.model import get_model
 from dostuff.lib.tracing import session_id_var, turn_id_var
 from dostuff.helpers.agent.append_step import append_step
+from dostuff.helpers.agent.loop_check_cancelled import CANCELLED_TURN
 from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_paths, expand_file_mentions,
                                                  format_mention, mention_candidates, strip_attachments)
 from dostuff.helpers.agent.model_cost import format_cost
@@ -58,6 +59,7 @@ from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
+from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers
 from dostuff.helpers.agent.slash_suggestion import slash_arg_hint, slash_suggestion
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
 from dostuff.helpers.hooks.dispatch import hook_line
@@ -104,6 +106,15 @@ QUIT_HINT = "ctrl+q or /exit to quit"  # flashed when Esc / Ctrl+C has nothing t
 HISTORY_SEARCH_MAX = 500  # Ctrl+R: newest prompts offered
 SKILL_MENU_DESCRIPTION_CHARS = 100  # skill descriptions can be paragraphs; the "/" menu shows the start
 TODO_RESULT_PREFIX = "todo_write: "  # loop() emits results as "<tool>: <result>"
+ASK_RESULT_PREFIX = "ask_user: "  # its result is a few short "question → answer" lines, shown in full
+ASK_SUBMIT_LABEL = "Submit answers"
+ASK_HINT = "↑/↓ select · Enter confirm · ←/→ change question · Esc cancel"
+ASK_INERT_HINT = "answer every question first"
+ASK_OTHER_LABEL = "Other (type your own)"
+ASK_EMPTY_INPUT_HINT = "type an answer (Esc cancels the questions)"
+# The current question's tab: bold orange, plus the solid bar `_tabs` puts in front of it. No background:
+# under the ansi-dark theme a hex `on` colour snaps to black, which is invisible on a dark terminal.
+ASK_CURRENT_TAB = "bold #e5c07b"
 # Gemini sends reasoning as whole summary paragraphs ~1 s apart; each new chunk is typed out
 # over THOUGHT_REVEAL_TICKS ticks so it reads like streaming instead of popping in as a block
 THOUGHT_REVEAL_INTERVAL_S = 0.03
@@ -474,6 +485,33 @@ class CommandMenu(OptionList):
         return self.get_option_at_index(self.highlighted).id
 
 
+def _option_window(count: int, cursor: int, visible: int = PICKER_MAX_VISIBLE) -> tuple[int, int]:
+    """The first and last row shown for `count` rows with the cursor at `cursor`: it scrolls by half a
+    screen, so the markers (`↑ N more` / `↓ N more`) appear the same way in every selector."""
+    start = max(0, min(cursor - visible // 2, count - visible))
+    return start, min(start + visible, count)
+
+
+def _append_option_rows(text: Text, rows: list[str], cursor: int, start: int, end: int,
+                        meta_key: str = "option", indent: str = "  ") -> None:
+    """The visible rows of a selector, numbered from `start` (the label already carries its number).
+
+    The rows share the scroll markers and the `❯` cursor mark, so the approval selector, the /resume
+    picker and the ask-user panel can't drift apart; each row carries `meta={meta_key: i}` for clicks.
+    """
+    if start:
+        text.append(f"\n{indent}↑ {start} more", style="dim")
+    for i in range(start, end):
+        row = Style(meta={meta_key: i})  # read back by on_click, wrapped lines included
+        text.append("\n")
+        if i == cursor:
+            text.append(f"❯ {rows[i]}", style=Style(bold=True, color="#8ab4f8") + row)
+        else:
+            text.append(f"  {rows[i]}", style=row)
+    if end < len(rows):
+        text.append(f"\n{indent}↓ {len(rows) - end} more", style="dim")
+
+
 def _confirm_text(details: str) -> Text:
     """Approval details in the confirm color, with diff lines colored like the diff view."""
     text = Text()
@@ -547,20 +585,9 @@ class PermissionPrompt(Static, can_focus=True):
                 typed = self._filter.strip()
                 text.append("\n  No match" + (f"; Enter uses '{typed}' as typed" if typed else ""), style="dim")
         count = len(self._options)
-        start = max(0, min(self._cursor - PICKER_MAX_VISIBLE // 2, count - PICKER_MAX_VISIBLE))
-        end = min(start + PICKER_MAX_VISIBLE, count)
-        if start:
-            text.append(f"\n  ↑ {start} more", style="dim")
-        for i in range(start, end):
-            label = self._options[i][1]
-            row = Style(meta={"option": i})  # read back by on_click, wrapped lines included
-            text.append("\n")
-            if i == self._cursor:
-                text.append(f"❯ {i + 1}. {label}", style=Style(bold=True, color="#8ab4f8") + row)
-            else:
-                text.append(f"  {i + 1}. {label}", style=row)
-        if end < count:
-            text.append(f"\n  ↓ {count - end} more", style="dim")
+        rows = [f"{i + 1}. {self._options[i][1]}" for i in range(count)]
+        start, end = _option_window(count, self._cursor)
+        _append_option_rows(text, rows, self._cursor, start, end)
         text.append("\n" + self._hint, style="dim")
         self.update(text)
 
@@ -620,6 +647,311 @@ class PermissionPrompt(Static, can_focus=True):
             self._choose(int(key) - 1)
         elif self.SHORTCUTS.get(key) in values:
             self._choose(values.index(self.SHORTCUTS[key]))
+        else:
+            return
+        event.stop()
+        event.prevent_default()
+
+
+class AskUserPanel(Static, can_focus=True):
+    """The `ask_user` panel (spec D6): the questions as tabs, the current one's options, and one submit row.
+
+    One instance is composed hidden and reused (mounting a second `#ask-panel` raised DuplicateIds before,
+    NOTES.md 2026-10-31), and `configure` resets it for the next call. The panel owns what it must to render
+    itself — the answers recorded so far, the cursors and the `✓` tab strip — and posts one `Submit(answers)`;
+    it never talks to the adapter or to the tool (tasks.md open point 2).
+
+    Nothing submits on a single keystroke: a pick only records the answer and moves on, and the call is
+    submitted from the `Submit answers` row, which is inert until every question has an answer.
+    """
+
+    class Submit(Message):
+        def __init__(self, answers: list[str]) -> None:
+            super().__init__()
+            self.answers = answers
+
+    class NeedsInput(Message):
+        """The `Other` row was picked: the app hands the input over for the typed answer (D6/REQ-4.3)."""
+
+        def __init__(self, index: int) -> None:
+            super().__init__()
+            self.index = index
+
+    class Inert(Message):
+        """Enter (or a click) on the submit row while a question is still unanswered."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(markup=False, **kwargs)
+        self.questions: list[dict] = []
+        self._single: list[str | None] = []  # the single-select pick, per question
+        self._toggles: list[set[int]] = []  # the multi-select picks (option indexes), per question
+        self._other: list[str] = []  # the typed answer to "Other", per question
+        self.cursor_question = 0
+        self.cursor_row = 0  # an option row, or len(options) for the Other row
+        self.submit_focused = False  # the cursor is on the submit row
+
+    # ── State ──────────────────────────────────────────────────────────────────
+
+    def configure(self, questions: list[dict]) -> None:
+        """Show a new call's questions, forgetting the previous call's answers."""
+        self.questions = questions
+        self._single = [None] * len(questions)
+        self._toggles = [set() for _ in questions]
+        self._other = [""] * len(questions)
+        self.cursor_question = 0
+        self.cursor_row = 0
+        self.submit_focused = False
+        if self.is_mounted:
+            self._render_panel()
+
+    def _options(self, index: int) -> list[dict]:
+        return self.questions[index].get("options") or []
+
+    def _multi(self, index: int) -> bool:
+        return bool(self.questions[index].get("multi_select"))
+
+    def _row_count(self, index: int) -> int:
+        """Option rows plus the `Other` row; 1 for a free-text question (D6)."""
+        return len(self._options(index)) + 1
+
+    def answer(self, index: int) -> str | None:
+        """One question's answer, or None while it is unanswered. Multi-select joins in **option order**
+        with the typed answer last (D5)."""
+        if not 0 <= index < len(self.questions):
+            return None
+        if not self._multi(index):
+            return self._single[index] or None
+        picks = [_one_line_answer(option.get("label", "")) for i, option in enumerate(self._options(index))
+                 if i in self._toggles[index]]
+        picks += [self._other[index]] if self._other[index] else []
+        return ", ".join(pick for pick in picks if pick) or None
+
+    def answers(self) -> list[str | None]:
+        return [self.answer(i) for i in range(len(self.questions))]
+
+    def answered(self, index: int) -> bool:
+        return self.answer(index) is not None
+
+    def all_answered(self) -> bool:
+        return bool(self.questions) and all(self.answered(i) for i in range(len(self.questions)))
+
+    def record_other(self, index: int, text: str) -> None:
+        """The typed answer to `Other` (or to a free-text question) came back from the input."""
+        answer = _one_line_answer(text)
+        if not answer:
+            return
+        self._other[index] = answer  # the row shows what was typed, single- or multi-select
+        if not self._multi(index):
+            self._single[index] = answer
+        self.cursor_question, self.submit_focused = index, False
+        self.cursor_row = self._other_row(index) if self._multi(index) else 0
+        self._advance(index)
+        self._render_quietly()
+
+    def _other_row(self, index: int) -> int:
+        return len(self._options(index))
+
+    def _advance(self, from_index: int) -> None:
+        """Auto-advance to the next unanswered question (wrapping), else the submit row (D6); when every
+        question is answered it stops on the submit row."""
+        count = len(self.questions)
+        for step in range(1, count + 1):
+            index = (from_index + step) % count
+            if not self.answered(index):
+                self._land_on(index)
+                return
+        self.submit_focused = True
+
+    def _land_on(self, index: int) -> None:
+        """The cursor arrives at a question. A question with no options shows its single `Other` row rather
+        than taking the input: the panel came up with all the answers on screen, so moving onto one (or
+        landing on it after a pick) must never swallow them. Enter on that row asks for the input (D6)."""
+        self.cursor_question, self.cursor_row, self.submit_focused = index, 0, False
+
+    # ── Rendering ──────────────────────────────────────────────────────────────
+
+    def on_mount(self) -> None:
+        self._render_panel()
+
+    def _tabs(self) -> Text:
+        """The tab strip (D6): one tab per question, the current one unmistakable.
+
+        The strip is the only thing that says which question you are on, so the current tab is bold orange
+        and carries a solid bar; an answered one carries `✓` in the same slot, so every tab is the same
+        width and the strip does not re-flow as answers land. Plain glyphs, never emoji: this line shares
+        its marks with the option rows' own `❯`/`✓`."""
+        text = Text()
+        for i, question in enumerate(self.questions):
+            if i:
+                text.append(" · ", style="dim")
+            here = i == self.cursor_question and not self.submit_focused
+            if here:
+                mark, mark_style = "▌ ", ASK_CURRENT_TAB
+            elif self.answered(i):
+                mark, mark_style = "✓ ", "bold #98c379"
+            else:
+                mark, mark_style = "  ", ""
+            text.append(mark, style=mark_style)
+            label = _one_line_answer(question.get("header") or f"Q{i + 1}")
+            text.append(label, style=ASK_CURRENT_TAB if here else "")
+        return text
+
+    def _submit_line(self) -> tuple[str, str]:
+        """(text, style) of the submit row: bright when it can submit, dim with the hint until then (D6)."""
+        if self.all_answered():
+            label, style = ASK_SUBMIT_LABEL, "bold #8ab4f8"
+        else:
+            label, style = f"{ASK_SUBMIT_LABEL}  ({ASK_INERT_HINT})", "dim"
+        return ((" ❯ " if self.submit_focused else "   ") + label), style
+
+    def _row_texts(self, index: int, width: int) -> list[str]:
+        """`✓ 1. label   description` per row, the description cut to one row (D6: the `detail` idea)."""
+        rows: list[str] = []
+        for i, option in enumerate(self._options(index)):
+            picked = i in self._toggles[index] if self._multi(index) else self._single[index] == _one_line_answer(option.get("label", ""))
+            label = _one_line_answer(option.get("label", ""))
+            line = f"{'✓' if picked else ' '} {i + 1}. {label}"
+            description = _one_line_answer(option.get("description", ""))
+            if description:
+                room = max(width - len(line) - 3, 8)
+                line += "   " + (description if len(description) <= room else description[:room - 1] + "…")
+            rows.append(line)
+        typed = self._other[index]
+        number = len(self._options(index)) + 1
+        rows.append(f"{'✓' if typed else ' '} {number}. {ASK_OTHER_LABEL}" + (f": {typed}" if typed else ""))
+        return rows
+
+    def _render_panel(self) -> None:
+        if not self.questions:
+            self.update(Text(""))
+            return
+        width = max((self.content_size.width or self.app.size.width) - 4, 20)
+        index = min(self.cursor_question, len(self.questions) - 1)
+        text = self._tabs()
+        text.append("\n   " + _one_line_answer(self.questions[index].get("question", "")), style="bold")
+        rows = self._row_texts(index, width)
+        start, end = _option_window(len(rows), min(self.cursor_row, len(rows) - 1))
+        _append_option_rows(text, rows, self.cursor_row if not self.submit_focused else -1, start, end)
+        text.append("\n   " + "─" * max(min(width - 3, 56), 10), style="dim")
+        line, style = self._submit_line()
+        text.append("\n" + line, style=Style(color="#8ab4f8", bold=True) + Style(meta={"ask-submit": True})
+                    if style.startswith("bold") else Style(dim=True, meta={"ask-submit": True}))
+        text.append("\n " + self._hint(), style="dim")
+        self.update(text)
+
+    def _render_quietly(self) -> None:
+        if self.is_mounted:
+            self._render_panel()
+
+    def _hint(self) -> str:
+        """The keys line. A free-text question's only row is `Other`, so say how to take the input from it;
+        the generic hint would leave Enter unexplained on that row."""
+        index = self.cursor_question
+        if not self.submit_focused and not self._options(index):
+            return "Enter or o types the answer · ←/→ change question · Esc cancel"
+        return ASK_HINT
+
+    # ── Keys and clicks (D6 table) ─────────────────────────────────────────────
+
+    def _record_row(self, row: int) -> None:
+        """A pick or toggle of one row of the current question; `Other` hands the input over."""
+        index = self.cursor_question
+        if row >= self._other_row(index):
+            self.cursor_row = self._other_row(index)
+            if self._multi(index) and self._other[index]:
+                self._other[index] = ""  # picking a typed "Other" again toggles it off (D6)
+                self._render_quietly()
+                return
+            self.post_message(self.NeedsInput(index))
+            return
+        if self._multi(index):
+            if row in self._toggles[index]:
+                self._toggles[index].discard(row)
+            else:
+                self._toggles[index].add(row)
+            self.cursor_row = row
+            self._render_quietly()
+            return  # a toggle stays put: several picks are the point
+        self._single[index] = _one_line_answer(self._options(index)[row].get("label", ""))
+        self._other[index] = ""
+        self._advance(index)
+        self._render_quietly()
+
+    def _submit(self) -> None:
+        if self.all_answered():
+            self.post_message(self.Submit([self.answer(i) or "" for i in range(len(self.questions))]))
+        else:
+            self.post_message(self.Inert())
+
+    def _go_to_question(self, index: int) -> None:
+        self._land_on(index % len(self.questions))
+        self._render_quietly()
+
+    def previous_question(self) -> None:
+        """Shift+Tab (the app's binding reaches here while the panel is up, D6)."""
+        if not self.questions:
+            return
+        if self.submit_focused:
+            self._go_to_question(len(self.questions) - 1)
+        else:
+            self._go_to_question(self.cursor_question - 1)
+
+    def on_click(self, event: Click) -> None:
+        meta = event.style.meta
+        if meta.get("ask-submit"):
+            self.submit_focused = True
+            self._render_quietly()
+            self._submit()
+            return
+        row = meta.get("option")  # the same meta key every selector's rows carry
+        if isinstance(row, int) and 0 <= row < self._row_count(self.cursor_question):
+            self.cursor_row, self.submit_focused = row, False
+            self._record_row(row)
+
+    def on_key(self, event: Key) -> None:
+        key = event.key
+        if key in ("tab", "right"):
+            if self.submit_focused:
+                return
+            if self.cursor_question + 1 < len(self.questions):
+                self._go_to_question(self.cursor_question + 1)
+            else:
+                self.submit_focused = True
+                self._render_quietly()
+        elif key in ("shift+tab", "left", "backtab"):
+            self.previous_question()
+        elif key in ("up", "k", "down", "j"):
+            if self.submit_focused:
+                self.submit_focused = False
+                self.cursor_row = 0
+            else:
+                step = -1 if key in ("up", "k") else 1
+                self.cursor_row = (self.cursor_row + step) % self._row_count(self.cursor_question)
+            self._render_quietly()
+        elif key == "enter":
+            if self.submit_focused:
+                self._submit()
+            else:
+                self._record_row(self.cursor_row)
+        elif key == "space" and self._multi(self.cursor_question):
+            self.submit_focused = False  # a toggle is a row pick, from the submit row too
+            self._record_row(self.cursor_row)
+        elif key == "o" and not self.submit_focused and self.cursor_row >= self._other_row(self.cursor_question):
+            # `o` is the deliberate way into a typed answer, for a free-text question whose panel is just
+            # its Other row. It always asks for the input — never the Enter row's toggle-off, which would
+            # throw a typed answer away when the user meant to edit it.
+            self.cursor_row = self._other_row(self.cursor_question)
+            self.post_message(self.NeedsInput(self.cursor_question))
+        elif key.isdigit():
+            number = int(key)
+            if 1 <= number <= len(self._options(self.cursor_question)):
+                self.submit_focused, self.cursor_row = False, number - 1
+                self._record_row(number - 1)
+            elif number == self._other_row(self.cursor_question) + 1:
+                self.submit_focused, self.cursor_row = False, self._other_row(self.cursor_question)
+                self._record_row(self._other_row(self.cursor_question))
+            else:
+                return
         else:
             return
         event.stop()
@@ -869,10 +1201,11 @@ class TuiAdapter:
       adapter.ask(message)              → TUI shows a selector; returns an ApprovalReply
                                           ("yes" | "always" | "no", plus feedback for "no")
       adapter.ask_batch(messages)       → one selector for several calls; adds "each"
+      adapter.ask_user(questions)       → the ask_user tool: every answer in order, or None when cancelled
 
     TUI calls:
       adapter.choose(value)             → an option was picked in the selector
-      adapter.got_input(text)           → typed reply (feedback after "No", or y/a/n)
+      adapter.got_input(text)           → typed reply (feedback after "No", or the answer to a question)
     """
 
     def __init__(self, app: "DostuffTUI"):
@@ -882,6 +1215,14 @@ class TuiAdapter:
         self._confirm_reply: ApprovalReply | None = None
         self._feedback_mode = False  # "No" was picked; the input now takes feedback for the model
         self._feedback_on_no = True  # whether "No" asks for that feedback (not for the hook trust prompt)
+        # The question channel (ask-user spec D7), beside the approval one and sharing its lock
+        self._waiting_for_ask = False
+        self._ask_event: asyncio.Event | None = None
+        self._ask_answers: list[str] | None = None  # one resolution's answers (None = cancelled)
+        self._ask_question: dict | None = None  # the question the input is answering right now
+        self._other_mode = False  # the input takes an answer right now (a free-text call, or "Other")
+        self._ask_panel_owns_input = False  # ...and it belongs to a question of the open panel
+        self._other_index = 0  # which question of the panel the input is answering
         self._ask_lock = asyncio.Lock()  # one prompt at a time
         self._last_turn_usage: dict = {}
         self._session_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -951,6 +1292,11 @@ class TuiAdapter:
             if text.startswith(TODO_RESULT_PREFIX):  # the plan is short and worth seeing in full
                 app._append_tool_result(text.removeprefix(TODO_RESULT_PREFIX), max_lines=100)
                 return
+            if text.startswith(ASK_RESULT_PREFIX):  # the answers are the whole point: show every pair (D9)
+                pairs = parse_answers(text.removeprefix(ASK_RESULT_PREFIX))
+                if pairs is not None:
+                    app._append_answers_block(pairs)
+                    return  # a cancelled or refused result has no pairs and falls through to the usual line
             app._append_call_result(text)
             return
         if event_type in ("confirm", "system", "error"):
@@ -1013,11 +1359,22 @@ class TuiAdapter:
                 return
             self._ask_lock.release()  # the user started typing while it waited for the lock
 
+    @contextlib.asynccontextmanager
+    async def _hold_prompt(self, background: bool = False) -> AsyncIterator[None]:
+        """Hold the one-prompt lock for the duration of a prompt and put the title back when it resolves,
+        so an approval and a question restore `running`/`done` in exactly one place (ask-user D7)."""
+        await self._acquire_prompt(background)
+        try:
+            yield
+        finally:
+            # a background agent's prompt can come while idle
+            self._app._set_title("running" if self._app._turn_in_progress else "done")
+            self._ask_lock.release()
+
     async def _prompt(self, details: str, question: str, options: list[tuple[str, str]],
                       feedback: bool = True, background: bool = False) -> ApprovalReply:
         # Runs on the UI loop (turns are async workers), so widgets can be touched directly
-        await self._acquire_prompt(background)
-        try:
+        async with self._hold_prompt(background):
             self._waiting_for_confirm = True
             self._feedback_mode = False
             self._feedback_on_no = feedback
@@ -1034,13 +1391,103 @@ class TuiAdapter:
                 self._feedback_mode = False
                 self._confirm_event = None
                 self._app._hide_permission_prompt()
-                # a background agent's prompt can come while idle
-                self._app._set_title("running" if self._app._turn_in_progress else "done")
             reply = self._confirm_reply or ApprovalReply("no")
             self._confirm_reply = None
             return reply
+
+    # ── The question channel (ask-user spec D7) ────────────────────────────────
+
+    async def ask_user(self, questions: list[dict]) -> list[tuple[str, str]] | None:
+        """Ask the questions; every answer in question order, or None when the user cancelled.
+
+        The panel renders all of them and posts one `Submit` (tasks.md open point 2); a call whose questions
+        are all free text never shows it, and the input takes each answer (D6). Emotionally this is the
+        sibling of `_prompt`: it shares the lock, the title and the notification.
+        """
+        if self._cancelled or self._cancel_event.is_set():
+            return None  # the turn is being cancelled: don't open a prompt on the way out
+        async with self._hold_prompt():
+            if self._uses_panel(questions):
+                answers = await self._ask_with_panel(questions)
+            else:
+                answers = await self._ask_free_text(questions)
+            if answers is None:
+                return None  # cancelled: the tool records the D5 cancel text
+            return [(_one_line_answer(q.get("question", "")), answer) for q, answer in zip(questions, answers)]
+
+    @staticmethod
+    def _uses_panel(questions: list[dict]) -> bool:
+        """A call with no option questions never shows the panel: each Enter is the submission (D6)."""
+        return any(question.get("options") for question in questions)
+
+    async def _ask_with_panel(self, questions: list[dict]) -> list[str] | None:
+        """The panel's one answer list, or None on Esc. A free-text question in a mixed call hands the
+        input over when its turn comes; the panel keeps the rest."""
+        event = self._start_ask(questions[0] if questions else {})
+        try:
+            self._app._show_ask_panel(questions)
+            await event.wait()
+            return self._ask_answers
         finally:
-            self._ask_lock.release()
+            self._finish_ask()
+
+    async def _ask_free_text(self, questions: list[dict]) -> list[str] | None:
+        """Every question is free text: the input takes each answer with the question as its placeholder
+        (D6), and the last Enter is the submission; there is no submit row."""
+        answers: list[str] = []
+        for question in questions:
+            event = self._start_ask(question)
+            try:
+                self._other_mode = True  # the input is the answer to this question
+                self._ask_question = question
+                self._app._hand_input_over(_one_line_answer(question.get("question", "")))
+                await event.wait()
+            finally:
+                self._finish_ask()
+            if self._ask_answers is None:
+                return None
+            answers.extend(self._ask_answers)
+        return answers
+
+    def _start_ask(self, question: dict) -> asyncio.Event:
+        """Open the question channel: one event per resolution, and the title/notification of REQ-4.6."""
+        self._waiting_for_ask = True
+        self._other_mode = False
+        self._ask_panel_owns_input = False
+        self._ask_answers = None
+        self._ask_question = question
+        event = asyncio.Event()
+        self._ask_event = event
+        self._app._approval_waiting(_one_line_answer(question.get("question", "")))
+        return event
+
+    def _finish_ask(self) -> None:
+        self._waiting_for_ask = False
+        self._other_mode = False
+        self._ask_panel_owns_input = False
+        self._other_index = 0
+        self._ask_event = None
+        self._ask_question = None
+        self._app._hide_ask_panel()
+        self._app._give_input_back()
+
+    def _resolve_ask(self, answers: list[str] | None) -> None:
+        """One resolution of the question channel: the answers (None = cancelled) wake the waiting turn."""
+        if self._waiting_for_ask and self._ask_event is not None:
+            self._ask_answers = answers
+            self._ask_event.set()
+
+    def cancel_pending_ask(self) -> None:
+        """Esc, Ctrl+Q or /exit while a question is open: resolve it as cancelled. A no-op when idle (D7)."""
+        self._resolve_ask(None)
+
+    def has_pending_ask(self) -> bool:
+        return self._waiting_for_ask
+
+    def has_pending_prompt(self) -> bool:
+        """The app's one gate (D7): a prompt of either kind owns the input. `has_pending_confirm` stays
+        approval-only, so the approval paths are untouched (CON-005)."""
+        return self._waiting_for_confirm or self._waiting_for_ask
 
     def _resolve(self, reply: ApprovalReply) -> None:
         if self._waiting_for_confirm and self._confirm_event is not None:
@@ -1060,10 +1507,38 @@ class TuiAdapter:
         self._resolve(ApprovalReply(value))  # type: ignore[arg-type]
 
     def got_input(self, text: str) -> None:
-        if self._feedback_mode:
+        if self._other_mode:
+            # The input is answering a question (ask-user D7): in a free-text-only call the text is the whole
+            # answer to this question, so a number is text too; otherwise it answers the "Other" row.
+            answer = _one_line_answer(text)
+            if not answer:  # open point 4: an empty Enter records nothing; Esc is the way out
+                self._app._flash_input_hint(ASK_EMPTY_INPUT_HINT)
+                return
+            if self._ask_panel_owns_input:
+                self._app._ask_panel_other(self._other_index, answer)
+            else:
+                self._resolve_ask([answer])
+        elif self._feedback_mode:
             self._resolve(ApprovalReply("no", feedback=text))
         else:
             self._resolve(ApprovalReply(parse_answer(text)))
+
+    def got_ask_submit(self, answers: list[str]) -> None:
+        """The panel's `Submit answers` row: every question is answered, so the call resolves (D6)."""
+        self._resolve_ask(list(answers))
+
+    def begin_other(self, index: int) -> None:
+        """The panel's `Other` row (or a free-text question in a mixed call): the input takes the text."""
+        if not self._waiting_for_ask:
+            return
+        self._other_mode = True
+        self._ask_panel_owns_input = True
+        self._other_index = index
+
+    def end_other(self) -> None:
+        """The typed answer was recorded: the input is a prompt input again, and the panel takes over."""
+        self._other_mode = False
+        self._ask_panel_owns_input = False
 
     def deny_pending_confirm(self) -> None:
         """ESC while a prompt is open: resolve it as "no"."""
@@ -1087,6 +1562,9 @@ class DostuffTUI(App):
         height: auto; margin-top: 1; padding: 0 1; background: transparent; border: round #e5c07b;
     }
     #picker {
+        height: auto; margin-top: 1; padding: 0 1; background: transparent; border: round #8ab4f8;
+    }
+    #ask-panel {
         height: auto; margin-top: 1; padding: 0 1; background: transparent; border: round #8ab4f8;
     }
     .msg-error { color: #e06c75; }
@@ -1120,6 +1598,10 @@ class DostuffTUI(App):
     #input > .text-area--cursor-line { background: transparent; }
     /* Ghost text: the theme's $text-muted is the terminal's plain foreground under ansi-dark */
     #input > .text-area--suggestion { color: #6a6a6a; }
+    /* The placeholder is where a handed-over input puts the question (ask-user D7) and where the denial
+       note asks for text. Textual's default is `$text 40%`, which an ANSI theme cannot blend, so it paints
+       plain white and reads as a real prompt. Dim it to the ghost text's grey, one step quieter than text. */
+    #input > .text-area--placeholder { color: #6a6a6a; }
     #status-row { height: 1; }
     #status { width: auto; height: 1; color: #8a8a8a; padding: 0 1; }
     #jobs-bar { width: auto; height: 1; display: none; padding: 0 1; }
@@ -1258,6 +1740,9 @@ class DostuffTUI(App):
         picker = PermissionPrompt("", [], id="picker")
         picker.display = False  # shown in place of the input by _show_picker
         yield picker
+        panel = AskUserPanel(id="ask-panel")
+        panel.display = False  # the ask_user questions, in place of the input (D6)
+        yield panel
         yield EnterSubmits(id="input", language="")
         with Horizontal(id="status-row"):
             yield Static(id="status")
@@ -1281,15 +1766,15 @@ class DostuffTUI(App):
 
     def _keep_input_focus(self, focused: Widget | None) -> None:
         """Focus always goes back to the input (or the selector shown in its place)."""
-        if not isinstance(focused, (EnterSubmits, PermissionPrompt, SettingsEditor)):
+        if not isinstance(focused, (EnterSubmits, PermissionPrompt, AskUserPanel, SettingsEditor)):
             # call_later, not call_after_refresh: waiting on a repaint is slow on Windows
             self.call_later(self._refocus_input)
 
     def _refocus_input(self) -> None:
-        if isinstance(self.screen.focused, (EnterSubmits, PermissionPrompt, SettingsEditor)):
+        if isinstance(self.screen.focused, (EnterSubmits, PermissionPrompt, AskUserPanel, SettingsEditor)):
             return
         try:
-            for widget in (*self.query(PermissionPrompt), *self.query(SettingsEditor)):
+            for widget in (*self.query(PermissionPrompt), *self.query(AskUserPanel), *self.query(SettingsEditor)):
                 if widget.display:  # the #picker stays mounted while hidden
                     self.screen.set_focus(widget)
                     return
@@ -1609,6 +2094,11 @@ class DostuffTUI(App):
         role = step.get("role", "?")
         content = step.get("content") or ""
         if role == "tool":
+            if step.get("name") == "ask_user" and not prefix:
+                pairs = parse_answers(content)
+                if pairs is not None:  # the same block the live view showed (T5.2, CON-007)
+                    self._append_answers_block(pairs)
+                    return
             self._append_call_result(f"{prefix}{step.get('name', '')}: {content}")
             return
         if role == "user":
@@ -2058,6 +2548,9 @@ class DostuffTUI(App):
 
     def action_cycle_permission_mode(self) -> None:
         """Shift+Tab: next permission mode for this session (ask → auto → plan → allowlist)."""
+        if self._ask_panel_open():
+            self._ask_panel().previous_question()  # Shift+Tab in the questions panel: back a question (D6)
+            return
         if self._settings_open() or self._picker_open():
             return
         mode = next_mode(self.permissions.mode or self.config.permission_mode)
@@ -2725,8 +3218,8 @@ class DostuffTUI(App):
 
     def on_enter_submits_submitted(self, event: EnterSubmits.Submitted) -> None:
         text = event.text
-        # A pending approval prompt consumes the input (empty Enter after "No" = deny without feedback)
-        if self.adapter.has_pending_confirm():
+        # A pending approval or question consumes the input (empty Enter after "No" = deny without feedback)
+        if self.adapter.has_pending_prompt():
             self.adapter.got_input(self._pastes.inline(text))
             self._clear_input()
             return
@@ -2914,17 +3407,106 @@ class DostuffTUI(App):
         self.query_one("#messages", VerticalScroll).anchor()  # show the details being approved
         self.call_after_refresh(prompt.focus)
 
+    # ── The question panel (ask-user D6) ───────────────────────────────────────
+
+    def _ask_panel(self) -> AskUserPanel:
+        return self.query_one("#ask-panel", AskUserPanel)
+
+    def _show_ask_panel(self, questions: list[dict]) -> None:
+        """Swap the input for the questions panel until the call is submitted or cancelled (D6)."""
+        panel = self._ask_panel()
+        self._close_picker()  # /resume-style pickers and the questions never share the input
+        menu = self.query("#command-menu")
+        if menu:
+            menu.first().display = False
+        inp = self.query_one("#input", EnterSubmits)
+        if inp.display:
+            self._viewport_before_prompt = self.query_one("#messages", VerticalScroll).size.height
+        inp.display = False
+        panel.configure(questions)
+        panel.display = True
+        # No anchor(): like _show_picker, the panel must not drag a transcript the user scrolled up back
+        # to the bottom. `Transcript._get_scrollable_region` already keeps a bottom-pinned view flush (T4.6).
+        self.call_after_refresh(panel.focus)
+
+    def _hide_ask_panel(self) -> None:
+        """Put the panel away; the input comes back through `_give_input_back` (idempotent when idle)."""
+        panel = self.query("#ask-panel")
+        if panel and panel.first().display:
+            panel.first().display = False
+
+    def _ask_panel_open(self) -> bool:
+        panels = self.query("#ask-panel")
+        return bool(panels) and panels.first().display
+
+    def on_ask_user_panel_submit(self, event: AskUserPanel.Submit) -> None:
+        self.adapter.got_ask_submit(event.answers)
+
+    def on_ask_user_panel_needs_input(self, event: AskUserPanel.NeedsInput) -> None:
+        """The `Other` row: the input takes the typed answer and the panel waits for it (D6/REQ-4.3)."""
+        question = self._ask_panel().questions[event.index]
+        self.adapter.begin_other(event.index)
+        prompt = _one_line_answer(question.get("question", ""))
+        if not (question.get("options") or []):
+            # A free-text question's one row *is* "Other", so naming it in the placeholder would read
+            # "Other (type your own): Name the app?" — the question alone is clearer.
+            self._hand_input_over(prompt or "Type your answer (Enter sends, Esc cancels)")
+            return
+        self._hand_input_over(f"{ASK_OTHER_LABEL}: {prompt or 'Type your answer (Enter sends, Esc cancels)'}")
+
+    def on_ask_user_panel_inert(self, event: AskUserPanel.Inert) -> None:
+        panel = self._ask_panel()
+        missing = [str(i + 1) for i in range(len(panel.questions)) if not panel.answered(i)]
+        self._flash_input_hint(f"answer every question first ({', '.join(missing)})")
+
+    def _ask_panel_other(self, index: int, text: str) -> None:
+        """The typed `Other` answer came back: record it, give the input back and re-focus the panel."""
+        panel = self._ask_panel()
+        panel.record_other(index, text)
+        self.adapter.end_other()
+        self._give_input_back()  # the draft and the placeholder come back...
+        self.query_one("#input", EnterSubmits).display = False  # ...but the panel still owns the screen
+        panel.display = True
+        panel.focus()
+
     def _ask_denial_feedback(self) -> None:
         """After "No": the input (yellow border) takes an optional note for the model."""
-        if self.query("#permission-prompt"):
+        self._hand_input_over("Tell the model what to do instead (Enter to send, empty Enter to just deny)")
+
+    def _hand_input_over(self, placeholder: str) -> None:
+        """Give the input to a prompt (ask-user D7): hide the prompt widget, yellow border, a new placeholder,
+        and the draft set aside until `_give_input_back` restores it. Used by the denial flow and by a
+        question, so the save/restore exists once."""
+        if self.query("#permission-prompt") or self._ask_panel_open():
             self._hold_transcript()
         self._hide_permission_prompt(restore_input=False)
+        self._hide_ask_panel()  # the "Other" row keeps its answers: only the widget leaves the screen
+        menu = self.query("#command-menu")
+        if menu:  # not every hand-over has the menu mounted (a bare adapter in a unit test)
+            menu.first().display = False
         inp = self.query_one("#input", EnterSubmits)
-        self._draft_before_feedback = inp.text
+        if not inp.has_class("feedback-mode"):
+            self._draft_before_feedback = inp.text  # a second hand-over keeps the draft it was given
         inp.text = ""
         if hasattr(inp, "placeholder"):
-            inp.placeholder = "Tell the model what to do instead (Enter to send, empty Enter to just deny)"
+            inp.placeholder = placeholder
         inp.add_class("feedback-mode")
+        inp.display = True
+        inp.focus()
+
+    def _give_input_back(self) -> None:
+        """The undo of `_hand_input_over` (and the approval prompt's restore): the draft comes back and the
+        input is a prompt input again."""
+        try:
+            inp = self.query_one("#input", EnterSubmits)
+        except Exception:
+            return  # shutting down
+        if inp.has_class("feedback-mode"):
+            inp.remove_class("feedback-mode")
+            if hasattr(inp, "placeholder"):
+                inp.placeholder = ""
+            inp.text = self._draft_before_feedback
+            self._draft_before_feedback = ""
         inp.display = True
         inp.focus()
 
@@ -2958,18 +3540,7 @@ class DostuffTUI(App):
             widget.remove()
         if not restore_input:
             return
-        try:
-            inp = self.query_one("#input", EnterSubmits)
-        except Exception:
-            return  # shutting down
-        if inp.has_class("feedback-mode"):
-            inp.remove_class("feedback-mode")
-            if hasattr(inp, "placeholder"):
-                inp.placeholder = ""
-            inp.text = self._draft_before_feedback
-            self._draft_before_feedback = ""
-        inp.display = True
-        inp.focus()
+        self._give_input_back()
 
     def on_permission_prompt_chosen(self, event: PermissionPrompt.Chosen) -> None:
         if event.source_id == "picker":
@@ -3107,6 +3678,7 @@ class DostuffTUI(App):
         """One agent turn. `wake`: started by a background job ending (D15) — `user_text` is the pending
         notice text, and no user step is stored: the loop drains the notice into history itself."""
         loader_widget: Static | None = None
+        cancelled = False  # the loop's own verdict: `adapter._cancelled` is cleared before it returns
         try:
             # One loader for the whole turn, from the start: a "Loading model libraries..." loader removed and
             # a "Working..." one mounted later left a frame with neither (the session-start bounce)
@@ -3215,6 +3787,7 @@ class DostuffTUI(App):
             )
 
             agent_text = result or "(no response)"
+            cancelled = result == CANCELLED_TURN
             # A streamed final answer is already on screen
             if agent_text.strip() != self._last_streamed_answer.strip():
                 self._append(agent_text, msg_type="agent")
@@ -3225,33 +3798,42 @@ class DostuffTUI(App):
             self._stop_timer()
             started, self._turn_start_time = self._turn_start_time, None
             self._turn_in_progress = False
+            cancelled = cancelled or self.adapter._cancelled  # an Esc after the loop's last check
             self._finish_stream_widgets()
             self._stop_loader(loader_widget)
             if started is not None:
-                self._append_turn_summary(time.time() - started)
+                self._append_turn_summary(time.time() - started, cancelled)
                 self._set_title("done")
-                if not self.adapter._cancelled and not self._prompt_queue:
+                if not cancelled and not self._prompt_queue:
                     self._notify("dostuff: turn finished", time.time() - started)
             self._release_transcript()  # after the summary, in the same refresh, so it fills the held rows
             self._render_status()  # session cost changed
-            self._process_prompt_queue()
+            self._process_prompt_queue(cancelled)
             self._schedule_wake()  # a job that ended after the loop's last drain
 
-    def _append_turn_summary(self, elapsed: float) -> None:
-        """`✻ Worked for 1m 5s · $0.01 · done 12:59 PM` under a finished turn."""
-        verb = "Cancelled after" if self.adapter._cancelled else "Worked for"
+    def _append_turn_summary(self, elapsed: float, cancelled: bool = False) -> None:
+        """`✻ Worked for 1m 5s · $0.01 · done 12:59 PM` under a finished turn.
+
+        `cancelled` is the turn's own outcome, not `adapter._cancelled`: `loop_check_cancelled` clears that
+        flag before `loop()` returns, so at summary time it has always been False already.
+        """
+        verb = "Cancelled after" if cancelled else "Worked for"
         parts = [f"✻ {verb} {_fmt_elapsed(elapsed)}"]
         if self.adapter._turn_cost:
             parts.append(format_cost(self.adapter._turn_cost))
         parts.append("done " + time.strftime("%I:%M %p").lstrip("0"))
         self._append(" · ".join(parts), msg_type="system")
 
-    def _process_prompt_queue(self) -> None:
+    def _process_prompt_queue(self, cancelled: bool = False) -> None:
         """Start the next queued prompt, if any. After Esc the queue goes back in the input instead:
-        cancelling stops the work, not just the turn that happened to be running."""
+        cancelling stops the work, not just the turn that happened to be running.
+
+        `cancelled` is passed in for the same reason as in `_append_turn_summary`: the adapter flag has
+        already been cleared by the loop by the time the queue is looked at.
+        """
         if not self._prompt_queue or self._quitting:
             return
-        if self.adapter._cancelled:
+        if cancelled or self.adapter._cancelled:
             prompts, self._prompt_queue = self._prompt_queue, []
             self._render_queue()
             self._put_back_in_input(prompts)
@@ -3486,7 +4068,7 @@ class DostuffTUI(App):
         if self._agent_view_open():
             self._close_agent_view()
             return
-        if not self._turn_in_progress and not self.adapter.has_pending_confirm():
+        if not self._turn_in_progress and not self.adapter.has_pending_prompt():
             # Nothing to cancel (a stale flag would cancel the next turn's first step); Esc Esc
             # with an empty input takes back the last prompt
             self._escape_when_idle()
@@ -3494,6 +4076,7 @@ class DostuffTUI(App):
         self.adapter._cancelled = True
         self.adapter._cancel_event.set()
         self.adapter.deny_pending_confirm()
+        self.adapter.cancel_pending_ask()  # a question resolves as cancelled before the flag is polled (D7)
         self._loader_label = "Cancelling..."
         self._render_loader()
 
@@ -3684,7 +4267,7 @@ class DostuffTUI(App):
 
     def action_history_search(self) -> None:
         """Ctrl+R: pick a past prompt from this directory's history (type to filter) to put in the input."""
-        if self._settings_open() or self._picker_open() or self.adapter.has_pending_confirm():
+        if self._settings_open() or self._picker_open() or self.adapter.has_pending_prompt():
             return
         inp = self.query_one("#input", EnterSubmits)
         prompts = list(dict.fromkeys(reversed(inp.prompt_history)))[:HISTORY_SEARCH_MAX]  # newest first, no repeats
@@ -3720,6 +4303,7 @@ class DostuffTUI(App):
         """
         if self._quitting or self._quit_confirming:
             return
+        self.adapter.cancel_pending_ask()  # nothing waits on a dead event while we quit (D7)
         if self._running_jobs() or self._running_background_agents():
             self._quit_confirming = True
             self.run_worker(self._quit_after_confirm(), name="quit_confirm", exit_on_error=False)
@@ -3909,6 +4493,23 @@ class DostuffTUI(App):
             self._append_tool_result(text)
         else:
             self._append_tool_result(f'moved to background as "{job_id}"\n{text}', max_lines=1)
+
+    def _append_answers_block(self, pairs: list[tuple[str, str]]) -> None:
+        """`ask_user`'s answers as one full `⎿` block, a row per pair (D9): no preview cap and no Ctrl+O,
+        because the whole point is that the user can read back what was answered.
+
+        Shared by the live path (`_emit_on_ui`) and by `/resume` (`_render_history_step`), so a stored
+        session renders identically to the turn that made it."""
+        text = Text()
+        for i, (question, answer) in enumerate(pairs):
+            text.append("  ⎿  " if i == 0 else "     ")
+            text.append(_one_line_answer(question), style="#8a8a8a")
+            text.append(" → ")
+            text.append(_one_line_answer(answer))
+            if i < len(pairs) - 1:
+                text.append("\n")
+        message = SelectableStatic(text, classes="msg msg-tool-result", markup=False)
+        self._mount_message(message)
 
     def action_toggle_tool_results(self) -> None:
         """Ctrl+O: expand every truncated tool / shell result, or collapse them all again."""

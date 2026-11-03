@@ -1,0 +1,4 @@
+> Where is auth handled?
+● delegate_to_subagent(task="Find where login tokens are checked", role="researcher")
+  ⎿  delegate_to_subagent: Tokens are checked in auth/session.py:42 (verify_token).
+Auth is handled in auth/session.py:42.

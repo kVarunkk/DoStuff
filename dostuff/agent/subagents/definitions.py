@@ -74,6 +74,8 @@ CLAUDE_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "Bash": ("bash_command",),
     "WebFetch": ("web_fetch",),
     "WebSearch": ("web_search",),
+    # Known so an agent file that lists it gets the restricted-tool warning, not "unknown" (ask-user D10)
+    "AskUserQuestion": ("ask_user",),
 }
 MCP_TOOLS = ("search_mcp_tools", "get_mcp_tool_details", "call_mcp_tool")
 
@@ -117,11 +119,15 @@ def map_tools(raw: Any, source: str) -> tuple[tuple[str, ...], list[str]]:
             targets: tuple[str, ...] = MCP_TOOLS
         elif name in CLAUDE_TOOL_NAMES:
             targets = CLAUDE_TOOL_NAMES[name]
-        elif name in BUILTIN_TOOL_NAMES and name not in RESTRICTED_SUBAGENT_TOOLS:
+        elif name in BUILTIN_TOOL_NAMES:
             targets = (name,)
         else:
-            why = "not available to subagents" if name in RESTRICTED_SUBAGENT_TOOLS else "unknown tool"
-            warnings.append(f"{source}: tool '{name}' dropped ({why})")
+            warnings.append(f"{source}: tool '{name}' dropped (unknown tool)")
+            continue
+        # Checked after the alias lookup as well as before it: AskUserQuestion → ask_user must not slip
+        # past the restriction by arriving under Claude Code's name (ask-user D10/D11)
+        if any(t in RESTRICTED_SUBAGENT_TOOLS for t in targets):
+            warnings.append(f"{source}: tool '{name}' dropped (not available to subagents)")
             continue
         mapped.extend(t for t in targets if t not in mapped)
     return tuple(mapped), warnings
