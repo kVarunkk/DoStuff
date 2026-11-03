@@ -401,7 +401,8 @@ def test_run_cost_uses_run_model(agents, fake_model, agent_type, main_model, mon
     monkeypatch.setattr(main_model, "context_window", 0)
     agent_type("quick", model="m-fast")
     priced: list[str] = []
-    monkeypatch.setattr(loop_module, "call_cost", lambda model, usage: (priced.append(model), 0.5)[1])
+    from dostuff.helpers.agent import model_cost
+    monkeypatch.setattr(model_cost, "call_cost", lambda model, usage: (priced.append(model), 0.5)[1])
     limits: list[str] = []
     monkeypatch.setattr(limit_module, "_litellm_limit", lambda model: (limits.append(model), 1000)[1])
     usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15)
