@@ -686,3 +686,257 @@ def test_loop_and_side_call_send_the_same_string(monkeypatch, btw):
     for snap, sent in zip(seen, calls):
         assert btw.compose_system_instruction(snap.system_instruction, btw.plan_mode_on(permissions),
                                               snap.compaction_notes, snap.session_hook_context) == sent["system"]
+
+
+# --- Steering Phase 2 (plan/2026-11-04-steering/tasks.md): delivery at the tool boundary (D6, D7) ---
+
+class _Store:
+    """Just enough of SessionStore for `append_step`: every step written, in order (CON-004)."""
+
+    def __init__(self):
+        self.appended: list = []
+
+    async def append(self, session_id, step):
+        self.appended.append((session_id, dict(step)))
+
+
+def _steer_run(monkeypatch, responses, steering=None, *, dispatch=None, on_call=None,
+               prompt_hook=None, hooks=None, **loop_kw):
+    """An `interactive_loop` turn with a steering queue: returns the four histories, the store, the scripted
+    `call_agent` calls and the adapter's events. Hooks are off unless a hook is passed in."""
+    from dostuff.helpers.hooks import HookOutcome
+    calls: list[dict] = []
+
+    async def fake_call_agent(steps_history, system_instruction, tool_names=None, stream=False):
+        calls.append({"history": [dict(s) for s in steps_history], "system": system_instruction})
+        if on_call is not None:
+            on_call(len(calls))
+        item = responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item, None
+
+    async def no_hooks(*args, **kwargs):
+        return HookOutcome()
+
+    async def no_prompt_hook(prompt, **kwargs):
+        return (None, "")  # not blocked, no context — the contract of user_prompt_submit
+
+    monkeypatch.setattr(loop_module, "call_agent", fake_call_agent)
+    monkeypatch.setattr(loop_module, "run_hooks", hooks or no_hooks)
+    monkeypatch.setattr(loop_module, "user_prompt_submit", prompt_hook or no_prompt_hook, raising=False)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+    if dispatch is not None:
+        monkeypatch.setattr(loop_module, "dispatch_tool", dispatch)
+    working = loop_kw.pop("working", None)
+    working = working if working is not None else [{"role": "user", "content": "hi"}]
+    adapter = Adapter()
+    steps: list = []
+    current: list = []
+    store = _Store()
+    loop_kw.setdefault("dynamic_system_instruction", "sys")
+    loop_kw.setdefault("session_id", "s1")
+    result = asyncio.run(loop(
+        turn_id="t1", user_text="hi", mcp_client=None, working_history=working,
+        turn_type=loop_kw.pop("turn_type", "interactive_loop"), stream=False, max_iterations=5,
+        adapter=adapter, steps_history=steps, current_session_history=current, store=store,
+        steering=steering, **loop_kw,
+    ))
+    return SimpleNamespace(result=result, working=working, steps=steps, current=current,
+                           store=store, calls=calls, adapter=adapter)
+
+
+def test_steer_delivered_after_tool_call(monkeypatch):
+    """T2.1 (D6, REQ-2.2/2.3/2.8): a message put while a tool runs is read at the next boundary — after the
+    tool result, before the next model call — and is written exactly once (CON-004)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "use pytest, not unittest"
+
+    async def dispatch(name, args, **kw):
+        msg = q.put(content)
+        q.ready(msg.id, content)  # the tool's own implementation puts it, as a real tool would
+        return "ok"
+
+    run = _steer_run(monkeypatch, [
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]), _msg(content="done")],
+        q, dispatch=dispatch)
+
+    # call 2 reads it as the last step, after the tool result it was reacting to
+    assert run.calls[1]["history"][-1] == {"role": "user", "content": content}
+    assert run.calls[1]["history"][-2]["role"] == "tool"
+    assert not any(s.get("content") == content for s in run.calls[0]["history"])
+    # exactly once in all four places (CON-004)
+    for place in (run.steps, run.working, run.current):
+        assert sum(1 for s in place if s.get("content") == content) == 1, place
+    assert sum(1 for _sid, s in run.store.appended if s.get("content") == content) == 1
+    # the delivery event names the index it was written at
+    steered = [d for e, d in run.adapter.events if e == "steered"]
+    assert len(steered) == 1
+    assert run.steps[steered[0]["index"]] == {"role": "user", "content": content}
+    assert steered[0]["id"]  # the TUI matches on it
+
+
+def test_steer_not_delivered_mid_call(monkeypatch):
+    """T2.1 (REQ-2.8, CON-005): delivery never happens while a tool call runs — the queue is only read at
+    the top of the next iteration."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "stop touching migrations"
+    working = [{"role": "user", "content": "hi"}]
+    during: list = []
+
+    async def dispatch(name, args, **kw):
+        msg = q.put(content)
+        q.ready(msg.id, content)
+        during.append([dict(s) for s in working])  # the history as the tool sees it
+        return "ok"
+
+    run = _steer_run(monkeypatch, [
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]), _msg(content="done")],
+        q, dispatch=dispatch, working=working)
+
+    assert not any(s.get("content") == content for s in during[0])  # not delivered mid-call
+    assert not any(s.get("content") == content for s in run.calls[0]["history"])
+    assert run.calls[1]["history"][-1] == {"role": "user", "content": content}
+
+
+def test_steer_order_after_notices_and_inbox(monkeypatch):
+    """T2.1 (D1): the drain reads notices first (a correction may react to them), then the inbox, then
+    steering — all before publish_snapshot, so a /btw asked afterwards sees all three."""
+    from dostuff.helpers.agent.notices import AgentNotice, get_notice_queue
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    msg = q.put("ignore that failure")
+    q.ready(msg.id, "ignore that failure")
+    queue = get_notice_queue()
+    queue.put("s1", AgentNotice(id="a1", agent_type="explore", description="d", status="completed",
+                                runtime=1.0, tokens=0, report="found it"))
+    try:
+        run = _steer_run(monkeypatch, [_msg(content="ok")], q, inbox=["a message from the model"])
+    finally:
+        queue.drain("s1")  # never leak into another test
+    contents = [s["content"] for s in run.calls[0]["history"]]
+    assert contents[0] == "hi"
+    assert "found it" in contents[1]
+    assert contents[2] == "a message from the model"
+    assert contents[3] == "ignore that failure"
+
+
+def test_steer_blocked_by_user_prompt_submit(monkeypatch):
+    """T2.2 (D6, REQ-2.4, CON-007): a hook that would block a prompt blocks the same text sent as a steering
+    message — nothing is appended, and the reason is emitted for the TUI to show."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "the password is hunter2"
+    msg = q.put(content)
+    q.ready(msg.id, content)
+
+    async def blocking(prompt, **kw):
+        return ("no secrets in the transcript", "") if "password" in prompt else (None, "")
+
+    run = _steer_run(monkeypatch, [_msg(content="ok")], q, prompt_hook=blocking)
+    assert not any(s.get("content") == content for s in run.working)
+    assert not any(s.get("content") == content for _sid, s in run.store.appended)
+    assert [d for e, d in run.adapter.events if e == "steer_blocked"] == [
+        {"id": msg.id, "reason": "no secrets in the transcript"}]
+    assert not any(e == "steered" for e, _ in run.adapter.events)
+
+
+def test_steer_hook_context_in_later_calls(monkeypatch):
+    """T2.2 (REQ-2.5): UserPromptSubmit context joins the system instruction of every later model call of
+    this turn, and is never written into a stored step (hooks spec REQ-2.2)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    ctx = "the tests live in tests/"
+
+    def on_call(n):
+        if n == 1:
+            msg = q.put("actually, use pytest")
+            q.ready(msg.id, "actually, use pytest")
+
+    async def contextual(prompt, **kw):
+        return (None, ctx)
+
+    run = _steer_run(monkeypatch, [
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]),
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "b.py"}), "c2")]),
+        _msg(content="done")], q, on_call=on_call, prompt_hook=contextual)
+    assert len(run.calls) == 3
+    assert ctx not in run.calls[0]["system"]
+    assert ctx in run.calls[1]["system"] and ctx in run.calls[2]["system"]
+    assert not any(ctx in str(s.get("content")) for s in run.steps)
+
+
+def test_steer_failed_emits(monkeypatch):
+    """T2.2 (REQ-2.4): a failed preparation emits steer_failed and appends nothing (CON-004)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "@missing.txt look"
+    msg = q.put(content)
+    q.fail(msg.id, "Could not read @missing.txt")
+
+    run = _steer_run(monkeypatch, [_msg(content="ok")], q)
+    assert [d for e, d in run.adapter.events if e == "steer_failed"] == [
+        {"id": msg.id, "error": "Could not read @missing.txt"}]
+    assert not any(e == "steered" for e, _ in run.adapter.events)
+    assert not any(s.get("content") == content for s in run.working)
+
+
+def test_final_answer_with_steer_continues(monkeypatch):
+    """T2.3 (D7, REQ-2.6): a final answer with a steering message waiting does not end the turn, and the
+    Stop hooks run only on the answer that really ends it."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    from dostuff.helpers.hooks import HookOutcome
+    q = SteeringQueue()
+    stops: list = []
+
+    async def counting_hooks(event, payload, **kw):
+        if event == "Stop":
+            stops.append(payload.get("last_assistant_message"))
+        return HookOutcome()
+
+    def on_call(n):
+        if n == 1:
+            msg = q.put("actually, use pytest")
+            q.ready(msg.id, "actually, use pytest")
+
+    run = _steer_run(monkeypatch, [_msg(content="first answer"), _msg(content="second answer")],
+                     q, on_call=on_call, hooks=counting_hooks)
+    assert len(run.calls) == 2
+    assert run.calls[1]["history"][-1] == {"role": "user", "content": "actually, use pytest"}
+    assert stops == ["second answer"]  # not "first answer"
+
+
+def test_final_answer_waits_for_preparing(monkeypatch):
+    """T2.3 (D7): an entry that is still being prepared also keeps the turn going, and is delivered once
+    it is readied."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    q.put("one more thing")  # unready when call 1 returns
+
+    def on_call(n):
+        if n == 2:
+            q.ready(q.pending()[0].id, "one more thing")
+
+    run = _steer_run(monkeypatch, [_msg(content="one"), _msg(content="two"), _msg(content="three")],
+                     q, on_call=on_call)
+    assert len(run.calls) == 3
+    assert not any(s.get("content") == "one more thing" for s in run.calls[0]["history"])
+    assert not any(s.get("content") == "one more thing" for s in run.calls[1]["history"])
+    assert run.calls[2]["history"][-1] == {"role": "user", "content": "one more thing"}
+
+
+def test_subagent_loop_ignores_steering(monkeypatch):
+    """T2.4 (REQ-2.7, CON-008): a subagent's route is send_message — passing a steering queue to a
+    `subagent_loop` delivers nothing and never even takes the entry."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "main session only"
+    msg = q.put(content)
+    q.ready(msg.id, content)
+
+    run = _steer_run(monkeypatch, [_msg(content="ok")], q, turn_type="subagent_loop")
+    assert not any(s.get("content") == content for s in run.working)
+    assert not any(e in ("steered", "steer_blocked", "steer_failed") for e, _ in run.adapter.events)
+    assert [m.raw for m in q.pending()] == [content]

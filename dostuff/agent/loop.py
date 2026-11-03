@@ -19,12 +19,15 @@ from dostuff.agent.run_tool import (
 )
 from dostuff.helpers.hooks import HookOutcome, run_hooks
 from dostuff.helpers.hooks.dispatch import report_outcome
-from dostuff.helpers.hooks.events import STOP_LIMIT_MESSAGE, STOP_NOTE, session_start, stop_event_for
+from dostuff.helpers.hooks.events import (
+    STOP_LIMIT_MESSAGE, STOP_NOTE, session_start, stop_event_for, user_prompt_submit, with_prompt_context,
+)
 from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
 from dostuff.tools.definitions import TOOL_MAP, default_tool_names
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
+from dostuff.helpers.agent.steering import SteeringQueue
 from dostuff.helpers.agent.side_question import (
     compose_system_instruction, plan_mode_on, publish_snapshot, published_snapshot, usage_dict as build_usage_dict,
 )
@@ -188,7 +191,7 @@ def _job_events(owner: str, adapter: Any) -> Iterator[None]:
         registry.remove_listener(on_job)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction).
 
     `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
@@ -198,9 +201,14 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
 
     `inbox` is a subagent's `send_message` queue (subagents spec D10): each message becomes a user step before
     the next model call, and a final answer with messages waiting doesn't end the run.
+
+    `steering` is the TUI's mid-turn messages (steering spec D1): read at the next tool boundary, inside this
+    turn. Main session only — a `subagent_loop` never delivers one (CON-008), and `run_agent_loop` doesn't pass it.
     """
     current_session_id.set(session_id)
     owner = owner or session_id
+    # Main session only (CON-008): a subagent's route is send_message, never the steering queue
+    steer = steering if turn_type == "interactive_loop" else None
     iteration = 0
     token_limit = get_model_token_limit()
     config = get_config()
@@ -290,6 +298,31 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     await append_note(format_notices(notices, max_tool_output_chars))
                 while inbox:  # send_message to this running subagent, oldest first (D10)
                     await append_note(inbox.pop(0))
+                if steer is not None:
+                    # The user's mid-turn messages, in submit order (D6): after the notices and the inbox so a
+                    # correction is read after the facts it may be reacting to, before publish_snapshot so a
+                    # /btw asked afterwards sees it. Every message goes through UserPromptSubmit (CON-007) and
+                    # is written here, once — never by the TUI at submit (CON-004).
+                    for steer_msg in steer.take_ready():
+                        if steer_msg.failed is not None:
+                            await loop_emit("steer_failed", {"id": steer_msg.id, "error": steer_msg.failed},
+                                            adapter=adapter)
+                            continue
+                        if steer_msg.content is None:
+                            continue  # unreachable: take_ready only returns ready or failed entries
+                        blocked, context = await user_prompt_submit(
+                            steer_msg.content, session_id=session_id, turn_id=turn_id, turn_type=turn_type,
+                            adapter=adapter)
+                        if blocked is not None:
+                            await loop_emit("steer_blocked", {"id": steer_msg.id, "reason": blocked},
+                                            adapter=adapter)
+                            continue
+                        await append_note(steer_msg.content)  # the only write (CON-004)
+                        if context:
+                            # The turn's system instruction only, never persisted (hooks spec REQ-2.2)
+                            dynamic_system_instruction = with_prompt_context(dynamic_system_instruction, context)
+                        await loop_emit("steered", {"id": steer_msg.id, "index": len(steps_history) - 1},
+                                        adapter=adapter)
                 # What a /btw side question reads while this turn runs (btw spec D3); main agent only
                 publish_snapshot(session_id, fork_context())
 
@@ -387,7 +420,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         "content": content,
                     }
                     await append_step(model_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
-                    if inbox:  # a send_message arrived during this call: read it instead of ending
+                    if inbox or (steer is not None and steer.has_ready_or_preparing()):
+                        # A send_message or a steering message arrived during this call: read it instead of
+                        # ending (D10, steering D7). Before the Stop hooks, so a Stop hook sees the answer
+                        # that really ends the turn.
                         iter_span.set_status(Status(StatusCode.OK))
                         continue
 
