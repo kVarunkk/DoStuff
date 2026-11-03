@@ -5525,3 +5525,64 @@ def test_fork_warns_about_running_fork_out(tui, agents, fake_model, side_call, m
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- Steering Phase 0: pins (plan/2026-11-04-steering/tasks.md T0.x) ------------------------
+
+
+@pytest.fixture
+def steer_tui(tui, monkeypatch):
+    """(cli_tui, HeldTurn): a turn in flight, held until released — the steering pins' setup."""
+    held = HeldTurn()
+    monkeypatch.setattr(tui, "agent_loop", held)
+    yield tui, held
+    held.hold = False
+    held.release()
+
+
+@pytest.mark.parametrize("text,expect", [
+    ("fix the bug", "queued"),
+    ("/etc/hosts look", "queued"),
+    ("/release-notes now", "queued"),
+    ("!ls", "refused"),
+    ("/clear", "refused"),
+    ("/jobs", "ran"),
+], ids=["plain", "path", "skill", "shell", "clear", "jobs"])
+def test_pin_mid_turn_routing(steer_tui, text, expect):
+    """T0.1 (steering spec D3): today's mid-turn routing, pinned before it gains a steering branch.
+
+    With a turn in flight a plain message, a path message and a skill command all join `_prompt_queue`;
+    `!command` and `/clear` are refused with their own message; `/jobs` runs at once. Green on unchanged
+    code — Phase 3 keeps this table for `queue` mode and adds a second one for `steer` mode.
+    """
+    cli_tui, held = steer_tui
+    skill_dir = Path(".dostuff", "skills", "release-notes")
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: release-notes\ndescription: Write release notes from git log\n---\nSummarise git log.\n",
+        encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-pin")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            #200 tries: the first turn of a cold run also waits for the backend to load
+            await _until(pilot, lambda: held.gate is not None, tries=200)
+            _submit(app, cli_tui, text)
+            await pilot.pause(0.3)
+            if expect == "queued":
+                assert app._prompt_queue == [text], app._prompt_queue
+                assert not any("while a turn is running" in t for t in _texts(app))
+            elif expect == "refused":
+                assert app._prompt_queue == []
+                assert any("while a turn is running" in t for t in _texts(app))
+            else:  # ran now, not queued
+                await _until(pilot, lambda: any("No background jobs." in t for t in _texts(app)))
+                assert app._prompt_queue == []
+            held.hold = False
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
