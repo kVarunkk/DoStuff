@@ -59,7 +59,7 @@ from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
-from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, pick_options
+from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers, pick_options
 from dostuff.helpers.agent.slash_suggestion import slash_arg_hint, slash_suggestion
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
 from dostuff.helpers.hooks.dispatch import hook_line
@@ -1273,6 +1273,11 @@ class TuiAdapter:
             if text.startswith(TODO_RESULT_PREFIX):  # the plan is short and worth seeing in full
                 app._append_tool_result(text.removeprefix(TODO_RESULT_PREFIX), max_lines=100)
                 return
+            if text.startswith(ASK_RESULT_PREFIX):  # the answers are the whole point: show every pair (D9)
+                pairs = parse_answers(text.removeprefix(ASK_RESULT_PREFIX))
+                if pairs is not None:
+                    app._append_answers_block(pairs)
+                    return  # a cancelled or refused result has no pairs and falls through to the usual line
             app._append_call_result(text)
             return
         if event_type in ("confirm", "system", "error"):
@@ -2063,6 +2068,11 @@ class DostuffTUI(App):
         role = step.get("role", "?")
         content = step.get("content") or ""
         if role == "tool":
+            if step.get("name") == "ask_user" and not prefix:
+                pairs = parse_answers(content)
+                if pairs is not None:  # the same block the live view showed (T5.2, CON-007)
+                    self._append_answers_block(pairs)
+                    return
             self._append_call_result(f"{prefix}{step.get('name', '')}: {content}")
             return
         if role == "user":
@@ -4452,6 +4462,23 @@ class DostuffTUI(App):
             self._append_tool_result(text)
         else:
             self._append_tool_result(f'moved to background as "{job_id}"\n{text}', max_lines=1)
+
+    def _append_answers_block(self, pairs: list[tuple[str, str]]) -> None:
+        """`ask_user`'s answers as one full `⎿` block, a row per pair (D9): no preview cap and no Ctrl+O,
+        because the whole point is that the user can read back what was answered.
+
+        Shared by the live path (`_emit_on_ui`) and by `/resume` (`_render_history_step`), so a stored
+        session renders identically to the turn that made it."""
+        text = Text()
+        for i, (question, answer) in enumerate(pairs):
+            text.append("  ⎿  " if i == 0 else "     ")
+            text.append(_one_line_answer(question), style="#8a8a8a")
+            text.append(" → ")
+            text.append(_one_line_answer(answer))
+            if i < len(pairs) - 1:
+                text.append("\n")
+        message = SelectableStatic(text, classes="msg msg-tool-result", markup=False)
+        self._mount_message(message)
 
     def action_toggle_tool_results(self) -> None:
         """Ctrl+O: expand every truncated tool / shell result, or collapse them all again."""

@@ -797,3 +797,43 @@ def test_print_mode_ask_user_end_to_end(monkeypatch):
     result = asyncio.run(ask_user([{"question": "Which db?", "options": [{"label": "SQLite"}, {"label": "Postgres"}]},
                                    {"question": "Name?"}], adapter=adapter))
     assert parse_answers(result) == [("Which db?", "Postgres"), ("Name?", "Tiger")]
+
+
+def test_export_keeps_the_grammar(env):
+    """`/export` writes the ask_user answers as text — the `→` arrow and one question per row, no escaping —
+    and the exported session re-reads as the same steps (T5.3: a store round trip, no second copy of the data)."""
+    from dostuff.helpers.ui.ask_answers import format_answers, parse_answers
+    from dostuff.lib.memory.session_store import SQLiteSessionStore
+
+    pairs = [("Which database should I use?", "Postgres"), ("Which auth methods?", "JWT, OAuth")]
+    result_text = format_answers(pairs)
+
+    async def seed():
+        store = SQLiteSessionStore(db_path=str(env["home"] / ".dostuff" / "data" / "sessions.db"))
+        await store.append("aac333", {"role": "user", "content": "build it"})
+        await store.append("aac333", {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "function": {"name": "ask_user", "arguments": '{"questions": [{"question": "x"}]}'}}]})
+        await store.append("aac333", {"role": "tool", "name": "ask_user", "tool_call_id": "c1", "content": result_text})
+        await store.close()
+
+    asyncio.run(seed())
+    result = runner.invoke(env["app"], ["export", "aac333", "-o", "-"])
+    assert result.exit_code == 0, result.output
+    md = result.output
+    # the grammar survives markdown verbatim: the arrow and the question/answer rows, unescaped
+    assert "Which database should I use?" in md and "Postgres" in md
+    assert "Which auth methods?" in md and "JWT, OAuth" in md
+    assert "→ Postgres" in md and "→ JWT, OAuth" in md
+    assert "&#8594;" not in md and "\\u2192" not in md
+
+    async def reread() -> list[dict]:
+        store = SQLiteSessionStore(db_path=str(env["home"] / ".dostuff" / "data" / "sessions.db"))
+        try:
+            return await store.load("aac333")
+        finally:
+            await store.close()
+
+    steps = asyncio.run(reread())
+    tool_steps = [s for s in steps if s.get("role") == "tool"]
+    assert len(tool_steps) == 1 and tool_steps[0]["content"] == result_text
+    assert parse_answers(tool_steps[0]["content"]) == pairs  # read back as the same pairs

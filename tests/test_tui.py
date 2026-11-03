@@ -4227,3 +4227,117 @@ def test_question_notifies_after_the_wait(tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- ask-user T5.1: the result renders as answers (REQ-4.5, D9) -------------------------------------
+
+ASK_RESULT_TEXT = (
+    "Asked the user 2 questions; they answered:\n"
+    "1. Which database should I use?\n"
+    "   → Postgres\n"
+    "2. Which auth methods?\n"
+    "   → JWT, OAuth"
+)
+
+
+def test_ask_result_block(tui):
+    """A live result renders as one ⎿ block with one row per answer, in full — not as a raw
+    `ask_user: Asked the user 2 questions…` line, and not cut to the preview height."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-result")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.adapter.emit("tool_result", f"ask_user: {ASK_RESULT_TEXT}")
+            await pilot.pause()
+            text = "\n".join(_message_lines(app))
+            assert "Which database should I use? → Postgres" in text
+            assert "Which auth methods? → JWT, OAuth" in text
+            assert "ask_user:" not in text  # the raw prefix is gone
+            # not a truncated ToolResult: the block is a plain message, so Ctrl+O has nothing to expand
+            assert not app.query(cli_tui.ToolResult) or all(
+                "asked the user" not in str(w.content).lower() for w in app.query(cli_tui.ToolResult))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ask_result_label_is_short(tui):
+    """The call line is `● ask_user("Which database should I use?" +2 more)`, not a JSON blob."""
+    cli_tui = tui
+    label = cli_tui.format_call_label("ask_user", '{"questions": [{"question": "Which database should I use?"},'
+                                                 ' {"question": "Which auth?"}, {"question": "Which cache?"}]}')
+    assert label == 'ask_user("Which database should I use?" +2 more)'
+
+
+def test_ask_result_replays(tui):
+    """A stored session renders the same call label and answer block on /resume as it did live."""
+    cli_tui = tui
+    call = {"id": "c1", "type": "function", "function": {
+        "name": "ask_user",
+        "arguments": '{"questions": [{"question": "Which database should I use? methods"},'
+                     ' {"question": "Which cache?"}]}',
+    }}
+    steps = [
+        {"role": "user", "content": "build it"},
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "tool", "name": "ask_user", "tool_call_id": "c1", "content": ASK_RESULT_TEXT},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-replay")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            for step in steps:
+                await app.store.append("ask-old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume ask-old"))
+            await _until(pilot, lambda: app.session_id == "ask-old", tries=200)
+            await pilot.pause(0.3)
+            lines = _message_lines(app)
+            await app._cleanup_and_save_session()
+            return lines
+
+    lines = asyncio.run(scenario())
+    call_lines = [t for t in lines if t.startswith("●")]
+    assert any('ask_user("Which database should I use? methods" +1 more)' in t for t in call_lines), call_lines
+    # one ⎿ block, a row per pair (the message contains the newlines; _message_lines joins them)
+    block = next(t for t in lines if t.lstrip().startswith("⎿"))
+    assert "Which database should I use? → Postgres" in block
+    assert "Which auth methods? → JWT, OAuth" in block
+    assert not any(t.startswith("ask_user: ") for t in lines)
+
+
+def test_cancelled_result_renders_as_tool_result(tui):
+    """The cancel, unavailable and refusal texts render as ordinary ⎿ results: no answer block, no lost text —
+    live and on /resume (T5.3, CON-007)."""
+    cli_tui = tui
+    from dostuff.helpers.ui.ask_answers import CANCELLED_ASK_RESULT, UNAVAILABLE_ASK_RESULT, parse_answers
+    assert parse_answers(CANCELLED_ASK_RESULT) is None
+    assert parse_answers(UNAVAILABLE_ASK_RESULT) is None
+    assert parse_answers("error: too many questions") is None
+    stored = [
+        {"role": "user", "content": "build it"},
+        {"role": "tool", "name": "ask_user", "tool_call_id": "c1", "content": UNAVAILABLE_ASK_RESULT},
+    ]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-plain")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.adapter.emit("tool_result", f"ask_user: {CANCELLED_ASK_RESULT}")
+            await pilot.pause()
+            live = "\n".join(_message_lines(app))
+            for step in stored:
+                await app.store.append("ask-plain-old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume ask-plain-old"))
+            await _until(pilot, lambda: app.session_id == "ask-plain-old", tries=200)
+            await pilot.pause(0.3)
+            replayed = "\n".join(_message_lines(app))
+            await app._cleanup_and_save_session()
+            return live, replayed
+
+    live, replayed = asyncio.run(scenario())
+    assert "cancelled the questions" in live and "→" not in live
+    assert "No user is available" in replayed
