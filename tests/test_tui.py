@@ -5409,3 +5409,119 @@ def test_btw_fork_out_survives_esc(btw_tui, agents, fake_model):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- /btw Phase 5: session boundaries (plan/2026-11-03-btw/tasks.md T5.x) -----------------------------------------
+
+@pytest.mark.parametrize("switch", ["clear", "resume", "fork"])
+def test_btw_thread_cleared_on_switch(btw_tui, switch):
+    from dostuff.helpers.agent.side_question import kept_prompt
+    cli_tui, held, side_call = btw_tui
+    held.hold = False
+    call = side_call(fake_response("answer A"), fake_response("answer B"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id=f"btw-{switch}")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "fix the bug")
+            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            old = app.session_id
+            assert kept_prompt(old) is not None
+            _submit(app, cli_tui, "/btw QUESTION-A")
+            await _btw_answered(pilot, app)  # left open: the switch must close it
+            if switch == "clear":
+                await app._clear_session()
+            elif switch == "resume":
+                await app._switch_session("btw-elsewhere")
+            else:
+                await app._fork_session("")
+            await pilot.pause()
+            assert app.session_id != old
+            assert not app._btw_open() and app._side_exchanges == []
+            assert kept_prompt(old) is None
+            _submit(app, cli_tui, "/btw QUESTION-B")
+            await _btw_answered(pilot, app)
+            sent = call.calls[1]["steps_history"]
+            assert not any("QUESTION-A" in str(s.get("content")) or s.get("content") == "answer A" for s in sent)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_btw_fork_out_carried_on_clear(tui, agents, fake_model, side_call, monkeypatch):
+    """A running fork-out moves to the new session with /clear (`_carry_background`) and wakes it there."""
+    from dostuff.helpers.agent.notices import get_notice_queue
+    import dostuff.agent.call_agent  # noqa: F401
+    cli_tui = tui
+    monkeypatch.setattr(cli_tui, "JOB_WAKE_DELAY_S", 0.3)
+    side_call(fake_response("guess [C]"))
+    gate = fake_model.gate("[C]", fake_response("carried report"))
+    woke: list[tuple[str, str]] = []
+
+    async def wake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                        current_session_history, steps_history, store, adapter=None, **kwargs):
+        get_notice_queue().drain(session_id)
+        woke.append((session_id, user_text))
+        return "handled"
+    monkeypatch.setattr(cli_tui, "agent_loop", wake_loop)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-carry")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            app.config.agents_wake_on_end = True
+            _submit(app, cli_tui, "/btw q [C]")
+            await _btw_answered(pilot, app)
+            await pilot.press("f")
+            await _until(pilot, lambda: bool(fake_model.calls_for("[C]")), tries=100)
+            [run] = agents.runs("btw-carry")
+            await app._clear_session()
+            new = app.session_id
+            assert run.owner == new
+            gate.set()
+            await _until(pilot, lambda: bool(woke), tries=100)
+            assert woke[0][0] == new and "carried report" in woke[0][1]
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("which", ["fork-out", "model fork", "none"])
+def test_fork_warns_about_running_fork_out(tui, agents, fake_model, side_call, monkeypatch, which):
+    from dostuff.agent.subagents.fork import ForkContext
+    import dostuff.agent.call_agent  # noqa: F401
+    cli_tui = tui
+    side_call(fake_response("guess [W]"))
+    gate = fake_model.gate("[W]", fake_response("never mind"))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="btw-strand")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _submit(app, cli_tui, "hello")  # the tui fixture's loop: approve, then it answers
+            await _until(pilot, app.adapter.has_pending_confirm)
+            _submit(app, cli_tui, "y")
+            await _until(pilot, lambda: not app._turn_in_progress)
+            if which == "fork-out":
+                _submit(app, cli_tui, "/btw q [W]")
+                await _btw_answered(pilot, app)
+                await pilot.press("f")
+            elif which == "model fork":
+                snap = ForkContext(system_instruction="s", compaction_notes="", history=[], tool_names=[])
+                await agents.start(owner="btw-strand", agent_type="fork", description="something else",
+                                   prompt="[W] x", background=True, fork=snap, adapter=app.adapter)
+            if which != "none":
+                await _until(pilot, lambda: bool(fake_model.calls_for("[W]")), tries=100)
+            await app._fork_session("")
+            await pilot.pause()
+            warned = cli_tui.BTW_FORK_STRANDED.format(old="btw-strand") in _texts(app)
+            assert warned is (which == "fork-out")
+            gate.set()
+            await _until(pilot, lambda: all(r.ended is not None for r in agents.runs()), tries=100)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

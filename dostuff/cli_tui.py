@@ -57,8 +57,8 @@ from dostuff.helpers.agent.model_cost import format_cost
 from dostuff.helpers.agent.notices import WAKE_LIMIT, agent_notice_line, fmt_agent_runtime, format_notices, get_notice_queue, parse_notices
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
 from dostuff.helpers.agent.side_question import (
-    BTW_FORK_DESCRIPTION, BTW_FORK_PROMPT, add_exchange, answer_side_question, kept_prompt, plan_mode_on,
-    snapshot as live_side_snapshot,
+    BTW_FORK_DESCRIPTION, BTW_FORK_PROMPT, add_exchange, answer_side_question, discard_snapshot, kept_prompt,
+    plan_mode_on, snapshot as live_side_snapshot,
 )
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
@@ -1060,6 +1060,7 @@ BTW_ANSWER_FOOTER = "Esc/Enter/Space close · f fork out · c copy"
 BTW_BUSY = "a side question is already running"
 BTW_USAGE = "Usage: /btw <question>"
 BTW_HANDED_OFF = "handed to a background agent · /agents to watch it"
+BTW_FORK_STRANDED = "⚙ a side-question agent is still running; its answer stays with '{old}'"
 
 
 # Shift+Enter needs a terminal that reports it (kitty keyboard protocol, e.g. kitty, WezTerm,
@@ -2150,6 +2151,7 @@ class DostuffTUI(App):
         A stored session gets this cwd and a fresh last_used; a new one gets its DB row with its
         first step, so launches that never send anything don't leave empty sessions behind.
         """
+        self._clear_side_thread(self.session_id)  # /resume and /fork; a no-op at startup (btw spec D10)
         self.session_id = session_id
         session_id_var.set(session_id)
         self.steps_history = await self.store.load(session_id)
@@ -2285,6 +2287,7 @@ class DostuffTUI(App):
         """
         old_session_id = self.session_id
         new_session_id = uuid.uuid4().hex[:16]
+        self._clear_side_thread(old_session_id)
         self.session_id = new_session_id
         carried = self._carry_background(old_session_id)
         self.steps_history = []
@@ -2406,6 +2409,9 @@ class DostuffTUI(App):
             return
         old_session_id = self.session_id
         new_session_id = uuid.uuid4().hex[:16]
+        # A fork-out is not carried into the fork: its run keeps the original as owner (btw spec D10, OUT-008)
+        stranded = any(r.agent_type == "fork" and r.description == BTW_FORK_DESCRIPTION and r.ended is None
+                       for r in _agent_registry().runs(old_session_id))
         try:
             await self.store.fork_session(old_session_id, new_session_id, title or None)
             await self._load_session(new_session_id)
@@ -2419,6 +2425,8 @@ class DostuffTUI(App):
             f"/resume {old_session_id} goes back to the original.",
             msg_type="system",
         )
+        if stranded:
+            self._append(BTW_FORK_STRANDED.format(old=old_session_id), msg_type="system")
         if in_worktree:
             await self._enter_worktree(f"fork-{new_session_id[:8]}")
 
@@ -3808,6 +3816,13 @@ class DostuffTUI(App):
         if usage.get("cost"):
             text += f" · {format_cost(usage['cost'])}"
         return text
+
+    def _clear_side_thread(self, old_session_id: str) -> None:
+        """A session switch: the side thread and the panel belong to the old session, and so do its kept prompt
+        parts (D10). A fork-out still running is a background run like any other (carried, or stranded by /fork)."""
+        self._side_exchanges.clear()
+        self._close_btw()
+        discard_snapshot(old_session_id)
 
     def on_btw_panel_close(self, event: BtwPanel.Close) -> None:
         self._close_btw()
