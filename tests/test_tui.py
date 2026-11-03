@@ -4085,3 +4085,145 @@ def test_cancelled_call_costs_one_step(tui, monkeypatch, hook_cmd, tmp_path):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- ask-user T4.6: the panel does not bounce the transcript (REQ-4.1) ----------------------------
+
+def test_ask_panel_does_not_bounce_the_transcript(tui):
+    """Opening the questions panel, arrowing through questions of different height and closing it must leave
+    every painted frame flush at the bottom, like the /resume picker and the approval prompt before it
+    (`test_picker_does_not_bounce_the_transcript`). The panel is taller than the input it replaces."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-bounce")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for i in range(25):  # enough to overflow the viewport
+                app._append(f"row{i:02d} " + "-" * 30, msg_type="user")
+            await pilot.pause()
+            await pilot.pause()
+            messages = app.query_one("#messages")
+            assert isinstance(messages, cli_tui.Transcript)
+            off_bottom: list[int] = []
+            original_display = app._display
+
+            def display(screen, renderable):
+                """Measure what is actually painted, before it goes to the terminal."""
+                rows = [strip.text.rstrip() for strip in
+                        app.screen._compositor.render_strips()[:messages.region.height]]
+                occupied = [y for y, row in enumerate(rows) if row]
+                if occupied:  # empty viewport: nothing to be flush with
+                    off_bottom.append(messages.region.height - 1 - occupied[-1])
+                return original_display(screen, renderable)
+            app._display = display  # type: ignore[method-assign]
+
+            # As if the user arrows through the questions: the panel changes height with the option count
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await pilot.pause()
+            for key in ("tab", "right", "shift+tab", "left", "tab"):
+                await pilot.press(key)
+                await pilot.pause()
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await pilot.pause()
+            await pilot.pause()
+            app._display = original_display  # type: ignore[method-assign]
+
+            assert off_bottom, "no frame was measured"
+            assert max(off_bottom) <= 0, f"the transcript drifted off the bottom: {off_bottom}"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ask_panel_keeps_a_scrolled_up_transcript_in_place(tui):
+    """`_hold_transcript` must not drag a transcript the user scrolled up back to the bottom either."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-scrolled")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for i in range(25):
+                app._append(f"row{i:02d} " + "-" * 30, msg_type="user")
+            await pilot.pause()
+            messages = app.query_one("#messages", cli_tui.Transcript)
+            messages.scroll_to(y=10, animate=False)
+            await pilot.pause()
+            await pilot.pause()
+            assert messages.scroll_y == 10
+
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await pilot.pause()
+            await pilot.pause()
+            assert messages.scroll_y == 10  # the panel opening did not scroll the conversation
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await pilot.pause()
+            await pilot.pause()
+            assert messages.scroll_y == 10  # nor did it closing
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- ask-user T4.7: title and notification (REQ-4.6, D7) ------------------------------------------
+
+def test_question_notifies(tui):
+    """An open question puts the title on `waiting` and notifies a terminal that is in the background;
+    answering it puts the title back, exactly as an approval prompt does."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-notify")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            written: list[str] = []
+            app._write_terminal = written.append  # type: ignore[method-assign]
+            app._notify_kind = "osc9"
+            app.app_focus = False
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await pilot.pause()
+            assert app._title_state == "waiting"
+            assert any("Which database should I use?" in w for w in written), written
+            assert any("approval needed" in w for w in written)  # open point 10: one voice for both prompts
+
+            written.clear()
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await pilot.pause()
+            assert app._title_state == "done"  # idle again, not `running`: no turn is going
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_question_notifies_after_the_wait(tui):
+    """A question left open past `ui.notify_after_seconds` notifies even while the terminal is focused
+    (`should_notify`, the rule approvals already use)."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-notify-late")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            written: list[str] = []
+            app._write_terminal = written.append  # type: ignore[method-assign]
+            app._notify_kind = "osc9"
+            app.app_focus = True
+            app.config.notify_after_seconds = 30
+            app._turn_start_time = time.time() - 60  # the turn has been waiting over the threshold
+            task = _ask_questions(app, [DB_QUESTION])
+            await _until(pilot, app.adapter.has_pending_ask)
+            await pilot.pause()
+            assert any("Which database should I use?" in w for w in written), written
+            app._turn_start_time = None
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

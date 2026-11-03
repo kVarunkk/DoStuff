@@ -3389,7 +3389,8 @@ class DostuffTUI(App):
         inp.display = False
         panel.configure(questions)
         panel.display = True
-        self.query_one("#messages", VerticalScroll).anchor()
+        # No anchor(): like _show_picker, the panel must not drag a transcript the user scrolled up back
+        # to the bottom. `Transcript._get_scrollable_region` already keeps a bottom-pinned view flush (T4.6).
         self.call_after_refresh(panel.focus)
 
     def _hide_ask_panel(self) -> None:
