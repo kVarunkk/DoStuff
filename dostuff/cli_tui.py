@@ -55,6 +55,10 @@ from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_pa
 from dostuff.helpers.agent.model_cost import format_cost
 from dostuff.helpers.agent.notices import WAKE_LIMIT, agent_notice_line, fmt_agent_runtime, format_notices, get_notice_queue, parse_notices
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
+from dostuff.helpers.agent.side_question import (
+    add_exchange, answer_side_question, kept_prompt, plan_mode_on, snapshot as live_side_snapshot,
+)
+from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
@@ -958,6 +962,96 @@ class AskUserPanel(Static, can_focus=True):
         event.prevent_default()
 
 
+class BtwPanel(Vertical, can_focus=True):
+    """The `/btw` side answer (btw spec D6): a title row, a scrollable body and a footer of keys.
+
+    Read-only, and outside `#msg-container`, so nothing in it can reach the transcript or `/export`. One instance is
+    composed hidden and reused, never mounted per question (the `DuplicateIds` lesson of `#picker` and
+    `#ask-panel`). It sits above the input and leaves the conversation visible: the turn keeps running underneath.
+
+    The panel owns its keys while focused (Enter/Space close, `f` fork out, `c` copy, ↑/↓ scroll); Esc is the app's
+    priority binding, which closes the panel unless an approval or a question is waiting (`action_cancel`).
+    """
+
+    BINDINGS = [
+        Binding("enter", "close", "Close", show=False),
+        Binding("space", "close", "Close", show=False),
+        Binding("f", "fork_out", "Fork out", show=False),
+        Binding("c", "copy", "Copy", show=False),
+        Binding("up", "scroll_body(-1)", show=False),
+        Binding("down", "scroll_body(1)", show=False),
+        Binding("pageup", "scroll_body(-10)", show=False),
+        Binding("pagedown", "scroll_body(10)", show=False),
+    ]
+
+    class Close(Message):
+        """Enter or Space."""
+
+    class ForkOut(Message):
+        """`f` on an answer: hand the question to a background fork (D8)."""
+
+    class Copy(Message):
+        """`c` on an answer."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.question = ""
+        self.snapshot: Any = None  # the ForkContext the side call used; a fork-out gets this same object (D8)
+        self.answer: Any = None  # the SideAnswer once it arrived
+        self.error = ""
+        self.body_text = ""  # what the body shows, as plain text
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="btw-title", markup=False)
+        with VerticalScroll(id="btw-scroll", can_focus=False):
+            yield Static(id="btw-body", markup=False)
+        yield Static(id="btw-footer", markup=False)
+
+    def configure(self, question: str) -> None:
+        """A new side question: forget the last answer, show `Asking…`."""
+        self.question, self.snapshot, self.answer, self.error = question, None, None, ""
+        self.body_text = "Asking…"
+        self.query_one("#btw-title", Static).update(Text(f"/btw — {_one_line(question, 500)}"))
+        self.query_one("#btw-body", Static).update(Text("Asking…", style="#8a8a8a"))
+        self.query_one("#btw-footer", Static).update(BTW_ASKING_FOOTER)
+        self.query_one("#btw-scroll", VerticalScroll).scroll_home(animate=False)
+
+    def show_answer(self, answer: Any, usage_text: str) -> None:
+        self.answer = answer
+        self.body_text = answer.text
+        self.query_one("#btw-body", Static).update(RichMarkdown(answer.text))
+        self.query_one("#btw-footer", Static).update(
+            BTW_ANSWER_FOOTER + (f" · {usage_text}" if usage_text else ""))
+
+    def show_error(self, message: str) -> None:
+        """A failed call or fork-out: said here, never as a turn error in the transcript (D6)."""
+        self.error = self.body_text = message
+        self.query_one("#btw-body", Static).update(Text(message, style="#e06c75"))
+        self.query_one("#btw-footer", Static).update(BTW_ANSWER_FOOTER if self.answer is not None else BTW_CLOSE_FOOTER)
+
+    def action_close(self) -> None:
+        self.post_message(self.Close())
+
+    def action_fork_out(self) -> None:
+        if self.answer is not None:  # inert while asking: the fork is given the answer to check (§7.3)
+            self.post_message(self.ForkOut())
+
+    def action_copy(self) -> None:
+        if self.answer is not None:
+            self.post_message(self.Copy())
+
+    def action_scroll_body(self, rows: int) -> None:
+        self.query_one("#btw-scroll", VerticalScroll).scroll_relative(y=rows, animate=False)
+
+
+BTW_ASKING_FOOTER = "Esc close"
+BTW_CLOSE_FOOTER = "Esc/Enter/Space close"
+BTW_ANSWER_FOOTER = "Esc/Enter/Space close · f fork out · c copy"
+BTW_BUSY = "a side question is already running"
+BTW_USAGE = "Usage: /btw <question>"
+BTW_HANDED_OFF = "handed to a background agent · /agents to watch it"
+
+
 # Shift+Enter needs a terminal that reports it (kitty keyboard protocol, e.g. kitty, WezTerm,
 # Ghostty); elsewhere it arrives as plain Enter, so the others stay as fallbacks.
 NEWLINE_KEYS = {"shift+enter", "ctrl+enter", "alt+enter", "ctrl+j"}
@@ -1623,6 +1717,16 @@ class DostuffTUI(App):
     #agent-view-scroll { height: 1fr; border: round #4a4a4a; }
     #agent-view-msgs { height: auto; }
     #agent-view-status { height: auto; padding: 0 1; color: #8a8a8a; }
+    /* /btw: #agent-view's look (title colour, round border), but auto height so the conversation stays visible */
+    #btw-panel {
+        height: auto; max-height: 50vh; margin-top: 1; padding: 0 1; background: transparent;
+        border: round #4a4a4a;
+    }
+    #btw-panel:focus { border: round #7a7a7a; }
+    #btw-title { height: 1; color: #8ab4f8; text-style: bold; text-wrap: nowrap; text-overflow: ellipsis; }
+    #btw-scroll { height: auto; max-height: 40vh; scrollbar-size-vertical: 1; }
+    #btw-body { height: auto; }
+    #btw-footer { height: auto; color: #8a8a8a; }
     #settings-panel { height: 1fr; }
     #settings-title { height: auto; padding: 0 1; color: #8ab4f8; }
     #settings-editor { height: 1fr; background: transparent; border: round #8ab4f8; }
@@ -1726,6 +1830,9 @@ class DostuffTUI(App):
         self._last_escape = 0.0  # time.monotonic() of an Esc with nothing to cancel (Esc Esc edits the last prompt)
         # (session id, steps_history index) → the prompt as typed, before @mentions / skills expanded it
         self._sent_prompts: dict[tuple[str, int], str] = {}
+        # /btw (btw spec D5): this session's side thread as sent (question step, answer), and the call in flight
+        self._side_exchanges: list[tuple[str, str]] = []
+        self._btw_worker: Worker | None = None
 
     # ── Compose UI ─────────────────────────────────────────────────────────────
 
@@ -1737,6 +1844,9 @@ class DostuffTUI(App):
                 yield JumpToBottom("↓ Jump to bottom", id="jump-bottom")
             yield CommandMenu(id="command-menu")
         yield QueueBar(id="queue-bar")
+        btw = BtwPanel(id="btw-panel")
+        btw.display = False  # a /btw side answer, above the input (btw spec D6)
+        yield btw
         picker = PermissionPrompt("", [], id="picker")
         picker.display = False  # shown in place of the input by _show_picker
         yield picker
@@ -1766,15 +1876,17 @@ class DostuffTUI(App):
 
     def _keep_input_focus(self, focused: Widget | None) -> None:
         """Focus always goes back to the input (or the selector shown in its place)."""
-        if not isinstance(focused, (EnterSubmits, PermissionPrompt, AskUserPanel, SettingsEditor)):
+        if not isinstance(focused, (EnterSubmits, PermissionPrompt, AskUserPanel, BtwPanel, SettingsEditor)):
             # call_later, not call_after_refresh: waiting on a repaint is slow on Windows
             self.call_later(self._refocus_input)
 
     def _refocus_input(self) -> None:
-        if isinstance(self.screen.focused, (EnterSubmits, PermissionPrompt, AskUserPanel, SettingsEditor)):
+        if isinstance(self.screen.focused, (EnterSubmits, PermissionPrompt, AskUserPanel, BtwPanel, SettingsEditor)):
             return
         try:
-            for widget in (*self.query(PermissionPrompt), *self.query(AskUserPanel), *self.query(SettingsEditor)):
+            # A prompt wins over the side answer: it is what the turn waits on (btw spec D6)
+            for widget in (*self.query(PermissionPrompt), *self.query(AskUserPanel), *self.query(BtwPanel),
+                           *self.query(SettingsEditor)):
                 if widget.display:  # the #picker stays mounted while hidden
                     self.screen.set_focus(widget)
                     return
@@ -3232,6 +3344,9 @@ class DostuffTUI(App):
         self._remember_prompt(text)
         cmd = text.strip().lower()
 
+        if cmd.split(maxsplit=1)[:1] == ["/btw"]:  # works mid-turn: never queued (btw spec D1, CON-006)
+            self._btw_command(self._pastes.inline(text.strip()[len("/btw"):]).strip())
+            return
         if text.lstrip().startswith("!"):
             command = self._pastes.inline(text.lstrip()[1:]).strip()
             if not command:
@@ -3584,6 +3699,113 @@ class DostuffTUI(App):
             return
         inp.display = True
         inp.focus()
+
+    # ── /btw: a side question in an overlay (plan/2026-11-03-btw/spec.md) ──────────
+
+    def _btw_panel(self) -> BtwPanel:
+        return self.query_one("#btw-panel", BtwPanel)
+
+    def _btw_open(self) -> bool:
+        panels = self.query("#btw-panel")
+        return bool(panels) and panels.first().display
+
+    def _btw_in_flight(self) -> bool:
+        return self._btw_worker is not None and not self._btw_worker.is_finished
+
+    def _btw_command(self, question: str) -> None:
+        if not question:
+            self._append(BTW_USAGE, msg_type="error")
+            return
+        if self._btw_in_flight():
+            self._flash_input_hint(BTW_BUSY)
+            return
+        self._show_btw(question)
+        self._btw_worker = self._start_worker(self._ask_side_question(question), name="btw")
+
+    def _show_btw(self, question: str) -> None:
+        """Shown at once with `Asking…`, filled when the answer arrives (D6). Takes focus for its keys."""
+        panel = self._btw_panel()
+        panel.configure(question)
+        panel.display = True
+        # Not while a prompt is up: the prompt keeps the focus and the first Esc (D6)
+        if not self.adapter.has_pending_prompt():
+            self.call_after_refresh(panel.focus)
+
+    def _close_btw(self) -> None:
+        """Hide the side answer (an unanswered call is cancelled) and give the focus back."""
+        if self._btw_in_flight() and self._btw_worker is not None:
+            self._btw_worker.cancel()
+        panels = self.query("#btw-panel")
+        if not panels or not panels.first().display:
+            return
+        panel = panels.first()
+        panel.display = False
+        if self.screen.focused is panel:
+            self.screen.set_focus(None)
+        self._refocus_input()
+
+    async def _side_snapshot(self, question: str) -> ForkContext:
+        """What a side question sees (D3): the running turn's snapshot; idle, the last turn's prompt parts with the
+        stored history and notes (an idle /compact may have changed them, tasks.md open point 2); with neither, a
+        system prompt built now, which is cache-cold once."""
+        live = live_side_snapshot(self.session_id)
+        if live is not None:
+            return live
+        meta = await self.store.get_session_meta(self.session_id) or {}
+        history = await self.store.load_working_history(self.session_id)
+        notes = meta.get("compaction_notes") or ""
+        kept = kept_prompt(self.session_id)
+        if kept is not None:
+            return ForkContext(system_instruction=kept.system_instruction, compaction_notes=notes, history=history,
+                               tool_names=list(kept.tool_names), session_hook_context=kept.session_hook_context)
+        from dostuff.tools.definitions import default_tool_names  # pulls in the tools: after the first frame
+        return ForkContext(system_instruction=await self._build_instructions(question), compaction_notes=notes,
+                           history=history, tool_names=default_tool_names(),
+                           session_hook_context=dict(self.session_hook_context))
+
+    async def _ask_side_question(self, question: str) -> None:
+        """One no-tools call over the conversation; the answer goes to the panel and the side thread, nowhere
+        else (CON-004). A failure is shown in the panel, never as a turn error."""
+        panel = self._btw_panel()
+        session_id = self.session_id
+        try:
+            await self._backend_ready.wait()
+            if self._backend_error:
+                raise RuntimeError(f"startup failed ({self._backend_error})")
+            snap = await self._side_snapshot(question)
+            panel.snapshot = snap
+            answer = await answer_side_question(snap, list(self._side_exchanges), question,
+                                                plan_mode_on(self.permissions, self.config))
+        except asyncio.CancelledError:
+            raise  # the panel was closed while asking
+        except Exception as e:
+            panel.show_error(f"Side question failed: {e}")
+            return
+        if self.session_id != session_id:
+            return  # the session changed while asking: this answer belongs to the old thread
+        add_exchange(self._side_exchanges, answer.sent_question, answer.answer)
+        panel.show_answer(answer, self._format_side_usage(answer.usage))
+
+    def _format_side_usage(self, usage: dict | None) -> str:
+        """`↑1.2k (1.1k cached) ↓340 · $0.0020`, shown on the panel and stored nowhere (D9)."""
+        if not usage:
+            return ""
+        text = f"↑{self._fmt_tokens(usage.get('prompt_tokens', 0))}"
+        if usage.get("cached_tokens"):
+            text += f" ({self._fmt_tokens(usage['cached_tokens'])} cached)"
+        text += f" ↓{self._fmt_tokens(usage.get('completion_tokens', 0))}"
+        if usage.get("cost"):
+            text += f" · {format_cost(usage['cost'])}"
+        return text
+
+    def on_btw_panel_close(self, event: BtwPanel.Close) -> None:
+        self._close_btw()
+
+    def on_btw_panel_copy(self, event: BtwPanel.Copy) -> None:
+        answer = self._btw_panel().answer
+        if answer is not None:
+            _copy_to_clipboard(self, answer.text)
+            self._flash_input_hint(f"copied side answer ({len(answer.text)} characters)")
 
     def _begin_turn(self, text: str) -> None:
         self._turn_in_progress = True
@@ -4058,6 +4280,9 @@ class DostuffTUI(App):
         menu = self.query_one("#command-menu", CommandMenu)
         if menu.display:
             menu.display = False
+            return
+        if self._btw_open() and not self.adapter.has_pending_prompt():
+            self._close_btw()  # closes the side answer; the turn keeps running (btw spec D6)
             return
         if self._picker_open():
             self._close_picker()
