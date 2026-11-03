@@ -514,3 +514,72 @@ def test_subagent_adapter_has_no_own_ask_user():
     adapter.emit("error", "boom")
     asyncio.run(adapter.ask("Run x?"))
     assert asked == []  # nothing asked on its own
+
+
+# --- T6.1 the prompt says when to ask (REQ-5.1, D12) ----------------------------------------------
+
+def test_system_instructions_have_the_asking_section():
+    """`## Asking the user` after `## Planning multi-step work`, naming `ask_user` and carrying the four
+    points of D12: when to ask, when not to, the 2-4 options / one call rule, and the cost trade-off."""
+    from dostuff.agent.instructions import build_base_instructions
+
+    text = build_base_instructions()[0]
+    assert "## Asking the user" in text
+    after_start = text.index("## Planning multi-step work")
+    asking = text.index("## Asking the user")
+    assert asking > after_start
+    assert text.index("## Asking the user") < text.index("## The web")  # sits where D12 puts it
+    section = text[asking:text.index("## The web")]
+    assert "ask_user" in section
+    # when to ask
+    assert "changes what you build" in section and "can't find it in the repo" in section
+    # when not to: a plan confirmation, permission, or what grep/read_file can answer
+    assert "confirm your plan" in section
+    assert "permission" in section and "approval prompt" in section
+    assert "grep" in section and "read_file" in section
+    # 2-4 concrete options, the trade-off, everything in one call, free text by omitting options
+    assert "2-4" in section and "one call" in section and "options" in section
+    # the cost trade-off
+    assert "cheap" in section and "expensive" in section
+
+
+def test_subagent_prompt_has_no_asking_section():
+    """D11: subagents can't ask, so their prompt must not offer the section. A pin: `build_subagent_prompt`
+    starts from `SUBAGENT_BASE`, not `SYSTEM_INSTRUCTIONS`, so it passes before and after T6.1 — it guards
+    against a later change that merges the two."""
+    import asyncio
+    from dostuff.agent.subagents.definitions import BUILTIN_TYPES
+    from dostuff.agent.subagents.prompt import build_subagent_prompt
+
+    prompt = asyncio.run(build_subagent_prompt(BUILTIN_TYPES["general-purpose"]))
+    # The project's own AGENTS.md may mention `ask_user` (this repo's does), so the pin is on the section
+    # and on D12's own words, not on the bare tool name.
+    assert "## Asking the user" not in prompt
+    assert "changes what you build" not in prompt
+
+
+def test_readme_documents_ask_user():
+    """REQ-5.2: the README has a Features bullet, the tools table row, the Claude Code mapping and a section
+    with the D6 panel sketch and the D5 result format (T6.3)."""
+    from pathlib import Path
+
+    from dostuff.helpers.ui.ask_answers import format_answers
+
+    text = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "ask_user" in text
+    # (a) a Features bullet
+    features = text[text.index("## Features"):text.index("## Install")]
+    assert any("`ask_user`" in line for line in features.splitlines() if line.startswith("- "))
+    # (b) the tools table row: read / never
+    tools = text[text.index("## Tools and permissions"):text.index("## Background jobs")]
+    assert any("`ask_user`" in line and "| read | never" in line for line in tools.splitlines())
+    # (c) Claude Code's AskUserQuestion, with multiSelect -> multi_select
+    coming = text[text.index("### Coming from Claude Code"):]
+    assert "AskUserQuestion" in coming and "multi_select" in coming
+    # (d) a section with the panel sketch and a real format_answers block, so docs and grammar cannot drift
+    section = text[text.index("## Asking the user"):text.index("## Subagents")]
+    assert "✔ Submit answers" in section and "Other (type your own)" in section
+    real = format_answers([("Which database should I use?", "Postgres"),
+                           ("Which auth methods should the API support?", "JWT, OAuth")])
+    for line in real.splitlines():
+        assert line.strip() in section, line

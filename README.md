@@ -35,6 +35,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **`@file` mentions** — type `@` in the prompt to pick a file or folder; its content (or listing) is sent with the message
 - **Project instructions** — `AGENTS.md` / `CLAUDE.md` from `~/.dostuff/`, the repo root and every folder down to the current one, combined
 - **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
+- **`ask_user`** — the agent asks you a real question — up to 4, with 2–4 options each, multi-select and a free-text "Other" — instead of guessing; the answers come back to it as one result and stay readable in `/resume`. See [Asking the user](#asking-the-user)
 - **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
 - **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
@@ -247,6 +248,7 @@ In the TUI:
 | `web_fetch` | network | yes; `a` (always) allows that domain for the session |
 | `web_search` | network | yes; `a` (always) allows every search for the session. Free: DuckDuckGo by default, the `ddgs` package if installed (`pip install "dostuff[search]"`), or your own SearXNG via `search.searxng_url` |
 | `agent`, `send_message`, `stop_agent` | — | no; each subagent's own calls ask, titled with the agent |
+| `ask_user` | read | never (it is the agent talking to you; subagents never get it) |
 | `read_settings` | read | never (MCP `env` / header values are shown as `<redacted>`) |
 | `edit_config`, `set_mcp_server`, `remove_mcp_server`, `create_agent_type` | settings | **always, in every mode, with no "always" option** (shows the diff or the server's command) |
 
@@ -345,6 +347,62 @@ paths). Directories older than 7 days are removed at startup.
 > terminal by design. Each session records its jobs in `~/.dostuff/jobs/<session>/jobs.json`, and the next start
 > warns `1 background job from an earlier session may still be running (npm run dev, pid 4812)`. It doesn't kill
 > them, since a pid may have been reused by then; check with your OS tools.
+
+---
+
+## Asking the user
+
+`ask_user` lets the agent stop and ask instead of guessing: a library to use, a product decision, a name. It is
+the one tool that talks to you, it never needs approval, and subagents never get it (they report back instead).
+
+The questions arrive as a panel in place of the input:
+
+```
+ DB ✓ · Auth ▸
+ ⚠ Which auth methods should the API support?
+  1. JWT      stateless, no extra service
+  2. OAuth    a provider to configure, but no password handling
+  3. Other (type your own)
+   ─────────────────────────────────────────────────────────
+ ✔ Submit answers
+ ↑/↓ select · Enter confirm · ←/→ change question · Esc cancel
+```
+
+- **Nothing submits on one key.** A pick records the answer and moves to the next question; `✔ Submit answers` is
+  the only thing that sends, and it stays inert (`answer every question first`) until every question has one.
+  `←`/`Shift+Tab` goes back, so an earlier answer can be changed before submitting.
+- **`2-4` options, one line each**, with the trade-off where it matters. A multi-select question toggles with
+  `space` or its number, and the joined answer comes back in option order.
+- **`Other`** is always the last row: pick it and the input takes a typed answer (a pasted block is collapsed to
+  one line). A question with no options skips the panel and takes the input directly.
+- **Esc** cancels the questions and ends the turn, like Esc on an approval prompt. **Ctrl+Q** / `/exit` with a
+  question open cancel it first and then quit.
+- Up to 4 questions per call. The prompt tells the model when to ask: when the answer changes what it builds and
+  the repo can't tell it; never to confirm a plan, to ask permission, or for anything `grep` / `read_file` answers.
+
+The answers reach the model as one tool result and stay readable in the transcript, live and after `/resume`:
+
+```
+  ⎿  Which database should I use? → Postgres
+     Which auth methods should the API support? → JWT, OAuth
+```
+
+That is exactly `format_answers`' output:
+
+```text
+Asked the user 2 questions; they answered:
+1. Which database should I use?
+   → Postgres
+2. Which auth methods should the API support?
+   → JWT, OAuth
+```
+
+A cancelled, refused or unavailable call renders as an ordinary tool result with the model told what to do
+(state the assumption and continue). `/export` writes it as text, unescaped.
+
+**`dostuff -p`** asks on the terminal when there is one on both ends: each question and its numbered options go to
+stderr and it reads one line per question (`2`, `1,3`, or free text; an empty line is `(no answer)`). With piped
+stdin the tool is still listed but reports "no user is available" and the model carries on with an assumption.
 
 ---
 
@@ -638,6 +696,7 @@ nesting are the same. Tool names and some argument names differ, so rename the m
 | `Edit` | `edit_file` | `file_path` → `path`, `old_string`/`new_string` → `old_str`/`new_str` |
 | `Read` | `read_file` | `file_path` → `path` |
 | `Grep` / `Glob` | `grep` / `glob` | per tool |
+| `AskUserQuestion` | `ask_user` | `multiSelect` → `multi_select`; the answers come back as the tool's result |
 | `mcp__<server>__<tool>` | `call_mcp_tool` | server and tool are inside `tool_input` |
 
 Not supported yet: `http`, `prompt` and `agent` hook types, and the `Notification`, `PreCompact` and `SessionEnd`

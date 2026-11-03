@@ -33,3 +33,13 @@ def test_mcp_tools_are_grouped_per_server():
 
 def test_no_mcp_servers_says_how_to_add_one():
     assert "MCP tools: none" in tools_listing({})
+
+
+def test_tools_listing_mentions_ask_user():
+    """`ask_user` is listed as never asking and never given to subagents, and the footer says it is the one
+    tool that talks to the user (T6.3, REQ-5.2)."""
+    text = tools_listing()
+    row = _row(text, "ask_user")
+    assert "never" in row and "  no " in row, row
+    footer = "\n".join(line for line in text.splitlines() if not line.startswith("  "))
+    assert "ask_user" in footer and "talks to the user" in footer

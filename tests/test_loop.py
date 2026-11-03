@@ -399,3 +399,45 @@ def test_ask_user_without_adapter_in_the_loop(monkeypatch):
     assert result == "done"
     tool_steps = [s for s in working if s["role"] == "tool"]
     assert len(tool_steps) == 1 and tool_steps[0]["content"] == UNAVAILABLE_ASK_RESULT
+
+
+def test_four_shapes_one_tool_step(monkeypatch):
+    """T6.4 / CON-006: cancelled, refused, non-interactive and answered — each is exactly one `role: "tool"`
+    step, and the model's next call sees it. Pinned together so a change to any one shape is deliberate."""
+    from tests.conftest import FakeAdapter
+    from dostuff.helpers.ui.ask_answers import UNAVAILABLE_ASK_RESULT, format_answers
+
+    question = json.dumps({"questions": [{"question": "Which db?",
+                                          "options": [{"label": "SQLite"}, {"label": "Postgres"}]}]})
+    call = lambda cid="c1": [_tc("ask_user", question, cid)]  # noqa: E731
+
+    def run(adapter, extra=None):
+        responses = [_msg(tool_calls=call()), _msg(content="done")] + (extra or [])
+        result, working, _ = _run(monkeypatch, responses, adapter=adapter)
+        steps = [s for s in working if s["role"] == "tool"]
+        assert len(steps) == 1, [s.get("content") for s in steps]
+        assert steps[0]["name"] == "ask_user" and steps[0]["tool_call_id"] == "c1"
+        return result, steps[0]["content"]
+
+    # answered
+    adapter = FakeAdapter()
+    adapter.ask_answers = [("Which db?", "SQLite")]
+    _, content = run(adapter)
+    assert content == format_answers([("Which db?", "SQLite")])
+
+    # cancelled
+    adapter = FakeAdapter()
+    adapter.ask_answers = None  # the scripted adapter's way of saying "Esc"
+    _, content = run(adapter)
+    from dostuff.helpers.ui.ask_answers import CANCELLED_ASK_RESULT
+    assert content == CANCELLED_ASK_RESULT
+
+    # refused: the model's arguments, not the user, were wrong
+    responses = [_msg(tool_calls=[_tc("ask_user", json.dumps({"questions": []}), "c1")]), _msg(content="done")]
+    _, working, _ = _run(monkeypatch, responses, adapter=FakeAdapter())
+    steps = [s for s in working if s["role"] == "tool"]
+    assert len(steps) == 1 and steps[0]["content"].startswith("error: ")
+
+    # non-interactive: no adapter to ask
+    _, content = run(None)
+    assert content == UNAVAILABLE_ASK_RESULT
