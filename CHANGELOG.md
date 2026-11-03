@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.9] - 2026-11-03
 
 Side questions: `/btw <question>` asks about the conversation while a turn runs, without stopping or queuing it — one model call, no tools, answered in a panel above the input and never added to the history; `f` hands it to a background agent that can check with tools.
 
