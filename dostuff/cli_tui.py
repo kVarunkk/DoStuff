@@ -59,7 +59,7 @@ from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
-from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers, pick_options
+from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers
 from dostuff.helpers.agent.slash_suggestion import slash_arg_hint, slash_suggestion
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
 from dostuff.helpers.hooks.dispatch import hook_line
@@ -483,14 +483,6 @@ class CommandMenu(OptionList):
         if not self.display or self.highlighted is None:
             return None
         return self.get_option_at_index(self.highlighted).id
-
-
-def pick_answer(text: str, options: list[dict]) -> str | None:
-    """What the input's text means for a question (ask-user D13): `2` / `1,3` pick options, anything else is
-    the typed answer. Empty text is no answer, so the question stays unanswered (open point 4)."""
-    if not text.strip():
-        return None
-    return pick_options(text, options) or _one_line_answer(text)
 
 
 def _option_window(count: int, cursor: int, visible: int = PICKER_MAX_VISIBLE) -> tuple[int, int]:
@@ -1415,7 +1407,10 @@ class TuiAdapter:
         if self._cancelled or self._cancel_event.is_set():
             return None  # the turn is being cancelled: don't open a prompt on the way out
         async with self._hold_prompt():
-            answers = await self._ask_with_panel(questions) if self._uses_panel(questions)                 else await self._ask_free_text(questions)
+            if self._uses_panel(questions):
+                answers = await self._ask_with_panel(questions)
+            else:
+                answers = await self._ask_free_text(questions)
             if answers is None:
                 return None  # cancelled: the tool records the D5 cancel text
             return [(_one_line_answer(q.get("question", "")), answer) for q, answer in zip(questions, answers)]
