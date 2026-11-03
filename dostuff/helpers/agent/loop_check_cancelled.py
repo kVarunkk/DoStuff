@@ -2,6 +2,11 @@ from typing import Any
 
 from dostuff.helpers.agent.append_step import append_step
 
+# What `loop()` returns when the user cancelled. It lives here, next to the flag it answers, so callers
+# that must recognise a cancelled turn can import it without pulling in litellm (`cli_tui.py`, CON-010);
+# `agent.loop` re-exports it under the same name.
+CANCELLED_TURN = "Cancelled by user."
+
 
 def is_cancelled(adapter: Any) -> bool:
     """True if the user pressed ESC (adapter cancel flag or event)."""
