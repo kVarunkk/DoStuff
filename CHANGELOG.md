@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.8] - 2026-11-03
 
 Structured questions: the agent can stop and ask you instead of guessing — up to 4 questions per call, 2–4 options each, multi-select and free text, answered in a panel in place of the input and returned as one parseable result.
 
