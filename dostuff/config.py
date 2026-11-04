@@ -150,6 +150,10 @@ class Config:
         self.notify_after_seconds = max(float(after), 0.0) if after is not None else NOTIFY_AFTER_SECONDS
         collapse = ui.get("paste_collapse_lines")
         self.paste_collapse_lines = max(int(collapse), 0) if collapse is not None else PASTE_COLLAPSE_LINES
+        # Mid-turn messages: `queue` runs them after the turn (today's behaviour), `steer` reads them at the
+        # next tool boundary (steering spec D2). Anything else falls back to `queue`.
+        mid_turn = str(ui.get("mid_turn_messages", "queue")).strip().lower()
+        self.mid_turn_messages = mid_turn if mid_turn in ("queue", "steer") else "queue"
         # Start a turn when a background job ends while the TUI is idle (background shell spec D15)
         self.jobs_wake_on_end = str(_block(self.raw, "jobs").get("wake_on_end", True)).lower() not in ("0", "false", "no", "off")
         # Subagents (plan/2026-11-01-subagents/spec.md D18): agent files, model aliases
