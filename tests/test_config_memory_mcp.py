@@ -72,11 +72,11 @@ def test_retry_settings(home):
 
 
 @pytest.mark.parametrize("value,expected", [
-    (None, "queue"),          # missing: today's behaviour (D2, CON-011)
-    ("queue", "queue"),
+    (None, "steer"),          # missing: the default reads at the next tool boundary (D2)
+    ("queue", "queue"),       # opt-in batching after the turn
     ("steer", "steer"),
     ("STEER", "steer"),       # case-insensitive (REQ-6.1)
-    ("bogus", "queue"),       # anything else falls back (REQ-6.1)
+    ("bogus", "steer"),       # anything else falls back (REQ-6.1)
 ])
 def test_mid_turn_messages_mode(home, value, expected):
     """steering spec REQ-6.1: `ui.mid_turn_messages` picks how a message sent mid-turn is routed (D2)."""

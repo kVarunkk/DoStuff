@@ -2697,8 +2697,10 @@ def test_job_wake_limit(tui, registry, monkeypatch):
 
 # --- prompt queue: listed above the input, /queue edits / reorders / removes, Esc puts it back ---
 
-def test_prompt_queue(tui, monkeypatch):
-    cli_tui = tui
+def test_prompt_queue(queue_mode, monkeypatch):
+    """The prompt queue itself, pinned in `queue` mode (the opt-in batching mode): plain messages
+    wait for the turn (steering spec D3 — the default mode routes them to the steering queue instead)."""
+    cli_tui, _ = queue_mode
     ran: list[str] = []
 
     async def gated_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
@@ -5550,14 +5552,15 @@ def steer_tui(tui, monkeypatch):
     ("/clear", "refused"),
     ("/jobs", "ran"),
 ], ids=["plain", "path", "skill", "shell", "clear", "jobs"])
-def test_pin_mid_turn_routing(steer_tui, text, expect):
-    """T0.1 (steering spec D3): today's mid-turn routing, pinned before it gains a steering branch.
+def test_pin_mid_turn_routing(queue_mode, text, expect):
+    """T0.1 (steering spec D3): the `queue`-mode mid-turn routing, pinned with the mode set explicitly.
 
     With a turn in flight a plain message, a path message and a skill command all join `_prompt_queue`;
-    `!command` and `/clear` are refused with their own message; `/jobs` runs at once. Green on unchanged
-    code — Phase 3 keeps this table for `queue` mode and adds a second one for `steer` mode.
+    `!command` and `/clear` are refused with their own message; `/jobs` runs at once. This table is the
+    opt-in `queue` mode; `test_steering_mode_mid_turn_routing` pins `steer` mode and
+    `test_default_mid_turn_is_steer` the default (no config key at all).
     """
-    cli_tui, held = steer_tui
+    cli_tui, held = queue_mode
     skill_dir = Path(".dostuff", "skills", "release-notes")
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
@@ -5659,8 +5662,9 @@ def test_steer_command_usage(tui):
 
 @pytest.fixture
 def steer_mode(steer_tui, tmp_path):
-    """(cli_tui, HeldTurn) with `ui.mid_turn_messages: steer` in the user config — D2's other mode, read
-    through REQ-6.1's real path (the yaml, not a set attribute)."""
+    """(cli_tui, HeldTurn) with `ui.mid_turn_messages: steer` written explicitly in the user config —
+    REQ-6.1's real path (the yaml, not a set attribute). `steer` is also the default (D2); this pins
+    the yaml path, `test_default_mid_turn_is_steer` the default."""
     from dostuff import config as config_module
 
     def apply():
@@ -5670,6 +5674,26 @@ def steer_mode(steer_tui, tmp_path):
         config_module.get_config().agents_wake_on_end = False
 
     (tmp_path / "home" / ".dostuff" / "config.yaml").write_text("ui:\n  mid_turn_messages: steer\n",
+                                                                encoding="utf-8")
+    apply()
+    yield steer_tui
+    (tmp_path / "home" / ".dostuff" / "config.yaml").unlink()
+    apply()
+
+
+@pytest.fixture
+def queue_mode(steer_tui, tmp_path):
+    """(cli_tui, HeldTurn) with `ui.mid_turn_messages: queue` in the user config — the opt-in batching
+    mode, pinned explicitly now that the default is `steer` (steering spec D2)."""
+    from dostuff import config as config_module
+
+    def apply():
+        config_module.reset_config()
+        # The tui fixture turns these off after its own reset; a second reset brings the defaults back
+        config_module.get_config().jobs_wake_on_end = False
+        config_module.get_config().agents_wake_on_end = False
+
+    (tmp_path / "home" / ".dostuff" / "config.yaml").write_text("ui:\n  mid_turn_messages: queue\n",
                                                                 encoding="utf-8")
     apply()
     yield steer_tui
@@ -5821,6 +5845,31 @@ def test_steer_mentions_and_pastes_expanded(steer_tui, monkeypatch):
             assert "the plan is here" in content
             assert any(t == "Attached notes.md" for t in _texts(app))
             assert app._prompt_queue == []
+            held.hold = False
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_default_mid_turn_is_steer(steer_tui):
+    """D2 (flipped default): with no `ui.mid_turn_messages` in any config, a plain message sent while a
+    turn runs goes to the steering queue — `steer` is the default, `queue` is the opt-in."""
+    cli_tui, held = steer_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-default")
+        assert app.config.mid_turn_messages == "steer"  # no config.yaml anywhere: the default
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "start the turn")
+            await _until(pilot, lambda: held.gate is not None, tries=200)
+            _submit(app, cli_tui, "fix the bug")
+            await pilot.pause(0.3)
+            assert [m.raw for m in app._steering.pending()] == ["fix the bug"]
+            assert app._prompt_queue == []
+            assert not any("fix the bug" in t for t in _texts(app))  # never shown at submit (REQ-3.4)
             held.hold = False
             held.release()
             await _until(pilot, lambda: not app._turn_in_progress)
@@ -6010,10 +6059,11 @@ def test_steer_blocked_and_failed_reported_not_delivered(tui):
 # --- Steering Phase 4 continued: bar, loader and the /queue picker (tasks.md T4.2) -------------
 
 
-def test_queue_bar_and_loader_count_steering(steer_tui):
+def test_queue_bar_and_loader_count_steering(queue_mode):
     """T4.2 (D9, REQ-4.2): the bar leads with the steering messages and their rule, then the queued
-    group as before; the loader counts them separately — `· 1 steering · 2 queued`."""
-    cli_tui, held = steer_tui
+    group as before; the loader counts them separately — `· 1 steering · 2 queued`. Pinned in `queue`
+    mode (the two groups only exist together there: plain messages steer in the default mode)."""
+    cli_tui, held = queue_mode
 
     async def scenario():
         app = cli_tui.DostuffTUI(session_id="steer-bar")
@@ -6044,11 +6094,11 @@ def test_queue_bar_and_loader_count_steering(steer_tui):
     asyncio.run(scenario())
 
 
-def test_queue_picker_steering_and_send_now(steer_tui):
+def test_queue_picker_steering_and_send_now(queue_mode):
     """T4.2 (REQ-4.3, D9): `/queue` lists steering entries marked `→` with Edit / Remove, queued prompts
     gain *Send now*, and Remove on an entry the loop has already taken says it was already read
-    (REQ-1.3)."""
-    cli_tui, held = steer_tui
+    (REQ-1.3). Pinned in `queue` mode: a plain message is the queued prompt in that mode only."""
+    cli_tui, held = queue_mode
 
     def labels(picker):
         return [label for _, label in picker._options]
@@ -6148,10 +6198,11 @@ def test_leftover_runs_next(steer_loop):
     asyncio.run(scenario())
 
 
-def test_leftover_on_cancel_back_to_input(steer_tui):
+def test_leftover_on_cancel_back_to_input(queue_mode):
     """T4.3 (D8, REQ-5.1): Esc means stop the work, corrections included — the pending steering message
-    goes back to the input **ahead of** the queued prompts, through the usual cancel path."""
-    cli_tui, held = steer_tui
+    goes back to the input **ahead of** the queued prompts, through the usual cancel path. Pinned in
+    `queue` mode so one message is queued and one steers (the default mode would steer both)."""
+    cli_tui, held = queue_mode
 
     async def scenario():
         app = cli_tui.DostuffTUI(session_id="steer-cancel")
