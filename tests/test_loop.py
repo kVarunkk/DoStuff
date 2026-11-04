@@ -909,22 +909,103 @@ def test_final_answer_with_steer_continues(monkeypatch):
 
 
 def test_final_answer_waits_for_preparing(monkeypatch):
-    """T2.3 (D7): an entry that is still being prepared also keeps the turn going, and is delivered once
-    it is readied."""
+    """T2.3 (D7, REQ-2.6): an entry that is still being prepared also keeps the turn going, and is
+    delivered once it is readied — the loop waits for the preparation instead of re-prompting the
+    model with an unchanged history (review fix: the old path called the model again with nothing new)."""
     from dostuff.helpers.agent.steering import SteeringQueue
     q = SteeringQueue()
-    q.put("one more thing")  # unready when call 1 returns
+    msg = q.put("one more thing")  # unready when call 1 returns
 
     def on_call(n):
-        if n == 2:
-            q.ready(q.pending()[0].id, "one more thing")
+        if n == 1:
+            # readiness arrives from outside while the loop waits at D7 — on the same loop, no thread
+            asyncio.get_running_loop().call_later(0.2, lambda: q.ready(msg.id, "one more thing"))
 
-    run = _steer_run(monkeypatch, [_msg(content="one"), _msg(content="two"), _msg(content="three")],
-                     q, on_call=on_call)
-    assert len(run.calls) == 3
+    run = _steer_run(monkeypatch, [_msg(content="one"), _msg(content="two")], q, on_call=on_call)
+    assert len(run.calls) == 2  # the second call reads the correction, never a bare re-prompt
     assert not any(s.get("content") == "one more thing" for s in run.calls[0]["history"])
-    assert not any(s.get("content") == "one more thing" for s in run.calls[1]["history"])
-    assert run.calls[2]["history"][-1] == {"role": "user", "content": "one more thing"}
+    assert run.calls[1]["history"][-1] == {"role": "user", "content": "one more thing"}
+
+
+def test_final_answer_delivers_after_notices(monkeypatch):
+    """D1 order at D7 (review round 2): a background-job notice that arrives during the final call is
+    appended before the correction, not after it — a correction is read after the facts it may react
+    to, whether it is delivered at the top of an iteration or at D7's final-answer path."""
+    from dostuff.helpers.agent.notices import AgentNotice, get_notice_queue
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    queue = get_notice_queue()
+
+    def on_call(n):
+        if n == 1:  # both arrive while the final call runs
+            queue.put("s1", AgentNotice(id="n1", agent_type="explore", description="d",
+                                        status="completed", runtime=1.0, tokens=0, report="found it"))
+            msg = q.put("ignore that failure")
+            q.ready(msg.id, "ignore that failure")
+
+    try:
+        run = _steer_run(monkeypatch, [_msg(content="done"), _msg(content="second")], q, on_call=on_call)
+    finally:
+        queue.drain("s1")  # never leak into another test
+    assert len(run.calls) == 2  # the correction keeps the turn going (D7)
+    contents = [str(s.get("content")) for s in run.steps]
+    notice_at = next(i for i, c in enumerate(contents) if "found it" in c)
+    steer_at = next(i for i, c in enumerate(contents) if "ignore that failure" in c)
+    assert notice_at < steer_at, contents  # facts first, then the correction reacting to them
+
+
+def test_final_answer_failed_steering_ends_the_turn(monkeypatch):
+    """D7 review fix: a message whose preparation fails during the final call is reported and the turn
+    ends on that answer — the loop never calls the model again with an unchanged history."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    from dostuff.helpers.hooks import HookOutcome
+    q = SteeringQueue()
+    ids: list[str] = []
+    stops: list = []
+
+    async def counting_hooks(event, payload, **kw):
+        if event == "Stop":
+            stops.append(payload.get("last_assistant_message"))
+        return HookOutcome()
+
+    def on_call(n):
+        if n == 1:
+            m = q.put("@missing.txt look")
+            q.fail(m.id, "Could not read @missing.txt")
+            ids.append(m.id)
+
+    run = _steer_run(monkeypatch, [_msg(content="the answer"), _msg(content="never")], q,
+                     on_call=on_call, hooks=counting_hooks)
+    assert len(run.calls) == 1  # the stale second response is never requested
+    assert [d for e, d in run.adapter.events if e == "steer_failed"] == [
+        {"id": ids[0], "error": "Could not read @missing.txt"}]
+    assert not any("@missing.txt" in str(s.get("content")) for s in run.working)
+    assert stops == ["the answer"]  # the Stop hooks saw the answer that really ends the turn
+
+
+def test_final_answer_blocked_steering_ends_the_turn(monkeypatch):
+    """D7 review fix: a message readied during the final call but blocked by UserPromptSubmit is
+    reported and the turn ends — a block never causes a re-prompt either (CON-007)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    ids: list[str] = []
+
+    def on_call(n):
+        if n == 1:
+            m = q.put("the password is hunter2")
+            q.ready(m.id, "the password is hunter2")
+            ids.append(m.id)
+
+    async def blocking(prompt, **kw):
+        return ("no secrets in the transcript", "") if "password" in prompt else (None, "")
+
+    run = _steer_run(monkeypatch, [_msg(content="done"), _msg(content="never")], q,
+                     on_call=on_call, prompt_hook=blocking)
+    assert len(run.calls) == 1
+    assert [d for e, d in run.adapter.events if e == "steer_blocked"] == [
+        {"id": ids[0], "reason": "no secrets in the transcript"}]
+    assert not any("hunter2" in str(s.get("content")) for s in run.working)
+    assert not any(e == "steered" for e, _ in run.adapter.events)
 
 
 def test_subagent_loop_ignores_steering(monkeypatch):
@@ -937,6 +1018,6 @@ def test_subagent_loop_ignores_steering(monkeypatch):
     q.ready(msg.id, content)
 
     run = _steer_run(monkeypatch, [_msg(content="ok")], q, turn_type="subagent_loop")
-    assert not any(s.get("content") == content for s in run.working)
+    assert not any(content in str(s.get("content") or "") for s in run.working)
     assert not any(e in ("steered", "steer_blocked", "steer_failed") for e, _ in run.adapter.events)
     assert [m.raw for m in q.pending()] == [content]

@@ -6153,6 +6153,38 @@ def test_queue_picker_steering_and_send_now(queue_mode):
     asyncio.run(scenario())
 
 
+def test_queue_clear_closes_the_picker_with_steering_pending(queue_mode):
+    """Review fix: "Clear the queue" closes the picker even when steering messages keep the bar up —
+    the prompt rows it listed are gone, and choosing one would hit "That prompt already started."."""
+    cli_tui, held = queue_mode
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-clear")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "start the turn")
+            await _until(pilot, lambda: held.gate is not None, tries=200)
+            _submit(app, cli_tui, "/steer a correction")
+            _submit(app, cli_tui, "run this afterwards")
+            await pilot.pause(0.3)
+            picker = app.query_one("#picker", cli_tui.PermissionPrompt)
+            app.action_show_queue()
+            assert any("run this afterwards" in label for _, label in picker._options)
+            await app._picker_callback("clear")
+            await pilot.pause()
+            assert app._prompt_queue == []
+            assert not picker.display  # closed, not left open over the cleared rows
+            assert [m.raw for m in app._steering.pending()] == ["a correction"]  # untouched
+            assert any("Cleared 1 queued prompt." in t for t in _texts(app))
+            assert app.query_one("#queue-bar", cli_tui.QueueBar).display  # steering keeps the bar up
+            held.hold = False
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 # --- Steering Phase 4 continued: leftovers (plan/2026-11-04-steering/tasks.md T4.3) -------------
 
 

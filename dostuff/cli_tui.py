@@ -4269,6 +4269,10 @@ class DostuffTUI(App):
     def _clear_queue(self) -> None:
         count = len(self._prompt_queue)
         self._prompt_queue.clear()
+        # The rows the picker listed are gone; with steering messages pending the bar stays up, so
+        # _render_queue alone would leave the picker open over dead options (choosing one says
+        # "That prompt already started."). Close it here — clicking the bar reopens the list.
+        self._close_picker()
         self._render_queue()
         self._append(f"Cleared {count} queued prompt{'s' if count != 1 else ''}." if count else "No queued prompts.",
                      msg_type="system")
