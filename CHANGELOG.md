@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.10] - 2026-11-04
 
 Mid-turn steering: `/steer <message>` sends a correction to the turn that is running — the model reads it at the next tool boundary, inside the same turn, instead of waiting for the turn to end — and it is how every plain message is routed by default (`ui.mid_turn_messages: queue` batches them after the turn instead).
 
