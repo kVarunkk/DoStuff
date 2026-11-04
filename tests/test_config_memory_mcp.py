@@ -70,6 +70,21 @@ def test_retry_settings(home):
     cfg = Config()
     assert (cfg.max_retries, cfg.retry_max_delay) == (0, 15.0)
 
+
+@pytest.mark.parametrize("value,expected", [
+    (None, "steer"),          # missing: the default reads at the next tool boundary (D2)
+    ("queue", "queue"),       # opt-in batching after the turn
+    ("steer", "steer"),
+    ("STEER", "steer"),       # case-insensitive (REQ-6.1)
+    ("bogus", "steer"),       # anything else falls back (REQ-6.1)
+])
+def test_mid_turn_messages_mode(home, value, expected):
+    """steering spec REQ-6.1: `ui.mid_turn_messages` picks how a message sent mid-turn is routed (D2)."""
+    user, _ = home
+    line = "" if value is None else f"  mid_turn_messages: {value}\n"
+    (user / ".dostuff" / "config.yaml").write_text(f"ui:\n{line}")
+    assert Config().mid_turn_messages == expected
+
 class FakeMemory:
     def __init__(self, similar):
         self.similar = similar

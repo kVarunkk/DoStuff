@@ -56,6 +56,7 @@ from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_pa
 from dostuff.helpers.agent.model_cost import format_cost
 from dostuff.helpers.agent.notices import WAKE_LIMIT, agent_notice_line, fmt_agent_runtime, format_notices, get_notice_queue, parse_notices
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
+from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, unframe_steered
 from dostuff.helpers.agent.side_question import (
     BTW_FORK_DESCRIPTION, BTW_FORK_PROMPT, add_exchange, answer_side_question, discard_snapshot, kept_prompt,
     plan_mode_on, snapshot as live_side_snapshot,
@@ -1413,6 +1414,10 @@ class TuiAdapter:
         if event_type == "settings_changed":  # the settings tools changed config.yaml or the MCP servers
             app._apply_settings(mcp=data == "mcp")
             return
+        if event_type in ("steered", "steer_blocked", "steer_failed") and isinstance(data, dict):
+            # The loop's verdict on one steering message (steering spec D6, D9)
+            app._on_steer_event(event_type, data)
+            return
         label = event_type.upper().replace("_", " ")
         app._append(f"[{label}] {data}", msg_type="agent")
 
@@ -1802,6 +1807,14 @@ class DostuffTUI(App):
         self._thought_timer: Timer | None = None
         self._last_streamed_answer: str = ""
         self._prompt_queue: list = []
+        # Mid-turn steering (plan/2026-11-04-steering): one queue per app, filled at submit and drained by
+        # loop() at the next tool boundary. In memory on purpose (D4) — an undelivered message is exactly
+        # as durable as a queued prompt.
+        self._steering = SteeringQueue()
+        # id → raw text of every message this app put on the queue. The loop's `take_ready` removes an
+        # entry before it reports back, so the raw lives here until its steered / blocked / failed event
+        # lands (D9: show and re-queue what the user typed, never the expansion).
+        self._steer_raws: dict[str, str] = {}
         self._pending_workers: list[Worker] = []
         self._copy_hint_timer: Timer | None = None
         self._turn_in_progress: bool = False
@@ -3366,6 +3379,9 @@ class DostuffTUI(App):
         if cmd.split(maxsplit=1)[:1] == ["/btw"]:  # works mid-turn: never queued (btw spec D1, CON-006)
             self._btw_command(self._pastes.inline(text.strip()[len("/btw"):]).strip())
             return
+        if cmd.split(maxsplit=1)[:1] == ["/steer"]:  # a mid-turn correction, parsed ahead of the guards (steering D2)
+            self._steer_command(text.strip()[len("/steer"):])
+            return
         if text.lstrip().startswith("!"):
             command = self._pastes.inline(text.lstrip()[1:]).strip()
             if not command:
@@ -3521,9 +3537,80 @@ class DostuffTUI(App):
         if not self._turn_in_progress:
             self._append(text, msg_type="user")
             self._begin_turn(text)
+        elif self.config.mid_turn_messages == "steer" and parse_skill_command(text, self._skill_commands) is None:
+            # `steer` mode (D3, REQ-3.2): a plain message corrects the turn at its next tool boundary.
+            # A skill or custom command wraps the text in SKILL.md and announces itself — that is a turn's
+            # prompt, not a correction, so it still waits in `_prompt_queue` (REQ-3.3) in both modes.
+            self._steer_submit(text)
         else:
             self._prompt_queue.append(text)
             self._render_queue()
+
+    # ── Mid-turn steering (/steer) ─────────────────────────────────────────────
+
+    def _steer_command(self, arg: str) -> None:
+        """`/steer <message>` (steering spec D2, REQ-3.1): a steering message mid-turn, an ordinary
+        prompt when idle — the habit is never an error."""
+        message = self._pastes.inline(arg).strip()
+        if not message:
+            self._append("Usage: /steer <message>", msg_type="error")
+            return
+        if self._turn_in_progress:
+            self._steer_submit(message)
+            return
+        self._append(message, msg_type="user")
+        self._begin_turn(message)
+
+    def _steer_submit(self, message: str) -> None:
+        """A message the running turn reads at the next tool boundary (D2/D3).
+
+        The slot is reserved synchronously, so submit order holds no matter when preparation
+        finishes (CON-006); nothing is written to the history here — the loop appends it once,
+        at delivery (CON-004).
+        """
+        msg = self._steering.put(message)
+        self._steer_raws[msg.id] = msg.raw
+        self._render_queue()
+        self._start_worker(self._prepare_steer(msg), name=f"steer_{msg.id[:6]}")
+
+    def _on_steer_event(self, event_type: str, data: dict) -> None:
+        """The loop's verdict on one steering message (steering spec D6, D9).
+
+        `steered`: finished the stream, then the raw text as a user message — it lands after the output
+        it was reacting to, where it was read — and is recorded at the delivered index, so Esc Esc puts
+        back what the user typed rather than the expanded attachments. Blocked / failed: the reason or
+        the error, never a message in the transcript (nothing was appended to the history either).
+        """
+        raw = self._steer_raws.pop(str(data.get("id")), None)
+        if event_type == "steered":
+            if raw is None:
+                return
+            self._finish_stream_widgets()
+            self._append(raw, msg_type="user")
+            self._sent_prompts[(self.session_id, int(data.get("index") or 0))] = raw
+        elif event_type == "steer_blocked":
+            self._append(blocked_prompt_message(str(data.get("reason") or "")), msg_type="system")
+        else:  # steer_failed: preparation could not finish; nothing was delivered
+            self._append(str(data.get("error") or "the message could not be prepared"), msg_type="error")
+        self._render_queue()
+
+    async def _prepare_steer(self, msg: SteerMessage) -> None:
+        """D5: @mentions and pastes resolved off the UI thread, in submit order; `ready`/`fail` hands
+        the entry to the loop. The "Attached …" lines show here, as they do for a prompt."""
+        try:
+            expansion = await asyncio.to_thread(expand_file_mentions, msg.raw, self.config.max_tool_output_chars)
+            if expansion.attached:
+                self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
+            if expansion.skipped:
+                self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
+            content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
+                                              self.config.paste_file_lines, self.config.max_tool_output_chars)
+        except Exception as e:  # unreadable mention, broken paste file: reported, never delivered (REQ-2.4)
+            self._steering.fail(msg.id, str(e))
+            self._render_queue()
+            return
+        self._steering.ready(msg.id, content)
+        self._render_queue()
 
     # ── Approval prompt ────────────────────────────────────────────────────────
 
@@ -4057,6 +4144,8 @@ class DostuffTUI(App):
                 max_iterations=self.max_iterations,
                 permissions=self.permissions,
                 session_hook_context=self.session_hook_context,
+                # D1: the app's mid-turn queue, drained at the next tool boundary (main session only)
+                steering=self._steering,
             )
 
             agent_text = result or "(no response)"
@@ -4072,6 +4161,15 @@ class DostuffTUI(App):
             started, self._turn_start_time = self._turn_start_time, None
             self._turn_in_progress = False
             cancelled = cancelled or self.adapter._cancelled  # an Esc after the loop's last check
+            # Leftovers (steering spec D8): whatever outlived the turn — sent after the loop's last D7
+            # check, still being prepared, or the turn hit the cap — goes back to the front of the queue
+            # now, so the cancel path below and the "turn finished" notification both see it.
+            leftovers = self._steering.take_all()
+            if leftovers:
+                for msg in leftovers:
+                    self._steer_raws.pop(msg.id, None)  # never delivered: its raw is only a prompt again
+                # Front of `_prompt_queue`, in order — and ahead of the queued prompts on the way back in
+                self._prompt_queue[0:0] = [msg.raw for msg in leftovers]
             self._finish_stream_widgets()
             self._stop_loader(loader_widget)
             if started is not None:
@@ -4081,6 +4179,11 @@ class DostuffTUI(App):
                     self._notify("dostuff: turn finished", time.time() - started)
             self._release_transcript()  # after the summary, in the same refresh, so it fills the held rows
             self._render_status()  # session cost changed
+            if leftovers and not cancelled:
+                # The cancel path says it its own way ("Moved N queued prompts back to the input")
+                count = len(leftovers)
+                self._append(f"{count} message{'s' if count != 1 else ''} arrived after the turn ended; "
+                             f"running {'it' if count == 1 else 'them'} next", msg_type="system")
             self._process_prompt_queue(cancelled)
             self._schedule_wake()  # a job that ended after the loop's last drain
 
@@ -4122,11 +4225,25 @@ class DostuffTUI(App):
 
     def _queue_bar_text(self) -> Text:
         width = max(self.size.width - 8, 20)
-        text = Text(f"{len(self._prompt_queue)} queued · click or /queue to edit, reorder or remove", style="#8a8a8a")
-        for i, prompt in enumerate(self._prompt_queue[:QUEUE_BAR_MAX_ROWS], 1):
-            text.append(f"\n  {i}. {_one_line(prompt, width)}")
-        if (more := len(self._prompt_queue) - QUEUE_BAR_MAX_ROWS) > 0:
-            text.append(f"\n  … {more} more", style="dim")
+        text = Text(style="#8a8a8a")
+        pending = self._steering.pending()
+        if pending:  # steering first: these are read before the queued group runs (steering spec D9)
+            text.append(f"→ {len(pending)} for the agent · read at the next tool boundary")
+            for i, msg in enumerate(pending[:QUEUE_BAR_MAX_ROWS], 1):
+                text.append(f"\n  → {i}. {_one_line(msg.raw, width)}")
+            if (more := len(pending) - QUEUE_BAR_MAX_ROWS) > 0:
+                text.append(f"\n  … {more} more", style="dim")
+            if self._foreground_jobs():  # D10: why it is waiting, and the way out
+                text.append("\n  waiting for a running command · Ctrl+B to background it",
+                            style="#e5c07b")
+        if self._prompt_queue:
+            if pending:
+                text.append("\n")
+            text.append(f"{len(self._prompt_queue)} queued · click or /queue to edit, reorder or remove")
+            for i, prompt in enumerate(self._prompt_queue[:QUEUE_BAR_MAX_ROWS], 1):
+                text.append(f"\n  {i}. {_one_line(prompt, width)}")
+            if (more := len(self._prompt_queue) - QUEUE_BAR_MAX_ROWS) > 0:
+                text.append(f"\n  … {more} more", style="dim")
         return text
 
     def _render_queue(self) -> None:
@@ -4136,8 +4253,8 @@ class DostuffTUI(App):
             bar = self.query_one("#queue-bar", QueueBar)
         except Exception:
             return  # not mounted yet / shutting down
-        bar.display = bool(self._prompt_queue)
-        if self._prompt_queue:
+        bar.display = bool(self._prompt_queue) or bool(self._steering.pending())
+        if bar.display:
             bar.update(self._queue_bar_text())
         elif self._queue_picker_open():
             self._close_picker()
@@ -4152,12 +4269,17 @@ class DostuffTUI(App):
     def _clear_queue(self) -> None:
         count = len(self._prompt_queue)
         self._prompt_queue.clear()
+        # The rows the picker listed are gone; with steering messages pending the bar stays up, so
+        # _render_queue alone would leave the picker open over dead options (choosing one says
+        # "That prompt already started."). Close it here — clicking the bar reopens the list.
+        self._close_picker()
         self._render_queue()
         self._append(f"Cleared {count} queued prompt{'s' if count != 1 else ''}." if count else "No queued prompts.",
                      msg_type="system")
 
     def _queue_picker_open(self) -> bool:
-        return self._picker_open() and self.query_one("#picker", PermissionPrompt)._question.startswith("Queued prompt")
+        return self._picker_open() and self.query_one("#picker", PermissionPrompt)._question.startswith(
+            ("Queued prompt", "Steering message"))
 
     def action_toggle_queue(self) -> None:
         """The queue bar was clicked: open the list, or close it when it's already showing."""
@@ -4167,26 +4289,72 @@ class DostuffTUI(App):
             self.action_show_queue()
 
     def action_show_queue(self) -> None:
-        """/queue or a click on the queue bar: pick a queued prompt, or clear them all."""
-        if not self._prompt_queue:
-            self._append("No queued prompts. Prompts sent while a turn runs wait here.", msg_type="system")
+        """/queue or a click on the queue bar: pick a steering message or a queued prompt, or clear the
+        prompts. Re-opens over our own picker (Edit / Remove / Back show it again), never over another's.
+        """
+        if ((self._picker_open() and not self._queue_picker_open()) or self._settings_open()
+                or self.query("#permission-prompt")):
             return
-        if self._picker_open() or self._settings_open() or self.query("#permission-prompt"):
+        pending = self._steering.pending()
+        if not pending and not self._prompt_queue:
+            self._append("No queued prompts or steering messages. Prompts sent while a turn runs wait here.",
+                         msg_type="system")
             return
         prompts = list(self._prompt_queue)
-        options = [(f"q{i}", f"{i + 1}. {_one_line(p, 70)}") for i, p in enumerate(prompts)]
+        options = [(f"s{i}", f"→ {i + 1}. {_one_line(m.raw, 70)}") for i, m in enumerate(pending)]
+        options += [(f"q{i}", f"{len(pending) + i + 1}. {_one_line(p, 70)}") for i, p in enumerate(prompts)]
         options.append(("clear", "Clear the queue"))
 
         async def choose(value: str) -> None:
             if value == "clear":
                 self._clear_queue()
+            elif value.startswith("s"):
+                self._steer_actions(pending[int(value[1:])].id)
             else:
                 self._queued_prompt_actions(prompts[int(value[1:])])
 
-        self._show_picker("Queued prompts (run in order after the current turn)", options, choose)
+        self._show_picker("Queued prompts and steering messages (→ read at the next tool boundary)",
+                          options, choose)
+
+    def _steer_actions(self, msg_id: str) -> None:
+        """One steering message: its text, then edit it (back to the input), remove it, or go back (D9)."""
+        pending = self._steering.pending()
+        msg = next((m for m in pending if m.id == msg_id), None)
+        if msg is None:  # read by the loop between the listing and this choice (REQ-1.3)
+            self._append("That message was already read.", msg_type="system")
+            return
+        raw = msg.raw
+        position = pending.index(msg)
+        options = [("edit", "Edit it (moves it back to the input)"), ("remove", "Remove it"),
+                   ("back", "Back to the list")]
+        lines = raw.splitlines() or [""]
+        detail = [(line, "#8a8a8a") for line in lines[:QUEUE_DETAIL_LINES]]
+        if len(lines) > QUEUE_DETAIL_LINES:
+            detail.append((f"… {len(lines) - QUEUE_DETAIL_LINES} more lines", "dim"))
+
+        async def act(choice: str) -> None:
+            if choice == "back":
+                self.action_show_queue()
+                return
+            if not self._steering.remove(msg_id):
+                self._append("That message was already read.", msg_type="system")
+                return
+            self._steer_raws.pop(msg_id, None)
+            if choice == "edit":
+                self._put_back_in_input([raw])
+            else:
+                self._append(f"Removed steering message: {_one_line(raw, 60)}", msg_type="system")
+            self._render_queue()
+            if self._steering.pending() or self._prompt_queue:
+                self.action_show_queue()
+            else:
+                self._close_picker()
+
+        self._show_picker(f"Steering message {position + 1} of {len(pending)}", options, act, detail=detail)
 
     def _queued_prompt_actions(self, prompt: str) -> None:
-        """One queued prompt: its text, then edit it, run it next, remove it, or go back."""
+        """One queued prompt: its text, then edit it, run it next, send it now (as a steering message),
+        remove it, or go back."""
         if prompt not in self._prompt_queue:
             self._append("That prompt already started.", msg_type="system")
             return
@@ -4194,7 +4362,8 @@ class DostuffTUI(App):
         options = [("edit", "Edit it (moves it back to the input)")]
         if position:
             options.append(("next", "Run it next"))
-        options += [("remove", "Remove it"), ("back", "Back to the list")]
+        options += [("send", "Send now (at the next tool boundary)"), ("remove", "Remove it"),
+                    ("back", "Back to the list")]
         lines = prompt.splitlines() or [""]
         detail = [(line, "#8a8a8a") for line in lines[:QUEUE_DETAIL_LINES]]
         if len(lines) > QUEUE_DETAIL_LINES:
@@ -4212,9 +4381,13 @@ class DostuffTUI(App):
                 self._prompt_queue.insert(0, prompt)
             elif choice == "edit":
                 self._put_back_in_input([prompt])
+            elif choice == "send":  # steering spec D2: read at the next boundary instead of after the turn
+                self._steer_submit(prompt)
             else:
                 self._append(f"Removed queued prompt: {_one_line(prompt, 60)}", msg_type="system")
             self._render_queue()
+            if choice == "send":
+                self.action_show_queue()  # back on the list, marked → now
 
         self._show_picker(f"Queued prompt {position + 1} of {len(self._prompt_queue)}", options, act, detail=detail)
 
@@ -4234,12 +4407,16 @@ class DostuffTUI(App):
         return loader_widget
 
     def _loader_text(self) -> Text:
-        """Bold label, then the elapsed time and queued-prompt count."""
+        """Bold label, then the elapsed time and the steering / queued counts (steering spec D9: the count
+        reads `· 1 steering · 2 queued`)."""
         text = Text(self._loader_label, style="bold")
         if self._turn_start_time is not None:
             text.append(f"  {_fmt_elapsed(time.time() - self._turn_start_time)}", style="bold #e5c07b")
+        counts = [f"· {len(pending)} steering" for pending in (self._steering.pending(),) if pending]
         if self._prompt_queue:
-            text.append(f"  · {len(self._prompt_queue)} queued", style="#8a8a8a")
+            counts.append(f"· {len(self._prompt_queue)} queued")
+        if counts:
+            text.append("  " + " ".join(counts), style="#8a8a8a")
         return text
 
     def _render_loader(self) -> None:
@@ -4381,6 +4558,7 @@ class DostuffTUI(App):
         if session_of(job.owner) == self.session_id:
             self.call_later(self._refresh_job_hint)
             self.call_later(self._render_jobs_bar)
+            self.call_later(self._render_queue)  # the D10 "Ctrl+B to background it" hint follows jobs
             if event == "end" and not job.foreground and job.killed_by in (None, "user"):
                 self.call_later(self._job_ended, job)  # the ones the owner gets a notice for (D7)
 
@@ -4518,7 +4696,10 @@ class DostuffTUI(App):
         if self._turn_in_progress or index is None:
             return
         dropped = self.steps_history[index:]
-        text = self._sent_prompts.get((self.session_id, index)) or strip_attachments(dropped[0]["content"])
+        # After a reload _sent_prompts is empty and the stored step may be framed (D6): unframe so
+        # Esc-to-restore returns the typed text, never the frame (REQ-2.9).
+        text = self._sent_prompts.get((self.session_id, index)) or unframe_steered(
+            strip_attachments(dropped[0]["content"]))
         try:
             await self.store.drop_last_steps(self.session_id, len(dropped))
         except Exception as e:

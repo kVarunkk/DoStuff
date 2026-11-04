@@ -686,3 +686,414 @@ def test_loop_and_side_call_send_the_same_string(monkeypatch, btw):
     for snap, sent in zip(seen, calls):
         assert btw.compose_system_instruction(snap.system_instruction, btw.plan_mode_on(permissions),
                                               snap.compaction_notes, snap.session_hook_context) == sent["system"]
+
+
+# --- Steering Phase 2 (plan/2026-11-04-steering/tasks.md): delivery at the tool boundary (D6, D7) ---
+
+class _Store:
+    """Just enough of SessionStore for `append_step`: every step written, in order (CON-004)."""
+
+    def __init__(self):
+        self.appended: list = []
+
+    async def append(self, session_id, step):
+        self.appended.append((session_id, dict(step)))
+
+
+def _steer_run(monkeypatch, responses, steering=None, *, dispatch=None, on_call=None,
+               prompt_hook=None, hooks=None, **loop_kw):
+    """An `interactive_loop` turn with a steering queue: returns the four histories, the store, the scripted
+    `call_agent` calls and the adapter's events. Hooks are off unless a hook is passed in."""
+    from dostuff.helpers.hooks import HookOutcome
+    calls: list[dict] = []
+
+    async def fake_call_agent(steps_history, system_instruction, tool_names=None, stream=False):
+        calls.append({"history": [dict(s) for s in steps_history], "system": system_instruction})
+        if on_call is not None:
+            on_call(len(calls))
+        item = responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item, None
+
+    async def no_hooks(*args, **kwargs):
+        return HookOutcome()
+
+    async def no_prompt_hook(prompt, **kwargs):
+        return (None, "")  # not blocked, no context — the contract of user_prompt_submit
+
+    monkeypatch.setattr(loop_module, "call_agent", fake_call_agent)
+    monkeypatch.setattr(loop_module, "run_hooks", hooks or no_hooks)
+    monkeypatch.setattr(loop_module, "user_prompt_submit", prompt_hook or no_prompt_hook, raising=False)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+    if dispatch is not None:
+        monkeypatch.setattr(loop_module, "dispatch_tool", dispatch)
+    working = loop_kw.pop("working", None)
+    working = working if working is not None else [{"role": "user", "content": "hi"}]
+    adapter = Adapter()
+    steps: list = []
+    current: list = []
+    store = _Store()
+    loop_kw.setdefault("dynamic_system_instruction", "sys")
+    loop_kw.setdefault("session_id", "s1")
+    result = asyncio.run(loop(
+        turn_id="t1", user_text="hi", mcp_client=None, working_history=working,
+        turn_type=loop_kw.pop("turn_type", "interactive_loop"), stream=False, max_iterations=5,
+        adapter=adapter, steps_history=steps, current_session_history=current, store=store,
+        steering=steering, **loop_kw,
+    ))
+    return SimpleNamespace(result=result, working=working, steps=steps, current=current,
+                           store=store, calls=calls, adapter=adapter)
+
+
+def test_steer_delivered_after_tool_call(monkeypatch):
+    """T2.1 (D6, REQ-2.2/2.3/2.8): a message put while a tool runs is read at the next boundary — after the
+    tool result, before the next model call — and is written exactly once (CON-004)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "use pytest, not unittest"
+
+    async def dispatch(name, args, **kw):
+        msg = q.put(content)
+        q.ready(msg.id, content)  # the tool's own implementation puts it, as a real tool would
+        return "ok"
+
+    run = _steer_run(monkeypatch, [
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]), _msg(content="done")],
+        q, dispatch=dispatch)
+
+    # call 2 reads it as the last step, after the tool result it was reacting to, framed (D6, REQ-2.9)
+    framed = loop_module.frame_steered(content)
+    assert run.calls[1]["history"][-1] == {"role": "user", "content": framed}
+    assert run.calls[1]["history"][-2]["role"] == "tool"
+    assert not any(content in str(s.get("content") or "") for s in run.calls[0]["history"])
+    # exactly once in all four places (CON-004)
+    for place in (run.steps, run.working, run.current):
+        assert sum(1 for s in place if content in str(s.get("content") or "")) == 1, place
+    assert sum(1 for _sid, s in run.store.appended if content in str(s.get("content") or "")) == 1
+    # the delivery event names the index it was written at
+    steered = [d for e, d in run.adapter.events if e == "steered"]
+    assert len(steered) == 1
+    assert run.steps[steered[0]["index"]] == {"role": "user", "content": framed}
+    assert steered[0]["id"]  # the TUI matches on it
+
+
+def test_steer_message_is_framed_for_resume_intent(monkeypatch):
+    """REQ-2.9 (D6): a delivered steering message lands framed — head line, raw content verbatim, tail
+    clause telling the model to continue the task — exactly once in every history, and the hook still
+    receives the raw content. Without the frame a standalone question was answered with a final response
+    and the turn ended with the original task unfinished (Claude Code parity: anthropics/claude-code#84389)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "what does this function do?"
+    seen: list = []
+
+    async def capturing(prompt, **kw):
+        seen.append(prompt)
+        return (None, "")
+
+    msg = q.put(content)
+    q.ready(msg.id, content)
+
+    run = _steer_run(monkeypatch, [_msg(content="ok")], q, prompt_hook=capturing)
+
+    head = "The user sent a new message while you were working:"
+    tail = "Address the message above, then continue the task you were working on."
+    delivered = [s for s in run.steps if s.get("role") == "user" and content in str(s.get("content"))]
+    assert len(delivered) == 1
+    assert delivered[0]["content"] == f"{head}\n{content}\n{tail}"  # the exact wording, pinned
+    for place in (run.steps, run.working, run.current):
+        assert sum(head in str(s.get("content") or "") for s in place) == 1, place
+        assert sum(tail in str(s.get("content") or "") for s in place) == 1, place
+    framed_store = [s for _sid, s in run.store.appended if head in str(s.get("content") or "")]
+    assert len(framed_store) == 1 and content in framed_store[0]["content"]
+    assert seen == [content]  # the hook saw the raw message, not the frame (REQ-2.9)
+
+
+def test_steer_context_rides_the_boundary_not_the_system(monkeypatch):
+    """Cache: the turn's system prompt must stay byte-stable within the turn (call_agent: breakpoints on
+    the system prompt + the moving last message read everything before them from cache). UserPromptSubmit
+    context on a steered message is therefore delivered as a note step immediately before the frame —
+    never folded into the system instruction mid-turn, which would invalidate the whole cached prefix."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "use pytest, not unittest"
+
+    async def context_hook(prompt, **kw):
+        return (None, "repo convention: pytest only")
+
+    async def dispatch(name, args, **kw):
+        msg = q.put(content)
+        q.ready(msg.id, content)
+        return "ok"
+
+    run = _steer_run(monkeypatch, [
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]), _msg(content="done")],
+        q, dispatch=dispatch, prompt_hook=context_hook)
+
+    # byte-identical system instruction on the call before and after the delivery — the cache prefix holds
+    assert run.calls[1]["system"] == run.calls[0]["system"]
+    # the context is a note step directly ahead of the framed message, in every history
+    frame = loop_module.frame_steered(content)
+    idx = next(i for i, s in enumerate(run.steps) if s.get("content") == frame)
+    note = run.steps[idx - 1]
+    assert note["role"] == "user"
+    assert note["content"] == "[Context from UserPromptSubmit hooks]\nrepo convention: pytest only"
+    for place in (run.working, run.current):
+        j = next(i for i, s in enumerate(place) if s.get("content") == frame)
+        assert place[j - 1]["content"].startswith("[Context from UserPromptSubmit hooks]")
+    assert any(str(s.get("content", "")).startswith("[Context from UserPromptSubmit hooks]")
+               for _sid, s in run.store.appended)
+
+
+def test_steer_not_delivered_mid_call(monkeypatch):
+    """T2.1 (REQ-2.8, CON-005): delivery never happens while a tool call runs — the queue is only read at
+    the top of the next iteration."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "stop touching migrations"
+    working = [{"role": "user", "content": "hi"}]
+    during: list = []
+
+    async def dispatch(name, args, **kw):
+        msg = q.put(content)
+        q.ready(msg.id, content)
+        during.append([dict(s) for s in working])  # the history as the tool sees it
+        return "ok"
+
+    run = _steer_run(monkeypatch, [
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]), _msg(content="done")],
+        q, dispatch=dispatch, working=working)
+
+    assert not any(content in str(s.get("content") or "") for s in during[0])  # not delivered mid-call
+    assert not any(content in str(s.get("content") or "") for s in run.calls[0]["history"])
+    assert run.calls[1]["history"][-1] == {"role": "user", "content": loop_module.frame_steered(content)}
+
+
+def test_steer_order_after_notices_and_inbox(monkeypatch):
+    """T2.1 (D1): the drain reads notices first (a correction may react to them), then the inbox, then
+    steering — all before publish_snapshot, so a /btw asked afterwards sees all three."""
+    from dostuff.helpers.agent.notices import AgentNotice, get_notice_queue
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    msg = q.put("ignore that failure")
+    q.ready(msg.id, "ignore that failure")
+    queue = get_notice_queue()
+    queue.put("s1", AgentNotice(id="a1", agent_type="explore", description="d", status="completed",
+                                runtime=1.0, tokens=0, report="found it"))
+    try:
+        run = _steer_run(monkeypatch, [_msg(content="ok")], q, inbox=["a message from the model"])
+    finally:
+        queue.drain("s1")  # never leak into another test
+    contents = [s["content"] for s in run.calls[0]["history"]]
+    assert contents[0] == "hi"
+    assert "found it" in contents[1]
+    assert contents[2] == "a message from the model"
+    assert contents[3] == loop_module.frame_steered("ignore that failure")
+
+
+def test_steer_blocked_by_user_prompt_submit(monkeypatch):
+    """T2.2 (D6, REQ-2.4, CON-007): a hook that would block a prompt blocks the same text sent as a steering
+    message — nothing is appended, and the reason is emitted for the TUI to show."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "the password is hunter2"
+    msg = q.put(content)
+    q.ready(msg.id, content)
+
+    async def blocking(prompt, **kw):
+        return ("no secrets in the transcript", "") if "password" in prompt else (None, "")
+
+    run = _steer_run(monkeypatch, [_msg(content="ok")], q, prompt_hook=blocking)
+    assert not any(content in str(s.get("content") or "") for s in run.working)
+    assert not any(content in str(s.get("content") or "") for _sid, s in run.store.appended)
+    assert [d for e, d in run.adapter.events if e == "steer_blocked"] == [
+        {"id": msg.id, "reason": "no secrets in the transcript"}]
+    assert not any(e == "steered" for e, _ in run.adapter.events)
+
+
+def test_steer_hook_context_in_later_calls(monkeypatch):
+    """T2.2 (REQ-2.5): UserPromptSubmit context reaches every later model call of this turn — as a note
+    step in the history, never in the system instruction (a mid-turn system change would invalidate the
+    prompt cache), and it is stored like any step."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    ctx = "the tests live in tests/"
+
+    def on_call(n):
+        if n == 1:
+            msg = q.put("actually, use pytest")
+            q.ready(msg.id, "actually, use pytest")
+
+    async def contextual(prompt, **kw):
+        return (None, ctx)
+
+    run = _steer_run(monkeypatch, [
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]),
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "b.py"}), "c2")]),
+        _msg(content="done")], q, on_call=on_call, prompt_hook=contextual)
+    assert len(run.calls) == 3
+    # never in the system instruction — the system prompt is byte-stable within the turn (the cache)
+    assert all(ctx not in c["system"] for c in run.calls)
+    # in the history of every call after the delivery, and nowhere before it
+    assert not any(ctx in str(s.get("content")) for s in run.calls[0]["history"])
+    assert all(any(ctx in str(s.get("content")) for s in c["history"]) for c in run.calls[1:])
+    # stored in every history — the note is a durable step now (visible in transcript/export)
+    assert any(ctx in str(s.get("content")) for s in run.steps)
+
+
+def test_steer_failed_emits(monkeypatch):
+    """T2.2 (REQ-2.4): a failed preparation emits steer_failed and appends nothing (CON-004)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "@missing.txt look"
+    msg = q.put(content)
+    q.fail(msg.id, "Could not read @missing.txt")
+
+    run = _steer_run(monkeypatch, [_msg(content="ok")], q)
+    assert [d for e, d in run.adapter.events if e == "steer_failed"] == [
+        {"id": msg.id, "error": "Could not read @missing.txt"}]
+    assert not any(e == "steered" for e, _ in run.adapter.events)
+    assert not any(content in str(s.get("content") or "") for s in run.working)
+
+
+def test_final_answer_with_steer_continues(monkeypatch):
+    """T2.3 (D7, REQ-2.6): a final answer with a steering message waiting does not end the turn, and the
+    Stop hooks run only on the answer that really ends it."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    from dostuff.helpers.hooks import HookOutcome
+    q = SteeringQueue()
+    stops: list = []
+
+    async def counting_hooks(event, payload, **kw):
+        if event == "Stop":
+            stops.append(payload.get("last_assistant_message"))
+        return HookOutcome()
+
+    def on_call(n):
+        if n == 1:
+            msg = q.put("actually, use pytest")
+            q.ready(msg.id, "actually, use pytest")
+
+    run = _steer_run(monkeypatch, [_msg(content="first answer"), _msg(content="second answer")],
+                     q, on_call=on_call, hooks=counting_hooks)
+    assert len(run.calls) == 2
+    assert run.calls[1]["history"][-1] == {
+        "role": "user", "content": loop_module.frame_steered("actually, use pytest")}
+    assert stops == ["second answer"]  # not "first answer"
+
+
+def test_final_answer_waits_for_preparing(monkeypatch):
+    """T2.3 (D7, REQ-2.6): an entry that is still being prepared also keeps the turn going, and is
+    delivered once it is readied — the loop waits for the preparation instead of re-prompting the
+    model with an unchanged history (review fix: the old path called the model again with nothing new)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    msg = q.put("one more thing")  # unready when call 1 returns
+
+    def on_call(n):
+        if n == 1:
+            # readiness arrives from outside while the loop waits at D7 — on the same loop, no thread
+            asyncio.get_running_loop().call_later(0.2, lambda: q.ready(msg.id, "one more thing"))
+
+    run = _steer_run(monkeypatch, [_msg(content="one"), _msg(content="two")], q, on_call=on_call)
+    assert len(run.calls) == 2  # the second call reads the correction, never a bare re-prompt
+    assert not any("one more thing" in str(s.get("content") or "") for s in run.calls[0]["history"])
+    assert run.calls[1]["history"][-1] == {
+        "role": "user", "content": loop_module.frame_steered("one more thing")}
+
+
+def test_final_answer_delivers_after_notices(monkeypatch):
+    """D1 order at D7 (review round 2): a background-job notice that arrives during the final call is
+    appended before the correction, not after it — a correction is read after the facts it may react
+    to, whether it is delivered at the top of an iteration or at D7's final-answer path."""
+    from dostuff.helpers.agent.notices import AgentNotice, get_notice_queue
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    queue = get_notice_queue()
+
+    def on_call(n):
+        if n == 1:  # both arrive while the final call runs
+            queue.put("s1", AgentNotice(id="n1", agent_type="explore", description="d",
+                                        status="completed", runtime=1.0, tokens=0, report="found it"))
+            msg = q.put("ignore that failure")
+            q.ready(msg.id, "ignore that failure")
+
+    try:
+        run = _steer_run(monkeypatch, [_msg(content="done"), _msg(content="second")], q, on_call=on_call)
+    finally:
+        queue.drain("s1")  # never leak into another test
+    assert len(run.calls) == 2  # the correction keeps the turn going (D7)
+    contents = [str(s.get("content")) for s in run.steps]
+    notice_at = next(i for i, c in enumerate(contents) if "found it" in c)
+    steer_at = next(i for i, c in enumerate(contents) if "The user sent a new message" in c)
+    assert notice_at < steer_at, contents  # facts first, then the correction reacting to them
+
+
+def test_final_answer_failed_steering_ends_the_turn(monkeypatch):
+    """D7 review fix: a message whose preparation fails during the final call is reported and the turn
+    ends on that answer — the loop never calls the model again with an unchanged history."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    from dostuff.helpers.hooks import HookOutcome
+    q = SteeringQueue()
+    ids: list[str] = []
+    stops: list = []
+
+    async def counting_hooks(event, payload, **kw):
+        if event == "Stop":
+            stops.append(payload.get("last_assistant_message"))
+        return HookOutcome()
+
+    def on_call(n):
+        if n == 1:
+            m = q.put("@missing.txt look")
+            q.fail(m.id, "Could not read @missing.txt")
+            ids.append(m.id)
+
+    run = _steer_run(monkeypatch, [_msg(content="the answer"), _msg(content="never")], q,
+                     on_call=on_call, hooks=counting_hooks)
+    assert len(run.calls) == 1  # the stale second response is never requested
+    assert [d for e, d in run.adapter.events if e == "steer_failed"] == [
+        {"id": ids[0], "error": "Could not read @missing.txt"}]
+    assert not any("@missing.txt" in str(s.get("content")) for s in run.working)
+    assert stops == ["the answer"]  # the Stop hooks saw the answer that really ends the turn
+
+
+def test_final_answer_blocked_steering_ends_the_turn(monkeypatch):
+    """D7 review fix: a message readied during the final call but blocked by UserPromptSubmit is
+    reported and the turn ends — a block never causes a re-prompt either (CON-007)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    ids: list[str] = []
+
+    def on_call(n):
+        if n == 1:
+            m = q.put("the password is hunter2")
+            q.ready(m.id, "the password is hunter2")
+            ids.append(m.id)
+
+    async def blocking(prompt, **kw):
+        return ("no secrets in the transcript", "") if "password" in prompt else (None, "")
+
+    run = _steer_run(monkeypatch, [_msg(content="done"), _msg(content="never")], q,
+                     on_call=on_call, prompt_hook=blocking)
+    assert len(run.calls) == 1
+    assert [d for e, d in run.adapter.events if e == "steer_blocked"] == [
+        {"id": ids[0], "reason": "no secrets in the transcript"}]
+    assert not any("hunter2" in str(s.get("content")) for s in run.working)
+    assert not any(e == "steered" for e, _ in run.adapter.events)
+
+
+def test_subagent_loop_ignores_steering(monkeypatch):
+    """T2.4 (REQ-2.7, CON-008): a subagent's route is send_message — passing a steering queue to a
+    `subagent_loop` delivers nothing and never even takes the entry."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "main session only"
+    msg = q.put(content)
+    q.ready(msg.id, content)
+
+    run = _steer_run(monkeypatch, [_msg(content="ok")], q, turn_type="subagent_loop")
+    assert not any(content in str(s.get("content") or "") for s in run.working)
+    assert not any(e in ("steered", "steer_blocked", "steer_failed") for e, _ in run.adapter.events)
+    assert [m.raw for m in q.pending()] == [content]

@@ -43,6 +43,9 @@ ui:
   # iTerm2, WezTerm, Ghostty, kitty …; Windows Terminal ignores it, use bell). /notifications on|off per session.
   notifications: off
   notify_after_seconds: 30
+  mid_turn_messages: steer  # steer (default): a message sent while a turn runs is read by the model at the
+                            # next tool boundary, inside the running turn | queue: it runs after the turn.
+                            # /steer <msg> sends one either way; see the README's "Mid-turn steering" section.
 
 jobs:
   # When a background job the agent started ends on its own while the TUI is idle, start a turn so the

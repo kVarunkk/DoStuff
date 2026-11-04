@@ -37,6 +37,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
 - **`ask_user`** — the agent asks you a real question — up to 4, with 2–4 options each, multi-select and a free-text "Other" — instead of guessing; the answers come back to it as one result and stay readable in `/resume`. See [Asking the user](#asking-the-user)
 - **`/btw` side questions** — ask about the conversation while a turn runs (or idle) without stopping or queuing it: one model call, no tools run, answered in a panel above the input and never added to the history; `f` hands the question to a background agent that can check it with tools. See [Side questions](#side-questions-btw)
+- **Mid-turn steering (`/steer`)** — send a correction to the turn that is running and the model reads it at the next tool boundary instead of waiting for the turn; plain messages steer by default, and `ui.mid_turn_messages: queue` batches them after the turn instead. See [Mid-turn steering](#mid-turn-steering-steer)
 - **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
 - **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
@@ -196,6 +197,7 @@ In the TUI:
 | `/permissions [mode]` | Show or change the permission mode for this session (`ask`, `allowlist`, `auto`, `plan`) |
 | `/copy`       | Copy the model's last answer to the clipboard |
 | `/btw <question>` | Ask a side question about the conversation, even while a turn runs: answered in a panel above the input, without tools, never added to the history. See [Side questions](#side-questions-btw) |
+| `/steer <message>` | Send a correction to the running turn: the model reads it at the next tool boundary and carries on, without the turn ending. See [Mid-turn steering](#mid-turn-steering-steer) |
 | `/notifications [on\|off\|bell\|osc9]` | Turn turn-finished / approval notifications on or off for this session (default from `ui.notifications`) |
 | `/model [<provider/model>] [--active]` | Pick a model: your saved ones (`models:` in config.yaml) first, then "More <provider> models…" for each provider's list (type to filter; Enter on no match uses what you typed). A model that isn't saved yet is added to `~/.dostuff/config.yaml`. A plain `/model` switch lasts only for this session; add `--active` (e.g. `/model --active`, or `/model anthropic/claude-sonnet-5-5 --active`) to make it the default that new sessions start with |
 | `/config [mcp] [project]` | Edit a settings file right in the TUI: pick `config.yaml` or the MCP servers, user (`~/.dostuff`) or project (`./.dostuff`), or name one (`/config mcp project`). `Ctrl+S` checks the file, saves it and applies it without a restart (an invalid file stays open with the error); `Esc` closes, twice if there are unsaved changes. A new file starts with every option commented out. `.env` files aren't offered |
@@ -230,7 +232,8 @@ In the TUI:
 - **Status bar** — `cwd • model • permission mode • context usage %` by default; `help`, `session`, `tokens` and `cost` can be added. Choose and order the items with `ui.status_bar` in `config.yaml`; when the terminal is too narrow (or zoomed in), long items are shortened and the least important dropped (help, session, cwd, tokens, cost, model, context, mode) instead of being cut off
 - **Shells** — while background jobs run, a `⚙ 2 shells` item sits at the end of the status bar whatever `ui.status_bar` says. Click it (or press `↓` in an empty input) to list the session's jobs with when each started and how long it has run, and click it again to close the list; pick one (click or Enter) to see its last 8 lines of output and log path in the same small panel, refresh them, or stop it
 - **Loading** — bold `Working...` with a live elapsed timer and queued-prompt count, or streamed thoughts displayed live
-- **Queued prompts** — prompts sent while a turn runs wait above the input, one row each, and run in order. Click the list (or `/queue`) to pick one and edit it (back into the input), run it next or remove it, or clear them all (`/queue clear`). `Esc` cancels the turn and moves the queued prompts back into the input instead of running them
+- **Queued prompts** — prompts that have to wait for the turn sit above the input, one row each, and run in order: skill and custom commands in both modes, plain messages with `ui.mid_turn_messages: queue`. Click the list (or `/queue`) to pick one and edit it (back into the input), run it next or remove it, or clear them all (`/queue clear`). `Esc` cancels the turn and moves the queued prompts back into the input instead of running them
+- **Steering messages** — `/steer <message>` (and every plain message by default; `ui.mid_turn_messages: queue` makes them wait instead) waits for the next tool boundary instead of the end of the turn: the bar leads with `→ N for the agent · read at the next tool boundary`, `/queue` lists them first with Edit / Remove (and *Send now* turns a queued prompt into one), and `Esc` puts a pending one back in the input ahead of the queue. See [Mid-turn steering](#mid-turn-steering-steer)
 - **Terminal title** — the tab / window title shows the run status: `⏳ dostuff · <folder>` while working, `✋` while an approval waits, `✓` when done; the old title comes back on exit. `ui.terminal_title: false` turns it off
 - **Notifications** (off by default) — `ui.notifications: bell` (terminal bell) or `osc9` (desktop notification in iTerm2, WezTerm, Ghostty, kitty …) when a turn finishes or an approval is waiting, if it took longer than `ui.notify_after_seconds` (30) or the terminal is in the background. `/notifications` switches it per session
 
@@ -460,6 +463,90 @@ session by `/clear` and `/resume`; `/fork` leaves it with the original session a
 
 With no turn running, `/btw` works from the stored conversation and the last turn's system prompt. `dostuff -p` has
 no `/btw` (only skills and custom commands run there), so `/btw` in a `-p` prompt is ordinary text for the model.
+
+---
+
+## Mid-turn steering (`/steer`)
+
+A message typed while a turn runs normally waits its turn: it joins the queue and runs as its own prompt when the
+current one ends. `/steer <message>` sends a **correction** instead — the model reads it at the next tool boundary and
+carries on with it, without the turn ending and without anything being interrupted:
+
+```
+> /steer actually target ./dostuff, not the repo root
+```
+
+It lands in the transcript as a user message right after the tool output it was reacting to — where the model read it
+— and the next model call sees it as the newest user message. A final answer that arrives while a correction is still
+waiting does not end the turn: the model reads it and redoes or extends the answer. That check runs before the `Stop`
+hooks, so they see the answer that really ends the turn.
+
+What the model reads is framed, not bare: the stored user step is your text wrapped in two fixed lines —
+`The user sent a new message while you were working:` above it, `Address the message above, then continue the task
+you were working on.` below. The loop has no notion of "the task", only the history, so without that instruction a
+standalone question tends to be answered with a final response and the turn ends with the interrupted work left
+mid-flight; Claude Code wraps mid-turn messages the same way. Everything you *see* stays raw — the transcript line,
+Esc-to-restore, and what a leftover re-runs — the frame reaches only the model, plus the stored transcript that
+`/resume` replays.
+
+### Two modes
+
+`ui.mid_turn_messages` in `config.yaml` decides what a **plain** message does while a turn runs (default `steer`):
+
+| Submitted | `queue` | `steer` (default) |
+|---|---|---|
+| Plain message | waits in the queue, runs after the turn | steering: read at the next tool boundary |
+| `/steer <message>` | steering | steering |
+| `/<skill> args`, custom command | waits in the queue | waits in the queue |
+| `/btw`, `/queue`, `/jobs`, … | run now | run now |
+| `/clear`, `/resume`, `/model`, … | refused while a turn runs | refused while a turn runs |
+| `!command` | refused while a turn runs | refused while a turn runs |
+| `#note` (quick memory) | run now | run now |
+
+`steer` is the default because it is Claude Code's behaviour: a correction is read now, at the next tool boundary,
+instead of after the turn. `queue` stays one key away for anyone who prefers batching — three instructions typed in a
+row run as three prompts while you are away, and a queued message is never read mid-task when you meant "next".
+`/steer` works in both modes, and with no turn running it is
+an ordinary prompt (it starts a turn), so the habit is never an error. Skills and custom commands stay in the queue in
+both modes: a skill is a turn's prompt, not a correction.
+
+### What you see
+
+- **On submit** the input clears and the bar above it leads with the steering group, `→ 1 for the agent · read at the next tool boundary`, above the usual `N queued · click or /queue …` rows; the loader counts them separately, `· 1 steering · 2 queued`.
+- **`/queue`** lists the steering messages first, each marked `→`, with *Edit* and *Remove* (once the loop has read
+  one, the picker says "That message was already read."), and every queued prompt gained *Send now (at the next tool
+  boundary)*, which turns it into a correction.
+- **Attachments are prepared in order**: `@mentions` are expanded and pastes resolved right after you send, in the
+  order you sent them, so a message holding a big file never jumps ahead of the one after it. The `Attached …` lines
+  show as they finish, as for a prompt.
+- **Hooks and the sandbox still apply**: `UserPromptSubmit` runs for each correction at the boundary, so a hook can
+  block it — it is shown like a blocked prompt and never reaches the model — or add context for this turn, written as a
+  note right before the correction (the system prompt never changes mid-turn, so the prompt cache holds); a preparation
+  failure is reported instead of half-delivered.
+
+### Latency, and `Ctrl+B`
+
+Delivery waits for the tool call in flight; nothing is interrupted to deliver sooner, so a two-minute `bash_command`
+delays a correction two minutes. While a message waits behind a running command the bar says why —
+`waiting for a running command · Ctrl+B to background it` — and `Ctrl+B` moves the command (or a foreground subagent)
+to the background, which returns the call to the loop at once: the message is read at the next boundary while the
+command keeps running. `Esc` remains the way to stop.
+
+### Leftovers
+
+A correction can outlive its turn — sent after the final answer's last check, still being prepared, the turn hit the
+iteration cap, the model call failed, or you pressed `Esc`. Nothing is lost:
+
+- **Cancelled** (`Esc`) — the raw text goes back into the input **ahead of** the queued prompts: stopping the work
+  includes the corrections to it.
+- **Otherwise** — it runs next: `1 message arrived after the turn ended; running it next`, then it is re-prepared from
+  what you typed and runs as a normal turn.
+
+Either way the text you typed is written to the history exactly once — whether the model read it mid-turn or it ran as
+the next turn.
+
+`dostuff -p` has no `/steer` (only skills and custom commands run there), so a `/steer` line in a `-p` prompt is
+ordinary text for the model.
 
 ---
 
@@ -804,6 +891,11 @@ memory:
 permissions:
   mode: ask                 # ask | allowlist | auto | plan
   allow: []
+
+ui:
+  mid_turn_messages: steer  # steer (default): a plain message sent while a turn runs is read by the model at
+                            # the next tool boundary, inside the running turn | queue: it waits and runs after
+                            # the turn. /steer sends one either way (see Mid-turn steering)
 
 agents:                     # see Subagents
   max_iterations: 100       # model calls per run; default: loop.max_iterations (older: loop.subagent_max_iterations)

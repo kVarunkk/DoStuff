@@ -19,12 +19,15 @@ from dostuff.agent.run_tool import (
 )
 from dostuff.helpers.hooks import HookOutcome, run_hooks
 from dostuff.helpers.hooks.dispatch import report_outcome
-from dostuff.helpers.hooks.events import STOP_LIMIT_MESSAGE, STOP_NOTE, session_start, stop_event_for
+from dostuff.helpers.hooks.events import (
+    STOP_LIMIT_MESSAGE, STOP_NOTE, session_start, stop_event_for, user_prompt_submit,
+)
 from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
 from dostuff.tools.definitions import TOOL_MAP, default_tool_names
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
+from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, frame_steered
 from dostuff.helpers.agent.side_question import (
     compose_system_instruction, plan_mode_on, publish_snapshot, published_snapshot, usage_dict as build_usage_dict,
 )
@@ -188,7 +191,7 @@ def _job_events(owner: str, adapter: Any) -> Iterator[None]:
         registry.remove_listener(on_job)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction).
 
     `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
@@ -198,9 +201,14 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
 
     `inbox` is a subagent's `send_message` queue (subagents spec D10): each message becomes a user step before
     the next model call, and a final answer with messages waiting doesn't end the run.
+
+    `steering` is the TUI's mid-turn messages (steering spec D1): read at the next tool boundary, inside this
+    turn. Main session only — a `subagent_loop` never delivers one (CON-008), and `run_agent_loop` doesn't pass it.
     """
     current_session_id.set(session_id)
     owner = owner or session_id
+    # Main session only (CON-008): a subagent's route is send_message, never the steering queue
+    steer = steering if turn_type == "interactive_loop" else None
     iteration = 0
     token_limit = get_model_token_limit()
     config = get_config()
@@ -242,8 +250,51 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
         return True
 
     async def append_note(text: str) -> None:
-        """A harness-authored user step: a Stop-hook continuation, background notices or a send_message."""
+        """A harness-authored user step: a Stop-hook continuation, background notices, a send_message or a
+        framed steering message."""
         await append_step({"role": "user", "content": text}, steps_history, working_history, current_session_history, session_id, store, turn_type)
+
+    async def deliver_steer(messages: list[SteerMessage]) -> int:
+        """D6's drain body, shared by the top-of-iteration drain and D7's final-answer path: a failed
+        or blocked message is reported and appended nowhere, the rest is written framed and once
+        (CON-004) after UserPromptSubmit (CON-007). Hook context, if any, rides ahead of the frame as
+        its own note — never a system-instruction fold, which mid-turn would invalidate the provider's
+        cached prompt prefix (the system prompt is stable within a turn). Returns how many reached the
+        history — D7 re-prompts the model only when that is above zero, never with an unchanged history."""
+        delivered = 0
+        for steer_msg in messages:
+            if steer_msg.failed is not None:
+                await loop_emit("steer_failed", {"id": steer_msg.id, "error": steer_msg.failed},
+                                adapter=adapter)
+                continue
+            if steer_msg.content is None:
+                continue  # unreachable: take_ready only returns ready or failed entries
+            blocked, context = await user_prompt_submit(
+                steer_msg.content, session_id=session_id, turn_id=turn_id, turn_type=turn_type,
+                adapter=adapter)
+            if blocked is not None:
+                await loop_emit("steer_blocked", {"id": steer_msg.id, "reason": blocked},
+                                adapter=adapter)
+                continue
+            if context:
+                # In-band note, not a system fold: a mid-turn system change would invalidate the
+                # provider's whole cached prefix — the system prompt stays byte-stable in a turn.
+                await append_note(f"[Context from UserPromptSubmit hooks]\n{context}")
+            await append_note(frame_steered(steer_msg.content))  # the steer message's only write (CON-004), framed (D6)
+            await loop_emit("steered", {"id": steer_msg.id, "index": len(steps_history) - 1},
+                            adapter=adapter)
+            delivered += 1
+        return delivered
+
+    async def drain_facts() -> None:
+        """Background-job notices and inbox messages, oldest first (D1/D7): both the top of an
+        iteration and D7's final-answer path drain them before a correction is delivered, so a
+        correction lands after the facts it may be reacting to."""
+        notices = get_notice_queue().drain(owner)
+        if notices:
+            await append_note(format_notices(notices, max_tool_output_chars))
+        while inbox:  # send_message to this running subagent, oldest first (D10)
+            await append_note(inbox.pop(0))
 
     def fork_context() -> ForkContext | None:
         """What a fork started now inherits (subagents spec D11): the history as it is before this response's
@@ -285,11 +336,12 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     return CANCELLED_TURN
 
                 # Background jobs and agents of this run that ended since the last model call (spec D7)
-                notices = get_notice_queue().drain(owner)
-                if notices:
-                    await append_note(format_notices(notices, max_tool_output_chars))
-                while inbox:  # send_message to this running subagent, oldest first (D10)
-                    await append_note(inbox.pop(0))
+                await drain_facts()
+                if steer is not None:
+                    # The user's mid-turn messages, in submit order (D6): after the notices and the inbox so a
+                    # correction is read after the facts it may be reacting to, before publish_snapshot so a
+                    # /btw asked afterwards sees it.
+                    await deliver_steer(steer.take_ready())
                 # What a /btw side question reads while this turn runs (btw spec D3); main agent only
                 publish_snapshot(session_id, fork_context())
 
@@ -387,9 +439,36 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         "content": content,
                     }
                     await append_step(model_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
-                    if inbox:  # a send_message arrived during this call: read it instead of ending
+                    if inbox:
+                        # A send_message arrived during this call: read it instead of ending (D10) — inbox
+                        # items always append at the drain, so the model always gets something new. Before
+                        # the Stop hooks, so a Stop hook sees the answer that really ends the turn.
                         iter_span.set_status(Status(StatusCode.OK))
                         continue
+                    if steer is not None and steer.has_ready_or_preparing():
+                        # D7: a steering message arrived during this call — read it instead of ending, but
+                        # never re-prompt with unchanged history: a failed or blocked message is reported
+                        # without appending and a still-preparing one appends nothing. Wait for each pending
+                        # message to settle, deliver what passes, and fall through to the Stop hooks once
+                        # nothing more will be delivered.
+                        steer_delivered = 0
+                        while steer.has_ready_or_preparing() and not steer_delivered:
+                            if await check_cancelled():
+                                return CANCELLED_TURN
+                            steer_taken = steer.take_ready()
+                            if steer_taken:
+                                await drain_facts()  # D1 order: facts that arrived during the call
+                                # land before the correction reacting to them (review round 2)
+                                steer_delivered += await deliver_steer(steer_taken)
+                            else:
+                                # preparation in flight: wait for it instead of calling the model again
+                                # with no new user content (the message arrives at this boundary anyway)
+                                await asyncio.sleep(0.05)
+                        if steer_delivered:
+                            iter_span.set_status(Status(StatusCode.OK))
+                            continue
+                        # every pending message failed or was blocked (both already reported above): this
+                        # answer really ends the turn — fall through to the Stop hooks below.
 
                     # Stop / SubagentStop: only here, on a final answer, never on cancel, errors or the
                     # iteration cap. A block keeps the turn going, at most stop_block_limit times (REQ-2.3)
