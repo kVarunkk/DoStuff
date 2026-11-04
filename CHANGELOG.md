@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Mid-turn steering: `/steer <message>` sends a correction to the turn that is running — the model reads it at the next tool boundary, inside the same turn, instead of waiting for the turn to end — and `ui.mid_turn_messages: steer` routes plain messages the same way.
+
+### Added
+- **`/steer <message>`** — a steering message, prepared like a prompt (`@mentions` expanded, pastes resolved, in order) and read by the loop at the next tool boundary. It appears in the transcript as a user message right after the tool output it was reacting to, and a final answer that arrives while a correction is still waiting does not end the turn: the model reads it and redoes or extends the answer, before the `Stop` hooks run. With no turn running it is an ordinary prompt (it starts a turn).
+- **`ui.mid_turn_messages: queue | steer`** (default `queue`) — what a **plain** message does while a turn runs: waits in the queue as today, or steers. `/steer` steers in both modes; skills and custom commands stay queued in both (a skill is a turn's prompt, not a correction); built-ins (`/btw`, `/queue`, `#note`, …) run now and `/clear`, `/resume`, `!command` are refused while a turn runs, exactly as before.
+- **The bar, the loader and `/queue`** — the bar leads with `→ N for the agent · read at the next tool boundary` above the queued group, the loader counts `· 1 steering · 2 queued`, `/queue` lists the steering messages first (marked `→`, with *Edit* / *Remove*, and "That message was already read." once the loop has taken one), and every queued prompt gained *Send now (at the next tool boundary)*.
+- **`Ctrl+B` and the latency rule** — delivery waits for the tool call in flight (nothing is interrupted to deliver sooner); while a message waits behind a running command the bar says `waiting for a running command · Ctrl+B to background it`, and `Ctrl+B` returns the call to the loop at once, so the message is read while the command keeps running.
+- **Leftovers** — a message that outlives its turn is never lost: on `Esc` the raw text goes back into the input ahead of the queued prompts; otherwise it runs next (`1 message arrived after the turn ended; running it next`), re-prepared from what you typed. Either way the text is written to the history exactly once.
+
+### Changed
+- `UserPromptSubmit` runs for each correction at the boundary, so a hook can block it (shown like a blocked prompt, never reaching the model), and a preparation failure is reported instead of half-delivered.
+
+### Documentation
+- README "Mid-turn steering (`/steer`)" section (the two modes with the routing table, what you see, latency and `Ctrl+B`, leftovers), a Features bullet, a TUI-controls bullet and a row in the commands table; `/steer` in `/help` and the `/` menu.
+
 ## [0.2.9] - 2026-11-03
 
 Side questions: `/btw <question>` asks about the conversation while a turn runs, without stopping or queuing it — one model call, no tools, answered in a panel above the input and never added to the history; `f` hands it to a background agent that can check with tools.

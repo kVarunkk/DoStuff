@@ -6033,7 +6033,7 @@ def test_queue_bar_and_loader_count_steering(steer_tui):
             assert "first correction" in bar_text  # steering rows are listed, marked →
             assert "2 queued" in bar_text and "click or /queue" in bar_text, bar_text
             loader = app._loader_text().plain
-            assert "· 1 steering" in loader and "· 2 queued" in loader, loader
+            assert "· 1 steering · 2 queued" in loader, loader
             app._prompt_queue.clear()  # so ending the turn doesn't start the queued prompts
             app._render_queue()
             held.hold = False
@@ -6216,6 +6216,27 @@ def test_ctrl_b_frees_the_boundary_for_steering(steer_loop_live, registry, _py):
             [job] = registry.jobs()
             assert job.ended is None and not job.foreground  # still sleeping: the message did not wait for it
             await _until(pilot, lambda: not app._turn_in_progress, tries=200)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- Steering Phase 5: docs (plan/2026-11-04-steering/tasks.md T5.1–T5.2) ------------------------
+
+
+def test_steer_registered(tui):
+    """T5.1: `/steer` is a first-class command — in the "/" menu, in `/help`, with its args hint."""
+    from dostuff.helpers.agent.constants import COMMAND_ARGS, COMMAND_DESCRIPTIONS, COMMAND_FLAGS
+    cli_tui = tui
+    assert "/steer" in COMMAND_DESCRIPTIONS and COMMAND_ARGS["/steer"] == "<message>"
+    assert "/steer" not in COMMAND_FLAGS
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-help")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/help")
+            await _until(pilot, lambda: any("/steer" in t for t in _texts(app)))
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

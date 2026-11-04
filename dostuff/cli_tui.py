@@ -4403,14 +4403,16 @@ class DostuffTUI(App):
         return loader_widget
 
     def _loader_text(self) -> Text:
-        """Bold label, then the elapsed time and the steering / queued counts (steering spec D9)."""
+        """Bold label, then the elapsed time and the steering / queued counts (steering spec D9: the count
+        reads `· 1 steering · 2 queued`)."""
         text = Text(self._loader_label, style="bold")
         if self._turn_start_time is not None:
             text.append(f"  {_fmt_elapsed(time.time() - self._turn_start_time)}", style="bold #e5c07b")
-        if (steering := len(self._steering.pending())):
-            text.append(f"  · {steering} steering", style="#8a8a8a")
+        counts = [f"· {len(pending)} steering" for pending in (self._steering.pending(),) if pending]
         if self._prompt_queue:
-            text.append(f"  · {len(self._prompt_queue)} queued", style="#8a8a8a")
+            counts.append(f"· {len(self._prompt_queue)} queued")
+        if counts:
+            text.append("  " + " ".join(counts), style="#8a8a8a")
         return text
 
     def _render_loader(self) -> None:
