@@ -20,7 +20,7 @@ from dostuff.agent.run_tool import (
 from dostuff.helpers.hooks import HookOutcome, run_hooks
 from dostuff.helpers.hooks.dispatch import report_outcome
 from dostuff.helpers.hooks.events import (
-    STOP_LIMIT_MESSAGE, STOP_NOTE, session_start, stop_event_for, user_prompt_submit, with_prompt_context,
+    STOP_LIMIT_MESSAGE, STOP_NOTE, session_start, stop_event_for, user_prompt_submit,
 )
 from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
@@ -257,9 +257,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     async def deliver_steer(messages: list[SteerMessage]) -> int:
         """D6's drain body, shared by the top-of-iteration drain and D7's final-answer path: a failed
         or blocked message is reported and appended nowhere, the rest is written framed and once
-        (CON-004) after UserPromptSubmit (CON-007). Returns how many reached the history — D7 re-prompts the model
-        only when that is above zero, never with an unchanged history."""
-        nonlocal dynamic_system_instruction
+        (CON-004) after UserPromptSubmit (CON-007). Hook context, if any, rides ahead of the frame as
+        its own note — never a system-instruction fold, which mid-turn would invalidate the provider's
+        cached prompt prefix (the system prompt is stable within a turn). Returns how many reached the
+        history — D7 re-prompts the model only when that is above zero, never with an unchanged history."""
         delivered = 0
         for steer_msg in messages:
             if steer_msg.failed is not None:
@@ -275,10 +276,11 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 await loop_emit("steer_blocked", {"id": steer_msg.id, "reason": blocked},
                                 adapter=adapter)
                 continue
-            await append_note(frame_steered(steer_msg.content))  # the only write (CON-004), framed (D6)
             if context:
-                # The turn's system instruction only, never persisted (hooks spec REQ-2.2)
-                dynamic_system_instruction = with_prompt_context(dynamic_system_instruction, context)
+                # In-band note, not a system fold: a mid-turn system change would invalidate the
+                # provider's whole cached prefix — the system prompt stays byte-stable in a turn.
+                await append_note(f"[Context from UserPromptSubmit hooks]\n{context}")
+            await append_note(frame_steered(steer_msg.content))  # the steer message's only write (CON-004), framed (D6)
             await loop_emit("steered", {"id": steer_msg.id, "index": len(steps_history) - 1},
                             adapter=adapter)
             delivered += 1

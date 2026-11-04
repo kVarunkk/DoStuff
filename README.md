@@ -520,8 +520,9 @@ both modes: a skill is a turn's prompt, not a correction.
   order you sent them, so a message holding a big file never jumps ahead of the one after it. The `Attached …` lines
   show as they finish, as for a prompt.
 - **Hooks and the sandbox still apply**: `UserPromptSubmit` runs for each correction at the boundary, so a hook can
-  block it — it is shown like a blocked prompt and never reaches the model — and a preparation failure is reported
-  instead of half-delivered.
+  block it — it is shown like a blocked prompt and never reaches the model — or add context for this turn, written as a
+  note right before the correction (the system prompt never changes mid-turn, so the prompt cache holds); a preparation
+  failure is reported instead of half-delivered.
 
 ### Latency, and `Ctrl+B`
 

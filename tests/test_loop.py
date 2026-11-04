@@ -810,6 +810,42 @@ def test_steer_message_is_framed_for_resume_intent(monkeypatch):
     assert seen == [content]  # the hook saw the raw message, not the frame (REQ-2.9)
 
 
+def test_steer_context_rides_the_boundary_not_the_system(monkeypatch):
+    """Cache: the turn's system prompt must stay byte-stable within the turn (call_agent: breakpoints on
+    the system prompt + the moving last message read everything before them from cache). UserPromptSubmit
+    context on a steered message is therefore delivered as a note step immediately before the frame —
+    never folded into the system instruction mid-turn, which would invalidate the whole cached prefix."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "use pytest, not unittest"
+
+    async def context_hook(prompt, **kw):
+        return (None, "repo convention: pytest only")
+
+    async def dispatch(name, args, **kw):
+        msg = q.put(content)
+        q.ready(msg.id, content)
+        return "ok"
+
+    run = _steer_run(monkeypatch, [
+        _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]), _msg(content="done")],
+        q, dispatch=dispatch, prompt_hook=context_hook)
+
+    # byte-identical system instruction on the call before and after the delivery — the cache prefix holds
+    assert run.calls[1]["system"] == run.calls[0]["system"]
+    # the context is a note step directly ahead of the framed message, in every history
+    frame = loop_module.frame_steered(content)
+    idx = next(i for i, s in enumerate(run.steps) if s.get("content") == frame)
+    note = run.steps[idx - 1]
+    assert note["role"] == "user"
+    assert note["content"] == "[Context from UserPromptSubmit hooks]\nrepo convention: pytest only"
+    for place in (run.working, run.current):
+        j = next(i for i, s in enumerate(place) if s.get("content") == frame)
+        assert place[j - 1]["content"].startswith("[Context from UserPromptSubmit hooks]")
+    assert any(str(s.get("content", "")).startswith("[Context from UserPromptSubmit hooks]")
+               for _sid, s in run.store.appended)
+
+
 def test_steer_not_delivered_mid_call(monkeypatch):
     """T2.1 (REQ-2.8, CON-005): delivery never happens while a tool call runs — the queue is only read at
     the top of the next iteration."""
@@ -877,8 +913,9 @@ def test_steer_blocked_by_user_prompt_submit(monkeypatch):
 
 
 def test_steer_hook_context_in_later_calls(monkeypatch):
-    """T2.2 (REQ-2.5): UserPromptSubmit context joins the system instruction of every later model call of
-    this turn, and is never written into a stored step (hooks spec REQ-2.2)."""
+    """T2.2 (REQ-2.5): UserPromptSubmit context reaches every later model call of this turn — as a note
+    step in the history, never in the system instruction (a mid-turn system change would invalidate the
+    prompt cache), and it is stored like any step."""
     from dostuff.helpers.agent.steering import SteeringQueue
     q = SteeringQueue()
     ctx = "the tests live in tests/"
@@ -896,9 +933,13 @@ def test_steer_hook_context_in_later_calls(monkeypatch):
         _msg(tool_calls=[_tc("read_file", json.dumps({"path": "b.py"}), "c2")]),
         _msg(content="done")], q, on_call=on_call, prompt_hook=contextual)
     assert len(run.calls) == 3
-    assert ctx not in run.calls[0]["system"]
-    assert ctx in run.calls[1]["system"] and ctx in run.calls[2]["system"]
-    assert not any(ctx in str(s.get("content")) for s in run.steps)
+    # never in the system instruction — the system prompt is byte-stable within the turn (the cache)
+    assert all(ctx not in c["system"] for c in run.calls)
+    # in the history of every call after the delivery, and nowhere before it
+    assert not any(ctx in str(s.get("content")) for s in run.calls[0]["history"])
+    assert all(any(ctx in str(s.get("content")) for s in c["history"]) for c in run.calls[1:])
+    # stored in every history — the note is a durable step now (visible in transcript/export)
+    assert any(ctx in str(s.get("content")) for s in run.steps)
 
 
 def test_steer_failed_emits(monkeypatch):

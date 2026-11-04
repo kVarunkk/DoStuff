@@ -17,7 +17,7 @@ Mid-turn steering: `/steer <message>` sends a correction to the turn that is run
 - **Leftovers** — a message that outlives its turn is never lost: on `Esc` the raw text goes back into the input ahead of the queued prompts; otherwise it runs next (`1 message arrived after the turn ended; running it next`), re-prepared from what you typed. Either way the text is written to the history exactly once.
 
 ### Changed
-- `UserPromptSubmit` runs for each correction at the boundary, so a hook can block it (shown like a blocked prompt, never reaching the model), and a preparation failure is reported instead of half-delivered.
+- `UserPromptSubmit` runs for each correction at the boundary, so a hook can block it (shown like a blocked prompt, never reaching the model) or add context for this turn: the context is written as a note step right before the correction, so the system prompt never changes mid-turn and the prompt cache holds. A preparation failure is reported instead of half-delivered.
 - **A delivered correction is framed for the model**: the stored user step is your text wrapped in `The user sent a new message while you were working:` above and `Address the message above, then continue the task you were working on.` below, so a mid-turn question is answered *and* the turn gets back to the original task instead of ending on the answer (Claude Code wraps mid-turn messages the same way). What you see while the turn runs, Esc-to-restore and what a leftover re-runs stay exactly what you typed; `/resume` replays the framed text.
 
 ### Documentation
