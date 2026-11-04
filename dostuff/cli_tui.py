@@ -56,6 +56,7 @@ from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_pa
 from dostuff.helpers.agent.model_cost import format_cost
 from dostuff.helpers.agent.notices import WAKE_LIMIT, agent_notice_line, fmt_agent_runtime, format_notices, get_notice_queue, parse_notices
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
+from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue
 from dostuff.helpers.agent.side_question import (
     BTW_FORK_DESCRIPTION, BTW_FORK_PROMPT, add_exchange, answer_side_question, discard_snapshot, kept_prompt,
     plan_mode_on, snapshot as live_side_snapshot,
@@ -1802,6 +1803,10 @@ class DostuffTUI(App):
         self._thought_timer: Timer | None = None
         self._last_streamed_answer: str = ""
         self._prompt_queue: list = []
+        # Mid-turn steering (plan/2026-11-04-steering): one queue per app, filled at submit and drained by
+        # loop() at the next tool boundary. In memory on purpose (D4) — an undelivered message is exactly
+        # as durable as a queued prompt.
+        self._steering = SteeringQueue()
         self._pending_workers: list[Worker] = []
         self._copy_hint_timer: Timer | None = None
         self._turn_in_progress: bool = False
@@ -3366,6 +3371,9 @@ class DostuffTUI(App):
         if cmd.split(maxsplit=1)[:1] == ["/btw"]:  # works mid-turn: never queued (btw spec D1, CON-006)
             self._btw_command(self._pastes.inline(text.strip()[len("/btw"):]).strip())
             return
+        if cmd.split(maxsplit=1)[:1] == ["/steer"]:  # a mid-turn correction, parsed ahead of the guards (steering D2)
+            self._steer_command(text.strip()[len("/steer"):])
+            return
         if text.lstrip().startswith("!"):
             command = self._pastes.inline(text.lstrip()[1:]).strip()
             if not command:
@@ -3521,9 +3529,58 @@ class DostuffTUI(App):
         if not self._turn_in_progress:
             self._append(text, msg_type="user")
             self._begin_turn(text)
+        elif self.config.mid_turn_messages == "steer" and parse_skill_command(text, self._skill_commands) is None:
+            # `steer` mode (D3, REQ-3.2): a plain message corrects the turn at its next tool boundary.
+            # A skill or custom command wraps the text in SKILL.md and announces itself — that is a turn's
+            # prompt, not a correction, so it still waits in `_prompt_queue` (REQ-3.3) in both modes.
+            self._steer_submit(text)
         else:
             self._prompt_queue.append(text)
             self._render_queue()
+
+    # ── Mid-turn steering (/steer) ─────────────────────────────────────────────
+
+    def _steer_command(self, arg: str) -> None:
+        """`/steer <message>` (steering spec D2, REQ-3.1): a steering message mid-turn, an ordinary
+        prompt when idle — the habit is never an error."""
+        message = self._pastes.inline(arg).strip()
+        if not message:
+            self._append("Usage: /steer <message>", msg_type="error")
+            return
+        if self._turn_in_progress:
+            self._steer_submit(message)
+            return
+        self._append(message, msg_type="user")
+        self._begin_turn(message)
+
+    def _steer_submit(self, message: str) -> None:
+        """A message the running turn reads at the next tool boundary (D2/D3).
+
+        The slot is reserved synchronously, so submit order holds no matter when preparation
+        finishes (CON-006); nothing is written to the history here — the loop appends it once,
+        at delivery (CON-004).
+        """
+        msg = self._steering.put(message)
+        self._render_queue()
+        self._start_worker(self._prepare_steer(msg), name=f"steer_{msg.id[:6]}")
+
+    async def _prepare_steer(self, msg: SteerMessage) -> None:
+        """D5: @mentions and pastes resolved off the UI thread, in submit order; `ready`/`fail` hands
+        the entry to the loop. The "Attached …" lines show here, as they do for a prompt."""
+        try:
+            expansion = await asyncio.to_thread(expand_file_mentions, msg.raw, self.config.max_tool_output_chars)
+            if expansion.attached:
+                self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
+            if expansion.skipped:
+                self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
+            content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
+                                              self.config.paste_file_lines, self.config.max_tool_output_chars)
+        except Exception as e:  # unreadable mention, broken paste file: reported, never delivered (REQ-2.4)
+            self._steering.fail(msg.id, str(e))
+            self._render_queue()
+            return
+        self._steering.ready(msg.id, content)
+        self._render_queue()
 
     # ── Approval prompt ────────────────────────────────────────────────────────
 
@@ -4057,6 +4114,8 @@ class DostuffTUI(App):
                 max_iterations=self.max_iterations,
                 permissions=self.permissions,
                 session_hook_context=self.session_hook_context,
+                # D1: the app's mid-turn queue, drained at the next tool boundary (main session only)
+                steering=self._steering,
             )
 
             agent_text = result or "(no response)"
