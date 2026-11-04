@@ -762,19 +762,52 @@ def test_steer_delivered_after_tool_call(monkeypatch):
         _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]), _msg(content="done")],
         q, dispatch=dispatch)
 
-    # call 2 reads it as the last step, after the tool result it was reacting to
-    assert run.calls[1]["history"][-1] == {"role": "user", "content": content}
+    # call 2 reads it as the last step, after the tool result it was reacting to, framed (D6, REQ-2.9)
+    framed = loop_module.frame_steered(content)
+    assert run.calls[1]["history"][-1] == {"role": "user", "content": framed}
     assert run.calls[1]["history"][-2]["role"] == "tool"
-    assert not any(s.get("content") == content for s in run.calls[0]["history"])
+    assert not any(content in str(s.get("content") or "") for s in run.calls[0]["history"])
     # exactly once in all four places (CON-004)
     for place in (run.steps, run.working, run.current):
-        assert sum(1 for s in place if s.get("content") == content) == 1, place
-    assert sum(1 for _sid, s in run.store.appended if s.get("content") == content) == 1
+        assert sum(1 for s in place if content in str(s.get("content") or "")) == 1, place
+    assert sum(1 for _sid, s in run.store.appended if content in str(s.get("content") or "")) == 1
     # the delivery event names the index it was written at
     steered = [d for e, d in run.adapter.events if e == "steered"]
     assert len(steered) == 1
-    assert run.steps[steered[0]["index"]] == {"role": "user", "content": content}
+    assert run.steps[steered[0]["index"]] == {"role": "user", "content": framed}
     assert steered[0]["id"]  # the TUI matches on it
+
+
+def test_steer_message_is_framed_for_resume_intent(monkeypatch):
+    """REQ-2.9 (D6): a delivered steering message lands framed — head line, raw content verbatim, tail
+    clause telling the model to continue the task — exactly once in every history, and the hook still
+    receives the raw content. Without the frame a standalone question was answered with a final response
+    and the turn ended with the original task unfinished (Claude Code parity: anthropics/claude-code#84389)."""
+    from dostuff.helpers.agent.steering import SteeringQueue
+    q = SteeringQueue()
+    content = "what does this function do?"
+    seen: list = []
+
+    async def capturing(prompt, **kw):
+        seen.append(prompt)
+        return (None, "")
+
+    msg = q.put(content)
+    q.ready(msg.id, content)
+
+    run = _steer_run(monkeypatch, [_msg(content="ok")], q, prompt_hook=capturing)
+
+    head = "The user sent a new message while you were working:"
+    tail = "Address the message above, then continue the task you were working on."
+    delivered = [s for s in run.steps if s.get("role") == "user" and content in str(s.get("content"))]
+    assert len(delivered) == 1
+    assert delivered[0]["content"] == f"{head}\n{content}\n{tail}"  # the exact wording, pinned
+    for place in (run.steps, run.working, run.current):
+        assert sum(head in str(s.get("content") or "") for s in place) == 1, place
+        assert sum(tail in str(s.get("content") or "") for s in place) == 1, place
+    framed_store = [s for _sid, s in run.store.appended if head in str(s.get("content") or "")]
+    assert len(framed_store) == 1 and content in framed_store[0]["content"]
+    assert seen == [content]  # the hook saw the raw message, not the frame (REQ-2.9)
 
 
 def test_steer_not_delivered_mid_call(monkeypatch):
@@ -796,9 +829,9 @@ def test_steer_not_delivered_mid_call(monkeypatch):
         _msg(tool_calls=[_tc("read_file", json.dumps({"path": "a.py"}), "c1")]), _msg(content="done")],
         q, dispatch=dispatch, working=working)
 
-    assert not any(s.get("content") == content for s in during[0])  # not delivered mid-call
-    assert not any(s.get("content") == content for s in run.calls[0]["history"])
-    assert run.calls[1]["history"][-1] == {"role": "user", "content": content}
+    assert not any(content in str(s.get("content") or "") for s in during[0])  # not delivered mid-call
+    assert not any(content in str(s.get("content") or "") for s in run.calls[0]["history"])
+    assert run.calls[1]["history"][-1] == {"role": "user", "content": loop_module.frame_steered(content)}
 
 
 def test_steer_order_after_notices_and_inbox(monkeypatch):
@@ -820,7 +853,7 @@ def test_steer_order_after_notices_and_inbox(monkeypatch):
     assert contents[0] == "hi"
     assert "found it" in contents[1]
     assert contents[2] == "a message from the model"
-    assert contents[3] == "ignore that failure"
+    assert contents[3] == loop_module.frame_steered("ignore that failure")
 
 
 def test_steer_blocked_by_user_prompt_submit(monkeypatch):
@@ -836,8 +869,8 @@ def test_steer_blocked_by_user_prompt_submit(monkeypatch):
         return ("no secrets in the transcript", "") if "password" in prompt else (None, "")
 
     run = _steer_run(monkeypatch, [_msg(content="ok")], q, prompt_hook=blocking)
-    assert not any(s.get("content") == content for s in run.working)
-    assert not any(s.get("content") == content for _sid, s in run.store.appended)
+    assert not any(content in str(s.get("content") or "") for s in run.working)
+    assert not any(content in str(s.get("content") or "") for _sid, s in run.store.appended)
     assert [d for e, d in run.adapter.events if e == "steer_blocked"] == [
         {"id": msg.id, "reason": "no secrets in the transcript"}]
     assert not any(e == "steered" for e, _ in run.adapter.events)
@@ -880,7 +913,7 @@ def test_steer_failed_emits(monkeypatch):
     assert [d for e, d in run.adapter.events if e == "steer_failed"] == [
         {"id": msg.id, "error": "Could not read @missing.txt"}]
     assert not any(e == "steered" for e, _ in run.adapter.events)
-    assert not any(s.get("content") == content for s in run.working)
+    assert not any(content in str(s.get("content") or "") for s in run.working)
 
 
 def test_final_answer_with_steer_continues(monkeypatch):
@@ -904,7 +937,8 @@ def test_final_answer_with_steer_continues(monkeypatch):
     run = _steer_run(monkeypatch, [_msg(content="first answer"), _msg(content="second answer")],
                      q, on_call=on_call, hooks=counting_hooks)
     assert len(run.calls) == 2
-    assert run.calls[1]["history"][-1] == {"role": "user", "content": "actually, use pytest"}
+    assert run.calls[1]["history"][-1] == {
+        "role": "user", "content": loop_module.frame_steered("actually, use pytest")}
     assert stops == ["second answer"]  # not "first answer"
 
 
@@ -923,8 +957,9 @@ def test_final_answer_waits_for_preparing(monkeypatch):
 
     run = _steer_run(monkeypatch, [_msg(content="one"), _msg(content="two")], q, on_call=on_call)
     assert len(run.calls) == 2  # the second call reads the correction, never a bare re-prompt
-    assert not any(s.get("content") == "one more thing" for s in run.calls[0]["history"])
-    assert run.calls[1]["history"][-1] == {"role": "user", "content": "one more thing"}
+    assert not any("one more thing" in str(s.get("content") or "") for s in run.calls[0]["history"])
+    assert run.calls[1]["history"][-1] == {
+        "role": "user", "content": loop_module.frame_steered("one more thing")}
 
 
 def test_final_answer_delivers_after_notices(monkeypatch):
@@ -950,7 +985,7 @@ def test_final_answer_delivers_after_notices(monkeypatch):
     assert len(run.calls) == 2  # the correction keeps the turn going (D7)
     contents = [str(s.get("content")) for s in run.steps]
     notice_at = next(i for i, c in enumerate(contents) if "found it" in c)
-    steer_at = next(i for i, c in enumerate(contents) if "ignore that failure" in c)
+    steer_at = next(i for i, c in enumerate(contents) if "The user sent a new message" in c)
     assert notice_at < steer_at, contents  # facts first, then the correction reacting to them
 
 

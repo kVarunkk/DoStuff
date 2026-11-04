@@ -481,6 +481,14 @@ It lands in the transcript as a user message right after the tool output it was 
 waiting does not end the turn: the model reads it and redoes or extends the answer. That check runs before the `Stop`
 hooks, so they see the answer that really ends the turn.
 
+What the model reads is framed, not bare: the stored user step is your text wrapped in two fixed lines —
+`The user sent a new message while you were working:` above it, `Address the message above, then continue the task
+you were working on.` below. The loop has no notion of "the task", only the history, so without that instruction a
+standalone question tends to be answered with a final response and the turn ends with the interrupted work left
+mid-flight; Claude Code wraps mid-turn messages the same way. Everything you *see* stays raw — the transcript line,
+Esc-to-restore, and what a leftover re-runs — the frame reaches only the model, plus the stored transcript that
+`/resume` replays.
+
 ### Two modes
 
 `ui.mid_turn_messages` in `config.yaml` decides what a **plain** message does while a turn runs (default `steer`):

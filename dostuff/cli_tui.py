@@ -56,7 +56,7 @@ from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_pa
 from dostuff.helpers.agent.model_cost import format_cost
 from dostuff.helpers.agent.notices import WAKE_LIMIT, agent_notice_line, fmt_agent_runtime, format_notices, get_notice_queue, parse_notices
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
-from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue
+from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, unframe_steered
 from dostuff.helpers.agent.side_question import (
     BTW_FORK_DESCRIPTION, BTW_FORK_PROMPT, add_exchange, answer_side_question, discard_snapshot, kept_prompt,
     plan_mode_on, snapshot as live_side_snapshot,
@@ -4696,7 +4696,10 @@ class DostuffTUI(App):
         if self._turn_in_progress or index is None:
             return
         dropped = self.steps_history[index:]
-        text = self._sent_prompts.get((self.session_id, index)) or strip_attachments(dropped[0]["content"])
+        # After a reload _sent_prompts is empty and the stored step may be framed (D6): unframe so
+        # Esc-to-restore returns the typed text, never the frame (REQ-2.9).
+        text = self._sent_prompts.get((self.session_id, index)) or unframe_steered(
+            strip_attachments(dropped[0]["content"]))
         try:
             await self.store.drop_last_steps(self.session_id, len(dropped))
         except Exception as e:

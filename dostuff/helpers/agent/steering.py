@@ -79,3 +79,29 @@ class SteeringQueue:
     def has_ready_or_preparing(self) -> bool:
         """D7: any pending entry keeps the turn going — a final answer must not end it first."""
         return bool(self._entries)
+
+
+# The step a delivered steering message becomes (spec D6): the step is this text verbatim —
+# message-adjacent prompting, which is how Claude Code's queued commands reach the model (the
+# wrapper in anthropics/claude-code#84389, v2.1.223: "Address the message above as you continue
+# this turn") — because without it a standalone question is answered with a final response and the
+# turn ends with the original task unfinished: the loop has no notion of the task, only the
+# history. Slim on purpose: #84389 is a complaint about Claude Code's ~5-line boilerplate repeating
+# per message, so this is one fixed head and one fixed tail, no per-session explanation. Written
+# to the history exactly once (CON-004). Lives here, next to the queue, so the TUI can import it
+# without pulling in the loop's heavy dependencies.
+STEER_FRAME_HEAD = "The user sent a new message while you were working:"
+STEER_FRAME_TAIL = "Address the message above, then continue the task you were working on."
+
+
+def frame_steered(content: str) -> str:
+    """A delivered steering message as the model reads it: head, raw content, resume clause (D6)."""
+    return f"{STEER_FRAME_HEAD}\n{content}\n{STEER_FRAME_TAIL}"
+
+
+def unframe_steered(text: str) -> str:
+    """The typed message back out of a stored step (D6/REQ-2.9): Esc-to-restore after a reload
+    returns the raw text, never the frame. Anything not framed passes through unchanged."""
+    if text.startswith(STEER_FRAME_HEAD + "\n") and text.endswith("\n" + STEER_FRAME_TAIL):
+        return text[len(STEER_FRAME_HEAD) + 1:-len(STEER_FRAME_TAIL) - 1]
+    return text

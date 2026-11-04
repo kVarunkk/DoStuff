@@ -18,6 +18,7 @@ Mid-turn steering: `/steer <message>` sends a correction to the turn that is run
 
 ### Changed
 - `UserPromptSubmit` runs for each correction at the boundary, so a hook can block it (shown like a blocked prompt, never reaching the model), and a preparation failure is reported instead of half-delivered.
+- **A delivered correction is framed for the model**: the stored user step is your text wrapped in `The user sent a new message while you were working:` above and `Address the message above, then continue the task you were working on.` below, so a mid-turn question is answered *and* the turn gets back to the original task instead of ending on the answer (Claude Code wraps mid-turn messages the same way). What you see while the turn runs, Esc-to-restore and what a leftover re-runs stay exactly what you typed; `/resume` replays the framed text.
 
 ### Documentation
 - README "Mid-turn steering (`/steer`)" section (the two modes with the routing table, what you see, latency and `Ctrl+B`, leftovers), a Features bullet, a TUI-controls bullet and a row in the commands table; `/steer` in `/help` and the `/` menu.

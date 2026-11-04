@@ -27,7 +27,7 @@ from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
 from dostuff.tools.definitions import TOOL_MAP, default_tool_names
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
-from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue
+from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, frame_steered
 from dostuff.helpers.agent.side_question import (
     compose_system_instruction, plan_mode_on, publish_snapshot, published_snapshot, usage_dict as build_usage_dict,
 )
@@ -250,12 +250,13 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
         return True
 
     async def append_note(text: str) -> None:
-        """A harness-authored user step: a Stop-hook continuation, background notices or a send_message."""
+        """A harness-authored user step: a Stop-hook continuation, background notices, a send_message or a
+        framed steering message."""
         await append_step({"role": "user", "content": text}, steps_history, working_history, current_session_history, session_id, store, turn_type)
 
     async def deliver_steer(messages: list[SteerMessage]) -> int:
         """D6's drain body, shared by the top-of-iteration drain and D7's final-answer path: a failed
-        or blocked message is reported and appended nowhere, the rest is written once
+        or blocked message is reported and appended nowhere, the rest is written framed and once
         (CON-004) after UserPromptSubmit (CON-007). Returns how many reached the history — D7 re-prompts the model
         only when that is above zero, never with an unchanged history."""
         nonlocal dynamic_system_instruction
@@ -274,7 +275,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 await loop_emit("steer_blocked", {"id": steer_msg.id, "reason": blocked},
                                 adapter=adapter)
                 continue
-            await append_note(steer_msg.content)  # the only write (CON-004)
+            await append_note(frame_steered(steer_msg.content))  # the only write (CON-004), framed (D6)
             if context:
                 # The turn's system instruction only, never persisted (hooks spec REQ-2.2)
                 dynamic_system_instruction = with_prompt_context(dynamic_system_instruction, context)

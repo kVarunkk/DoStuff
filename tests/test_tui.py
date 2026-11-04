@@ -6034,6 +6034,52 @@ def test_esc_esc_after_steer(steer_loop, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_esc_esc_after_steer_across_a_reload(steer_loop, monkeypatch):
+    """Review round 2 (D6 frame): after a reload the stored step is framed and `_sent_prompts` is
+    empty — Esc-to-restore still puts back what the user typed, never the frame (the frame reaches
+    only the model and the stored transcript)."""
+    cli_tui, state = steer_loop
+    from conftest import fake_response, fake_tool_call
+    from dostuff.helpers.agent import file_mentions
+    monkeypatch.setattr(file_mentions, "_index", {})
+    Path("plan.md").write_text("use pytest\n", encoding="utf-8")
+    state.responses = [
+        fake_response(tool_calls=[fake_tool_call("read_file", {"path": "plan.md"}, "c1")]),
+        fake_response("finished"),
+    ]
+
+    async def scenario():
+        app1 = cli_tui.DostuffTUI(session_id="steer-reload")
+
+        async def submit_while_tool_runs(name, args):
+            app1.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/steer check @plan.md"))
+
+        state.on_dispatch = submit_while_tool_runs
+        async with app1.run_test() as pilot:
+            await pilot.pause()
+            app1.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("start the turn"))
+            await _until(pilot, lambda: not app1._turn_in_progress, tries=300)
+            framed = [s for s in app1.steps_history
+                      if "The user sent a new message" in str(s.get("content"))]
+            assert len(framed) == 1 and "<attached_file" in framed[0]["content"]  # framed + expanded
+            await app1._cleanup_and_save_session()
+
+        # a fresh app on the same session: the stored step is framed, _sent_prompts is empty
+        app2 = cli_tui.DostuffTUI(session_id="steer-reload")
+        async with app2.run_test() as pilot:
+            await pilot.pause()
+            assert not app2._sent_prompts  # the bug's precondition: only the fallback can restore
+            inp = app2.query_one("#input", cli_tui.EnterSubmits)
+            await pilot.press("escape")
+            await pilot.press("escape")
+            await _until(pilot, lambda: "check @plan.md" in inp.text, tries=200)
+            assert "The user sent a new message" not in inp.text  # unframed, not the frame
+            assert "Address the message above" not in inp.text
+            await app2._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_steer_blocked_and_failed_reported_not_delivered(tui):
     """T4.1 (D6, REQ-2.4): the TUI shows what the loop reports for a blocked or failed message — the
     hook's reason / the preparation error — and neither becomes a user message in the transcript."""
