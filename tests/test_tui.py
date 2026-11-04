@@ -2737,7 +2737,7 @@ def test_prompt_queue(tui, monkeypatch):
             await pilot.pause()
             assert [label for _, label in picker._options] == ["1. second", "2. third", "3. fourth", "Clear the queue"]
             await choose("q2")
-            assert [v for v, _ in picker._options] == ["edit", "next", "remove", "back"]
+            assert [v for v, _ in picker._options] == ["edit", "next", "send", "remove", "back"]
             await choose("next")
             assert app._prompt_queue == ["fourth", "second", "third"]
 
@@ -5824,6 +5824,398 @@ def test_steer_mentions_and_pastes_expanded(steer_tui, monkeypatch):
             held.hold = False
             held.release()
             await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- Steering Phase 4: display and leftovers (plan/2026-11-04-steering/tasks.md T4.x) ----------
+
+
+class _SteerRun:
+    """What `steer_loop`'s scripted `call_agent` / `dispatch_tool` recorded."""
+
+    def __init__(self):
+        self.responses: list = []
+        self.calls: list = []       # the history each model call saw
+        self.dispatched: list = []  # (tool name, args)
+        self.results: list = []     # (tool name, result) once a live dispatch returned
+        self.on_dispatch = None     # async: submit a steering message while the tool runs
+
+
+@pytest.fixture
+def _steer_loop(tui, monkeypatch):
+    """(cli_tui, _SteerRun): the **real** `loop()` driving the TUI — Phase 2's delivery path end to end.
+    Only `call_agent` is scripted; hooks, `append_note`, the events and `_emit_on_ui` are the real thing,
+    which is what Phase 4 is about. `steer_loop` scripts `dispatch_tool` too; `steer_loop_live` doesn't."""
+    from conftest import fake_response
+    from dostuff.agent import loop as loop_module
+    cli_tui = tui
+    state = _SteerRun()
+
+    async def real_loop(*args, **kwargs):
+        return await loop_module.loop(*args, **kwargs)
+
+    async def fake_call_agent(steps_history, system_instruction, tool_names=None, stream=False):
+        state.calls.append([dict(s) for s in steps_history])
+        item = state.responses.pop(0) if state.responses else fake_response("done")
+        if isinstance(item, BaseException):
+            raise item
+        return item, None
+
+    monkeypatch.setattr(cli_tui, "agent_loop", real_loop)
+    monkeypatch.setattr(loop_module, "call_agent", fake_call_agent)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+    return cli_tui, state
+
+
+@pytest.fixture
+def steer_loop(_steer_loop, monkeypatch):
+    """`_steer_loop` with a scripted `dispatch_tool`: tools never really run, and a test can submit a
+    steering message from inside one (`state.on_dispatch`)."""
+    from dostuff.agent import loop as loop_module
+    cli_tui, state = _steer_loop
+
+    async def fake_dispatch(name, args, *a, **kw):
+        state.dispatched.append((name, dict(args)))
+        if state.on_dispatch is not None:
+            await state.on_dispatch(name, dict(args))
+        return "ok"
+
+    monkeypatch.setattr(loop_module, "dispatch_tool", fake_dispatch)
+    return cli_tui, state
+
+
+@pytest.fixture
+def steer_loop_live(_steer_loop, registry, monkeypatch):
+    """`_steer_loop` with the **real** `dispatch_tool`: the model's tool calls really run (T4.4 needs a
+    foreground `bash_command` blocking the loop). `registry` is the session's jobs registry, wired into
+    the tools the way every jobs test does it (conftest's fixture only yields it)."""
+    from dostuff.agent import loop as loop_module
+    from dostuff.tools.bash import jobs as jobs_module
+    cli_tui, state = _steer_loop
+    monkeypatch.setattr(jobs_module, "_registry", registry)
+    real_dispatch = loop_module.dispatch_tool
+
+    async def recording_dispatch(name, args, *a, **kw):
+        state.dispatched.append((name, dict(args) if isinstance(args, dict) else {}))
+        result = await real_dispatch(name, args, *a, **kw)
+        state.results.append((name, str(result)[:300]))
+        return result
+
+    monkeypatch.setattr(loop_module, "dispatch_tool", recording_dispatch)
+    return cli_tui, state
+
+
+def test_steered_message_shown_after_tool_output(steer_loop):
+    """T4.1 (D9, REQ-4.1): the delivered message shows where it was read — after the tool output it was
+    reacting to, as an ordinary user message with the raw text — and `_sent_prompts` records that raw text
+    at the delivered index (so Esc Esc can put it back)."""
+    cli_tui, state = steer_loop
+    from conftest import fake_response, fake_tool_call
+    state.responses = [
+        fake_response(tool_calls=[fake_tool_call("read_file", {"path": "plan.md"}, "c1")]),
+        fake_response("the finished answer"),
+    ]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-show")
+
+        async def submit_while_tool_runs(name, args):
+            # a message arriving during a tool call: put from inside the tool (spec test conventions)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/steer use pytest, not unittest"))
+
+        state.on_dispatch = submit_while_tool_runs
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("start the turn"))
+            await _until(pilot, lambda: not app._turn_in_progress, tries=300)
+            lines = _message_lines(app)
+            tool_at = next(i for i, line in enumerate(lines) if line.startswith("●"))
+            shown_at = next(i for i, line in enumerate(lines) if "use pytest, not unittest" in line)
+            assert tool_at < shown_at, lines  # after the output it was reacting to, not before it
+            assert lines[shown_at].startswith("> ")  # a user message, as typed
+            hits = [s for s in app.steps_history if "use pytest, not unittest" in str(s.get("content"))]
+            assert len(hits) == 1 and hits[0]["role"] == "user"  # exactly once (CON-004)
+            index = app.steps_history.index(hits[0])
+            assert app._sent_prompts.get((app.session_id, index)) == "use pytest, not unittest"
+            assert not any("STEERED" in line for line in lines)  # the event is consumed, not printed raw
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_esc_esc_after_steer(steer_loop, monkeypatch):
+    """T4.1 (D9): Esc Esc puts back what the user typed, not the expanded attachments, and the rewind
+    starts at the steering message — the last prompt the user actually sent."""
+    cli_tui, state = steer_loop
+    from conftest import fake_response, fake_tool_call
+    from dostuff.helpers.agent import file_mentions
+    monkeypatch.setattr(file_mentions, "_index", {})
+    Path("plan.md").write_text("use pytest\n", encoding="utf-8")
+    state.responses = [
+        fake_response(tool_calls=[fake_tool_call("read_file", {"path": "plan.md"}, "c1")]),
+        fake_response("finished"),
+    ]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-esc")
+
+        async def submit_while_tool_runs(name, args):
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/steer check @plan.md"))
+
+        state.on_dispatch = submit_while_tool_runs
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("start the turn"))
+            await _until(pilot, lambda: not app._turn_in_progress, tries=300)
+            delivered = [s for s in app.steps_history if "<attached_file" in str(s.get("content"))]
+            assert len(delivered) == 1  # the loop stored the expanded text (D5)
+            # D9: the raw text is recorded at the delivered index, which is what Esc Esc reads back
+            assert app._sent_prompts.get((app.session_id, app.steps_history.index(delivered[0]))) == "check @plan.md"
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            assert not inp.text.strip()
+            await pilot.press("escape")
+            await pilot.press("escape")
+            await _until(pilot, lambda: not any("<attached_file" in str(s.get("content"))
+                                                for s in app.steps_history))
+            assert inp.text == "check @plan.md", inp.text  # raw, not the expansion
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_steer_blocked_and_failed_reported_not_delivered(tui):
+    """T4.1 (D6, REQ-2.4): the TUI shows what the loop reports for a blocked or failed message — the
+    hook's reason / the preparation error — and neither becomes a user message in the transcript."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-blocked")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = len(_message_lines(app))
+            app.adapter.emit("steer_blocked", {"id": "b1", "reason": "no passwords in prompts"})
+            app.adapter.emit("steer_failed", {"id": "f1", "error": "Could not read @missing.txt"})
+            await _until(pilot, lambda: any("no passwords in prompts" in t for t in _texts(app)))
+            await _until(pilot, lambda: any("Could not read @missing.txt" in t for t in _texts(app)))
+            lines = _message_lines(app)[before:]
+            assert not any(line.startswith("> ") for line in lines), lines  # nothing delivered
+            assert not any("STEER BLOCKED" in line or "STEER FAILED" in line for line in lines)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- Steering Phase 4 continued: bar, loader and the /queue picker (tasks.md T4.2) -------------
+
+
+def test_queue_bar_and_loader_count_steering(steer_tui):
+    """T4.2 (D9, REQ-4.2): the bar leads with the steering messages and their rule, then the queued
+    group as before; the loader counts them separately — `· 1 steering · 2 queued`."""
+    cli_tui, held = steer_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-bar")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "start the turn")
+            await _until(pilot, lambda: held.gate is not None, tries=200)
+            _submit(app, cli_tui, "/steer first correction")
+            _submit(app, cli_tui, "queued one")
+            _submit(app, cli_tui, "queued two")
+            await pilot.pause(0.3)
+            bar = app.query_one("#queue-bar", cli_tui.QueueBar)
+            assert bar.display
+            rendered = bar.render()
+            bar_text = rendered.plain if hasattr(rendered, "plain") else str(rendered)
+            assert "→ 1 for the agent · read at the next tool boundary" in bar_text, bar_text
+            assert "first correction" in bar_text  # steering rows are listed, marked →
+            assert "2 queued" in bar_text and "click or /queue" in bar_text, bar_text
+            loader = app._loader_text().plain
+            assert "· 1 steering" in loader and "· 2 queued" in loader, loader
+            app._prompt_queue.clear()  # so ending the turn doesn't start the queued prompts
+            app._render_queue()
+            held.hold = False
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_queue_picker_steering_and_send_now(steer_tui):
+    """T4.2 (REQ-4.3, D9): `/queue` lists steering entries marked `→` with Edit / Remove, queued prompts
+    gain *Send now*, and Remove on an entry the loop has already taken says it was already read
+    (REQ-1.3)."""
+    cli_tui, held = steer_tui
+
+    def labels(picker):
+        return [label for _, label in picker._options]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-picker")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "start the turn")
+            await _until(pilot, lambda: held.gate is not None, tries=200)
+            _submit(app, cli_tui, "/steer a correction")
+            _submit(app, cli_tui, "run this afterwards")
+            await pilot.pause(0.3)
+            picker = app.query_one("#picker", cli_tui.PermissionPrompt)
+
+            # the list: the steering entry first, marked →, then the queued prompt
+            app.action_show_queue()
+            rows = labels(picker)
+            assert rows[0].startswith("→") and "a correction" in rows[0], rows
+            assert any("run this afterwards" in row for row in rows), rows
+
+            # a queued prompt now offers "Send now", which moves it onto the steering queue (D2)
+            await app._picker_callback("q0")
+            rows = labels(picker)
+            assert any("Send now" in row for row in rows), rows
+            await app._picker_callback("send")
+            assert app._prompt_queue == []
+            assert [m.raw for m in app._steering.pending()] == ["a correction", "run this afterwards"]
+
+            # Remove takes a pending entry out
+            app.action_show_queue()
+            await app._picker_callback("s0")
+            rows = labels(picker)
+            assert any("Remove" in row for row in rows) and any("Edit" in row for row in rows), rows
+            await app._picker_callback("remove")
+            assert [m.raw for m in app._steering.pending()] == ["run this afterwards"]
+            assert "a correction" not in app._steer_raws.values()
+
+            # already taken by the loop between the listing and the choice: say so, remove nothing
+            _submit(app, cli_tui, "/steer second correction")
+            await pilot.pause(0.3)
+            app.action_show_queue()
+            app._steering.take_ready()  # the loop reads it at the next tool boundary
+            await app._picker_callback("s0")
+            await _until(pilot, lambda: any("That message was already read." in t for t in _texts(app)))
+            assert app._steering.pending() == []
+            held.hold = False
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- Steering Phase 4 continued: leftovers (plan/2026-11-04-steering/tasks.md T4.3) -------------
+
+
+def test_leftover_runs_next(steer_loop):
+    """T4.3 (D8, REQ-5.2): messages that outlive their turn — the iteration cap closed the loop before
+    they reached a boundary — go to the front of `_prompt_queue` in order, announce themselves once, and
+    each runs as a normal turn whose content is stored exactly once (CON-004)."""
+    cli_tui, state = steer_loop
+    from conftest import fake_response, fake_tool_call
+    state.responses = [fake_response(tool_calls=[fake_tool_call("read_file", {"path": "plan.md"}, "c1")])]
+    raws = ["fix it before you finish", "and this too"]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-leftover")
+        app.max_iterations = 1  # the cap: nothing after the tool call gets a boundary
+
+        async def submit_while_tool_runs(name, args):
+            for raw in raws:
+                app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(f"/steer {raw}"))
+
+        state.on_dispatch = submit_while_tool_runs
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("start the turn"))
+            await _until(pilot, lambda: any("2 messages arrived after the turn ended; running them next" in t
+                                            for t in _texts(app)), tries=300)
+            assert app._steering.pending() == []
+            await _until(pilot, lambda: not app._turn_in_progress
+                         and all(any(s.get("content") == raw for s in app.steps_history) for raw in raws),
+                         tries=300)
+            # in order, once each, in all four places (CON-004)
+            delivered = [s.get("content") for s in app.steps_history if s.get("content") in raws]
+            assert delivered == raws, delivered
+            working = await app.store.load_working_history(app.session_id)
+            stored = await app.store.load(app.session_id)
+            for raw in raws:
+                assert sum(1 for s in working if s.get("content") == raw) == 1
+                assert sum(1 for s in app.current_session_history if s.get("content") == raw) == 1
+                assert sum(1 for s in stored if s.get("content") == raw) == 1
+            assert app._steer_raws == {}  # the ids are forgotten with the leftovers
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_leftover_on_cancel_back_to_input(steer_tui):
+    """T4.3 (D8, REQ-5.1): Esc means stop the work, corrections included — the pending steering message
+    goes back to the input **ahead of** the queued prompts, through the usual cancel path."""
+    cli_tui, held = steer_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-cancel")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "start the turn")
+            await _until(pilot, lambda: held.gate is not None, tries=200)
+            _submit(app, cli_tui, "queued prompt one")
+            _submit(app, cli_tui, "/steer a correction")
+            await pilot.pause(0.3)
+            assert [m.raw for m in app._steering.pending()] == ["a correction"]
+            await pilot.press("escape")  # cancel the running turn
+            held.release()               # the fake loop wakes, sees the cancel and returns
+            await _until(pilot, lambda: not app._turn_in_progress)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            assert inp.text.startswith("a correction"), inp.text  # ahead of the queued prompt
+            assert "queued prompt one" in inp.text
+            assert inp.text.index("a correction") < inp.text.index("queued prompt one")
+            assert app._steering.pending() == [] and app._steer_raws == {}
+            assert any("Moved 2 queued prompts back to the input" in t for t in _texts(app))
+            assert not any("arrived after the turn ended" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- Steering Phase 4 continued: Ctrl+B and the boundary (tasks.md T4.4, spec open point 3) ------
+
+
+def test_ctrl_b_frees_the_boundary_for_steering(steer_loop_live, registry, _py):
+    """T4.4 (D10, open point 3): a steering message waits behind a foreground `bash_command`, and the
+    queue bar says so and points at Ctrl+B. Pressing it detaches the command and the message is delivered
+    at once, while the command is still running — the assumption D10's hint is written on."""
+    cli_tui, state = steer_loop_live
+    from conftest import fake_response, fake_tool_call
+    sleeper = _py("import time; time.sleep(30)")
+    state.responses = [
+        fake_response(tool_calls=[fake_tool_call("bash_command", {"command": sleeper}, "c1")]),
+        fake_response("done"),
+    ]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="steer-ctrlb")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.permissions.mode = "auto"  # the shell call must not stop for an approval
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("start the turn"))
+            await _until(pilot, lambda: any(j.foreground and j.ended is None for j in registry.jobs()), tries=200)
+            app.on_enter_submits_submitted(
+                cli_tui.EnterSubmits.Submitted("/steer use the fixture, not the mock"))
+            await _until(pilot, lambda: bool(app._steering.pending())
+                         and app._steering.pending()[0].content is not None)
+            # it waits for the command (CON-005: nothing is interrupted), and the bar says why
+            assert not any("use the fixture" in line for line in _message_lines(app))
+            rendered = app.query_one("#queue-bar", cli_tui.QueueBar).render()
+            bar_text = rendered.plain if hasattr(rendered, "plain") else str(rendered)
+            assert "waiting for a running command · Ctrl+B to background it" in bar_text, bar_text
+
+            await pilot.press("ctrl+b")  # D10's escape hatch: detach the command, keep the turn going
+            await _until(pilot, lambda: any("use the fixture" in line and line.startswith("> ")
+                                            for line in _message_lines(app)), tries=200)
+            [job] = registry.jobs()
+            assert job.ended is None and not job.foreground  # still sleeping: the message did not wait for it
+            await _until(pilot, lambda: not app._turn_in_progress, tries=200)
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
