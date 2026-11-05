@@ -6552,7 +6552,7 @@ def test_system_instruction_stable_across_turns(tui, fake_model, monkeypatch):
     first, second = (call["messages"] for call in fake_model.calls)
     assert first[0] == second[0]
     assert second[:len(first)] == first  # the history only grew: the whole prefix is reusable
-    assert "new.txt" in second[-2]["content"] and "new.txt" not in first[-2]["content"]
+    assert "new.txt" in second[-1]["content"] and "new.txt" not in first[-1]["content"]
 
 
 def test_model_still_sees_environment_and_facts(tui, fake_model, monkeypatch):
@@ -6571,11 +6571,11 @@ def test_model_still_sees_environment_and_facts(tui, fake_model, monkeypatch):
     asyncio.run(scenario())
     messages = fake_model.calls[0]["messages"]
     assert "<environment>\ncwd:" not in messages[0]["content"]
-    bundle = messages[-2]
+    bundle = messages[-1]  # the context step and the prompt, one message on the way out
     assert bundle["role"] == "user" and "meta" not in bundle
     assert "<environment>" in bundle["content"]
     assert "- recalled: what is my name?" in bundle["content"]
-    assert messages[-1] == {"role": "user", "content": "what is my name?"}
+    assert bundle["content"].endswith("</turn-context>\n\nwhat is my name?")
 
 
 def test_hook_context_reaches_the_bundle_not_the_system(turn_tui, monkeypatch):

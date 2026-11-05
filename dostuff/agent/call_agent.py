@@ -39,13 +39,41 @@ def build_request_kwargs(stream: bool) -> dict[str, Any]:
     return kwargs
 
 
+def _as_blocks(content: Any) -> list[Any]:
+    if isinstance(content, list):
+        return content
+    return [{"type": "text", "text": content}] if content else []
+
+
+def _join_user_content(first: Any, second: Any) -> Any:
+    if isinstance(first, list) or isinstance(second, list):
+        return _as_blocks(first) + _as_blocks(second)  # an image block must survive, so no flattening to text
+    return "\n\n".join(text for text in (first, second) if text)
+
+
+def provider_messages(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The history as a provider may see it. The steps themselves are left alone: the store and every reader need
+    them apart, while a request needs valid turns.
+
+    `meta` is dostuff's own (the turn-context marker), so it is dropped. Adjacent user steps become one message,
+    because Perplexity and strict chat templates (vLLM's Gemma, Mistral) reject two in a row, and a turn's context
+    step always sits right before its prompt. Same history, same result, so the cached prefix holds.
+    """
+    messages: list[dict[str, Any]] = []
+    for step in steps:
+        message = {k: v for k, v in step.items() if k != "meta"} if "meta" in step else step
+        if messages and message.get("role") == "user" and messages[-1].get("role") == "user":
+            messages[-1] = {**messages[-1], "content": _join_user_content(messages[-1].get("content"), message.get("content"))}
+        else:
+            messages.append(message)
+    return messages
+
+
 async def call_agent(steps_history: list, system_instruction: str, tool_names: list[str] | None = None, stream: bool = False):
     if tool_names is None:
         tool_names = default_tool_names()
     active_schemas = [TOOL_SCHEMAS[name] for name in tool_names if name in TOOL_SCHEMAS]
-    # `meta` is dostuff's own (the turn-context marker): no provider may see it, and the store must keep it
-    messages = [{"role": "system", "content": system_instruction}] + [
-        {k: v for k, v in step.items() if k != "meta"} if "meta" in step else step for step in steps_history]
+    messages = [{"role": "system", "content": system_instruction}] + provider_messages(steps_history)
     request = build_request_kwargs(stream)
 
     span = tracer.start_span("model_call")

@@ -211,8 +211,7 @@ def test_send_message_inbox(agents, fake_model, tmp_path):
     a, w, q, stored = asyncio.run(go())
     # A: the messages come after its last step, in order, and it keeps going instead of ending
     second = fake_model.calls_for("[A]")[1]["messages"]
-    assert second[-3:] == [{"role": "assistant", "content": "first answer"},
-                           {"role": "user", "content": "m1"}, {"role": "user", "content": "m2"}]
+    assert second[-2:] == [{"role": "assistant", "content": "first answer"}, {"role": "user", "content": "m1\n\nm2"}]
     assert a.result == "after m2" and a.inbox == []
     assert [s["content"] for s in stored if s["role"] == "user"] == ["[A] x", "m1", "m2"]
     # W: after the tool result of the call that waited for approval
@@ -220,7 +219,7 @@ def test_send_message_inbox(agents, fake_model, tmp_path):
     assert after[-2]["role"] == "tool" and after[-1] == {"role": "user", "content": "wm"}
     # Q: it was queued, so the message comes right after its task
     first_q = fake_model.calls_for("[Q]")[0]["messages"]
-    assert first_q[1:] == [{"role": "user", "content": "[Q] x"}, {"role": "user", "content": "qm"}]
+    assert first_q[1:] == [{"role": "user", "content": "[Q] x\n\nqm"}]
 
 
 # --- T5.6 /resume and restart -----------------------------------------------------------------

@@ -1,10 +1,12 @@
 """The turn-context step: the marker, the composer, the plan step (plan/2026-11-05-cache-stable-context)."""
+import asyncio
 import json
 import subprocess
 import sys
 
 import pytest
 
+from dostuff.agent.call_agent import provider_messages
 from dostuff.helpers.agent.turn_context import (
     HIDDEN_LIKE_PATTERN, PROMPT_CONTEXT_HEADER, TURN_CONTEXT_MARKER, compose_turn_context, delivered_plan_mode,
     is_turn_context, make_context_step, make_plan_mode_step,
@@ -127,3 +129,69 @@ def test_marker_literal_not_duplicated():
     found = [p.relative_to(root).as_posix() for p in root.rglob("*.py")
              if '"turn_context"' in (text := p.read_text(encoding="utf-8")) or "'turn_context'" in text]
     assert found == ["helpers/agent/turn_context.py"]
+
+
+# --- what a provider receives -----------------------------------------------------------------------------------
+
+def _context_step(text="<turn-context>env</turn-context>"):
+    return make_context_step(text)
+
+
+def test_context_step_and_prompt_reach_the_provider_as_one_message():
+    sent = provider_messages([_context_step(), {"role": "user", "content": "the prompt"}])
+    assert sent == [{"role": "user", "content": "<turn-context>env</turn-context>\n\nthe prompt"}]
+
+
+def test_no_two_user_messages_in_a_row_across_a_turn_with_tools():
+    call = {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    plan = make_plan_mode_step(True, "plan on")
+    sent = provider_messages([
+        _context_step(), {"role": "user", "content": "go"}, plan,
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "c1", "content": "result"},
+        {"role": "user", "content": "[hook ctx]"}, {"role": "user", "content": "steer"},
+    ])
+    assert [m["role"] for m in sent] == ["user", "assistant", "tool", "user"]
+    assert sent[-1]["content"] == "[hook ctx]\n\nsteer"
+    assert sent[2]["content"] == "result"  # a tool result never takes a note into itself
+
+
+def test_merge_leaves_the_stored_steps_alone():
+    steps = [_context_step(), {"role": "user", "content": "go"}]
+    before = json.loads(json.dumps(steps))
+    provider_messages(steps)
+    assert steps == before
+
+
+def test_meta_never_reaches_the_provider():
+    sent = provider_messages([_context_step(), {"role": "assistant", "content": "a"}, _context_step()])
+    assert all("meta" not in m for m in sent)
+
+
+def test_merge_keeps_image_blocks():
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+    sent = provider_messages([{"role": "user", "content": "look"}, {"role": "user", "content": [image]}])
+    assert sent == [{"role": "user", "content": [{"type": "text", "text": "look"}, image]}]
+
+
+def test_merge_skips_empty_content():
+    sent = provider_messages([{"role": "user", "content": ""}, {"role": "user", "content": "go"}])
+    assert sent == [{"role": "user", "content": "go"}]
+
+
+def test_a_later_turn_only_extends_what_the_last_one_sent():
+    """The cache rests on this: every message of a call is unchanged, in place, in the next call."""
+    first = [_context_step("<turn-context>1</turn-context>"), {"role": "user", "content": "one"}]
+    second = first + [{"role": "assistant", "content": "done"}, _context_step("<turn-context>2</turn-context>"),
+                      {"role": "user", "content": "two"}]
+    earlier = provider_messages(first)
+    assert provider_messages(second)[:len(earlier)] == earlier
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_call_agent_merges_for_every_provider(fake_model, monkeypatch, explicit):
+    from dostuff.agent import call_agent as module
+    monkeypatch.setattr(module, "uses_explicit_prompt_caching", lambda: explicit)
+    steps = [_context_step(), {"role": "user", "content": "go"}]
+    asyncio.run(module.call_agent(steps, "system", tool_names=[]))
+    assert [m["role"] for m in fake_model.calls[0]["messages"]] == ["system", "user"]
