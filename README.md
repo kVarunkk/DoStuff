@@ -202,7 +202,7 @@ In the TUI:
 | `/model [<provider/model>] [--active]` | Pick a model: your saved ones (`models:` in config.yaml) first, then "More <provider> models…" for each provider's list (type to filter; Enter on no match uses what you typed). A model that isn't saved yet is added to `~/.dostuff/config.yaml`. A plain `/model` switch lasts only for this session; add `--active` (e.g. `/model --active`, or `/model anthropic/claude-sonnet-5-5 --active`) to make it the default that new sessions start with |
 | `/config [mcp] [project]` | Edit a settings file right in the TUI: pick `config.yaml` or the MCP servers, user (`~/.dostuff`) or project (`./.dostuff`), or name one (`/config mcp project`). `Ctrl+S` checks the file, saves it and applies it without a restart (an invalid file stays open with the error); `Esc` closes, twice if there are unsaved changes. A new file starts with every option commented out. `.env` files aren't offered |
 | `/status`     | Session, directory, model, permission mode, tokens, context use, MCP servers |
-| `/context`    | What fills the context window: system prompt, tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
+| `/context`    | What fills the context window: system prompt, turn context (the environment, recalled memories and hook context sent with each prompt), tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
 | `/memory [project\|global]` | Edit `AGENTS.md` (this project's or `~/.dostuff/AGENTS.md`) in the same editor as `/config`; `Ctrl+S` saves and the agent follows it from the next message |
 | `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory, hooks), with a fix for each problem |
 | `/tools`      | Every tool the agent has: when it asks (in `ask` mode), whether subagents get it and what it does, then each connected MCP server's tools (reached through `call_mcp_tool`) |
@@ -520,7 +520,7 @@ both modes: a skill is a turn's prompt, not a correction.
   order you sent them, so a message holding a big file never jumps ahead of the one after it. The `Attached …` lines
   show as they finish, as for a prompt.
 - **Hooks and the sandbox still apply**: `UserPromptSubmit` runs for each correction at the boundary, so a hook can
-  block it — it is shown like a blocked prompt and never reaches the model — or add context for this turn, written as a
+  block it — it is shown like a blocked prompt and never reaches the model — or add context, written as a
   note right before the correction (the system prompt never changes mid-turn, so the prompt cache holds); a preparation
   failure is reported instead of half-delivered.
 
@@ -670,7 +670,7 @@ matcher and tool argument names are renamed (see [the table below](#coming-from-
 | Event | When | Matcher is matched against | What a hook can do |
 |---|---|---|---|
 | `SessionStart` | Before the first turn of a session, and after a compaction | the source: `startup`, `resume`, `clear`, `compact` | Add context for the rest of the session |
-| `UserPromptSubmit` | After you send a prompt, before it is stored or sent | — | Reject the prompt, or add context for this turn |
+| `UserPromptSubmit` | After you send a prompt, before it is stored or sent | — | Reject the prompt, or add context sent with it (hidden from the transcript, and stays in the model's history) |
 | `PreToolUse` | Before each tool call, before any approval prompt | the tool name | `allow`, `deny` or `ask`; rewrite the arguments |
 | `PostToolUse` | After a tool call ran | the tool name | Append text to the result the model sees |
 | `Stop` | When the agent is about to give its final answer | — | Block, so the turn continues with your reason |

@@ -239,3 +239,23 @@ def test_fork_is_listed_as_a_type(name, agents_home):
     result = asyncio.run(agent(description="d", prompt="x", mcp_client=object(), session_id="s1",  # type: ignore[arg-type]
                                turn_id="t1", subagent_type="nope"))
     assert name in result
+
+
+# --- Cache-stable context, T4.1 ----------------------------------------------------------------------------------
+
+def test_fork_copies_context_steps(agents, fake_model):
+    from dostuff.agent.subagents.fork import FORK_DIRECTIVE
+    from dostuff.helpers.agent.turn_context import make_context_step
+    fake_model.script("[MAIN]", fake_response(tool_calls=[_fork_call()]), fake_response("main done"))
+    fake_model.script("[F]", fake_response("fork report"))
+    bundle = "<turn-context>\n<environment>\ncwd: /x\n</environment>\n</turn-context>"
+    working = [make_context_step(bundle), *[dict(s) for s in EARLIER]]
+
+    asyncio.run(_main_turn(working))
+
+    main_first = fake_model.calls[0]
+    [fork_first] = _fork_calls(fake_model)
+    assert fork_first["messages"][0] == main_first["messages"][0]  # the same system string
+    assert fork_first["messages"][1] == {"role": "user", "content": bundle}  # kept, and no `meta` on the wire
+    assert fork_first["messages"][1:-1] == main_first["messages"][1:]  # so the copied prefix still matches
+    assert fork_first["messages"][-1]["content"] == FORK_DIRECTIVE.format(prompt="[F] X")

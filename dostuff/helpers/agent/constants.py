@@ -9,7 +9,7 @@ COMMAND_DESCRIPTIONS = {
     "/permissions": "Switch permission mode for this session: ask, allowlist, auto or plan (/permissions <mode>; Shift+Tab cycles)",
     "/config": "Edit settings here: config.yaml or the MCP servers, user or project (/config [mcp] [project])",
     "/status": "Show session, model, tokens, context use, permissions and MCP servers",
-    "/context": "Show what fills the context window: system prompt, tools, project instructions, messages",
+    "/context": "Show what fills the context window: system prompt, turn context, tools, project instructions, messages",
     "/memory": "Edit the instructions file (AGENTS.md) the agent follows (/memory [project|global]); `# note` adds a line",
     "/doctor": "Check config, API key, MCP config and memory setup, with a fix for each problem",
     "/tools": "List the agent's tools: when each asks, whether subagents get it, and the connected MCP servers' tools",

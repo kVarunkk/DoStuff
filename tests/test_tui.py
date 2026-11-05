@@ -6753,3 +6753,26 @@ def test_show_context_has_turn_context_row(turn_tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+def test_side_question_system_matches_turn(btw_tui):
+    """REQ-5.1: byte-equal to the main turn's, and the same after another turn and a plan-mode toggle."""
+    cli_tui, held, side_call = btw_tui
+    held.hold = False
+    call = side_call()
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-btw-system")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for n, prompt in enumerate(("fix the bug", "and the other one"), start=1):
+                _submit(app, cli_tui, prompt)
+                await _until(pilot, lambda: not app._turn_in_progress and len(held.systems) == n)
+            app.permissions.mode = "plan"
+            _submit(app, cli_tui, "/btw what did I ask?")
+            await _btw_answered(pilot, app)
+            assert held.systems[0] == held.systems[1]
+            assert call.calls[0]["system_instruction"] == held.systems[-1]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
