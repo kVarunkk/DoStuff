@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.11] - 2026-11-06
 
 Skills in your home folder now open at the first try, the provider's prompt cache survives from one turn to the next, the current prompt stays pinned while you scroll, and GPT and Grok tool calls work on OpenCode Go.
 
