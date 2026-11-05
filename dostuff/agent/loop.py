@@ -13,7 +13,7 @@ import asyncio
 import inspect
 import random
 from dataclasses import dataclass
-from dostuff.agent.permissions import SessionPermissions
+from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, PLAN_MODE_OFF_INSTRUCTION, SessionPermissions
 from dostuff.agent.run_tool import (
     CANCELLED_RESULT, authorize_batch, authorize_tool, dispatch_tool, post_tool_use, pre_tool_use,
 )
@@ -28,6 +28,7 @@ from dostuff.tools.definitions import TOOL_MAP, default_tool_names
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
 from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, frame_steered
+from dostuff.helpers.agent.turn_context import PROMPT_CONTEXT_HEADER, delivered_plan_mode, make_plan_mode_step
 from dostuff.helpers.agent.side_question import (
     compose_system_instruction, plan_mode_on, publish_snapshot, published_snapshot, usage_dict as build_usage_dict,
 )
@@ -254,6 +255,16 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
         framed steering message."""
         await append_step({"role": "user", "content": text}, steps_history, working_history, current_session_history, session_id, store, turn_type)
 
+    async def sync_plan_mode() -> None:
+        """Tell the model when plan mode differs from what the history last said (D11). Read before each call,
+        since the mode can change mid-turn (Shift+Tab); the system prompt never changes for it, so the cache holds."""
+        plan_mode = plan_mode_on(permissions, config)
+        if plan_mode == delivered_plan_mode(working_history):
+            return
+        step = make_plan_mode_step(plan_mode, PLAN_MODE_INSTRUCTION if plan_mode else PLAN_MODE_OFF_INSTRUCTION)
+        await append_step(step, steps_history, working_history, current_session_history, session_id, store, turn_type)
+        publish_snapshot(session_id, fork_context())
+
     async def deliver_steer(messages: list[SteerMessage]) -> int:
         """D6's drain body, shared by the top-of-iteration drain and D7's final-answer path: a failed
         or blocked message is reported and appended nowhere, the rest is written framed and once
@@ -279,7 +290,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             if context:
                 # In-band note, not a system fold: a mid-turn system change would invalidate the
                 # provider's whole cached prefix — the system prompt stays byte-stable in a turn.
-                await append_note(f"[Context from UserPromptSubmit hooks]\n{context}")
+                await append_note(f"{PROMPT_CONTEXT_HEADER}\n{context}")
             await append_note(frame_steered(steer_msg.content))  # the steer message's only write (CON-004), framed (D6)
             await loop_emit("steered", {"id": steer_msg.id, "index": len(steps_history) - 1},
                             adapter=adapter)
@@ -353,13 +364,12 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 while True:
                     model_span = None
                     progress = StreamProgress()
+                    await sync_plan_mode()  # here, so a retry after an overflow compaction is covered too
                     try:
-                        # Read per call: the mode can change mid-turn (Shift+Tab)
-                        plan_mode = plan_mode_on(permissions, config)
                         interaction, model_span = await call_agent(
                             steps_history=working_history,
                             system_instruction=compose_system_instruction(
-                                dynamic_system_instruction, plan_mode, compaction_notes, session_hook_context),
+                                dynamic_system_instruction, compaction_notes, session_hook_context),
                             tool_names=tool_names,
                             stream=stream,
                         )

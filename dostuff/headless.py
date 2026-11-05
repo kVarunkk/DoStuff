@@ -15,7 +15,7 @@ from typing import Any, Callable, Literal
 from dostuff.agent.permissions import ApprovalReply, PermissionMode, SessionPermissions, parse_answer
 from dostuff.helpers.hooks import trust
 from dostuff.helpers.hooks.dispatch import hook_line, untrusted_notice_given
-from dostuff.helpers.hooks.events import blocked_prompt_message, session_start, user_prompt_submit, with_prompt_context
+from dostuff.helpers.hooks.events import blocked_prompt_message, session_start, user_prompt_submit
 from dostuff.helpers.ui.ask_answers import NoUserAvailable, one_line, pick_options
 
 PREVIEW_LINES = 4
@@ -271,11 +271,12 @@ async def run_headless(
     project's hooks without a trust record (hooks spec D4).
     """
     # Heavy imports here so `dostuff --help` stays fast
-    from dostuff.agent.instructions import build_base_instructions, build_turn_instructions
+    from dostuff.agent.instructions import build_base_instructions, build_system_instructions, build_turn_context
     from dostuff.agent.loop import loop as agent_loop
     from dostuff.config import get_config
     from dostuff.helpers.agent.append_step import append_step
     from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    from dostuff.helpers.agent.turn_context import make_context_step
     from dostuff.helpers.mcp.load_mcp_config import load_mcp_config
     from dostuff.helpers.skills.custom_commands import discover_commands
     from dostuff.helpers.skills.skill_command import parse_skill_command, skill_commands, skill_prompt
@@ -350,9 +351,15 @@ async def run_headless(
                                                            adapter=adapter)
         if blocked is not None:
             raise _Refused(blocked_prompt_message(blocked))
+        # The turn's context rides ahead of the prompt as a hidden step, never in the system prompt (D5)
+        bundle = await build_turn_context(prompt, memory_store=get_semantic_store(), episodic_store=get_episodic_store(),
+                                          user_id=config.get_user_id(), prompt_context=prompt_context)
+        if bundle:
+            await append_step(make_context_step(bundle), steps_history, working_history,
+                              current_session_history, session_id, store, "interactive_loop")
         await append_step({"role": "user", "content": content}, steps_history, working_history,
                           current_session_history, session_id, store, "interactive_loop")
-        turn_instructions = await build_turn_instructions(base, prompt, get_semantic_store(), get_episodic_store(), config.get_user_id())
+        turn_instructions = build_system_instructions(base)
         permissions = SessionPermissions(mode=permission_mode, allow=list(allowed_tools or []))
 
         async def turn(text: str, instructions: str, meta: dict[str, Any]) -> str:
@@ -370,8 +377,7 @@ async def run_headless(
                 permissions=permissions,
                 session_hook_context=session_hook_context,
             )
-        # UserPromptSubmit context is for this turn only, never stored
-        result = await turn(prompt, with_prompt_context(turn_instructions, prompt_context), meta)
+        result = await turn(prompt, turn_instructions, meta)
         # Background agents are waited for: each batch of their notices gets a turn, like the TUI's wake-up
         # (subagents spec D17); past WAKE_LIMIT the rest are stopped in `finally`
         wake_turns = 0

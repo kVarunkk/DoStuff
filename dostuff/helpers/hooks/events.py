@@ -45,8 +45,8 @@ async def user_prompt_submit(
 ) -> tuple[str | None, str]:
     """(blocked reason or None, extra context) for a prompt about to be appended as the user step.
 
-    A block (exit 2, `decision: block`, or a failed `fail_closed` hook) rejects the prompt; the context
-    belongs in that turn's system instruction only and is never persisted (REQ-2.2).
+    A block (exit 2, `decision: block`, or a failed `fail_closed` hook) rejects the prompt; the context rides
+    the turn's hidden context step, never the system prompt (cache-stable context spec D3).
     """
     payload = payload_for("UserPromptSubmit", session_id=session_id, turn_id=turn_id, turn_type=turn_type,
                           prompt=prompt)
@@ -57,11 +57,6 @@ async def user_prompt_submit(
     if outcome.decision == "deny":
         return outcome.reason or f"hook '{outcome.decided_by}'", ""
     return None, outcome.context
-
-
-def with_prompt_context(instructions: str, context: str) -> str:
-    """The turn's system instruction plus UserPromptSubmit context."""
-    return f"{instructions}\n\n[Context from UserPromptSubmit hooks]\n{context}" if context else instructions
 
 
 async def session_start(

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, SessionPermissions
+from dostuff.agent.permissions import SessionPermissions
 from dostuff.helpers.agent import side_question as sq
 from dostuff.helpers.agent.side_question import (
     BTW_MAX_EXCHANGES, SIDE_QUESTION_PROMPT, TOOL_CALL_NOTE, SideAnswer, add_exchange, answer_side_question,
@@ -28,8 +28,8 @@ def _fresh_registry():
     sq._reset_registry()
 
 
-def _ask(ctx, exchanges=(), question="where is retry?", plan_mode=False):
-    return asyncio.run(answer_side_question(ctx, list(exchanges), question, plan_mode=plan_mode))
+def _ask(ctx, exchanges=(), question="where is retry?"):
+    return asyncio.run(answer_side_question(ctx, list(exchanges), question))
 
 
 # --- T0.1 -------------------------------------------------------------------------------------------------------
@@ -57,7 +57,7 @@ def test_publish_none_is_noop(fork_ctx):
     publish_snapshot("s1", fork_ctx())
     before = snapshot("s1")
     publish_snapshot("s1", None)
-    assert snapshot("s1") is before
+    assert snapshot("s1") == before
 
 
 def test_demote_on_exit(fork_ctx):
@@ -85,7 +85,7 @@ def test_demote_disabled(fork_ctx):
     live = snapshot("s1")
     with published_snapshot("s1", enabled=False):
         pass
-    assert snapshot("s1") is live
+    assert snapshot("s1") == live
 
 
 def test_discard(fork_ctx):
@@ -121,17 +121,15 @@ def _suffix(context):
 
 # The T0.2 cases (tests/test_loop.py::SYSTEM_PIN_CASES), with the strings the unchanged loop sent
 COMPOSE_CASES = [
-    (True, "N", {"startup": "ctx"},
-     "D\n\n" + PLAN_MODE_INSTRUCTION + "\n\n[Summary of earlier conversation]: N" + _suffix({"startup": "ctx"})),
-    (False, "N", {"startup": "ctx"}, "D\n\n[Summary of earlier conversation]: N" + _suffix({"startup": "ctx"})),
-    (True, "", {"startup": "ctx"}, "D\n\n" + PLAN_MODE_INSTRUCTION + _suffix({"startup": "ctx"})),
-    (True, "N", None, "D\n\n" + PLAN_MODE_INSTRUCTION + "\n\n[Summary of earlier conversation]: N"),
+    ("N", {"startup": "ctx"}, "D\n\n[Summary of earlier conversation]: N" + _suffix({"startup": "ctx"})),
+    ("", {"startup": "ctx"}, "D" + _suffix({"startup": "ctx"})),
+    ("N", None, "D\n\n[Summary of earlier conversation]: N"),
 ]
 
 
-@pytest.mark.parametrize("plan, notes, context, expected", COMPOSE_CASES)
-def test_compose_matches_loop_pin(plan, notes, context, expected):
-    assert compose_system_instruction("D", plan, notes, context) == expected
+@pytest.mark.parametrize("notes, context, expected", COMPOSE_CASES)
+def test_compose_matches_loop_pin(notes, context, expected):
+    assert compose_system_instruction("D", notes, context) == expected
 
 
 def test_plan_mode_on():
@@ -201,7 +199,7 @@ def test_sends_turn_tools_not_empty(fork_ctx, side_call):
     assert got["tool_names"] == ["read_file", "bash"]
     assert got["stream"] is False
     assert got["steps_history"] == build_messages(ctx, [], "where is retry?")
-    assert got["system_instruction"] == compose_system_instruction("SYS", False, "N", {"startup": "c"})
+    assert got["system_instruction"] == compose_system_instruction("SYS", "N", {"startup": "c"})
 
 
 def test_plain_answer(fork_ctx, side_call):
@@ -318,9 +316,10 @@ def test_usage_dict_shared(fork_ctx, side_call, monkeypatch):
     assert answer.usage == expected and answer.cost == 0.5
 
 
-def test_no_emit_no_store():
+def test_side_question_has_no_plan_mode():
+    """No adapter and no store (CON-004), and no plan mode: its state is in the snapshot's history (D11)."""
     params = set(inspect.signature(answer_side_question).parameters)
-    assert params == {"snap", "exchanges", "question", "plan_mode"}
+    assert params == {"snap", "exchanges", "question"}
 
 
 # --- T5.3 the README ---------------------------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""The <environment> block added to the system prompt each turn (cwd, OS, shell, date, git)."""
+"""The <environment> block (cwd, OS, shell, date, git): in each turn's context step, and a subagent's system prompt."""
 import datetime
 import platform
 import subprocess

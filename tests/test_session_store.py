@@ -438,3 +438,74 @@ def test_fork_session_skips_agents(tmp_path):
         finally:
             await store.close()
     asyncio.run(scenario())
+
+
+# --- Cache-stable context (plan/2026-11-05-cache-stable-context/tasks.md) ---------------------------------------
+
+def test_pin_session_title_is_first_prompt(tmp_path):
+    async def scenario():
+        store = SQLiteSessionStore(str(tmp_path / "sessions.db"))
+        try:
+            await store.append("s", {"role": "user", "content": "fix the bug"})
+            await store.append("s", {"role": "assistant", "content": "done"})
+            assert (await store.list_sessions())[0]["title"] == "fix the bug"
+        finally:
+            await store.close()
+    asyncio.run(scenario())
+
+
+def _context_row():
+    from dostuff.helpers.agent.turn_context import make_context_step
+    return make_context_step("<turn-context>\n<environment>\ncwd: /x\n</environment>\n</turn-context>")
+
+
+def test_title_skips_context_step(tmp_path):
+    async def scenario():
+        store = SQLiteSessionStore(str(tmp_path / "sessions.db"))
+        try:
+            await store.append("s", _context_row())
+            assert (await store.list_sessions())[0]["title"] == ""  # nothing visible yet
+            await store.append("s", {"role": "user", "content": "fix the bug"})
+            assert (await store.list_sessions())[0]["title"] == "fix the bug"
+        finally:
+            await store.close()
+    asyncio.run(scenario())
+
+
+def test_fork_title_skips_context_step(tmp_path):
+    async def scenario():
+        store = SQLiteSessionStore(str(tmp_path / "sessions.db"))
+        try:
+            await store.append("src", _context_row())
+            await store.append("src", {"role": "user", "content": "fix the bug"})
+            await store.fork_session("src", "fork")
+            assert (await store.get_session_meta("fork"))["title"] == "fix the bug (fork)"
+        finally:
+            await store.close()
+    asyncio.run(scenario())
+
+
+def test_title_from_legacy_steps_unchanged(tmp_path):
+    """Rows written before this change have no `meta`: `NOT LIKE` must not exclude them."""
+    async def scenario():
+        store = SQLiteSessionStore(str(tmp_path / "sessions.db"))
+        try:
+            await store.append("s", {"role": "user", "content": "old prompt"})
+            await store.append("s", {"role": "user", "content": "newer prompt"})
+            assert (await store.list_sessions())[0]["title"] == "old prompt"
+        finally:
+            await store.close()
+    asyncio.run(scenario())
+
+
+def test_title_keeps_prompt_quoting_the_marker(tmp_path):
+    prompt = 'why is "hidden": "turn_context" in my step?'
+
+    async def scenario():
+        store = SQLiteSessionStore(str(tmp_path / "sessions.db"))
+        try:
+            await store.append("s", {"role": "user", "content": prompt})
+            assert (await store.list_sessions())[0]["title"] == prompt
+        finally:
+            await store.close()
+    asyncio.run(scenario())

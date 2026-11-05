@@ -82,3 +82,26 @@ def test_allowed_tools_patterns():
     assert check("bash_command", "shell", {"command": "rm -rf build && make"}, shell, ask).action == "allow"
     assert check("write_file", "write", {"path": "a"}, SessionPermissions(mode="plan", allow=["write_file"]), ask).action == "deny"
     assert check("edit_config", "settings", {}, SessionPermissions(allow=["edit_config"]), ask).action == "ask"
+
+
+# --- Cache-stable context, T3.6 ----------------------------------------------------------------------------------
+
+def test_context_parts_has_turn_context():
+    parts = context_parts("SYSTEM", "", {}, [], "", len, next_context="ENV")
+    assert [name for name, _ in parts] == ["System prompt", "Turn context", "Tools", "MCP tools", "Project instructions",
+                                           "Summary of earlier messages", "Messages"]
+    assert dict(parts)["System prompt"] == len("SYSTEM") and dict(parts)["Turn context"] == len("ENV")
+
+
+def test_context_parts_counts_every_context_step_once():
+    from dostuff.helpers.agent.turn_context import make_context_step, make_plan_mode_step
+    plan = make_plan_mode_step(True, "x")
+    messages = [make_context_step("bundle"), {"role": "user", "content": "hello"}, plan]
+    parts = dict(context_parts("S", "", {}, messages, "", len))
+    assert parts["Turn context"] == len("bundle") + len(plan["content"])
+    assert parts["Messages"] == len("hello")
+
+
+def test_turn_context_part_has_a_colour():
+    from dostuff.helpers.agent.context_usage import PART_STYLES
+    assert PART_STYLES["Turn context"]

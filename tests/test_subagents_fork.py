@@ -58,10 +58,11 @@ def test_fork_first_call(agents, fake_model):
     assert "earlier notes" in fork_first["messages"][0]["content"]
     assert "hook context" in fork_first["messages"][0]["content"]
     # (b) the main working history as of the call, without the in-flight assistant step
-    assert fork_first["messages"][1:-1] == main_first["messages"][1:]
-    # (c) then one user step: the directive and the task
+    assert fork_first["messages"][1:-1] == main_first["messages"][1:-1]
+    # (c) then the directive and the task, which extend the last user message: it ended on a user step
     last = fork_first["messages"][-1]
-    assert last["role"] == "user" and last["content"] == FORK_DIRECTIVE.format(prompt="[F] X")
+    directive = FORK_DIRECTIVE.format(prompt="[F] X")
+    assert last["role"] == "user" and last["content"] == main_first["messages"][-1]["content"] + "\n\n" + directive
     assert "Your task: [F] X" in last["content"]
     # the main history was copied, not shared
     assert not any("Your task" in str(s.get("content")) for s in working)
@@ -172,7 +173,7 @@ def test_fork_background_follow_up(agents, fake_model):
     second = _fork_calls(fake_model)[-1]["messages"]
     contents = [m.get("content") for m in second[1:]]
     # its own history: the copy it started from, its report, the follow-up; no fresh copy of the main one
-    assert contents.count(FORK_DIRECTIVE.format(prompt="[F] X")) == 1
+    assert sum(FORK_DIRECTIVE.format(prompt="[F] X") in str(c) for c in contents) == 1
     assert contents[-2:] == ["fork report 1", "[F] and then?"]
     assert "main done" not in contents
     assert second[0] == fake_model.calls[0]["messages"][0]  # the same system message as when it started
@@ -239,3 +240,46 @@ def test_fork_is_listed_as_a_type(name, agents_home):
     result = asyncio.run(agent(description="d", prompt="x", mcp_client=object(), session_id="s1",  # type: ignore[arg-type]
                                turn_id="t1", subagent_type="nope"))
     assert name in result
+
+
+# --- Cache-stable context, T4.1 ----------------------------------------------------------------------------------
+
+def test_fork_copies_context_steps(agents, fake_model):
+    from dostuff.agent.subagents.fork import FORK_DIRECTIVE
+    from dostuff.helpers.agent.turn_context import make_context_step
+    fake_model.script("[MAIN]", fake_response(tool_calls=[_fork_call()]), fake_response("main done"))
+    fake_model.script("[F]", fake_response("fork report"))
+    bundle = "<turn-context>\n<environment>\ncwd: /x\n</environment>\n</turn-context>"
+    working = [make_context_step(bundle), *[dict(s) for s in EARLIER]]
+
+    asyncio.run(_main_turn(working))
+
+    main_first = fake_model.calls[0]
+    [fork_first] = _fork_calls(fake_model)
+    assert fork_first["messages"][0] == main_first["messages"][0]  # the same system string
+    kept = fork_first["messages"][1]
+    assert kept["content"].startswith(bundle + "\n\n") and "meta" not in kept  # kept, and no `meta` on the wire
+    assert fork_first["messages"][1:-1] == main_first["messages"][1:-1]  # so the copied prefix still matches
+    assert fork_first["messages"][-1]["content"].endswith(FORK_DIRECTIVE.format(prompt="[F] X"))
+
+
+# --- a /btw fork-out and the live snapshot -----------------------------------------------------------------------
+
+def test_fork_out_leaves_the_live_snapshot_for_the_next_side_question(agents, fake_model):
+    from dostuff.agent.subagents.fork import ForkContext
+    from dostuff.helpers.agent.side_question import build_messages, discard_snapshot, publish_snapshot, snapshot
+    fake_model.script("[F]", fake_response("fork report"))
+
+    async def go():
+        publish_snapshot("fork-out", ForkContext("sys", "", [dict(s) for s in EARLIER], ["read_file"], None))
+        run = await agents.start(owner="fork-out", agent_type="fork", background=True, description="x",
+                                 prompt="[F] X", fork=snapshot("fork-out"), adapter=FakeAdapter())
+        while run.ended is None:
+            await asyncio.sleep(0.01)
+        return run
+
+    run = asyncio.run(go())
+    assert run.status == "completed" and fake_model.calls_for("[F]")  # the fork did take its copy
+    messages = build_messages(snapshot("fork-out"), [], "what was the word?")
+    discard_snapshot("fork-out")
+    assert messages[:len(EARLIER)] == EARLIER

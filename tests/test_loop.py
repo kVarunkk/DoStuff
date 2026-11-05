@@ -491,13 +491,12 @@ SYSTEM_PIN_CASES = [
 
 @pytest.mark.parametrize("plan, notes, context", SYSTEM_PIN_CASES)
 def test_pin_loop_system_instruction(monkeypatch, plan, notes, context):
-    from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, SessionPermissions
+    from dostuff.agent.permissions import SessionPermissions
     from dostuff.helpers.hooks.events import session_context_suffix
     permissions = SessionPermissions(mode="plan" if plan else "auto")
     _, _, calls = _interactive(monkeypatch, [_msg(content="ok")], dynamic_system_instruction="D",
                                compaction_notes=notes, session_hook_context=context, permissions=permissions)
-    expected = ("D" + (f"\n\n{PLAN_MODE_INSTRUCTION}" if plan else "")
-                + (f"\n\n[Summary of earlier conversation]: {notes}" if notes else "")
+    expected = ("D" + (f"\n\n[Summary of earlier conversation]: {notes}" if notes else "")
                 + session_context_suffix(context))
     assert calls[0]["system"] == expected
     if context:
@@ -586,7 +585,7 @@ def test_subagent_turn_does_not_publish(monkeypatch, btw, fork_ctx):
     seen = []
     _interactive(monkeypatch, [_msg(content="ok")], turn_type="subagent_loop",
                  on_call=lambda n: seen.append(btw.snapshot("s1")))
-    assert seen == [live] and btw.snapshot("s1") is live  # neither replaced nor demoted (open point 1)
+    assert seen == [live] and btw.snapshot("s1") == live  # neither replaced nor demoted (open point 1)
 
 
 def test_demoted_after_return(monkeypatch, btw):
@@ -632,7 +631,7 @@ def test_subagent_exit_keeps_main_live(monkeypatch, btw, fork_ctx):
     btw.publish_snapshot("s1", fork_ctx())
     live = btw.snapshot("s1")
     _interactive(monkeypatch, [_msg(content="ok")], turn_type="subagent_loop")
-    assert btw.snapshot("s1") is live and btw.kept_prompt("s1") is None
+    assert btw.snapshot("s1") == live and btw.kept_prompt("s1") is None
 
 
 def test_overflow_compaction_republishes(monkeypatch, btw):
@@ -684,8 +683,8 @@ def test_loop_and_side_call_send_the_same_string(monkeypatch, btw):
                                compaction_notes="N", session_hook_context={"startup": "c"},
                                permissions=permissions, on_call=lambda n: seen.append(btw.snapshot("s1")))
     for snap, sent in zip(seen, calls):
-        assert btw.compose_system_instruction(snap.system_instruction, btw.plan_mode_on(permissions),
-                                              snap.compaction_notes, snap.session_hook_context) == sent["system"]
+        assert btw.compose_system_instruction(snap.system_instruction, snap.compaction_notes,
+                                              snap.session_hook_context) == sent["system"]
 
 
 # --- Steering Phase 2 (plan/2026-11-04-steering/tasks.md): delivery at the tool boundary (D6, D7) ---
@@ -1097,3 +1096,171 @@ def test_subagent_loop_ignores_steering(monkeypatch):
     assert not any(content in str(s.get("content") or "") for s in run.working)
     assert not any(e in ("steered", "steer_blocked", "steer_failed") for e, _ in run.adapter.events)
     assert [m.raw for m in q.pending()] == [content]
+
+
+# --- Cache-stable context (plan/2026-11-05-cache-stable-context/tasks.md) ---------------------------------------
+
+def test_call_agent_drops_meta_from_messages(monkeypatch):
+    from dostuff.agent import call_agent as module
+    from dostuff.helpers.agent.turn_context import is_turn_context, make_context_step
+    seen = {}
+
+    async def fake(**kwargs):
+        seen.update(kwargs)
+        return "reply"
+    monkeypatch.setattr(module, "acompletion", fake)
+    monkeypatch.setattr(module, "build_request_kwargs", lambda stream: {"model": "m"})
+    hidden = make_context_step("bundle")
+    plain = {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]}
+    history = [hidden, plain]
+
+    _, span = asyncio.run(module.call_agent(history, "sys", tool_names=[]))
+    span.end()
+
+    assert seen["messages"] == [{"role": "system", "content": "sys"}, {"role": "user", "content": "bundle"}, plain]
+    assert seen["messages"][2] is plain  # no copy of a step that has no meta
+    assert history[0] is hidden and is_turn_context(hidden)  # the store's copy keeps its marker
+
+
+def test_bundle_not_written_by_loop(monkeypatch):
+    from dostuff.helpers.agent.turn_context import is_turn_context
+    _, working, _ = _interactive(monkeypatch, [_msg(content="ok")])
+    assert not any(is_turn_context(s) for s in working)
+
+
+def _plan_steps(history):
+    return [s for s in history if "plan_mode" in (s.get("meta") or {})]
+
+
+def _read_call():
+    return _tc("read_file", json.dumps({"path": "a.py"}), "c1")
+
+
+async def _read_dispatch(name, args, **kw):
+    return "x"
+
+
+def test_plan_on_appends_one_step(monkeypatch):
+    from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, SessionPermissions
+    _, working, calls = _interactive(monkeypatch, [_msg(tool_calls=[_read_call()]), _msg(content="ok")],
+                                     dispatch=_read_dispatch, permissions=SessionPermissions(mode="plan"))
+    [step] = _plan_steps(working)
+    assert PLAN_MODE_INSTRUCTION in step["content"] and step["meta"]["plan_mode"] is True
+    assert calls[0]["history"][-1] == step
+    assert len(_plan_steps(calls[1]["history"])) == 1  # only on change
+
+
+@pytest.mark.parametrize("mode", ["auto", None])
+def test_plan_never_used_adds_no_step(monkeypatch, mode):
+    from dostuff.agent.permissions import SessionPermissions
+    _, working, _ = _interactive(monkeypatch, [_msg(content="ok")], permissions=SessionPermissions(mode=mode))
+    assert _plan_steps(working) == []
+
+
+def test_plan_off_appends_off_step(monkeypatch):
+    from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, PLAN_MODE_OFF_INSTRUCTION, SessionPermissions
+    from dostuff.helpers.agent.turn_context import make_plan_mode_step
+    working = [make_plan_mode_step(True, PLAN_MODE_INSTRUCTION), {"role": "user", "content": "hi"}]
+    _, working, calls = _interactive(monkeypatch, [_msg(content="ok")], working=working,
+                                     permissions=SessionPermissions(mode="auto"))
+    on, off = _plan_steps(working)
+    assert PLAN_MODE_OFF_INSTRUCTION in off["content"] and off["meta"]["plan_mode"] is False
+    assert calls[0]["history"][-1] == off
+
+
+def _toggled_mid_turn(monkeypatch):
+    from dostuff.agent.permissions import SessionPermissions
+    permissions = SessionPermissions(mode="auto")
+
+    async def dispatch(name, args, **kw):
+        permissions.mode = "plan"  # Shift+Tab while the tool runs
+        return "x"
+    return _interactive(monkeypatch, [_msg(tool_calls=[_read_call()]), _msg(content="ok")], dispatch=dispatch,
+                        permissions=permissions)
+
+
+def test_plan_toggle_mid_turn_reaches_next_call(monkeypatch):
+    _, _, calls = _toggled_mid_turn(monkeypatch)
+    assert _plan_steps(calls[0]["history"]) == []
+    assert calls[1]["history"][-1] == _plan_steps(calls[1]["history"])[0]
+
+
+def test_plan_toggle_keeps_system_identical(monkeypatch):
+    _, _, calls = _toggled_mid_turn(monkeypatch)
+    assert calls[0]["system"] == calls[1]["system"] == "sys"
+
+
+def test_plan_step_in_published_snapshot(monkeypatch, btw):
+    from dostuff.agent.permissions import SessionPermissions
+    seen = []
+    _interactive(monkeypatch, [_msg(content="ok")], permissions=SessionPermissions(mode="plan"),
+                 on_call=lambda n: seen.append(btw.snapshot("s1")))
+    assert len(_plan_steps(seen[0].history)) == 1
+
+
+def test_plan_step_redelivered_after_overflow_compaction(monkeypatch):
+    from dostuff.agent.permissions import SessionPermissions
+
+    async def fake_compact(steps, keep_budget, notes, limit):
+        return [{"role": "user", "content": "hi"}], "SUMMARY"  # the plan step went with the old steps
+    monkeypatch.setattr(loop_module, "compact_context", fake_compact)
+    overflow = litellm.ContextWindowExceededError("x", "m", "openai")
+    _, _, calls = _interactive(monkeypatch, [overflow, _msg(content="ok")],
+                               permissions=SessionPermissions(mode="plan"))
+    assert len(calls) == 2 and len(_plan_steps(calls[1]["history"])) == 1
+    assert calls[1]["history"][-1] == _plan_steps(calls[1]["history"])[0]
+
+
+def test_subagent_loop_gets_plan_step(monkeypatch):
+    from dostuff.agent.permissions import SessionPermissions
+    _, working, _ = _interactive(monkeypatch, [_msg(content="ok")], permissions=SessionPermissions(mode="plan"),
+                                 turn_type="subagent_loop")
+    assert len(_plan_steps(working)) == 1
+
+
+def _compaction_requests(monkeypatch):
+    """Record every summary request; each answers with a fixed summary."""
+    from dostuff.helpers.agent import manage_context
+    requests = []
+
+    async def fake_summarize(chunk, notes):
+        requests.append(chunk)
+        return "SUMMARY"
+    monkeypatch.setattr(manage_context, "_summarize", fake_summarize)
+    return requests
+
+
+def _compact(steps, keep_budget=1):
+    from dostuff.helpers.agent.manage_context import compact_context
+    return asyncio.run(compact_context(steps, keep_budget, "", 100_000))
+
+
+def test_compaction_never_summarises_context_steps(monkeypatch):
+    from dostuff.helpers.agent.turn_context import make_context_step, make_plan_mode_step
+    requests = _compaction_requests(monkeypatch)
+    steps = [make_context_step("<turn-context>\ncwd: /secret-path\n</turn-context>"),
+             {"role": "user", "content": "old prompt"}, make_plan_mode_step(True, "## Plan mode"),
+             {"role": "assistant", "content": "old answer"}, {"role": "user", "content": "new prompt"}]
+    recent, notes = _compact(steps)
+    assert notes == "SUMMARY" and recent == steps[-1:]
+    sent = "".join(requests)
+    assert "old prompt" in sent and "old answer" in sent
+    assert "turn-context" not in sent and "/secret-path" not in sent and "Plan mode" not in sent
+
+
+def test_compaction_keeps_recent_context_steps(monkeypatch):
+    from dostuff.helpers.agent.turn_context import make_context_step
+    _compaction_requests(monkeypatch)
+    context = make_context_step("<turn-context>b</turn-context>")
+    steps = [{"role": "user", "content": "old prompt"}, {"role": "assistant", "content": "old answer"},
+             context, {"role": "user", "content": "new prompt"}]
+    recent, notes = _compact(steps, keep_budget=40)
+    assert notes == "SUMMARY" and recent == steps[2:]
+
+
+def test_compaction_with_only_context_steps_old(monkeypatch):
+    from dostuff.helpers.agent.turn_context import make_context_step
+    requests = _compaction_requests(monkeypatch)
+    steps = [make_context_step("<turn-context>b</turn-context>"), {"role": "user", "content": "the prompt"}]
+    assert _compact(steps) == (steps, "")
+    assert requests == []

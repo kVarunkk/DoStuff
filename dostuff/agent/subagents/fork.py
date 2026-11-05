@@ -23,7 +23,7 @@ NO_CONVERSATION = ("[error] A fork copies the main agent's conversation, and the
 class ForkContext:
     """What a fork inherits from the main agent's loop at the moment of the call (D11). `loop()` builds it and
     `dispatch_tool` injects it into `agent` and `send_message` as the `fork_context` harness param."""
-    system_instruction: str  # the main turn's dynamic system instruction (before plan mode and notes)
+    system_instruction: str  # the main turn's dynamic system instruction (before the notes)
     compaction_notes: str
     history: list[dict[str, Any]]  # a copy of the main working history, without the in-flight assistant step
     tool_names: list[str]  # the main agent's tools

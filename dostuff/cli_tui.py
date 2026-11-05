@@ -34,7 +34,7 @@ from textual.events import Click, Key, Paste, TextSelected
 from dostuff import __version__
 from dostuff.config import NOTIFY_KINDS, STATUS_BAR_ITEMS, get_config, parse_compact_threshold
 from dostuff.agent.permissions import PERMISSION_MODES, ApprovalReply, SessionPermissions, next_mode, parse_answer
-from dostuff.agent.instructions import build_base_instructions, build_turn_instructions
+from dostuff.agent.instructions import build_base_instructions, build_system_instructions, build_turn_context
 from dostuff.helpers.agent.constants import COMMAND_DESCRIPTIONS, COMMAND_FLAGS
 from dostuff.helpers.memory.export_session import session_to_markdown
 from dostuff.helpers.memory.shell_step import format_shell_step as _format_shell_step, parse_shell_step as _parse_shell_step
@@ -59,18 +59,19 @@ from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
 from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, unframe_steered
 from dostuff.helpers.agent.side_question import (
     BTW_FORK_DESCRIPTION, BTW_FORK_PROMPT, add_exchange, answer_side_question, discard_snapshot, kept_prompt,
-    plan_mode_on, snapshot as live_side_snapshot,
+    snapshot as live_side_snapshot,
 )
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
+from dostuff.helpers.agent.turn_context import is_turn_context, make_context_step
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
 from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers
 from dostuff.helpers.agent.slash_suggestion import slash_arg_hint, slash_suggestion
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
 from dostuff.helpers.hooks.dispatch import hook_line
-from dostuff.helpers.hooks.events import blocked_prompt_message, parse_stop_note, session_start, user_prompt_submit, with_prompt_context
+from dostuff.helpers.hooks.events import blocked_prompt_message, parse_stop_note, session_start, user_prompt_submit
 from dostuff.helpers.mcp.load_mcp_config import load_mcp_config, mcp_config_sources, read_mcp_file
 from dostuff.helpers.skills.custom_commands import discover_commands
 from dostuff.helpers.skills.skill_command import parse_skill_command, skill_commands, skill_prompt
@@ -2229,6 +2230,8 @@ class DostuffTUI(App):
     def _render_history_step(self, step: dict, prefix: str = "") -> None:
         """Render a stored step like the live adapter does (● call / ⎿ result). `prefix` (`[agent: …] `) marks
         a subagent's transcript in /agents."""
+        if is_turn_context(step):
+            return
         role = step.get("role", "?")
         content = step.get("content") or ""
         if role == "tool":
@@ -2982,12 +2985,13 @@ class DostuffTUI(App):
 
             def measure() -> list[tuple[str, int]]:
                 return context_parts(
-                    self._system_instructions + "\n\n" + build_environment_block(),
+                    self._system_instructions,
                     load_project_instructions(),
                     {name: TOOL_SCHEMAS[name] for name in default_tool_names()},
                     messages,
                     meta.get("compaction_notes") or "",
                     lambda text: count_tokens(text, model),
+                    next_context=build_environment_block(),
                 )
             parts = await asyncio.to_thread(measure)
             text = render_context(parts, get_model_token_limit(), get_model(), meta.get("last_input_tokens") or 0)
@@ -3865,7 +3869,10 @@ class DostuffTUI(App):
             return ForkContext(system_instruction=kept.system_instruction, compaction_notes=notes, history=history,
                                tool_names=list(kept.tool_names), session_hook_context=kept.session_hook_context)
         from dostuff.tools.definitions import default_tool_names  # pulls in the tools: after the first frame
-        return ForkContext(system_instruction=await self._build_instructions(question), compaction_notes=notes,
+        bundle = await self._build_turn_context(question)
+        if bundle:  # this snapshot's copy only: a side question stores nothing
+            history.append(make_context_step(bundle))
+        return ForkContext(system_instruction=self._build_instructions(), compaction_notes=notes,
                            history=history, tool_names=default_tool_names(),
                            session_hook_context=dict(self.session_hook_context))
 
@@ -3880,8 +3887,7 @@ class DostuffTUI(App):
                 raise RuntimeError(f"startup failed ({self._backend_error})")
             snap = await self._side_snapshot(question)
             panel.snapshot = snap
-            answer = await answer_side_question(snap, list(self._side_exchanges), question,
-                                                plan_mode_on(self.permissions, self.config))
+            answer = await answer_side_question(snap, list(self._side_exchanges), question)
         except asyncio.CancelledError:
             raise  # the panel was closed while asking
         except Exception as e:
@@ -4031,8 +4037,12 @@ class DostuffTUI(App):
 
     # ── One agent turn ─────────────────────────────────────────────────────────
 
-    async def _build_instructions(self, user_text: str) -> str:
-        return await build_turn_instructions(self._system_instructions, user_text, self.memory_store, self.episodic_store, self.user_id)
+    def _build_instructions(self) -> str:
+        return build_system_instructions(self._system_instructions)
+
+    async def _build_turn_context(self, user_text: str, prompt_context: str = "") -> str:
+        return await build_turn_context(user_text, memory_store=self.memory_store, episodic_store=self.episodic_store,
+                                        user_id=self.user_id, prompt_context=prompt_context)
 
     async def _run_turn(self, user_text: str, wake: bool = False) -> None:
         """One agent turn. `wake`: started by a background job ending (D15) — `user_text` is the pending
@@ -4103,6 +4113,20 @@ class DostuffTUI(App):
                     self._append(blocked_prompt_message(blocked), msg_type="system")
                     return
 
+            # The turn's context rides ahead of the prompt as a hidden step, never in the system prompt (D5). A
+            # wake turn has no prompt, but the environment moved and the notice text recalls like one
+            bundle = await self._build_turn_context(user_text, prompt_context)
+            if bundle:
+                await append_step(
+                    make_context_step(bundle),
+                    self.steps_history,
+                    working_history,
+                    self.current_session_history,
+                    self.session_id,
+                    self.store,
+                    "interactive_loop",
+                )
+            if not wake:
                 self._sent_prompts[(self.session_id, len(self.steps_history))] = user_text
                 await append_step(
                     {"role": "user", "content": content},
@@ -4114,8 +4138,7 @@ class DostuffTUI(App):
                     "interactive_loop",
                 )
 
-            # The hook context is for this turn only: it is not part of the stored user step
-            dynamic_instructions = with_prompt_context(await self._build_instructions(user_text), prompt_context)
+            dynamic_instructions = self._build_instructions()
 
             self._set_title("running")
             self._turn_start_time = time.time()
@@ -4667,6 +4690,7 @@ class DostuffTUI(App):
             step = self.steps_history[i]
             content = step.get("content") if isinstance(step, dict) else None
             if (step.get("role") == "user" and isinstance(content, str) and content != EMPTY_RESPONSE_NUDGE
+                    and not is_turn_context(step)
                     and not content.startswith("[/undo]") and _parse_shell_step(content) is None
                     and parse_stop_note(content) is None and parse_notices(content) is None):
                 return i
@@ -4696,18 +4720,21 @@ class DostuffTUI(App):
         if self._turn_in_progress or index is None:
             return
         dropped = self.steps_history[index:]
+        # The prompt's context step sits just before it and goes with it; the text below stays on the prompt
+        start = index - 1 if index and is_turn_context(self.steps_history[index - 1]) else index
+        count = len(self.steps_history) - start
         # After a reload _sent_prompts is empty and the stored step may be framed (D6): unframe so
         # Esc-to-restore returns the typed text, never the frame (REQ-2.9).
         text = self._sent_prompts.get((self.session_id, index)) or unframe_steered(
             strip_attachments(dropped[0]["content"]))
         try:
-            await self.store.drop_last_steps(self.session_id, len(dropped))
+            await self.store.drop_last_steps(self.session_id, count)
         except Exception as e:
             self._append(f"Could not remove the last prompt: {e}", msg_type="error")
             return
-        del self.steps_history[index:]
+        del self.steps_history[start:]
         if self.current_session_history:
-            del self.current_session_history[-min(len(dropped), len(self.current_session_history)):]
+            del self.current_session_history[-min(count, len(self.current_session_history)):]
         changed_files = any(
             (tc.get("function") or {}).get("name") in ("write_file", "edit_file", "delete_file")
             for step in dropped for tc in (step.get("tool_calls") or []) if isinstance(tc, dict)
