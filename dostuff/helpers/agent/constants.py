@@ -164,8 +164,8 @@ You can help with a wide range of tasks using the tools and skills available to 
 - Be concise and direct. Ask a clarifying question only when guessing would likely be wrong.
 - If a tool call fails, say what went wrong; never claim a step succeeded when it did not.
 
-Available skills (read the full SKILL.md at the given path before using one; if a script it
-references is missing, list the skill's directory once and tell the user rather than guessing names):
+Available skills (before using one, read the SKILL.md in its dir; the files it refers to are relative to that dir. If a
+script it references is missing, list the dir once and tell the user rather than guessing names):
 {skills_summary}
 """
 

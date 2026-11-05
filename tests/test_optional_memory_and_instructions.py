@@ -156,7 +156,20 @@ def test_with_prompt_context_is_gone():
 
 def _index_block(skill):
     """One skill's rows in the index: the shape lives here, in one place."""
-    return f"- name: {skill['name']}\n  description: {skill['description']}\n  location: {skill['location']}"
+    return f"- name: {skill['name']}\n  description: {skill['description']}\n  dir: {skill['dir']}"
+
+
+def test_skill_headers_point_at_the_dir(monkeypatch):
+    from dostuff.agent.subagents.definitions import BUILTIN_TYPES
+    from dostuff.agent.subagents.prompt import _sections
+    from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
+    from dostuff.helpers.skills import discover_skills as ds
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [])
+    subagent = _sections(BUILTIN_TYPES["general-purpose"], None)
+    for text in (" ".join(SYSTEM_INSTRUCTIONS.split()), " ".join(subagent.split())):
+        assert "read the SKILL.md in its dir" in text
+        assert "the files it refers to are relative to that dir" in text
+        assert "at the given path" not in text
 
 
 def test_pin_skills_summary_shape(tmp_path, monkeypatch):
@@ -172,4 +185,5 @@ def test_pin_skills_summary_shape(tmp_path, monkeypatch):
 
     assert [s["name"] for s in skills] == ["alpha", "beta"]
     assert skills_summary(skills) == "\n\n".join(_index_block(s) for s in skills)
+    assert all(Path(s["dir"]).is_absolute() and Path(s["dir"]).is_dir() for s in skills)
     assert skills_summary([]) == "(none available)"

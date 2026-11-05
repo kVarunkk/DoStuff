@@ -27,7 +27,7 @@ def _background_wait(interactive: bool) -> str:
 def skills_summary(skills: list[dict[str, Any]]) -> str:
     """The skills list as the system prompt shows it."""
     summary = "\n\n".join(
-        f"- name: {s['name']}\n  description: {s['description']}\n  location: {s['location']}"
+        f"- name: {s['name']}\n  description: {s['description']}\n  dir: {s['dir']}"
         for s in skills
     )
     return summary or "(none available)"

@@ -40,8 +40,8 @@ def _sections(agent_def: "AgentDef", worktree: Worktree | None) -> str:
     project = project_instructions_section(project_root())
     if project:
         parts.append(project)
-    parts.append("Available skills (read the full SKILL.md at the given path before using one):\n"
-                 + skills_summary(discover_skills()))
+    parts.append("Available skills (before using one, read the SKILL.md in its dir; the files it refers to are "
+                 "relative to that dir):\n" + skills_summary(discover_skills()))
     return "\n\n".join(parts)
 
 
