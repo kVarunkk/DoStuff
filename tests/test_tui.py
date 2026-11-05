@@ -6369,3 +6369,125 @@ def test_steer_registered(tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+def test_sticky_prompt_follows_the_turn_at_the_top(tui):
+    cli_tui = tui
+    from textual.events import MouseScrollUp
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="sticky")
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            messages = app.query_one("#messages", cli_tui.VerticalScroll)
+            sticky = app.query_one("#sticky-prompt", cli_tui.StickyPrompt)
+            app._append("first\nsecond line", msg_type="user")
+            for i in range(30):
+                app._append(f"one {i}", msg_type="system")
+            app._append("! ls -la", msg_type="shell")
+            for i in range(30):
+                app._append(f"two {i}", msg_type="system")
+            await pilot.pause()
+            first, shell = app.query(".msg-user").first(), app.query(".msg-shell").first()
+
+            async def scroll(y):
+                messages.scroll_to(y=y, animate=False, immediate=True)
+                await _until(pilot, lambda: round(messages.scroll_y) == y)
+                await pilot.pause()
+
+            # Pinned at the bottom of the second turn: its command is the one above the view
+            assert sticky.display and sticky.target is shell
+            assert str(sticky.content) == "! ls -la" and sticky.has_class("-shell")
+            top = messages.region.y
+            assert app.screen.get_widget_at(2, top)[0] is sticky
+
+            # While any row of the prompt is on screen the prompt speaks for itself
+            await scroll(first.virtual_region.bottom - 1)
+            assert not sticky.display
+            # One row on: the whole prompt on one row, and the conversation only moved by that row
+            line = app.query(".msg-system").first()
+            y_before = line.region.y
+            await scroll(first.virtual_region.bottom)
+            assert sticky.display and sticky.target is first and not sticky.has_class("-shell")
+            assert str(sticky.content) == "> first second line" and sticky.region.height == 1
+            assert line.region.y == y_before - 1
+
+            # The next turn takes over only when it reaches the top
+            await scroll(shell.virtual_region.y - 1)
+            assert sticky.target is first
+            await scroll(shell.virtual_region.y)
+            assert not sticky.display
+            await scroll(shell.virtual_region.bottom)
+            assert sticky.target is shell
+
+            # The wheel scrolls the conversation with the pointer on the bar
+            before = messages.scroll_y
+            await pilot._post_mouse_events([MouseScrollUp], widget=sticky)
+            await _until(pilot, lambda: messages.scroll_y < before)
+
+            # A click goes to the start of the turn
+            await scroll(first.virtual_region.bottom + 10)
+            await pilot.click("#sticky-prompt")
+            await _until(pilot, lambda: round(messages.scroll_y) == first.virtual_region.y)
+            await pilot.pause()
+            assert not sticky.display and first.region.y == top
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_sticky_prompt_while_pinned_and_after_clear(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="stickylive")
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            messages = app.query_one("#messages", cli_tui.VerticalScroll)
+            sticky = app.query_one("#sticky-prompt", cli_tui.StickyPrompt)
+            jump = app.query_one("#jump-bottom", cli_tui.JumpToBottom)
+            app._append("[not markup] a very long prompt " + "word " * 40, msg_type="user")
+            await pilot.pause()
+            assert not sticky.display
+
+            # Nobody scrolls: the anchor moves scroll_y without firing its watchers
+            for i in range(30):
+                app._append(f"streamed {i}", msg_type="system")
+                await pilot.pause()
+            await _until(pilot, lambda: sticky.display)
+            assert messages.is_vertical_scroll_end
+            assert str(sticky.content).startswith("> [not markup] a very long prompt")
+            assert sticky.region.height == 1
+
+            # Same when the viewport changes height: the content didn't grow, the top row moved
+            prompt = app.query(".msg-user").first()
+            content = messages.virtual_size.height
+            around_prompt = content - prompt.virtual_region.bottom + 1  # its last row on the top row
+            await pilot.resize_terminal(60, around_prompt + app.size.height - messages.size.height)
+            await _until(pilot, lambda: not sticky.display)
+            await pilot.resize_terminal(60, 20)
+            await _until(pilot, lambda: sticky.display)
+            assert messages.virtual_size.height == content
+
+            # Clicked mid-stream: new output must not drag the view back down
+            await pilot.click("#sticky-prompt")
+            await _until(pilot, lambda: round(messages.scroll_y) == prompt.virtual_region.y)
+            app._append("more output", msg_type="system")
+            for _ in range(3):
+                await pilot.pause()
+            assert round(messages.scroll_y) == prompt.virtual_region.y
+            assert jump.display and not sticky.display
+
+            # The next prompt goes back to the bottom as usual
+            app._append("next", msg_type="user")
+            await _until(pilot, lambda: messages.is_vertical_scroll_end)
+
+            messages.scroll_to(y=prompt.virtual_region.bottom + 2, animate=False, immediate=True)
+            await _until(pilot, lambda: sticky.display)
+            await app.query_one("#msg-container", cli_tui.Vertical).remove_children()
+            await _until(pilot, lambda: not sticky.display)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
