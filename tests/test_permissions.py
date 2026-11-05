@@ -420,3 +420,14 @@ def test_ask_user_allowed_in_plan_mode():
     assert check("ask_user", "read", args, None, PLAN).action == "allow"
     assert "ask_user" in PLAN_MODE_INSTRUCTION
     assert "before" in PLAN_MODE_INSTRUCTION.split("ask_user")[0][-80:]
+
+
+@pytest.mark.parametrize("command, read_only", [
+    ("cat ~/.agents/skills/x/SKILL.md", True),
+    ("cat /home/u/.agents/skills/x/SKILL.md", True),
+    ("cat /home/u/.dostuff/skills/x/SKILL.md", False),
+    ("cat /home/u/.dostuff/config.yaml", False),
+])
+def test_skill_paths_shell_rules(command, read_only):
+    """The file tools' skill-dir allowlist changes nothing for the shell (skill-loading REQ-2.6)."""
+    assert is_read_only_shell(command) is read_only

@@ -152,3 +152,24 @@ def test_hook_context_rides_the_bundle():
 def test_with_prompt_context_is_gone():
     with pytest.raises(ImportError):
         from dostuff.helpers.hooks.events import with_prompt_context  # noqa: F401
+
+
+def _index_block(skill):
+    """One skill's rows in the index: the shape lives here, in one place."""
+    return f"- name: {skill['name']}\n  description: {skill['description']}\n  location: {skill['location']}"
+
+
+def test_pin_skills_summary_shape(tmp_path, monkeypatch):
+    from dostuff.agent.instructions import skills_summary
+    from dostuff.helpers.skills import discover_skills as ds
+    for name in ("alpha", "beta"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "SKILL.md").write_text(f"---\nname: {name}\ndescription: the {name}\n---\nbody\n",
+                                                  encoding="utf-8")
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [str(tmp_path)])
+
+    skills = ds.discover_skills()
+
+    assert [s["name"] for s in skills] == ["alpha", "beta"]
+    assert skills_summary(skills) == "\n\n".join(_index_block(s) for s in skills)
+    assert skills_summary([]) == "(none available)"
