@@ -6369,3 +6369,65 @@ def test_steer_registered(tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- Cache-stable context (plan/2026-11-05-cache-stable-context/tasks.md) ---------------------------------------
+
+@pytest.fixture
+def turn_tui(tui, monkeypatch):
+    """(cli_tui, seen): a loop that answers at once and records, per turn, what it was given."""
+    from dostuff.helpers.agent.append_step import append_step
+    seen = []
+
+    async def fake(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
+                   current_session_history, steps_history, store, adapter=None, **kwargs):
+        seen.append({"text": user_text, "instructions": instructions, "history": [dict(s) for s in working_history]})
+        text = f"answer to {user_text}"
+        await append_step({"role": "assistant", "content": text}, steps_history, working_history,
+                          current_session_history, session_id, store, turn_type)
+        return text
+    monkeypatch.setattr(tui, "agent_loop", fake)
+    return tui, seen
+
+
+def _record_appends(app):
+    """Every (text, msg_type) `_append` is given from now on."""
+    got = []
+    original = app._append
+
+    def spy(text, *args, **kwargs):
+        got.append((text, kwargs.get("msg_type")))
+        return original(text, *args, **kwargs)
+    app._append = spy  # type: ignore[method-assign]
+    return got
+
+
+def test_pin_user_step_render(tui):
+    async def scenario():
+        app = tui.DostuffTUI(session_id="pin-render")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            got = _record_appends(app)
+            app.steps_history = [{"role": "user", "content": "a plain prompt"}]
+            app._render_history()
+            assert ("a plain prompt", "user") in got
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_pin_system_instruction_recorded(turn_tui):
+    from dostuff.agent.instructions import build_turn_instructions
+    cli_tui, seen = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin-system")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert seen[0]["instructions"] == await build_turn_instructions(
+                app._system_instructions, "hello", app.memory_store, app.episodic_store, app.user_id)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

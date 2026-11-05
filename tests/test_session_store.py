@@ -438,3 +438,17 @@ def test_fork_session_skips_agents(tmp_path):
         finally:
             await store.close()
     asyncio.run(scenario())
+
+
+# --- Cache-stable context (plan/2026-11-05-cache-stable-context/tasks.md) ---------------------------------------
+
+def test_pin_session_title_is_first_prompt(tmp_path):
+    async def scenario():
+        store = SQLiteSessionStore(str(tmp_path / "sessions.db"))
+        try:
+            await store.append("s", {"role": "user", "content": "fix the bug"})
+            await store.append("s", {"role": "assistant", "content": "done"})
+            assert (await store.list_sessions())[0]["title"] == "fix the bug"
+        finally:
+            await store.close()
+    asyncio.run(scenario())
