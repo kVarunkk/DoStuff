@@ -225,6 +225,7 @@ In the TUI:
 **Visual elements:**
 
 - **Messages** — `>` for your prompts (on a grey band), `●` for agent replies and tool calls, `⎿` for tool results; the terminal background shows through
+- **Sticky prompt** — once a prompt or `!command` scrolls off the top, it stays pinned there on one row while you are in its turn, as the answer streams or when you scroll back through an old one, until the next prompt reaches the top. Click it to go back to the start of the turn; `↓ Jump to bottom` returns you to the latest message
 - **Approvals** — a selector (arrows, a number, or `y` = allow once, `a` = always this session, `n` = deny with an optional note); several calls in one response can be approved together
 - **Turn summary** — `✻ Worked for 1m 5s · $0.01 · done 12:59 PM` after each turn
 - **Diffs** — `write_file` / `edit_file` changes shown as a coloured diff

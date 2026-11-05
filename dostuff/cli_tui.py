@@ -288,6 +288,35 @@ class ToolResult(Static):
         self.set_expanded(not self.expanded)
 
 
+class StickyPrompt(Static):
+    """The top row of the conversation while its turn's prompt is scrolled out of view: that prompt on one
+    row, like a sticky section header. A click goes back to the prompt.
+
+    On its own layer of `#messages`: in the base layer, appearing would push the conversation down a row
+    (the prompt back in view, the bar gone, the prompt out of view again: a flicker at the threshold).
+    Inside the scrollable, not over it, so the mouse wheel keeps working with the pointer on the bar."""
+
+    ALLOW_SELECT = False  # a click with a little mouse movement would start a selection instead
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__("", markup=False, **kwargs)
+        self.target: Static | None = None
+
+    def show(self, target: Static | None) -> None:
+        if target is self.target:
+            return
+        self.target = target
+        self.display = target is not None
+        if target is not None:
+            self.update(" ".join(str(target.content).split()))
+            self.set_class(target.has_class("msg-shell"), "-shell")
+
+    def on_click(self) -> None:
+        if self.target is None or not isinstance(self.parent, Transcript):
+            return
+        self.parent.scroll_to(y=self.target.virtual_region.y, animate=False)  # also releases the anchor
+
+
 class Transcript(VerticalScroll):
     """The conversation viewport.
 
@@ -307,6 +336,28 @@ class Transcript(VerticalScroll):
     def _get_scrollable_region(self, region: Region) -> Region:
         self._container_size = region.size
         return super()._get_scrollable_region(region)
+
+    def on_mount(self) -> None:
+        # Pinned to the bottom, the compositor moves scroll_y with set_reactive and its watchers never fire:
+        # what moves the view then is the content growing (virtual_size) or the viewport resizing (on_resize).
+        self.watch(self, "scroll_y", self._update_sticky_prompt, init=False)
+        self.watch(self, "virtual_size", self._update_sticky_prompt, init=False)
+
+    def on_resize(self) -> None:
+        self._update_sticky_prompt()
+
+    def _update_sticky_prompt(self) -> None:
+        self.query_one("#sticky-prompt", StickyPrompt).show(self._prompt_above_view())
+
+    def _prompt_above_view(self) -> Static | None:
+        """The prompt or `!command` whose turn fills the top row, if it is entirely above that row."""
+        top = self.scroll_offset.y
+        for widget in reversed(self.query_one("#msg-container").children):
+            if isinstance(widget, Static) and (widget.has_class("msg-user") or widget.has_class("msg-shell")):
+                region = widget.virtual_region
+                if region.height and region.y <= top:  # no height: mounted, not laid out yet
+                    return widget if region.bottom <= top else None
+        return None
 
 
 class _JumpToBottomLabel(Static):
@@ -1664,7 +1715,7 @@ class DostuffTUI(App):
     # grey band (like Claude Code) so turns are easy to find when scrolling.
     CSS = """
     Screen { background: transparent; }
-    #messages { height: 1fr; background: transparent; scrollbar-size-vertical: 1; }
+    #messages { height: 1fr; background: transparent; scrollbar-size-vertical: 1; layers: base sticky; }
     #msg-container { height: auto; min-height: 100%; }
     .msg { width: 100%; height: auto; padding: 0 1; margin-top: 1; background: transparent; }
     .msg-user { color: #d0d0d0; background: #373737; }
@@ -1729,6 +1780,12 @@ class DostuffTUI(App):
         text-align: center; color: #8ab4f8; text-style: bold; background: #2c2c2c;
     }
     #jump-bottom-label:hover { background: #3a3a3a; }
+    #sticky-prompt {
+        layer: sticky; dock: top; display: none; width: 100%; height: 1; padding: 0 1;
+        color: #d0d0d0; background: #373737; text-wrap: nowrap; text-overflow: ellipsis;
+    }
+    #sticky-prompt.-shell { color: #d7769f; }
+    #sticky-prompt:hover { background: #4a4a4a; }
     #agent-view { height: 1fr; }
     #agent-view-title { height: auto; padding: 0 1; color: #8ab4f8; text-style: bold; }
     #agent-view-scroll { height: 1fr; border: round #4a4a4a; }
@@ -1868,6 +1925,7 @@ class DostuffTUI(App):
             with Transcript(id="messages", can_focus=False):
                 yield Vertical(id="msg-container")
                 yield JumpToBottom("↓ Jump to bottom", id="jump-bottom")
+                yield StickyPrompt(id="sticky-prompt")
             yield CommandMenu(id="command-menu")
         yield QueueBar(id="queue-bar")
         btw = BtwPanel(id="btw-panel")
