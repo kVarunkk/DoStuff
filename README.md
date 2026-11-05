@@ -41,7 +41,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
 - **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
-- **File sandbox** — file tools stay inside the project directory and never read `.env*` files or `~/.dostuff/`
+- **File sandbox** — file tools stay inside the project directory, plus read-only access to discovered skill folders, and never read `.env*` files or the rest of `~/.dostuff/`
 - **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`
 - **Subagents** — the `agent` tool starts agents in parallel, in the foreground or the background, from built-in types (`explore`, `plan`, `general-purpose`), your own Markdown agent files (Claude Code's `.claude/agents/` work too) or a `fork` of the conversation; continue one with `send_message`, stop it with `stop_agent`, see them all in `/agents`. See [Subagents](#subagents)
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
@@ -286,7 +286,8 @@ API keys stay in `.env` files, which the agent can't read or change. Subagents d
 
 > [!IMPORTANT]
 > File tools are sandboxed to the project directory (the directory the session runs in): paths that resolve
-> outside it are rejected, and `.env*` files and `~/.dostuff/` cannot be read. **The shell is not sandboxed**:
+> outside it are rejected, except that discovered skill folders can be read (never written), and `.env*` files and
+> the rest of `~/.dostuff/` cannot be read. **The shell is not sandboxed**:
 > `bash_command` can touch anything your user can, which is why non-read-only commands ask first.
 > The shell is Git Bash / `bash` when found, otherwise PowerShell on Windows or `/bin/sh`.
 
@@ -1043,7 +1044,11 @@ Skills are directories containing a `SKILL.md` (frontmatter with `name` and `des
 4. `~/.agents/skills/`
 5. `<cwd>/skills/`
 
-**Conflict resolution:** No deduplication in the system prompt. If two skills share the same name (from different directories), both are loaded and passed to the model — the agent may see the same skill twice with different `location` paths. To avoid confusion, keep names unique across the search paths.
+**Conflict resolution:** Skills are deduplicated by name: if two share a name, the first one found (in the order above) wins and the other is dropped, from the system prompt and from the slash commands alike.
+
+**How a skill reaches the model:** the system prompt lists each skill's `name`, `description` and `dir` (its absolute folder), and only those. When the model decides to use a skill it reads the `SKILL.md` in that dir with `read_file`, so a body costs nothing until it is needed. Frontmatter is parsed as YAML, so quoted and folded (`>`, `|`) descriptions arrive as plain text; a file with invalid YAML still loads, with its fields read line by line.
+
+File tools can read a discovered skill's folder wherever it lives, including the files next to `SKILL.md` (`scripts/`, `reference/`), but never write there. `.env*` files stay unreadable inside a skill folder too, and of `~/.dostuff/` only discovered skills under `~/.dostuff/skills/` can be read.
 
 **Example structure:**
 

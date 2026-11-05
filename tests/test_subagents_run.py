@@ -232,7 +232,9 @@ def _git_repo(root):
 
 
 def test_subagent_prompt_has_project_rules(agents, fake_model, monkeypatch, tmp_path, agents_home):
+    from dostuff.agent.instructions import skills_summary
     from dostuff.agent.subagents.prompt import SUBAGENT_BASE
+    from dostuff.helpers.skills.discover_skills import discover_skills
     from dostuff.lib.worktree import create_worktree
     repo = _git_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
@@ -262,6 +264,8 @@ def test_subagent_prompt_has_project_rules(agents, fake_model, monkeypatch, tmp_
         assert -1 not in positions, (marker, [p for p, i in zip(parts, positions) if i == -1])
         assert positions == sorted(positions), marker
         assert "<relevant_user_facts>" not in text and "<past_episodes>" not in text
+        assert skills_summary(discover_skills()) in text  # the same block as the main prompt, `dir:` included
+        assert "  dir: " in text and "  location: " not in text
     assert "git worktree" not in system_of("[A]")
 
 

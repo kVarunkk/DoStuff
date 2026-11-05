@@ -2,6 +2,10 @@ import os
 import re
 from pathlib import Path
 
+import yaml
+
+from dostuff.helpers.tools.resolve_safe_path import set_skill_roots
+
 # Search order is precedence order: the first skill found with a given name wins,
 # so project skills override same-named user (home) skills.
 SKILLS_DIRS = [
@@ -11,6 +15,25 @@ SKILLS_DIRS = [
     str(Path.home() / ".agents" / "skills"),
     "./skills",
 ]
+
+
+def _parse_frontmatter(frontmatter: str) -> dict[str, str]:
+    """`name` and `description` as written, when they are strings. BaseLoader keeps scalars as spelled
+    (`name: 1.10`, `name: yes`). Invalid YAML falls back to one regex per field: a malformed third-party
+    SKILL.md degrades, it never drops out of the index."""
+    try:
+        parsed = yaml.load(frontmatter, Loader=yaml.BaseLoader)
+    except yaml.YAMLError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return {key: parsed[key] for key in ("name", "description") if isinstance(parsed.get(key), str)}
+    fields = {}
+    for key in ("name", "description"):
+        match = re.search(rf"^{key}:[ \t]*(.+)$", frontmatter, re.MULTILINE)
+        if match:
+            fields[key] = match.group(1)
+    return fields
+
 
 def discover_skills() -> list[dict]:
     skills = []
@@ -29,21 +52,23 @@ def discover_skills() -> list[dict]:
             skill_md_path = os.path.join(SKILLS_DIR, entry, "SKILL.md")
             if not os.path.isfile(skill_md_path):
                 continue
-            with open(skill_md_path, "r", encoding="utf-8") as f:
+            with open(skill_md_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             match = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
             if not match:
                 continue
-            frontmatter = match.group(1)
-            name_match = re.search(r"name:\s*(.+)", frontmatter)
-            desc_match = re.search(r"description:\s*(.+)", frontmatter)
-            name = name_match.group(1).strip() if name_match else entry
+            fields = _parse_frontmatter(match.group(1))
+            name = fields.get("name", "").strip() or entry
             if name in seen_names:
                 continue
             seen_names.add(name)
+            # The entry folder, never the file's parent: a symlinked SKILL.md must not move `dir`
+            skill_dir = Path(SKILLS_DIR, entry).resolve()
             skills.append({
                 "name": name,
-                "description": desc_match.group(1).strip() if desc_match else "",
-                "location": skill_md_path,
+                "description": " ".join(fields.get("description", "").split()),
+                "dir": str(skill_dir),
+                "location": str(skill_dir / "SKILL.md"),
             })
+    set_skill_roots(s["dir"] for s in skills)
     return skills

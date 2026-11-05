@@ -152,3 +152,45 @@ def test_hook_context_rides_the_bundle():
 def test_with_prompt_context_is_gone():
     with pytest.raises(ImportError):
         from dostuff.helpers.hooks.events import with_prompt_context  # noqa: F401
+
+
+def _index_block(skill):
+    """One skill's rows in the index: the shape lives here, in one place."""
+    return f"- name: {skill['name']}\n  description: {skill['description']}\n  dir: {skill['dir']}"
+
+
+def test_skill_headers_point_at_the_dir(monkeypatch):
+    from dostuff.agent.subagents.definitions import BUILTIN_TYPES
+    from dostuff.agent.subagents.prompt import _sections
+    from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
+    from dostuff.helpers.skills import discover_skills as ds
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [])
+    subagent = _sections(BUILTIN_TYPES["general-purpose"], None)
+    for text in (" ".join(SYSTEM_INSTRUCTIONS.split()), " ".join(subagent.split())):
+        assert "read the SKILL.md in its dir" in text
+        assert "the files it refers to are relative to that dir" in text
+        assert "at the given path" not in text
+
+
+def test_system_prompt_names_the_skill_dir_exception():
+    from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
+    section = " ".join(SYSTEM_INSTRUCTIONS.split("## Responding")[0].split())
+    assert "File tools cannot reach outside it, and cannot read .env files or ~/.dostuff" in section
+    assert "can read (not write) the skill dirs" in section
+
+
+def test_pin_skills_summary_shape(tmp_path, monkeypatch):
+    from dostuff.agent.instructions import skills_summary
+    from dostuff.helpers.skills import discover_skills as ds
+    for name in ("alpha", "beta"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "SKILL.md").write_text(f"---\nname: {name}\ndescription: the {name}\n---\nbody\n",
+                                                  encoding="utf-8")
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [str(tmp_path)])
+
+    skills = ds.discover_skills()
+
+    assert [s["name"] for s in skills] == ["alpha", "beta"]
+    assert skills_summary(skills) == "\n\n".join(_index_block(s) for s in skills)
+    assert all(Path(s["dir"]).is_absolute() and Path(s["dir"]).is_dir() for s in skills)
+    assert skills_summary([]) == "(none available)"
