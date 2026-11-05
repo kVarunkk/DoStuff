@@ -212,6 +212,17 @@ def test_skill_roots_are_resolved_and_deduped(tmp_path):
     assert skill_roots() == {(tmp_path / "x").resolve()}
 
 
+def test_readme_documents_skills():
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    start = readme.index("\n## Skills\n")
+    skills = readme[start:readme.index("\n## ", start + 1)]
+    assert "`dir`" in skills and "`read_file`" in skills
+    folders = ["<cwd>/.dostuff/skills/", "<cwd>/.agents/skills/", "~/.dostuff/skills/", "~/.agents/skills/", "<cwd>/skills/"]
+    positions = [skills.index(folder) for folder in folders]
+    assert positions == sorted(positions)
+    assert "No deduplication" not in readme
+
+
 def test_skills_import_is_light():
     code = ("import sys, dostuff.helpers.skills.discover_skills; "
             "print(sorted(m for m in ('litellm', 'chromadb', 'mcp') if m in sys.modules))")
