@@ -585,7 +585,7 @@ def test_subagent_turn_does_not_publish(monkeypatch, btw, fork_ctx):
     seen = []
     _interactive(monkeypatch, [_msg(content="ok")], turn_type="subagent_loop",
                  on_call=lambda n: seen.append(btw.snapshot("s1")))
-    assert seen == [live] and btw.snapshot("s1") is live  # neither replaced nor demoted (open point 1)
+    assert seen == [live] and btw.snapshot("s1") == live  # neither replaced nor demoted (open point 1)
 
 
 def test_demoted_after_return(monkeypatch, btw):
@@ -631,7 +631,7 @@ def test_subagent_exit_keeps_main_live(monkeypatch, btw, fork_ctx):
     btw.publish_snapshot("s1", fork_ctx())
     live = btw.snapshot("s1")
     _interactive(monkeypatch, [_msg(content="ok")], turn_type="subagent_loop")
-    assert btw.snapshot("s1") is live and btw.kept_prompt("s1") is None
+    assert btw.snapshot("s1") == live and btw.kept_prompt("s1") is None
 
 
 def test_overflow_compaction_republishes(monkeypatch, btw):

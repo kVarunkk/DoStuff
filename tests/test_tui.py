@@ -5274,7 +5274,7 @@ def test_btw_fork_out_starts_fork(btw_tui, monkeypatch):
             _submit(app, cli_tui, "/btw which file?")
             panel = await _btw_answered(pilot, app)
             used = panel.snapshot
-            assert used is held.snapshots[0]  # the live snapshot the side call read
+            assert used == held.snapshots[0]  # the live snapshot the side call read
             await pilot.press("f")
             await _until(pilot, lambda: not app._btw_open())
             [kwargs] = fake.started

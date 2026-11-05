@@ -64,9 +64,10 @@ def publish_snapshot(session_id: str, ctx: ForkContext | None) -> None:
 
 
 def snapshot(session_id: str) -> ForkContext | None:
-    """The live snapshot of a turn that is running now, else None."""
+    """A copy of the live snapshot of a turn that is running now, else None. A copy, because a fork-out empties the
+    history of the context it is given, and the next side question must still see the conversation."""
     entry = _entries.get(session_id)
-    return entry.live if entry else None
+    return _copy(entry.live) if entry and entry.live else None
 
 
 def kept_prompt(session_id: str) -> ForkContext | None:

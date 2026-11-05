@@ -57,7 +57,7 @@ def test_publish_none_is_noop(fork_ctx):
     publish_snapshot("s1", fork_ctx())
     before = snapshot("s1")
     publish_snapshot("s1", None)
-    assert snapshot("s1") is before
+    assert snapshot("s1") == before
 
 
 def test_demote_on_exit(fork_ctx):
@@ -85,7 +85,7 @@ def test_demote_disabled(fork_ctx):
     live = snapshot("s1")
     with published_snapshot("s1", enabled=False):
         pass
-    assert snapshot("s1") is live
+    assert snapshot("s1") == live
 
 
 def test_discard(fork_ctx):

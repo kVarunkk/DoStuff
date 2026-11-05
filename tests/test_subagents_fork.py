@@ -261,3 +261,25 @@ def test_fork_copies_context_steps(agents, fake_model):
     assert kept["content"].startswith(bundle + "\n\n") and "meta" not in kept  # kept, and no `meta` on the wire
     assert fork_first["messages"][1:-1] == main_first["messages"][1:-1]  # so the copied prefix still matches
     assert fork_first["messages"][-1]["content"].endswith(FORK_DIRECTIVE.format(prompt="[F] X"))
+
+
+# --- a /btw fork-out and the live snapshot -----------------------------------------------------------------------
+
+def test_fork_out_leaves_the_live_snapshot_for_the_next_side_question(agents, fake_model):
+    from dostuff.agent.subagents.fork import ForkContext
+    from dostuff.helpers.agent.side_question import build_messages, discard_snapshot, publish_snapshot, snapshot
+    fake_model.script("[F]", fake_response("fork report"))
+
+    async def go():
+        publish_snapshot("fork-out", ForkContext("sys", "", [dict(s) for s in EARLIER], ["read_file"], None))
+        run = await agents.start(owner="fork-out", agent_type="fork", background=True, description="x",
+                                 prompt="[F] X", fork=snapshot("fork-out"), adapter=FakeAdapter())
+        while run.ended is None:
+            await asyncio.sleep(0.01)
+        return run
+
+    run = asyncio.run(go())
+    assert run.status == "completed" and fake_model.calls_for("[F]")  # the fork did take its copy
+    messages = build_messages(snapshot("fork-out"), [], "what was the word?")
+    discard_snapshot("fork-out")
+    assert messages[:len(EARLIER)] == EARLIER
