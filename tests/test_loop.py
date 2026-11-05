@@ -232,6 +232,44 @@ def test_consume_stream_keeps_ids_and_finish_reason():
     assert adapter.events[-1] == ("stream_end", None)
 
 
+NOTE_ARGS = r'{"path":"note.txt","content":"Keep building, one step at a time. 🚀\n"}'
+
+
+def _streamed_args(*pieces):
+    """The tool call consume_stream builds from these argument pieces."""
+    def chunk(args, call_id=None, name=None):
+        call = SimpleNamespace(index=0, id=call_id, function=SimpleNamespace(name=name, arguments=args))
+        return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None, tool_calls=[call]),
+                                                        finish_reason=None)], usage=None)
+
+    async def stream():
+        yield chunk(pieces[0], "call_1", "write_file")
+        for piece in pieces[1:]:
+            yield chunk(piece)
+
+    return asyncio.run(consume_stream(stream(), Adapter())).choices[0].message.tool_calls[0]
+
+
+@pytest.mark.parametrize("pieces", [
+    (NOTE_ARGS, NOTE_ARGS),  # whole in the "started" event, then whole again as one update
+    (NOTE_ARGS, NOTE_ARGS[:20], NOTE_ARGS[20:]),  # whole, then streamed in pieces
+])
+def test_consume_stream_collapses_repeated_arguments(pieces):
+    """The Responses route (GPT, Grok) can deliver the arguments twice; `{...}{...}` fails every tool call."""
+    call = _streamed_args(*pieces)
+    assert call.function.arguments == NOTE_ARGS
+    assert json.loads(call.function.arguments)["path"] == "note.txt"
+    assert call.model_dump()["function"]["arguments"] == NOTE_ARGS  # what history stores and replays
+
+
+@pytest.mark.parametrize("args", [
+    "{}", '{"a": 1}', '{"a": "{}{}"}',  # valid: left alone
+    "abab", "[1][1]", '{"a": 1}{"a": 2}', '{"a": 1}{"a"',  # not one object repeated: still reported as invalid
+])
+def test_consume_stream_leaves_other_arguments_alone(args):
+    assert _streamed_args(args).function.arguments == args
+
+
 # ── split_by_token_budget ────────────────────────────────────────────────────
 
 def test_split_always_makes_progress_and_keeps_tool_pairs():

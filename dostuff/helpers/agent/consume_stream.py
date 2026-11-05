@@ -1,3 +1,4 @@
+import json
 import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -21,6 +22,18 @@ def _emit(adapter: Any, event_type: str, data: Any) -> None:
 def _is_cancelled(adapter: Any) -> bool:
     event = getattr(adapter, "_cancel_event", None)
     return bool(getattr(adapter, "_cancelled", False) or (event is not None and event.is_set()))
+
+
+def _collapse_repeated_arguments(text: str) -> str:
+    """One copy of tool-call arguments that arrived twice, whole: `{...}{...}`. The Responses route (GPT, Grok) can
+    deliver them in both the call's first event and its updates. Two objects never parse, so valid arguments are safe."""
+    half = text[:len(text) // 2]
+    if not half or half + half != text:
+        return text
+    try:
+        return half if isinstance(json.loads(half), dict) else text
+    except ValueError:
+        return text
 
 
 async def consume_stream(stream_iter, adapter, emit_fn=None, progress: StreamProgress | None = None):
@@ -89,7 +102,7 @@ async def consume_stream(stream_iter, adapter, emit_fn=None, progress: StreamPro
         tc_ns = SimpleNamespace(
             id=info["id"] or f"call_{uuid.uuid4().hex[:24]}",
             type="function",
-            function=SimpleNamespace(name=info["name"], arguments=info["args_text"]),
+            function=SimpleNamespace(name=info["name"], arguments=_collapse_repeated_arguments(info["args_text"])),
         )
         tc_ns.model_dump = lambda tc=tc_ns: {
             "id": tc.id,
