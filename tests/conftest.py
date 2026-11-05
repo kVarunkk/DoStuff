@@ -269,6 +269,31 @@ def agents_home(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture(autouse=True)
+def _restore_skill_roots():
+    """Discovery publishes the sandbox's allowlist process-wide, and many tests discover without saying so."""
+    from dostuff.helpers.tools.resolve_safe_path import set_skill_roots, skill_roots
+    roots = skill_roots()
+    yield
+    set_skill_roots(roots)
+
+
+@pytest.fixture
+def home_skills(tmp_path, monkeypatch):
+    """A fake `~` with empty skill folders. Three patches, because no one of them reaches every reader:
+    `Path.home` for the sandbox, `SKILLS_DIRS` (computed at import) for discovery, the env for `expanduser`."""
+    from dostuff.helpers.skills import discover_skills as ds
+    home = tmp_path / "home"
+    folders = [home / ".dostuff" / "skills", home / ".agents" / "skills"]
+    for folder in folders:
+        folder.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [str(folder) for folder in folders])
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
 @pytest.fixture
 def _start_subagent(monkeypatch):
     """`await _start_subagent(task, tools=…, isolation=…, adapter=…)`: start a subagent the way the main agent

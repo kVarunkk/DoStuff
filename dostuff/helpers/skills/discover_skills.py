@@ -4,6 +4,8 @@ from pathlib import Path
 
 import yaml
 
+from dostuff.helpers.tools.resolve_safe_path import set_skill_roots
+
 # Search order is precedence order: the first skill found with a given name wins,
 # so project skills override same-named user (home) skills.
 SKILLS_DIRS = [
@@ -68,4 +70,5 @@ def discover_skills() -> list[dict]:
                 "dir": str(skill_dir),
                 "location": str(skill_dir / "SKILL.md"),
             })
+    set_skill_roots(s["dir"] for s in skills)
     return skills

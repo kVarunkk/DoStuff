@@ -7,6 +7,7 @@ import pytest
 
 from dostuff.agent.instructions import skills_summary
 from dostuff.helpers.skills import discover_skills as ds
+from dostuff.helpers.tools.resolve_safe_path import set_skill_roots, skill_roots
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -193,6 +194,22 @@ def test_index_string_is_exact_for_a_mixed_tree(tmp_path, monkeypatch):
 
     assert index == "\n\n".join(f"- name: {n}\n  description: {d}\n  dir: {p.resolve()}"
                                 for n, d, p in zip(names, descriptions, dirs))
+
+
+def test_discover_publishes_skill_roots(tmp_path, monkeypatch):
+    _skill(tmp_path, "x", "x", "d")
+    _skill(tmp_path, "y", "y", "d")
+    (tmp_path / "not-a-skill").mkdir()
+
+    skills = _discover(tmp_path, monkeypatch)
+
+    assert skill_roots() == {Path(s["dir"]).resolve() for s in skills}
+
+
+def test_skill_roots_are_resolved_and_deduped(tmp_path):
+    (tmp_path / "x").mkdir()
+    set_skill_roots([tmp_path / "x", tmp_path / "x" / ".." / "x"])
+    assert skill_roots() == {(tmp_path / "x").resolve()}
 
 
 def test_skills_import_is_light():

@@ -15,7 +15,7 @@ from dostuff.agent.permissions import (
     parse_answer,
 )
 from dostuff.agent.run_tool import authorize_batch, authorize_tool, run_tool
-from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path
+from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path, set_skill_roots
 from dostuff.lib.exceptions import PathAccessDenied, PathOutsideProject
 
 ASK = PermissionConfig(mode="ask")
@@ -431,3 +431,49 @@ def test_ask_user_allowed_in_plan_mode():
 def test_skill_paths_shell_rules(command, read_only):
     """The file tools' skill-dir allowlist changes nothing for the shell (skill-loading REQ-2.6)."""
     assert is_read_only_shell(command) is read_only
+
+
+def test_skill_roots_never_affect_writes(tmp_path, monkeypatch):
+    project, skill = tmp_path / "project", tmp_path / "skill"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    for roots in ([], [skill]):
+        set_skill_roots(roots)
+        with pytest.raises(PathOutsideProject):
+            resolve_safe_path(str(skill / "SKILL.md"))
+
+
+def test_every_other_dostuff_path_still_denied(tmp_path, monkeypatch, home_skills):
+    """The one place a rejection is narrowed, so the still-denied list is written out, not derived. Each path
+    twice: from a project the root check stops it first; only with the root at `~` does the predicate decide."""
+    from dostuff.helpers.skills.discover_skills import discover_skills
+    kept = home_skills / ".dostuff" / "skills" / "kept"
+    kept.mkdir()
+    (kept / "SKILL.md").write_text("---\nname: kept\ndescription: d\n---\nbody\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    discover_skills()
+
+    home = home_skills
+    assert resolve_safe_path(str(kept / "SKILL.md"), home, for_read=True) == (kept / "SKILL.md").resolve()
+    for path in (home / ".dostuff" / "config.yaml",
+                 home / ".dostuff" / "mcp_config.json",
+                 home / ".dostuff" / "hooks" / "pre.py",
+                 home / ".dostuff" / "data" / "sessions.db",
+                 home / ".dostuff" / "skills" / "not-discovered" / "SKILL.md",
+                 home / ".dostuff" / "skills"):
+        with pytest.raises(PathOutsideProject):
+            resolve_safe_path(str(path), for_read=True)
+        with pytest.raises(PathAccessDenied):
+            resolve_safe_path(str(path), home, for_read=True)
+
+
+@pytest.mark.parametrize("root", [".dostuff", ".dostuff/skills"])
+def test_a_root_at_or_above_dostuff_skills_admits_nothing_there(home_skills, root):
+    """An entry can be a symlink, so a skill dir can resolve to these: settings must stay denied even then."""
+    set_skill_roots([home_skills / root])
+    with pytest.raises(PathAccessDenied):
+        resolve_safe_path(str(home_skills / ".dostuff" / "config.yaml"), home_skills, for_read=True)
+    with pytest.raises(PathAccessDenied):
+        resolve_safe_path(str(home_skills / ".dostuff" / "skills" / "other" / "SKILL.md"), home_skills, for_read=True)

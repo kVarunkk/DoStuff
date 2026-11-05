@@ -1,9 +1,15 @@
 """edit_file, read_file offset/limit, grep and glob (REQ-5.1 – 5.3, 5.7)."""
+import os
+import shutil
 from pathlib import Path
 
 import pytest
 
+from dostuff.helpers.skills.discover_skills import discover_skills
+from dostuff.lib.exceptions import PathAccessDenied, PathOutsideProject
+from dostuff.tools.files.delete_file import delete_file
 from dostuff.tools.files.edit_file import edit_file
+from dostuff.tools.files.list_files import list_files
 from dostuff.tools.files.read_file import read_file
 from dostuff.tools.files.write_file import write_file
 from dostuff.tools.search.glob import glob
@@ -114,3 +120,130 @@ def test_glob_patterns(project):
     assert "src/app.py" in glob("**/*.py")
     assert glob("src/*.py").splitlines() == ["src/app.py"]
     assert "No files" in glob("*.rs")
+
+
+# ── discovered skill dirs (skill-loading D2/B) ───────────────────────────────
+
+SKILL_MD = "---\nname: {name}\ndescription: d\n---\nbody\n"
+READ_TOOLS = {
+    "read_file": lambda d: read_file(str(d / "SKILL.md")),
+    "list_files": lambda d: list_files(str(d)),
+    "grep": lambda d: grep("name:", str(d)),
+    "glob": lambda d: glob("*.md", str(d)),
+}
+
+
+def _add_skill(folder, name):
+    skill = folder / name
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(SKILL_MD.format(name=name), encoding="utf-8")
+    (skill / "scripts" / "x.sh").write_text("echo sibling\n", encoding="utf-8")
+    return skill
+
+
+@pytest.fixture
+def home_skill(tmp_path, monkeypatch, home_skills):
+    """A discovered skill in `~/.agents/skills`, with the session in a project that does not contain the fake `~`."""
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    skill = _add_skill(home_skills / ".agents" / "skills", "demo")
+    discover_skills()
+    return skill
+
+
+@pytest.mark.parametrize("tool", READ_TOOLS)
+def test_home_skill_is_readable_by_file_tools(home_skill, tool):
+    result = READ_TOOLS[tool](home_skill)
+    assert "SKILL.md" in result or "name: demo" in result
+
+
+def test_sibling_file_of_a_home_skill_is_readable(home_skill):
+    assert "echo sibling" in read_file(str(home_skill / "scripts" / "x.sh"))
+
+
+def test_tilde_path_to_a_home_skill_resolves(home_skill):
+    assert "name: demo" in read_file("~/.agents/skills/demo/SKILL.md")
+
+
+@pytest.mark.parametrize("tool", READ_TOOLS)
+@pytest.mark.parametrize("folder", [".agents/skills/demo-sibling", ".agents/other"])
+def test_non_skill_dir_outside_root_still_denied(home_skill, home_skills, tool, folder):
+    denied = home_skills / folder
+    denied.mkdir(parents=True)
+    (denied / "SKILL.md").write_text("no frontmatter, so never discovered\n", encoding="utf-8")
+    with pytest.raises(PathOutsideProject):
+        READ_TOOLS[tool](denied)
+
+
+def test_symlinked_skill_md_does_not_widen_reads(tmp_path, monkeypatch, home_skills):
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "note.md").write_text(SKILL_MD.format(name="x"), encoding="utf-8")
+    (notes / "secret.txt").write_text("secret\n", encoding="utf-8")
+    entry = home_skills / ".agents" / "skills" / "x"
+    entry.mkdir()
+    try:
+        os.symlink(notes / "note.md", entry / "SKILL.md")
+    except OSError:
+        pytest.skip("creating a symlink needs a privilege this user lacks")
+    discover_skills()
+
+    with pytest.raises(PathOutsideProject):
+        read_file(str(notes / "secret.txt"))
+
+
+def test_write_edit_delete_deny_skill_dirs(home_skill):
+    target = home_skill / "SKILL.md"
+    before = target.read_text(encoding="utf-8")
+    for attempt in (lambda: write_file(str(target), "x"),
+                    lambda: edit_file(str(target), "body", "x"),
+                    lambda: delete_file(str(target))):
+        with pytest.raises(PathOutsideProject):
+            attempt()
+    assert target.read_text(encoding="utf-8") == before
+
+
+def test_dostuff_skills_are_readable_when_discovered(tmp_path, monkeypatch, home_skills):
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    skill = _add_skill(home_skills / ".dostuff" / "skills", "kept")
+    discover_skills()
+
+    assert "name: kept" in read_file(str(skill / "SKILL.md"))
+    assert "name: kept" in grep("name:", str(skill))
+    assert "SKILL.md" in list_files(str(skill))
+
+
+def test_env_files_in_skill_dirs_still_denied(tmp_path, monkeypatch, home_skills):
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    skills = [_add_skill(home_skills / ".agents" / "skills", "a"), _add_skill(home_skills / ".dostuff" / "skills", "b")]
+    discover_skills()
+
+    for skill in skills:
+        (skill / ".env").write_text("TOKEN=hunter2\n", encoding="utf-8")
+        with pytest.raises(PathAccessDenied):
+            read_file(str(skill / ".env"))
+        assert "hunter2" not in grep("TOKEN", str(skill))
+
+
+def test_allowlist_follows_discovery(home_skill, home_skills):
+    target = str(home_skill / "SKILL.md")
+    assert "name: demo" in read_file(target)
+
+    shutil.rmtree(home_skill)
+    home_skill.mkdir()
+    (home_skill / "SKILL.md").write_text("no frontmatter any more\n", encoding="utf-8")
+    discover_skills()
+    with pytest.raises(PathOutsideProject):
+        read_file(target)
+
+    added = _add_skill(home_skills / ".agents" / "skills", "added")
+    discover_skills()
+    assert "name: added" in read_file(str(added / "SKILL.md"))
