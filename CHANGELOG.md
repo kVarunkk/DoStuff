@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Skills in your home folder now open at the first try, the provider's prompt cache survives from one turn to the next, the current prompt stays pinned while you scroll, and GPT and Grok tool calls work on OpenCode Go.
+
+### Added
+- **Sticky prompt** — once a prompt or `!command` scrolls off the top, it stays pinned there on one row while you are in its turn, as the answer streams or when you scroll back through an old one, until the next prompt takes over. Click it to jump to the prompt.
+- **`/context` has a "Turn context" row** — the environment, recalled memories and hook context sent with each prompt.
+
+### Changed
+- **The system prompt stays the same across turns**, so a provider's prompt cache is no longer lost at every turn or when plan mode is toggled. The environment, recalled memories, hook context and plan mode now travel in a hidden step sent with your prompt, which stays out of the transcript, exports, session titles and compaction.
+- Adjacent user messages are joined when sent, because some providers reject two in a row. They stay separate in the stored session.
+- `UserPromptSubmit` hook context now stays in the model's history (hidden) instead of applying to that turn only.
+- **Skill descriptions are parsed as YAML**, so quoted and folded (`>`, `|`) descriptions reach the model as plain text. A `SKILL.md` with invalid YAML stays listed, with its fields read line by line.
+- The system prompt shows each skill's absolute `dir` instead of the path to its `SKILL.md`, with a note that the files a skill refers to are relative to that dir.
+
+### Fixed
+- **Home-folder skills can be read by the file tools.** `read_file`, `list_files`, `grep` and `glob` now reach discovered skill folders, including the files next to `SKILL.md`; before, every skill outside the project failed with an access error and the model had to fall back to the shell. Access is read-only, limited to discovered skills, and `.env*` files and the rest of `~/.dostuff/` stay unreadable.
+- A `SKILL.md` that is not valid UTF-8 no longer stops every skill from loading.
+- GPT and Grok on OpenCode Go no longer fail every tool call with "not valid JSON": arguments delivered twice are collapsed to one copy.
+- After forking out of a `/btw` answer, the next `/btw` keeps its view of the conversation.
+
+### Documentation
+- README: how a skill reaches the model, the sandbox's skill-folder exception, and the sticky prompt. The skills "Conflict resolution" paragraph was wrong and now says what happens: the first skill found with a name wins.
+
 ## [0.2.10] - 2026-11-04
 
 Mid-turn steering: `/steer <message>` sends a correction to the turn that is running — the model reads it at the next tool boundary, inside the same turn, instead of waiting for the turn to end — and it is how every plain message is routed by default (`ui.mid_turn_messages: queue` batches them after the turn instead).
