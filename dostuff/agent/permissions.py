@@ -43,6 +43,10 @@ PLAN_MODE_INSTRUCTION = (
     "concrete step-by-step plan. In plan mode, ask what you need *before* writing the plan, with "
     "`ask_user` — not after. Don't make the changes until the user leaves plan mode (Shift+Tab or /permissions)."
 )
+PLAN_MODE_OFF_INSTRUCTION = (
+    "## Plan mode\nPlan mode is off: the earlier plan-mode restrictions no longer apply. Normal permission checks "
+    "do, so you can make changes now."
+)
 
 
 def next_mode(mode: str) -> str:

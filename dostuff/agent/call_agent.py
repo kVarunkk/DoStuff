@@ -8,7 +8,7 @@ from dostuff.lib.tracing import content_attr, tracer
 from opentelemetry.trace import Status, StatusCode
 
 
-# Two breakpoints: the system prompt (tools + instructions, stable within a turn) and the last
+# Two breakpoints: the system prompt (tools + instructions, stable across turns) and the last
 # message, which moves each call, so the next call reads everything before it from the cache.
 CACHE_BREAKPOINTS: list[dict[str, Any]] = [
     {"location": "message", "role": "system"},
@@ -43,7 +43,9 @@ async def call_agent(steps_history: list, system_instruction: str, tool_names: l
     if tool_names is None:
         tool_names = default_tool_names()
     active_schemas = [TOOL_SCHEMAS[name] for name in tool_names if name in TOOL_SCHEMAS]
-    messages = [{"role": "system", "content": system_instruction}] + steps_history
+    # `meta` is dostuff's own (the turn-context marker): no provider may see it, and the store must keep it
+    messages = [{"role": "system", "content": system_instruction}] + [
+        {k: v for k, v in step.items() if k != "meta"} if "meta" in step else step for step in steps_history]
     request = build_request_kwargs(stream)
 
     span = tracer.start_span("model_call")

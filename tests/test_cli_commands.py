@@ -327,7 +327,7 @@ def test_print_mode(env, headless):
     # --session continues a stored session with its history
     result = runner.invoke(app, ["-p", "and then?", "--session", out["session_id"]])
     assert result.exit_code == 0
-    assert [s["role"] for s in headless[-1]["history"]] == ["user", "assistant", "user"]
+    assert [s["role"] for s in headless[-1]["history"] if "meta" not in s] == ["user", "assistant", "user"]
 
     assert runner.invoke(app, ["-p", "x", "--session", "nope"]).exit_code == 1
     assert runner.invoke(app, ["-p", "x", "--permission-mode", "yolo"]).exit_code == 2
@@ -837,3 +837,28 @@ def test_export_keeps_the_grammar(env):
     tool_steps = [s for s in steps if s.get("role") == "tool"]
     assert len(tool_steps) == 1 and tool_steps[0]["content"] == result_text
     assert parse_answers(tool_steps[0]["content"]) == pairs  # read back as the same pairs
+
+
+# --- Cache-stable context (plan/2026-11-05-cache-stable-context/tasks.md) ---------------------------------------
+
+def test_headless_appends_context_step(env, headless):
+    from dostuff.helpers.agent.turn_context import is_turn_context
+    result = runner.invoke(env["app"], ["-p", "say hi"])
+    assert result.exit_code == 0, result.output
+    context, prompt = headless[-1]["history"]
+    assert is_turn_context(context) and "<environment>" in context["content"]
+    assert prompt == {"role": "user", "content": "say hi"}
+
+
+def test_headless_wake_turn_adds_no_context_step(env, headless_agents, capsys):
+    """D5: a headless wake turn reuses what the first turn already put in the history."""
+    from conftest import FakeStep, fake_response
+    fm = headless_agents
+    fm.script("[M]", fake_response(tool_calls=[_agent_call("BG", "dig", "c1", background=True)]),
+              fake_response("it is running"), fake_response("final: 42"))
+    fm.script("[BG]", FakeStep(fake_response("bg report 42"), delay=0.3))
+    assert _run_headless("[M] start it") == 0
+    capsys.readouterr()
+    messages = fm.calls_for("[M]")[2]["messages"]
+    assert sum("<turn-context>" in str(m.get("content")) for m in messages) == 1
+    assert "<environment>\ncwd:" not in messages[0]["content"]

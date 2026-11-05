@@ -168,6 +168,7 @@ class FakeModel:
 
     def _marker(self, messages: list[dict]) -> str | None:
         users = [str(m.get("content") or "") for m in messages if m.get("role") == "user"]
+        users = [u for u in users if not u.startswith("<turn-context>")]  # the harness's, not the agent's task
         # A fork's history starts with the main agent's; its own task is the step with the fork directive
         first_user = next((u for u in users if u.startswith(FORK_DIRECTIVE_START)), users[0] if users else "")
         return next((m for m in self.scripts if m is not None and m in first_user), None)

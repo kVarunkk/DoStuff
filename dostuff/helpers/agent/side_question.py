@@ -113,13 +113,10 @@ def plan_mode_on(permissions: Any, config: Any = None) -> bool:
     return ((permissions.mode if permissions else None) or getattr(config, "permission_mode", "ask")) == "plan"
 
 
-def compose_system_instruction(base: str, plan_mode: bool, compaction_notes: str,
-                               session_hook_context: dict[str, str] | None) -> str:
+def compose_system_instruction(base: str, compaction_notes: str, session_hook_context: dict[str, str] | None) -> str:
     """The system string a model call gets. One copy, so the loop and `/btw` can't differ by a byte (D4)."""
-    from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION
     from dostuff.helpers.hooks.events import session_context_suffix
     return (base
-            + (f"\n\n{PLAN_MODE_INSTRUCTION}" if plan_mode else "")
             + (f"\n\n[Summary of earlier conversation]: {compaction_notes}" if compaction_notes else "")
             + session_context_suffix(session_hook_context))
 
@@ -194,8 +191,7 @@ def _note(names: list[str]) -> str:
     return f"{TOOL_CALL_NOTE} Asked for: {', '.join(names)}." if names else TOOL_CALL_NOTE
 
 
-async def answer_side_question(snap: ForkContext, exchanges: list[tuple[str, str]], question: str,
-                               plan_mode: bool) -> SideAnswer:
+async def answer_side_question(snap: ForkContext, exchanges: list[tuple[str, str]], question: str) -> SideAnswer:
     """One model call, with the turn's tools sent and none run. Takes no adapter and no store, so it can't emit
     usage or write anything (CON-004, CON-010). Raises what the call raises."""
     from dostuff.agent.call_agent import call_agent
@@ -203,7 +199,7 @@ async def answer_side_question(snap: ForkContext, exchanges: list[tuple[str, str
     interaction, span = await call_agent(
         steps_history=build_messages(snap, exchanges, question),
         system_instruction=compose_system_instruction(
-            snap.system_instruction, plan_mode, snap.compaction_notes, snap.session_hook_context),
+            snap.system_instruction, snap.compaction_notes, snap.session_hook_context),
         tool_names=list(snap.tool_names),  # the turn's, not []: the schemas are part of the cached prefix (D2)
         stream=False,
     )

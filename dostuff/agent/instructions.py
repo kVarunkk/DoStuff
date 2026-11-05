@@ -1,4 +1,4 @@
-"""System prompt for a turn, shared by the TUI and `dostuff -p` (headless)."""
+"""The system prompt and the per-turn context, shared by the TUI and `dostuff -p` (headless)."""
 import asyncio
 from pathlib import Path
 from typing import Any
@@ -10,6 +10,7 @@ from dostuff.helpers.agent.constants import (
 from dostuff.helpers.agent.environment_context import build_environment_block
 from dostuff.helpers.agent.load_identity import load_identity
 from dostuff.helpers.agent.load_project_instructions import load_project_instructions
+from dostuff.helpers.agent.turn_context import compose_turn_context
 from dostuff.helpers.skills.discover_skills import discover_skills
 from dostuff.helpers.ui.emit import emit
 from dostuff.lib.memory import chroma
@@ -67,8 +68,16 @@ def build_base_instructions(interactive: bool = False) -> tuple[str, list[dict[s
     return instructions, skills
 
 
-async def build_turn_instructions(base: str, user_text: str, memory_store: Any, episodic_store: Any, user_id: str) -> str:
-    """Base instructions + the environment block + memories and past episodes relevant to user_text.
+def build_system_instructions(base: str) -> str:
+    """The system prompt of every turn: `base`, byte for byte. Anything that changes per turn goes in
+    `build_turn_context` instead: one differing byte here invalidates the provider's whole cached prefix."""
+    return base
+
+
+async def build_turn_context(user_text: str, *, memory_store: Any, episodic_store: Any, user_id: str,
+                             prompt_context: str = "") -> str:
+    """The turn's hidden context step: the environment block, memories and past episodes relevant to user_text,
+    and UserPromptSubmit context.
 
     The stores are None when long-term memory is off (chromadb not installed): no recall then.
     """
@@ -98,9 +107,5 @@ async def build_turn_instructions(base: str, user_text: str, memory_store: Any, 
         for ep in episodes
     )
 
-    instructions = base + "\n\n" + await asyncio.to_thread(build_environment_block)
-    if memory_text:
-        instructions += f"\n\n<relevant_user_facts>\n{memory_text}\n</relevant_user_facts>"
-    if episodic_text:
-        instructions += f"\n\n<past_episodes>\n{episodic_text}\n</past_episodes>"
-    return instructions
+    environment = await asyncio.to_thread(build_environment_block)
+    return compose_turn_context(environment, memory_text, episodic_text, prompt_context)

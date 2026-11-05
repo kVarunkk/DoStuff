@@ -59,11 +59,6 @@ async def user_prompt_submit(
     return None, outcome.context
 
 
-def with_prompt_context(instructions: str, context: str) -> str:
-    """The turn's system instruction plus UserPromptSubmit context."""
-    return f"{instructions}\n\n[Context from UserPromptSubmit hooks]\n{context}" if context else instructions
-
-
 async def session_start(
     source: str, holder: dict[str, str], *, session_id: str, turn_id: str = "",
     turn_type: str = "interactive_loop", adapter: Any = None,

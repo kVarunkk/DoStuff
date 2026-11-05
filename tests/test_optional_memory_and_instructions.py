@@ -21,7 +21,7 @@ def no_chroma(monkeypatch, tmp_path):
 
 
 def test_without_chromadb_memory_is_off(no_chroma):
-    from dostuff.agent.instructions import build_base_instructions, build_turn_instructions
+    from dostuff.agent.instructions import build_base_instructions, build_turn_context
     from dostuff.lib.memory.stores import get_episodic_store, get_semantic_store, make_tool_registry_store
     from dostuff.tools.definitions import MEMORY_TOOLS, TOOL_SCHEMAS, default_tool_names
 
@@ -32,7 +32,7 @@ def test_without_chromadb_memory_is_off(no_chroma):
 
     base, _ = build_base_instructions()
     assert "save_memory" not in base and "## Long-term memory" not in base
-    turn = asyncio.run(build_turn_instructions(base, "hi", None, None, "user"))
+    turn = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="user"))
     assert "<environment>" in turn and "<relevant_user_facts>" not in turn
 
     from dostuff.tools.memory.save_memory import save_memory
@@ -83,3 +83,72 @@ def test_instruction_files_are_combined_general_first(tmp_path):
 
     # A single file is used as-is
     assert load_project_instructions(repo / "pkg" / ".." , tmp_path / "nohome") == "repo rule"
+
+
+# --- Cache-stable context (plan/2026-11-05-cache-stable-context/tasks.md) ---------------------------------------
+
+class _Store:
+    def __init__(self, rows=None, error=None):
+        self.rows, self.error, self.calls = rows or [], error, []
+
+    async def query(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if self.error:
+            raise self.error
+        return self.rows
+
+
+FACT = {"key": "name", "value": "Ada"}
+EPISODE = {"event_type": "EVENT", "anchor_event": "shipped", "summary": "it went out", "created_at_iso": "2026-11-05"}
+
+
+@pytest.mark.parametrize("base", ["base", "base\n\n  "])
+def test_system_instructions_is_base_verbatim(base):
+    from dostuff.agent.instructions import build_system_instructions
+    assert build_system_instructions(base) == base
+
+
+def test_no_stale_importer():
+    root = Path(__file__).resolve().parents[1] / "dostuff"
+    assert not [p for p in root.rglob("*.py") if "build_turn_instructions" in p.read_text(encoding="utf-8")]
+
+
+def test_turn_context_recalls_facts_and_episodes():
+    from dostuff.agent.instructions import build_turn_context
+    from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
+    facts, episodes = _Store([FACT]), _Store([EPISODE])
+    text = asyncio.run(build_turn_context("hi", memory_store=facts, episodic_store=episodes, user_id="u"))
+    assert "<relevant_user_facts>\n- name: Ada\n</relevant_user_facts>" in text
+    assert "  • [EVENT] shipped\n    Summary: it went out\n    Date: 2026-11-05" in text
+    assert facts.calls == [(("u",), {"query_text": "hi", "top_k": 5, "min_similarity": MIN_FACT_SIMILARITY})]
+    assert episodes.calls[0][1]["top_k"] == 3 and episodes.calls[0][1]["query_text"] == "hi"
+
+
+def test_turn_context_recall_failure_is_reported(monkeypatch):
+    from dostuff.agent import instructions
+    said = []
+    monkeypatch.setattr(instructions, "emit", lambda text, kind: said.append((text, kind)))
+    text = asyncio.run(instructions.build_turn_context(
+        "hi", memory_store=_Store(error=RuntimeError("no model")), episodic_store=_Store([EPISODE]), user_id="u"))
+    assert said == [("Memory recall failed, continuing without it: no model", "error")]
+    assert "<environment>" in text and "<past_episodes>" not in text
+
+
+def test_turn_context_without_memory_stores():
+    from dostuff.agent.instructions import build_turn_context
+    text = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="u",
+                                          prompt_context="from a hook"))
+    assert "<environment>" in text and "from a hook" in text
+    assert "<relevant_user_facts>" not in text and "<past_episodes>" not in text
+
+
+def test_hook_context_rides_the_bundle():
+    from dostuff.agent.instructions import build_turn_context
+    text = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="u",
+                                          prompt_context="from a hook"))
+    assert text.startswith("<turn-context>\n") and text.endswith("[Context from UserPromptSubmit hooks]\nfrom a hook\n</turn-context>")
+
+
+def test_with_prompt_context_is_gone():
+    with pytest.raises(ImportError):
+        from dostuff.helpers.hooks.events import with_prompt_context  # noqa: F401

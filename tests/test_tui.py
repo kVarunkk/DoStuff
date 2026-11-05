@@ -42,7 +42,7 @@ def tui(tmp_path, monkeypatch):
 
     async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
                         current_session_history, steps_history, store, adapter=None, **kwargs):
-        assert "<environment>" in instructions
+        assert any("<environment>" in str(s.get("content")) for s in working_history)
         answer = await adapter.ask("Allow write_file?")
         text = f"answer to {user_text} ({answer})"
         adapter.emit("partial_thought", "thinking...")
@@ -64,6 +64,12 @@ def _texts(app):
     return [str(getattr(w, "content", getattr(w, "renderable", ""))) for w in app.query("#msg-container Static")]
 
 
+def _shown(steps):
+    """The steps a user can see: everything but the hidden turn-context steps."""
+    from dostuff.helpers.agent.turn_context import is_turn_context
+    return [s for s in steps if not is_turn_context(s)]
+
+
 def test_turn_clear_and_exit(tui):
     cli_tui = tui
 
@@ -83,7 +89,7 @@ def test_turn_clear_and_exit(tui):
                 if not app._turn_in_progress:
                     break
             assert not app._turn_in_progress
-            assert [s["role"] for s in app.steps_history] == ["user", "assistant"]
+            assert [s["role"] for s in _shown(app.steps_history)] == ["user", "assistant"]
             assert await app.store.load("smoke") == app.steps_history
             # The streamed answer is not appended a second time
             texts = _texts(app)
@@ -97,7 +103,7 @@ def test_turn_clear_and_exit(tui):
                     break
             assert app.steps_history == [] and app.current_session_history == []
             assert app.session_id != "smoke"
-            assert len(await app.store.load("smoke")) == 2
+            assert len(_shown(await app.store.load("smoke"))) == 2
             assert app.adapter._session_usage["total_tokens"] == 0
 
             await app._cleanup_and_save_session()
@@ -183,7 +189,7 @@ def test_resume_picker_and_session_commands(tui, tmp_path):
             assert not app.query_one("#input", cli_tui.EnterSubmits).display
             await pilot.press("enter")
             await _until(pilot, lambda: app.session_id == "first")
-            assert [s["role"] for s in app.steps_history] == ["user", "assistant"]
+            assert [s["role"] for s in _shown(app.steps_history)] == ["user", "assistant"]
             assert app.query_one("#input", cli_tui.EnterSubmits).display
             # The empty session /clear made was never saved, so there's nothing to go back to
             assert await app.store.get_session_meta(new_id) is None
@@ -764,7 +770,7 @@ def test_file_mention_completion_and_attachment(tui, monkeypatch):
                 await pilot.pause(0.05)
                 if not app._turn_in_progress:
                     break
-            sent = app.steps_history[0]["content"]
+            sent = _shown(app.steps_history)[0]["content"]
             assert sent.startswith("fix @src/main.py now\n\n<attached_file path=\"src/main.py\">")
             assert "print('hi')" in sent
             assert any(t == "Attached src/main.py" for t in _texts(app))
@@ -1006,7 +1012,7 @@ def test_big_paste_collapses_and_spills_to_file(tui):
             await _until(pilot, app.adapter.has_pending_confirm)
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
             await _until(pilot, lambda: not app._turn_in_progress)
-            user = app.steps_history[0]["content"]
+            user = _shown(app.steps_history)[0]["content"]
             assert '<pasted_content file=".dostuff/pastes/pasteses-1.txt" lines="500"' in user
             assert "log line 20\n" in user and "log line 21" not in user
             saved = Path(".dostuff/pastes/pasteses-1.txt").read_text(encoding="utf-8")
@@ -1045,7 +1051,7 @@ def test_skill_slash_command_runs_skill(tui):
             await _until(pilot, app.adapter.has_pending_confirm)
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
             await _until(pilot, lambda: not app._turn_in_progress)
-            sent = app.steps_history[0]["content"]
+            sent = _shown(app.steps_history)[0]["content"]
             assert "Read git log and summarise." in sent and "name: release-notes" not in sent
             assert sent.endswith("(no arguments)")
             assert not any("Unknown command" in t for t in _texts(app))
@@ -1055,7 +1061,7 @@ def test_skill_slash_command_runs_skill(tui):
             await _until(pilot, app.adapter.has_pending_confirm)
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
             await _until(pilot, lambda: not app._turn_in_progress)
-            sent = app.steps_history[2]["content"]
+            sent = _shown(app.steps_history)[2]["content"]
             assert "Arguments: for @CHANGES.txt" in sent and "v1 fixed things" in sent
             await app._cleanup_and_save_session()
 
@@ -1227,7 +1233,7 @@ def test_roadmap_021_commands_memory_context_doctor_history(tui, tmp_path, monke
             await _until(pilot, app.adapter.has_pending_confirm)
             submit("y")
             await _until(pilot, lambda: not app._turn_in_progress)
-            assert app.steps_history[0]["content"] == "Review src/app.py for bugs."
+            assert _shown(app.steps_history)[0]["content"] == "Review src/app.py for bugs."
             assert any("Running command review" in t for t in _texts(app))
 
             # Esc with text in the input has nothing to do: it says how to quit instead
@@ -1342,13 +1348,14 @@ def test_tui_prompt_blocked_by_hook(tui, monkeypatch, hook_cmd):
             assert await app.store.load("blocked") == []
             assert any(t.startswith("Prompt blocked by a UserPromptSubmit hook") for t in _texts(app))
 
-            # a context hook: the context reaches the turn's instructions, not the history
+            # a context hook: the context reaches the hidden context step, not the prompt or the system
             ctx = hook_cmd("print('team rules: be brief')")
             _write_hooks({"UserPromptSubmit": [{"hooks": [{"type": "command", "command": ctx}]}]})
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("hello"))
             await _until(pilot, lambda: bool(calls) and not app._turn_in_progress, tries=200)
-            assert "team rules: be brief" in calls[0]["instructions"]
-            assert calls[0]["history"] == [{"role": "user", "content": "hello"}]
+            assert "team rules: be brief" in str(calls[0]["history"][-2]["content"])
+            assert "team rules: be brief" not in calls[0]["instructions"]
+            assert _shown(calls[0]["history"]) == [{"role": "user", "content": "hello"}]
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -1620,7 +1627,7 @@ if n == 0:
             texts = _texts(app)
             assert not any("[Stop hook" in t for t in texts)
             assert any(t.startswith("⚓ Stop") and "tests are failing" in t for t in texts)
-            assert app._last_prompt_index() == 0  # Esc Esc edits the real prompt, not the Stop note
+            assert app._last_prompt_index() == 1  # Esc Esc edits the real prompt, not the Stop note
             await app._cleanup_and_save_session()
 
     asyncio.run(declined())
@@ -4596,8 +4603,7 @@ class HeldTurn:
                                session_hook_context=dict(context) if context is not None else None)
             side_question.publish_snapshot(session_id, snap)
             self.snapshots.append(side_question.snapshot(session_id))
-            self.systems.append(side_question.compose_system_instruction(
-                instructions, side_question.plan_mode_on(kwargs.get("permissions")), notes, context))
+            self.systems.append(side_question.compose_system_instruction(instructions, notes, context))
             if self.hold:
                 self.gate = asyncio.Event()
                 await self.gate.wait()
@@ -4726,7 +4732,7 @@ def test_btw_mid_turn(btw_tui):
             assert str(app.query_one("#status", cli_tui.Static).render()) == status_before
             held.release()
             await _until(pilot, lambda: not app._turn_in_progress)
-            assert [s["role"] for s in app.steps_history] == ["user", "assistant"]
+            assert [s["role"] for s in _shown(app.steps_history)] == ["user", "assistant"]
             assert not any("which file" in str(s.get("content")) for s in await app.store.load(app.session_id))
             await app._cleanup_and_save_session()
 
@@ -4781,7 +4787,7 @@ def test_btw_idle_uses_kept_parts_and_store(btw_tui):
         async with app.run_test() as pilot:
             await pilot.pause()
             _submit(app, cli_tui, "fix the bug")
-            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            await _until(pilot, lambda: not app._turn_in_progress and len(_shown(app.steps_history)) == 2)
             _submit(app, cli_tui, "/btw what did I ask?")
             await _btw_answered(pilot, app)
             stored = await app.store.load_working_history(app.session_id)
@@ -4807,7 +4813,7 @@ def test_btw_idle_after_compact(btw_tui, monkeypatch):
         async with app.run_test() as pilot:
             await pilot.pause()
             _submit(app, cli_tui, "fix the bug")
-            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            await _until(pilot, lambda: not app._turn_in_progress and len(_shown(app.steps_history)) == 2)
             _submit(app, cli_tui, "/compact")
             await _until(pilot, lambda: any("Context compacted" in t for t in _texts(app)))
             _submit(app, cli_tui, "/btw what did I ask?")
@@ -4830,18 +4836,18 @@ def test_btw_cold_session(btw_tui, monkeypatch):
 
     async def scenario():
         app = cli_tui.DostuffTUI(session_id="btw-cold")
-        original = app._build_instructions
+        original = app._build_turn_context
 
-        async def build(text):
+        async def build(text, prompt_context=""):
             built.append(text)
-            return await original(text)
-        app._build_instructions = build  # type: ignore[method-assign]
+            return await original(text, prompt_context)
+        app._build_turn_context = build  # type: ignore[method-assign]
         async with app.run_test() as pilot:
             await pilot.pause()
             _submit(app, cli_tui, "/btw anything yet?")
             await _btw_answered(pilot, app)
             assert built == ["anything yet?"]
-            assert "<environment>" in call.calls[0]["system_instruction"]
+            assert "<environment>" in call.calls[0]["steps_history"][-2]["content"]
             assert call.calls[0]["tool_names"] == default_tool_names()
             await app._cleanup_and_save_session()
 
@@ -4912,7 +4918,7 @@ def test_btw_panel_not_in_transcript_or_export(btw_tui, tmp_path):
         async with app.run_test() as pilot:
             await pilot.pause()
             _submit(app, cli_tui, "fix the bug")
-            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            await _until(pilot, lambda: not app._turn_in_progress and len(_shown(app.steps_history)) == 2)
             lines = _message_lines(app)
             _submit(app, cli_tui, "/btw SIDE-QUESTION-TEXT")
             await _btw_answered(pilot, app)
@@ -5074,7 +5080,7 @@ def test_btw_esc_idle_no_recall(btw_tui):
         async with app.run_test() as pilot:
             await pilot.pause()
             _submit(app, cli_tui, "first prompt")
-            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            await _until(pilot, lambda: not app._turn_in_progress and len(_shown(app.steps_history)) == 2)
             _submit(app, cli_tui, "/btw q")
             await _btw_answered(pilot, app)
             app._last_escape = 0.0
@@ -5083,7 +5089,7 @@ def test_btw_esc_idle_no_recall(btw_tui):
             await pilot.press("escape")  # one more: had the first been an idle Esc, this would recall the prompt
             await pilot.pause(0.2)
             assert app.query_one("#input", cli_tui.EnterSubmits).text == ""
-            assert len(app.steps_history) == 2
+            assert len(_shown(app.steps_history)) == 2
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -5429,7 +5435,7 @@ def test_btw_thread_cleared_on_switch(btw_tui, switch):
         async with app.run_test() as pilot:
             await pilot.pause()
             _submit(app, cli_tui, "fix the bug")
-            await _until(pilot, lambda: not app._turn_in_progress and len(app.steps_history) == 2)
+            await _until(pilot, lambda: not app._turn_in_progress and len(_shown(app.steps_history)) == 2)
             old = app.session_id
             assert kept_prompt(old) is not None
             _submit(app, cli_tui, "/btw QUESTION-A")
@@ -6417,7 +6423,7 @@ def test_pin_user_step_render(tui):
 
 
 def test_pin_system_instruction_recorded(turn_tui):
-    from dostuff.agent.instructions import build_turn_instructions
+    from dostuff.agent.instructions import build_system_instructions
     cli_tui, seen = turn_tui
 
     async def scenario():
@@ -6426,8 +6432,244 @@ def test_pin_system_instruction_recorded(turn_tui):
             await pilot.pause()
             _submit(app, cli_tui, "hello")
             await _until(pilot, lambda: not app._turn_in_progress and seen)
-            assert seen[0]["instructions"] == await build_turn_instructions(
-                app._system_instructions, "hello", app.memory_store, app.episodic_store, app.user_id)
+            assert seen[0]["instructions"] == build_system_instructions(app._system_instructions)
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+def _context_steps(history):
+    from dostuff.helpers.agent.turn_context import is_turn_context
+    return [s for s in history if is_turn_context(s)]
+
+
+class _Recall:
+    """A memory store: every query recalls its own question, so a different prompt recalls a different fact."""
+
+    def __init__(self, hits=True):
+        self.hits = hits
+        self.queries = []
+
+    async def query(self, *args, **kwargs):
+        self.queries.append(kwargs["query_text"])
+        return [{"key": "recalled", "value": kwargs["query_text"]}] if self.hits else []
+
+
+def _use_recall(app):
+    app.memory_store, app.episodic_store = _Recall(), _Recall(hits=False)
+    return app.memory_store
+
+
+def test_run_turn_appends_context_then_prompt(turn_tui):
+    from dostuff.helpers.agent.turn_context import is_turn_context
+    cli_tui, seen = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-order")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            context, prompt = seen[0]["history"][-2:]
+            assert is_turn_context(context) and "<environment>" in context["content"]
+            assert prompt == {"role": "user", "content": "hello"}
+            assert app.steps_history[:2] == [context, prompt]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_sent_prompts_key_is_the_prompt_index(turn_tui):
+    cli_tui, seen = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-sent")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            [(key, typed)] = app._sent_prompts.items()
+            assert typed == "hello" and app.steps_history[key[1]]["content"] == "hello"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_wake_turn_appends_context_step(turn_tui):
+    from dostuff.helpers.agent.notices import get_notice_queue
+    cli_tui, seen = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-wake")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            recall = _use_recall(app)
+            get_notice_queue().put(app.session_id, types.SimpleNamespace(kind="job", killed_by="user", wake=False))
+            await app._run_turn("the job ended", wake=True)
+            get_notice_queue().drain(app.session_id)
+            [context] = _context_steps(seen[0]["history"])
+            assert seen[0]["history"][-1] == context  # the loop drains the notice after it
+            assert "<environment>" in context["content"] and "the job ended" in context["content"]
+            assert recall.queries == ["the job ended"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def _real_turns(tui, fake_model, monkeypatch, *replies):
+    """The real `loop()` and `call_agent` in the TUI, in a git repository, on scripted replies."""
+    import subprocess
+
+    from conftest import fake_response
+
+    from dostuff.agent.loop import loop
+    monkeypatch.setattr(tui, "agent_loop", loop)
+    subprocess.run(["git", "init", "-q"], check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty",
+                    "-m", "start"], check=True)  # `rev-parse HEAD` fails on an unborn branch
+    fake_model.script(None, *[fake_response(text) for text in replies])
+
+
+def test_system_instruction_stable_across_turns(tui, fake_model, monkeypatch):
+    """The regression test for the whole change (REQ-5.1): what reaches the provider, not what a builder returns."""
+    _real_turns(tui, fake_model, monkeypatch, "one", "two")
+
+    async def scenario():
+        app = tui.DostuffTUI(session_id="ctx-stable")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _use_recall(app)
+            _submit(app, tui, "first question")
+            await _until(pilot, lambda: not app._turn_in_progress and len(fake_model.calls) == 1)
+            Path("new.txt").write_text("x", encoding="utf-8")  # `git status` moves between the turns
+            _submit(app, tui, "second question")
+            await _until(pilot, lambda: not app._turn_in_progress and len(fake_model.calls) == 2)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+    first, second = (call["messages"] for call in fake_model.calls)
+    assert first[0] == second[0]
+    assert second[:len(first)] == first  # the history only grew: the whole prefix is reusable
+    assert "new.txt" in second[-2]["content"] and "new.txt" not in first[-2]["content"]
+
+
+def test_model_still_sees_environment_and_facts(tui, fake_model, monkeypatch):
+    _real_turns(tui, fake_model, monkeypatch, "one")
+
+    async def scenario():
+        app = tui.DostuffTUI(session_id="ctx-sees")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _use_recall(app)
+            _submit(app, tui, "what is my name?")
+            await _until(pilot, lambda: not app._turn_in_progress and fake_model.calls)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+    messages = fake_model.calls[0]["messages"]
+    assert "<environment>\ncwd:" not in messages[0]["content"]
+    bundle = messages[-2]
+    assert bundle["role"] == "user" and "meta" not in bundle
+    assert "<environment>" in bundle["content"]
+    assert "- recalled: what is my name?" in bundle["content"]
+    assert messages[-1] == {"role": "user", "content": "what is my name?"}
+
+
+def test_hook_context_reaches_the_bundle_not_the_system(turn_tui, monkeypatch):
+    cli_tui, seen = turn_tui
+
+    async def hook_context(prompt, **kwargs):
+        return None, "from the hook"
+    monkeypatch.setattr(cli_tui, "user_prompt_submit", hook_context)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-hook")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert "from the hook" not in seen[0]["instructions"]
+            assert "from the hook" in _context_steps(seen[0]["history"])[0]["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_side_snapshot_fallback_has_environment(turn_tui):
+    from dostuff.helpers.agent.turn_context import is_turn_context
+    cli_tui, _ = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-btw")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            snap = await app._side_snapshot("anything yet?")
+            assert snap.system_instruction == app._system_instructions
+            assert is_turn_context(snap.history[-1]) and "<environment>" in snap.history[-1]["content"]
+            assert await app.store.load(app.session_id) == []  # the snapshot's copy only
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def _plan_step():
+    from dostuff.helpers.agent.turn_context import make_plan_mode_step
+    return make_plan_mode_step(True, "## Plan mode\nrules")
+
+
+def test_last_prompt_index_skips_context_step(tui):
+    from dostuff.helpers.agent.turn_context import make_context_step
+
+    async def scenario():
+        app = tui.DostuffTUI(session_id="ctx-index")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.steps_history = [make_context_step("<turn-context>b</turn-context>"),
+                                 {"role": "user", "content": "the prompt"}, _plan_step(),
+                                 {"role": "assistant", "content": "answer"}]
+            assert app._last_prompt_index() == 1
+            app.steps_history = [make_context_step("<turn-context>b</turn-context>")]
+            assert app._last_prompt_index() is None
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def _two_turns_then_take_back(cli_tui, seen, reload):
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-back")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for n, prompt in enumerate(("first", "second"), start=1):
+                _submit(app, cli_tui, prompt)
+                await _until(pilot, lambda: not app._turn_in_progress and len(seen) == n)
+            await app._backend_ready.wait()
+            await app.store.append(app.session_id, _plan_step())
+            app.steps_history.append(_plan_step())
+            app.current_session_history.append(_plan_step())
+            if reload:
+                await app._switch_session("ctx-back")
+                app._sent_prompts.clear()
+            await app._edit_previous_prompt()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            assert inp.text == "second" and "<turn-context>" not in inp.text
+            stored = await app.store.load(app.session_id)
+            assert stored == app.steps_history
+            assert await app.store.load_working_history(app.session_id) == stored
+            assert [s["content"] for s in _shown(stored)] == ["first", "answer to first"]
+            assert len(_context_steps(stored)) == 1  # the first turn's: only the taken-back turn's bundle went
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_edit_previous_prompt_drops_both(turn_tui):
+    _two_turns_then_take_back(*turn_tui, reload=False)
+
+
+def test_edit_previous_prompt_after_reload(turn_tui):
+    _two_turns_then_take_back(*turn_tui, reload=True)
