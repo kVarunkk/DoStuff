@@ -1216,3 +1216,51 @@ def test_subagent_loop_gets_plan_step(monkeypatch):
     _, working, _ = _interactive(monkeypatch, [_msg(content="ok")], permissions=SessionPermissions(mode="plan"),
                                  turn_type="subagent_loop")
     assert len(_plan_steps(working)) == 1
+
+
+def _compaction_requests(monkeypatch):
+    """Record every summary request; each answers with a fixed summary."""
+    from dostuff.helpers.agent import manage_context
+    requests = []
+
+    async def fake_summarize(chunk, notes):
+        requests.append(chunk)
+        return "SUMMARY"
+    monkeypatch.setattr(manage_context, "_summarize", fake_summarize)
+    return requests
+
+
+def _compact(steps, keep_budget=1):
+    from dostuff.helpers.agent.manage_context import compact_context
+    return asyncio.run(compact_context(steps, keep_budget, "", 100_000))
+
+
+def test_compaction_never_summarises_context_steps(monkeypatch):
+    from dostuff.helpers.agent.turn_context import make_context_step, make_plan_mode_step
+    requests = _compaction_requests(monkeypatch)
+    steps = [make_context_step("<turn-context>\ncwd: /secret-path\n</turn-context>"),
+             {"role": "user", "content": "old prompt"}, make_plan_mode_step(True, "## Plan mode"),
+             {"role": "assistant", "content": "old answer"}, {"role": "user", "content": "new prompt"}]
+    recent, notes = _compact(steps)
+    assert notes == "SUMMARY" and recent == steps[-1:]
+    sent = "".join(requests)
+    assert "old prompt" in sent and "old answer" in sent
+    assert "turn-context" not in sent and "/secret-path" not in sent and "Plan mode" not in sent
+
+
+def test_compaction_keeps_recent_context_steps(monkeypatch):
+    from dostuff.helpers.agent.turn_context import make_context_step
+    _compaction_requests(monkeypatch)
+    context = make_context_step("<turn-context>b</turn-context>")
+    steps = [{"role": "user", "content": "old prompt"}, {"role": "assistant", "content": "old answer"},
+             context, {"role": "user", "content": "new prompt"}]
+    recent, notes = _compact(steps, keep_budget=40)
+    assert notes == "SUMMARY" and recent == steps[2:]
+
+
+def test_compaction_with_only_context_steps_old(monkeypatch):
+    from dostuff.helpers.agent.turn_context import make_context_step
+    requests = _compaction_requests(monkeypatch)
+    steps = [make_context_step("<turn-context>b</turn-context>"), {"role": "user", "content": "the prompt"}]
+    assert _compact(steps) == (steps, "")
+    assert requests == []

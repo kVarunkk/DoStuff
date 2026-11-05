@@ -6673,3 +6673,83 @@ def test_edit_previous_prompt_drops_both(turn_tui):
 
 def test_edit_previous_prompt_after_reload(turn_tui):
     _two_turns_then_take_back(*turn_tui, reload=True)
+
+
+# --- Phase 3: hidden ---------------------------------------------------------------------------------------------
+
+BUNDLE = "<turn-context>\n<environment>\ncwd: /secret-path\n</environment>\n</turn-context>"
+
+
+def _hidden_steps():
+    from dostuff.helpers.agent.turn_context import make_context_step
+    return [make_context_step(BUNDLE), {"role": "user", "content": "the prompt"}, _plan_step(),
+            {"role": "assistant", "content": "the answer"}]
+
+
+def _assert_hidden(app):
+    texts = "\n".join(_texts(app))
+    assert "the prompt" in texts
+    assert "<turn-context>" not in texts and "/secret-path" not in texts and "Plan mode" not in texts
+
+
+def test_context_step_not_rendered(tui):
+    async def scenario():
+        app = tui.DostuffTUI(session_id="ctx-render")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.steps_history = _hidden_steps()
+            app._render_history()
+            await pilot.pause()
+            _assert_hidden(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_context_step_not_rendered_on_resume(tui):
+    async def scenario():
+        app = tui.DostuffTUI(session_id="ctx-live")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            for step in _hidden_steps():
+                await app.store.append("ctx-stored", step)
+            await app._switch_session("ctx-stored")
+            await pilot.pause()
+            _assert_hidden(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_agent_view_skips_context_step(tui):
+    """The /agents view renders a run's transcript with the same function, and a prefix."""
+    async def scenario():
+        app = tui.DostuffTUI(session_id="ctx-agent")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for step in _hidden_steps():
+                app._render_history_step(step, prefix="[agent: x] ")
+            await pilot.pause()
+            _assert_hidden(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_show_context_has_turn_context_row(turn_tui):
+    cli_tui, seen = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-usage")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            await app._show_context()
+            await pilot.pause()
+            row = next(line for t in _texts(app) for line in t.splitlines() if "Turn context" in line)
+            assert row.split("Turn context")[1].split()[0] != "0"  # the bundle sent, and the next one's environment
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

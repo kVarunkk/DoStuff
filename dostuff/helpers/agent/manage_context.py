@@ -1,5 +1,6 @@
 import json
 from litellm import acompletion, ModelResponse
+from dostuff.helpers.agent.turn_context import is_turn_context
 from dostuff.lib.model import completion_kwargs
 
 # Share of the context window one summary request may use (prompt + notes + chunk)
@@ -113,6 +114,8 @@ async def compact_context(steps_history: list[dict], keep_token_budget: int, exi
     old_steps, recent_steps = split_by_token_budget(steps_history, keep_token_budget)
     if not old_steps:
         return steps_history, ""
+    # Their text must not reach the notes, which the user is shown; an old `git status` isn't a fact to carry on
+    old_steps = [step for step in old_steps if not is_turn_context(step)]
 
     if context_window is None:
         from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit

@@ -4,11 +4,14 @@ from typing import Any, Callable
 
 from rich.text import Text
 
+from dostuff.helpers.agent.turn_context import is_turn_context
+
 # The MCP tools the model is given; each server's own tools are found through them, not sent
 MCP_META_TOOLS = frozenset({"search_mcp_tools", "get_mcp_tool_details", "call_mcp_tool"})
 BAR_WIDTH = 40
 PART_STYLES = {
     "System prompt": "#8a8a8a",
+    "Turn context": "#98c379",
     "Tools": "#c678dd",
     "MCP tools": "#d7769f",
     "Project instructions": "#e5c07b",
@@ -37,20 +40,24 @@ def _message_text(message: dict[str, Any]) -> str:
 
 
 def context_parts(system_prompt: str, project_instructions: str, tool_schemas: dict[str, dict[str, Any]],
-                  messages: list[dict[str, Any]], summary: str, count: Callable[[str], int]) -> list[tuple[str, int]]:
+                  messages: list[dict[str, Any]], summary: str, count: Callable[[str], int],
+                  next_context: str = "") -> list[tuple[str, int]]:
     """(part, tokens) for each part of the next request; `system_prompt` includes the project
-    instructions, which are counted on their own."""
+    instructions, which are counted on their own. "Turn context" is every context step already in `messages`, plus
+    `next_context`: what the next request adds (its recall can't be known yet, so that part is an estimate)."""
     if project_instructions and project_instructions in system_prompt:
         system_prompt = system_prompt.replace(project_instructions, "", 1)
     tools = [s for name, s in tool_schemas.items() if name not in MCP_META_TOOLS]
     mcp = [s for name, s in tool_schemas.items() if name in MCP_META_TOOLS]
+    context = [m for m in messages if is_turn_context(m)]
     return [
         ("System prompt", count(system_prompt)),
+        ("Turn context", count(next_context) + sum(count(_message_text(m)) for m in context)),
         ("Tools", count(json.dumps(tools)) if tools else 0),
         ("MCP tools", count(json.dumps(mcp)) if mcp else 0),
         ("Project instructions", count(project_instructions)),
         ("Summary of earlier messages", count(summary)),
-        ("Messages", sum(count(_message_text(m)) for m in messages)),
+        ("Messages", sum(count(_message_text(m)) for m in messages if not is_turn_context(m))),
     ]
 
 

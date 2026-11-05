@@ -2230,6 +2230,8 @@ class DostuffTUI(App):
     def _render_history_step(self, step: dict, prefix: str = "") -> None:
         """Render a stored step like the live adapter does (● call / ⎿ result). `prefix` (`[agent: …] `) marks
         a subagent's transcript in /agents."""
+        if is_turn_context(step):
+            return
         role = step.get("role", "?")
         content = step.get("content") or ""
         if role == "tool":
@@ -2983,12 +2985,13 @@ class DostuffTUI(App):
 
             def measure() -> list[tuple[str, int]]:
                 return context_parts(
-                    self._system_instructions + "\n\n" + build_environment_block(),
+                    self._system_instructions,
                     load_project_instructions(),
                     {name: TOOL_SCHEMAS[name] for name in default_tool_names()},
                     messages,
                     meta.get("compaction_notes") or "",
                     lambda text: count_tokens(text, model),
+                    next_context=build_environment_block(),
                 )
             parts = await asyncio.to_thread(measure)
             text = render_context(parts, get_model_token_limit(), get_model(), meta.get("last_input_tokens") or 0)

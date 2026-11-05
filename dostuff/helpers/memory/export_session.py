@@ -4,6 +4,7 @@ from typing import Any
 
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE
 from dostuff.helpers.agent.file_mentions import attached_paths, strip_attachments
+from dostuff.helpers.agent.turn_context import is_turn_context
 from dostuff.helpers.memory.shell_step import parse_shell_step
 
 
@@ -42,6 +43,8 @@ def session_to_markdown(steps: list[dict[str, Any]], meta: dict[str, Any] | None
     lines.append("")
 
     for step in steps:
+        if is_turn_context(step):
+            continue
         role = step.get("role")
         content = step.get("content") or ""
         if not isinstance(content, str):

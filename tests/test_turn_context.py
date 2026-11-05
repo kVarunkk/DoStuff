@@ -117,3 +117,13 @@ def test_bundle_does_not_change_delivered_plan_mode():
 def test_plan_step_survives_json_roundtrip():
     history = json.loads(json.dumps([make_plan_mode_step(True, "on")]))
     assert is_turn_context(history[0]) and delivered_plan_mode(history) is True
+
+
+# --- T3.7 single source for the marker --------------------------------------------------------------------------
+
+def test_marker_literal_not_duplicated():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "dostuff"
+    found = [p.relative_to(root).as_posix() for p in root.rglob("*.py")
+             if '"turn_context"' in (text := p.read_text(encoding="utf-8")) or "'turn_context'" in text]
+    assert found == ["helpers/agent/turn_context.py"]

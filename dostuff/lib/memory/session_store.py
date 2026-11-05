@@ -5,6 +5,7 @@ import json
 import os
 import aiosqlite
 from dostuff.helpers.agent.file_mentions import strip_attachments
+from dostuff.helpers.agent.turn_context import HIDDEN_LIKE_PATTERN
 from dostuff.helpers.memory.shell_step import parse_shell_step
 
 # PRAGMA user_version of the newest schema; bump and add a step to _migrate() to change it.
@@ -318,11 +319,13 @@ class SQLiteSessionStore(SessionStore):
             SELECT s.session_id, s.working_dir, s.last_used, s.created_at, s.title, COUNT(st.id),
                    (SELECT step_data FROM session_steps
                     WHERE session_id = s.session_id AND step_data LIKE '{"role": "user"%'
+                      AND step_data NOT LIKE ?
                     ORDER BY step_order ASC LIMIT 1)
             FROM sessions s LEFT JOIN session_steps st ON st.session_id = s.session_id
             GROUP BY s.session_id
             ORDER BY s.last_used DESC
-            """
+            """,
+            (HIDDEN_LIKE_PATTERN,),
         ) as cursor:
             rows = await cursor.fetchall()
         target = _norm_dir(working_dir) if working_dir else None
@@ -364,8 +367,8 @@ class SQLiteSessionStore(SessionStore):
         if title is None:
             async with db.execute(
                 "SELECT step_data FROM session_steps WHERE session_id = ? AND step_data LIKE '{\"role\": \"user\"%' "
-                "ORDER BY step_order ASC LIMIT 1",
-                (source_id,),
+                "AND step_data NOT LIKE ? ORDER BY step_order ASC LIMIT 1",
+                (source_id, HIDDEN_LIKE_PATTERN),
             ) as cur:
                 first_user = await cur.fetchone()
             base = row[0] or _session_title(first_user[0] if first_user else None)
