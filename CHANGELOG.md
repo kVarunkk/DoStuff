@@ -25,6 +25,7 @@ Skills in your home folder now open at the first try, the provider's prompt cach
 - A `SKILL.md` that is not valid UTF-8 no longer stops every skill from loading.
 - GPT and Grok on OpenCode Go no longer fail every tool call with "not valid JSON": arguments delivered twice are collapsed to one copy.
 - After forking out of a `/btw` answer, the next `/btw` keeps its view of the conversation.
+- `/agents` opens its list straight away, so a background agent's approval prompt can no longer appear on top of it.
 
 ### Documentation
 - README: how a skill reaches the model, the sandbox's skill-folder exception, and the sticky prompt. The skills "Conflict resolution" paragraph was wrong and now says what happens: the first skill found with a name wins.

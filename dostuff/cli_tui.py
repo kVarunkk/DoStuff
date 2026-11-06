@@ -3527,7 +3527,10 @@ class DostuffTUI(App):
             self._start_worker(self._jobs_command(arg), name="jobs")
             return
         if name == "/agents":
-            self._start_worker(self._agents_command(arg), name="agents")
+            if arg.strip():
+                self._start_worker(self._agents_command(arg), name="agents")
+            else:  # not in a worker: the input is already empty, and a held-back approval would take that gap
+                self._show_agents_list()
             return
         if name == "/queue":
             if arg.lower() == "clear":
