@@ -74,7 +74,9 @@ from dostuff.helpers.hooks.dispatch import hook_line
 from dostuff.helpers.hooks.events import blocked_prompt_message, parse_stop_note, session_start, user_prompt_submit
 from dostuff.helpers.mcp.load_mcp_config import load_mcp_config, mcp_config_sources, read_mcp_file
 from dostuff.helpers.skills.custom_commands import discover_commands
-from dostuff.helpers.skills.skill_command import parse_skill_command, skill_commands, skill_prompt
+from dostuff.helpers.skills.skill_command import (
+    mention_line, parse_skill_command, skill_commands, skill_mentions, skill_prompt, with_mention_note,
+)
 from dostuff.setup_wizard import PROVIDERS, missing_api_keys, read_template
 from dostuff.helpers.models.add_model_entry import ModelConfigError, add_model_entry
 from dostuff.helpers.models.list_models import FETCHED_PROVIDERS, ModelListError, provider_models
@@ -3664,6 +3666,7 @@ class DostuffTUI(App):
         """D5: @mentions and pastes resolved off the UI thread, in submit order; `ready`/`fail` hands
         the entry to the loop. The "Attached …" lines show here, as they do for a prompt."""
         try:
+            mentions = skill_mentions(msg.raw, self._skill_commands)  # what was typed, before anything expands
             expansion = await asyncio.to_thread(expand_file_mentions, msg.raw, self.config.max_tool_output_chars)
             if expansion.attached:
                 self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
@@ -3671,6 +3674,9 @@ class DostuffTUI(App):
                 self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
             content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
                                               self.config.paste_file_lines, self.config.max_tool_output_chars)
+            content = with_mention_note(content, mentions)
+            if mentions:
+                self._append(mention_line(mentions), msg_type="system")
         except Exception as e:  # unreadable mention, broken paste file: reported, never delivered (REQ-2.4)
             self._steering.fail(msg.id, str(e))
             self._render_queue()
@@ -4129,6 +4135,7 @@ class DostuffTUI(App):
             if not wake:
                 # `/<skill> args`: only the args get @mentions and pastes; the SKILL.md text goes around them
                 skill_run = parse_skill_command(user_text, self._skill_commands)
+                mentions = skill_mentions(user_text, self._skill_commands)  # what was typed, before anything expands
                 expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else user_text,
                                                     self.config.max_tool_output_chars)
                 if expansion.attached:
@@ -4147,6 +4154,9 @@ class DostuffTUI(App):
                     what = "command" if skill_run[0].get("kind") == "command" else "skill"
                     self._append(f"Running {what} {skill_run[0]['name']} ({_rel_path(skill_run[0]['location'])})",
                                  msg_type="system")
+                content = with_mention_note(content, mentions)
+                if mentions:
+                    self._append(mention_line(mentions), msg_type="system")
 
             # Reset cancel state before the hooks below, so ESC can stop a slow one
             self.adapter._cancelled = False

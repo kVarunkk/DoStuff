@@ -279,7 +279,9 @@ async def run_headless(
     from dostuff.helpers.agent.turn_context import make_context_step
     from dostuff.helpers.mcp.load_mcp_config import load_mcp_config
     from dostuff.helpers.skills.custom_commands import discover_commands
-    from dostuff.helpers.skills.skill_command import parse_skill_command, skill_commands, skill_prompt
+    from dostuff.helpers.skills.skill_command import (
+        mention_line, parse_skill_command, skill_commands, skill_mentions, skill_prompt, with_mention_note,
+    )
     from dostuff.helpers.ui.emit import set_adapter
     from dostuff.lib.mcp.mcp_client import MCPClient
     from dostuff.lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
@@ -335,7 +337,9 @@ async def run_headless(
         steps_history = await store.load(session_id)
         working_history = await store.load_working_history(session_id)
         current_session_history: list = []
-        skill_run = parse_skill_command(prompt, skill_commands(skills, discover_commands()))  # `-p "/<name> args"`
+        commands = skill_commands(skills, discover_commands())
+        skill_run = parse_skill_command(prompt, commands)  # `-p "/<name> args"`
+        mentions = skill_mentions(prompt, commands)  # what was typed, before anything expands
         expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else prompt,
                                             config.max_tool_output_chars)
         if expansion.attached:
@@ -343,6 +347,9 @@ async def run_headless(
         if expansion.skipped:
             adapter.emit("error", "Not attached: " + "; ".join(expansion.skipped))
         content = await asyncio.to_thread(skill_prompt, skill_run[0], expansion.content) if skill_run else expansion.content
+        content = with_mention_note(content, mentions)
+        if mentions:
+            adapter._progress(mention_line(mentions))
         # SessionStart, then UserPromptSubmit: both before the user step is appended (hooks spec D1)
         session_hook_context: dict[str, str] = {}
         await session_start("resume" if meta else "startup", session_hook_context, session_id=session_id,

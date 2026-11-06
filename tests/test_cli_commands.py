@@ -872,3 +872,39 @@ def test_print_mode_runs_a_manual_skill(env, headless):
     result = runner.invoke(env["app"], ["-p", "/deploy", "-q"])
     assert result.exit_code == 0, result.output
     assert "Ship it." in headless[-1]["history"][-1]["content"]
+
+
+def _project_skill(name="deploy", description="Ship it", extra=""):
+    skill = Path(".dostuff", "skills", name)
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {description}\n{extra}---\n\nShip it.\n",
+                                    encoding="utf-8")
+    return skill.resolve()
+
+
+def test_print_mode_mention(env, headless, hook_cmd, tmp_path):
+    skill = _project_skill()
+    seen = tmp_path / "prompt.json"
+    logger = hook_cmd(f"import json, sys; json.dump(json.load(sys.stdin), open({str(seen)!r}, 'w'))")
+    _write_hooks(env["home"], {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": logger}]}]})
+    result = runner.invoke(env["app"], ["-p", "go ahead and /deploy", "--trust-project-hooks"])
+    assert result.exit_code == 0, result.output
+    assert "Skill available for this message: deploy" in result.stderr
+    content = headless[-1]["history"][-1]["content"]
+    assert content.startswith("go ahead and /deploy\n\n<skill-mentions>\n")
+    assert content.endswith(f"- name: deploy\n  description: Ship it\n  dir: {skill}\n</skill-mentions>")
+    # UserPromptSubmit sees the note, as it sees an expanded skill or an attached file
+    assert "<skill-mentions>" in json.loads(seen.read_text())["prompt"]
+
+
+def test_print_mode_scans_what_was_typed_only(env, headless):
+    _project_skill()
+    Path("notes.txt").write_text("please /deploy now\n", encoding="utf-8")
+    result = runner.invoke(env["app"], ["-p", "see @notes.txt", "-q"])
+    assert result.exit_code == 0, result.output
+    assert "<skill-mentions>" not in headless[-1]["history"][-1]["content"]
+    # A plain prompt is untouched, and so is a skill run with a mention in its arguments
+    runner.invoke(env["app"], ["-p", "just a prompt", "-q"])
+    assert headless[-1]["history"][-1]["content"] == "just a prompt"
+    runner.invoke(env["app"], ["-p", "/deploy then /deploy", "-q"])
+    assert "<skill-mentions>" not in headless[-1]["history"][-1]["content"]
