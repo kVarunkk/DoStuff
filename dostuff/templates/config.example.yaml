@@ -118,7 +118,7 @@ permissions:
 #       hooks:
 #         - { type: command, name: block-main-push, command: "python .dostuff/hooks/block_main_push.py" }
 #   PostToolUse:              # stdout is appended to the tool result the model sees
-#     - matcher: "write_file|edit_file"
+#     - matcher: "write_file|edit_file"   # edit_file also matches multi_edit; its tool_input is {path, edits}
 #       hooks:
 #         - { type: command, name: format, command: "python .dostuff/hooks/format_file.py" }
 #   Stop:                     # exit 2 (or "decision": "block") sends the reason back and the agent continues

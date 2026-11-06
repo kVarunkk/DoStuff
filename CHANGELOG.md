@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The agent can make several edits to a file in one approved step, a skill can be kept for you to run by hand, and you can allow a skill for one message by naming it in the sentence.
+
+### Added
+- **`multi_edit` tool** — several exact-string edits to one file in one call: one approval, one diff, and if any edit fails the file is left untouched. `/undo` restores it like any other file change.
+- **`disable-model-invocation` for skills** — set it in a `SKILL.md` and the model is not told about the skill, so it only runs when you ask. It stays in the `/` menu and `/help`, and the `Skills loaded` line marks it `(manual only)`. This is not a security boundary: the skill's files stay readable, so use a `PreToolUse` hook to guarantee a command never runs.
+- **Skill mentions** — `go ahead and /deploy` makes that skill available for that message, including a manual-only one. The model judges from your wording, so `don't run /deploy yet` works, and a `Skill available for this message: deploy` line confirms it was recognised. Only what you type counts, not a `/deploy` inside an attached file or a collapsed paste. Works in prompts, queued prompts, steering messages and `dostuff -p`.
+- **Skill completion mid-message** — `/` after a space opens the menu with skills only. Tab and Enter replace just that word, so your sentence stays and nothing is sent.
+
+### Changed
+- **Hooks with an `edit_file` matcher now also run for `multi_edit`**, so a guard or a formatter still holds for the same change. The payload says `tool_name: multi_edit` with `tool_input: {path, edits}`: a script that reads `tool_input.path` keeps working, and one that reads `tool_input.old_str` needs to read `edits` for this tool. A hook that rewrites `old_str` / `new_str` makes the `multi_edit` call fail, and nothing is written.
+- Allowing `edit_file` also allows `multi_edit`, and the other way round, in `permissions.allow`, `--allowed-tools` and "always" for the session.
+- `Edit` and `MultiEdit` in an agent file's `tools:` now give the agent both `edit_file` and `multi_edit`.
+
+### Documentation
+- README: `multi_edit` in the tools and name tables, the `edit_file` matcher rule for hooks, and manual-only skills and mentions in the Skills section.
+
 ## [0.2.11] - 2026-11-06
 
 Skills in your home folder now open at the first try, the provider's prompt cache survives from one turn to the next, the current prompt stays pinned while you scroll, and GPT and Grok tool calls work on OpenCode Go.
