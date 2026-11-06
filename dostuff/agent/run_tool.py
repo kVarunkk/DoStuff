@@ -21,6 +21,8 @@ from dostuff.lib.checkpoints import CHECKPOINT_TOOLS, get_checkpoint_store
 from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.tracing import content_attr, traced
 from dostuff.tools.definitions import HARNESS_PARAMS, TOOL_MAP, ToolSpec
+from dostuff.tools.files.edit_file import EditFailed
+from dostuff.tools.files.multi_edit import apply_edits, check_edits
 from dostuff.tools.settings import SETTINGS_TOOLS, settings_preview
 
 # Legacy approval flags a model may still try to pass; always dropped before dispatch.
@@ -43,7 +45,7 @@ def _approval_preview(tool: str, args: dict[str, Any]) -> str:
     """A plain diff for file writes/edits so the user sees what they approve."""
     if tool in SETTINGS_TOOLS:
         return settings_preview(tool, args)
-    if tool not in ("write_file", "edit_file") or not isinstance(args.get("path"), str):
+    if tool not in ("write_file", "edit_file", "multi_edit") or not isinstance(args.get("path"), str):
         return ""
     try:
         path = resolve_safe_path(args["path"])
@@ -55,6 +57,14 @@ def _approval_preview(tool: str, args: dict[str, Any]) -> str:
         if not old_str or old_str not in old:
             return "  (old_str not found; the edit will fail)"
         new = old.replace(old_str, new_str) if args.get("replace_all") else old.replace(old_str, new_str, 1)
+    elif tool == "multi_edit":
+        try:
+            check_edits(args.get("edits"))
+            new, _ = apply_edits(old, args["edits"], args["path"])
+        except EditFailed as e:
+            return f"  ({e.brief}; the call will fail)"
+        except ValueError:
+            return ""  # malformed: the tool reports it
     else:
         new = str(args.get("content", ""))
         if not old:

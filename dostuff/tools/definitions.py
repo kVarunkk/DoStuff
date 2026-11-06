@@ -14,6 +14,7 @@ from dostuff.tools.bash.kill_shell import kill_shell
 from dostuff.tools.files.delete_file import delete_file
 from dostuff.tools.files.edit_file import edit_file
 from dostuff.tools.files.list_files import list_files
+from dostuff.tools.files.multi_edit import multi_edit
 from dostuff.tools.files.read_file import read_file
 from dostuff.tools.files.write_file import write_file
 from dostuff.tools.get_current_datetime import get_current_datetime
@@ -58,6 +59,8 @@ _TOOLS = [
     ToolSpec("read_file", read_file, "read"),
     ToolSpec("write_file", write_file, "write"),
     ToolSpec("edit_file", edit_file, "write"),
+    # Keep its argument named `path`: the settings check, plan mode and checkpoints all key on it
+    ToolSpec("multi_edit", multi_edit, "write"),
     ToolSpec("delete_file", delete_file, "write"),
     ToolSpec("list_files", list_files, "read"),
     ToolSpec("grep", grep, "read"),

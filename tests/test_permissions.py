@@ -10,6 +10,7 @@ from dostuff.agent.permissions import (
     PermissionConfig,
     SessionPermissions,
     check,
+    describe_approval_keys,
     has_unsafe_constructs,
     is_read_only_shell,
     parse_answer,
@@ -17,6 +18,7 @@ from dostuff.agent.permissions import (
 from dostuff.agent.run_tool import authorize_batch, authorize_tool, run_tool
 from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path, set_skill_roots
 from dostuff.lib.exceptions import PathAccessDenied, PathOutsideProject
+from dostuff.tools.definitions import TOOL_MAP
 
 ASK = PermissionConfig(mode="ask")
 
@@ -477,3 +479,95 @@ def test_a_root_at_or_above_dostuff_skills_admits_nothing_there(home_skills, roo
         resolve_safe_path(str(home_skills / ".dostuff" / "config.yaml"), home_skills, for_read=True)
     with pytest.raises(PathAccessDenied):
         resolve_safe_path(str(home_skills / ".dostuff" / "skills" / "other" / "SKILL.md"), home_skills, for_read=True)
+
+
+# --- multi_edit (plan/2026-11-06-skills-and-multi-edit) -------------------------------------------------
+
+def _edits(*pairs):
+    return [{"old_str": old, "new_str": new} for old, new in pairs]
+
+
+def test_multi_edit_preview(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("a.txt").write_text("one\nmiddle\ntwo\n", encoding="utf-8")
+
+    def preview(args):
+        return run_tool_module._approval_preview("multi_edit", args)
+
+    # One diff of the final text: edit 2 builds on edit 1, and the intermediate state is not shown
+    shown = preview({"path": "a.txt", "edits": _edits(("one", "uno"), ("uno", "eins"), ("two", "zwei"))})
+    assert shown.count("--- a.txt") == 1
+    assert "-one" in shown and "+eins" in shown and "-two" in shown and "+zwei" in shown and "uno" not in shown
+
+    assert preview({"path": "a.txt", "edits": _edits(("one", "1"), ("nope", "x"), ("two", "2"))}) \
+        == "  (edit 2 of 3: old_str not found; the call will fail)"
+    assert preview({"path": "a.txt", "edits": _edits(("one", "1"), ("two", "two"))}) \
+        == "  (edit 2 of 2: old_str and new_str are identical; the call will fail)"
+
+    # Malformed: nothing to show, and the tool reports the error
+    for edits in ("[]", {"old_str": "a"}, [], ["one"], [{"old_str": "one"}], [{"old_str": 1, "new_str": "x"}], None):
+        assert preview({"path": "a.txt", "edits": edits}) == "", edits
+    assert preview({"path": "a.txt"}) == ""
+
+
+def test_multi_edit_preview_matches_a_crlf_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("a.txt").write_bytes(b"one\r\ntwo\r\n")
+    shown = run_tool_module._approval_preview("multi_edit", {"path": "a.txt", "edits": _edits(("one\ntwo", "both"))})
+    assert "+both" in shown and "not found" not in shown
+
+
+def test_multi_edit_always_label():
+    assert describe_approval_keys([("multi_edit", "multi_edit")]) == "file edits"
+    assert describe_approval_keys([("edit_file", "edit_file"), ("multi_edit", "multi_edit")]) == "file edits"
+
+
+def test_multi_edit_settings_path_asks():
+    """`.dostuff/config.yaml` through multi_edit asks in auto mode, because `path` is the argument the check reads."""
+    assert "path" in TOOL_MAP["multi_edit"].schema["function"]["parameters"]["properties"]
+    kind = TOOL_MAP["multi_edit"].kind
+    args = {"path": ".dostuff/config.yaml", "edits": _edits(("a", "b"))}
+    decision = check("multi_edit", kind, args, None, PermissionConfig(mode="auto"))
+    assert decision.action == "ask" and decision.approval_keys == []
+    assert check("multi_edit", kind, {**args, "path": "src/a.py"}, None, PermissionConfig(mode="auto")).action == "allow"
+
+
+def test_multi_edit_refused_in_plan_mode():
+    decision = check("multi_edit", TOOL_MAP["multi_edit"].kind, {"path": "a.py", "edits": _edits(("a", "b"))}, None,
+                     PermissionConfig(mode="plan"))
+    assert decision.action == "deny" and "Plan mode" in decision.reason
+
+
+@pytest.mark.parametrize("granted, called", [("edit_file", "multi_edit"), ("multi_edit", "edit_file")])
+def test_edit_tools_allow_each_other(granted, called):
+    args = {"path": "a.py"}
+    # permissions.allow, in allowlist mode
+    assert check(called, "write", args, None, PermissionConfig(mode="allowlist", allow=[granted])).action == "allow"
+    # --allowed-tools, in any mode
+    assert check(called, "write", args, SessionPermissions(allow=[granted]), ASK).action == "allow"
+    # "always" for the session
+    session = SessionPermissions()
+    session.approve(check(granted, "write", args, session, ASK).approval_keys)
+    assert check(granted, "write", args, session, ASK).action == "allow"
+    assert check(called, "write", args, session, ASK).action == "allow"
+
+
+@pytest.mark.parametrize("edit_tool", ["edit_file", "multi_edit"])
+def test_edit_grants_stop_at_the_edit_tools(edit_tool):
+    """An edit rule never widens to write_file or delete_file, nor a write_file rule to the edit tools."""
+    args = {"path": "a.py"}
+    cfg = PermissionConfig(mode="allowlist", allow=[edit_tool])
+    session = SessionPermissions(allow=[edit_tool])
+    for other in ("write_file", "delete_file"):
+        assert check(other, "write", args, None, cfg).action == "ask"
+        assert check(other, "write", args, session, ASK).action == "ask"
+    always = SessionPermissions()
+    always.approve(check(edit_tool, "write", args, always, ASK).approval_keys)
+    assert check("write_file", "write", args, always, ASK).action == "ask"
+    write_rule = PermissionConfig(mode="allowlist", allow=["write_file"])
+    assert check(edit_tool, "write", args, None, write_rule).action == "ask"
+
+
+def test_edit_grant_does_not_reach_a_settings_path():
+    args = {"path": ".dostuff/config.yaml"}
+    assert check("multi_edit", "write", args, SessionPermissions(allow=["edit_file"]), ASK).action == "ask"

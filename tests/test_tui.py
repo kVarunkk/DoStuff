@@ -6901,3 +6901,108 @@ def test_sticky_prompt_while_pinned_and_after_clear(tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+def test_pin_slash_menu_start_of_input(tui):
+    """The `/` menu at the start of the input, pinned before mid-prompt completion goes in beside it (CON-002)."""
+    cli_tui = tui
+    skill_dir = Path(".dostuff", "skills", "deploy")
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: deploy\ndescription: Ship it\n---\n\nShip.\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin-menu")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            menu = app.query_one("#command-menu", cli_tui.CommandMenu)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+
+            # Every built-in and the skill
+            await pilot.press("/")
+            await _until(pilot, lambda: menu.display)
+            assert menu.mode == "command" and menu.option_count == len(cli_tui.COMMAND_DESCRIPTIONS) + 1
+
+            # Tab fills the command; no arguments, no space
+            await pilot.press(*"cle")
+            await _until(pilot, lambda: menu.selected_command() == "/clear")
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "/clear")
+            app._clear_input()
+
+            # A command with arguments gets a space, and its hint shows
+            await pilot.press(*"/ren")
+            await _until(pilot, lambda: menu.selected_command() == "/rename")
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "/rename ")
+            assert inp.suggestion == "<title>" and not menu.display
+            app._clear_input()
+
+            # A skill takes arguments too
+            await pilot.press(*"/dep")
+            await _until(pilot, lambda: menu.selected_command() == "/deploy")
+            assert inp.suggestion == "loy [arguments]" and inp.completion == "loy"
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "/deploy ")
+            app._clear_input()
+
+            # Enter submits the highlighted command, whatever was typed of it
+            await pilot.press(*"/dep")
+            await _until(pilot, lambda: menu.selected_command() == "/deploy")
+            await pilot.press("enter")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            assert not menu.display and inp.text == ""
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert "The user ran the /deploy skill." in _shown(app.steps_history)[0]["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_pin_prompt_content_plain(tui):
+    """The stored user step with no skill mention, exactly (REQ-4.3): a mention must be the only thing that adds to it."""
+    cli_tui = tui
+    Path("notes.txt").write_text("alpha\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin-content")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            marker = app._pastes.add("line one\nline two\nline three")
+            for prompt in (f"see @notes.txt and {marker}", "/etc/hosts look"):
+                app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(prompt))
+                await _until(pilot, app.adapter.has_pending_confirm)
+                app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+                await _until(pilot, lambda: not app._turn_in_progress)
+            first, _, second, _ = _shown(app.steps_history)
+            assert first == {"role": "user", "content":
+                             "see @notes.txt and line one\nline two\nline three\n\n"
+                             '<attached_file path="notes.txt">\n1\talpha\n</attached_file>'}
+            assert second == {"role": "user", "content": "/etc/hosts look"}
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_take_back_mentions_undo_after_multi_edit(turn_tui):
+    """The hint reads CHECKPOINT_TOOLS, so a tool /undo can restore is one the hint mentions."""
+    cli_tui, seen = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="back-multi")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "change it")
+            await _until(pilot, lambda: not app._turn_in_progress and len(seen) == 1)
+            await app._backend_ready.wait()
+            step = {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "multi_edit", "arguments": "{}"}}]}
+            await app.store.append(app.session_id, step)
+            app.steps_history.append(step)
+            app.current_session_history.append(step)
+            got = _record_appends(app)
+            await app._edit_previous_prompt()
+            assert any("/undo restores them" in text for text, _ in got), got
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

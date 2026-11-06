@@ -475,6 +475,51 @@
     },
     "type": "function"
   },
+  "multi_edit": {
+    "function": {
+      "description": "Makes several exact-string replacements in one file, in one call. Prefer this over repeated\nedit_file calls when changing one file in several places. All or nothing: if any edit fails, the\nfile is left untouched.",
+      "name": "multi_edit",
+      "parameters": {
+        "properties": {
+          "edits": {
+            "description": "The replacements, applied in order: each one sees the result of the ones before it. Each old_str must occur exactly once unless that edit sets replace_all.",
+            "items": {
+              "properties": {
+                "new_str": {
+                  "description": "Replacement text.",
+                  "type": "string"
+                },
+                "old_str": {
+                  "description": "Exact text to replace, as the file reads after the edits before this one.",
+                  "type": "string"
+                },
+                "replace_all": {
+                  "description": "Replace every occurrence instead of requiring exactly one.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "old_str",
+                "new_str"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "path": {
+            "description": "Path relative to the project root, e.g. 'src/app.py'.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "edits"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
   "read_file": {
     "function": {
       "description": "Read a text file, returning numbered lines (like `cat -n`).",

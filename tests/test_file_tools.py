@@ -8,8 +8,9 @@ import pytest
 from dostuff.helpers.skills.discover_skills import discover_skills
 from dostuff.lib.exceptions import PathAccessDenied, PathOutsideProject
 from dostuff.tools.files.delete_file import delete_file
-from dostuff.tools.files.edit_file import edit_file
+from dostuff.tools.files.edit_file import apply_edit, edit_file
 from dostuff.tools.files.list_files import list_files
+from dostuff.tools.files.multi_edit import multi_edit
 from dostuff.tools.files.read_file import read_file
 from dostuff.tools.files.write_file import write_file
 from dostuff.tools.search.glob import glob
@@ -247,3 +248,158 @@ def test_allowlist_follows_discovery(home_skill, home_skills):
     added = _add_skill(home_skills / ".agents" / "skills", "added")
     discover_skills()
     assert "name: added" in read_file(str(added / "SKILL.md"))
+
+
+# ── pins: edit_file's messages are part of its contract (spec CON-001) ────────
+
+@pytest.mark.parametrize("old_str, new_str, replace_all, error, message", [
+    ("nope", "y", False, ValueError, "old_str not found in a.py. Read the file and copy the text exactly."),
+    ("x", "y", False, ValueError,
+     "old_str occurs 2 times in a.py. Add surrounding lines to make it unique, or set replace_all=true."),
+    ("", "y", False, ValueError, "old_str must not be empty; use write_file to create a file."),
+    ("x", "x", False, ValueError, "old_str and new_str are identical; nothing to change."),
+    ("x", "x", True, ValueError, "old_str and new_str are identical; nothing to change."),
+])
+def test_pin_edit_file_errors(project, old_str, new_str, replace_all, error, message):
+    (project / "a.py").write_bytes(b"x\nx\n")
+    with pytest.raises(error) as caught:
+        edit_file("a.py", old_str, new_str, replace_all)
+    assert str(caught.value) == message
+    assert (project / "a.py").read_bytes() == b"x\nx\n"
+
+
+def test_pin_edit_file_missing_file_message(project):
+    with pytest.raises(FileNotFoundError) as caught:
+        edit_file("missing.py", "a", "b")
+    assert str(caught.value) == "File not found: missing.py"
+
+
+# ── apply_edit: the matching step edit_file and multi_edit share ──────────────
+
+def test_apply_edit():
+    assert apply_edit("a b a", "b", "c", False, "f") == ("a c a", 1)
+    assert apply_edit("a b a", "a", "z", True, "f") == ("z b z", 2)
+    assert apply_edit("one\ntwo\n", "one\r\ntwo", "uno\r\ndos", False, "f") == ("uno\ndos\n", 1)
+    with pytest.raises(ValueError, match="old_str not found in f"):
+        apply_edit("a", "b", "c", False, "f")
+
+
+# ── multi_edit ───────────────────────────────────────────────────────────────
+
+def _op(old_str, new_str, **kwargs):
+    return {"old_str": old_str, "new_str": new_str, **kwargs}
+
+
+def test_multi_edit_applies_in_order(project):
+    """Edit 2 sees edit 1's result: its old_str does not exist until edit 1 has run."""
+    (project / "a.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
+    result = multi_edit("a.py", [_op("x = 1", "x = 10"), _op("x = 10\ny", "x = 11\nz")])
+    assert (project / "a.py").read_text(encoding="utf-8") == "x = 11\nz = 2\n"
+    assert result.startswith("File edited (2 edits, 2 replacement(s)): a.py")
+    assert "-x = 1" in result and "+x = 11" in result and "x = 10" not in result  # one diff of the final text
+
+
+def test_multi_edit_reads_once_and_writes_once(project, monkeypatch):
+    import builtins
+    (project / "a.py").write_text("a b c\n", encoding="utf-8")
+    real_open, modes = builtins.open, []
+
+    def counting_open(file, mode="r", *args, **kwargs):
+        if str(file).endswith("a.py"):
+            modes.append(mode)
+        return real_open(file, mode, *args, **kwargs)
+    monkeypatch.setattr(builtins, "open", counting_open)
+    multi_edit("a.py", [_op("a", "1"), _op("b", "2"), _op("c", "3")])
+    assert modes == ["r", "w"]
+
+
+def test_multi_edit_replace_all_per_edit(project):
+    (project / "a.py").write_text("x x y\n", encoding="utf-8")
+    result = multi_edit("a.py", [_op("x", "z", replace_all=True), _op("y", "w")])
+    assert (project / "a.py").read_text(encoding="utf-8") == "z z w\n"
+    assert "(2 edits, 3 replacement(s))" in result
+
+
+@pytest.mark.parametrize("edits, message", [
+    ([_op("nope", "b"), _op("two", "2"), _op("three", "3")],
+     "edit 1 of 3: old_str not found in a.txt. Read the file and copy the text exactly."),
+    ([_op("one", "1"), _op("nope", "b"), _op("three", "3")],
+     "edit 2 of 3: old_str not found in a.txt. Read the file and copy the text exactly."),
+    ([_op("one", "1"), _op("two", "2"), _op("nope", "b")],
+     "edit 3 of 3: old_str not found in a.txt. Read the file and copy the text exactly."),
+    ([_op("one", "1"), _op("dup", "d")],
+     "edit 2 of 2: old_str occurs 2 times in a.txt. Add surrounding lines to make it unique, "
+     "or set replace_all=true."),
+    ([_op("one", "1"), _op("two", "two")], "edit 2 of 2: old_str and new_str are identical; nothing to change."),
+    ([_op("one", "1"), _op("", "x")], "edit 2 of 2: old_str must not be empty; use write_file to create a file."),
+    # An earlier edit can remove what a later one needs
+    ([_op("one", "1"), _op("one", "uno")],
+     "edit 2 of 2: old_str not found in a.txt. Read the file and copy the text exactly."),
+])
+def test_multi_edit_failure_leaves_file(project, edits, message):
+    target = project / "a.txt"
+    target.write_bytes(b"one\ntwo\nthree\ndup dup\n")
+    os.utime(target, (1_000_000_000, 1_000_000_000))
+    with pytest.raises(ValueError) as caught:
+        multi_edit("a.txt", edits)
+    assert str(caught.value) == message
+    assert target.read_bytes() == b"one\ntwo\nthree\ndup dup\n"
+    assert target.stat().st_mtime == 1_000_000_000
+
+
+def test_multi_edit_bad_targets(project):
+    (project / "a.txt").write_text("one\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="edits must not be empty"):
+        multi_edit("a.txt", [])
+    with pytest.raises(FileNotFoundError, match="File not found: missing.txt"):
+        multi_edit("missing.txt", [_op("a", "b")])
+    with pytest.raises(PathOutsideProject):
+        multi_edit("../outside.txt", [_op("a", "b")])
+
+
+def test_multi_edit_crlf(project):
+    (project / "win.txt").write_bytes(b"one\r\ntwo\r\nthree\r\n")
+    multi_edit("win.txt", [_op("one\ntwo", "uno\ndos"), _op("dos\nthree", "dos\ntres\nmas")])
+    assert (project / "win.txt").read_bytes() == b"uno\r\ndos\r\ntres\r\nmas\r\n"
+
+    (project / "unix.txt").write_bytes(b"one\ntwo\n")
+    multi_edit("unix.txt", [_op("one\r\ntwo", "uno\r\ndos")])
+    assert (project / "unix.txt").read_bytes() == b"uno\ndos\n"
+
+
+def test_multi_edit_mixed_endings_match_edit_file(project):
+    """A file with both endings comes out all CRLF from either tool: the same rule, applied once."""
+    (project / "a.txt").write_bytes(b"one\r\ntwo\nthree\n")
+    (project / "b.txt").write_bytes(b"one\r\ntwo\nthree\n")
+    edit_file("a.txt", "two", "2")
+    multi_edit("b.txt", [_op("two", "2")])
+    assert (project / "b.txt").read_bytes() == (project / "a.txt").read_bytes() == b"one\r\n2\r\nthree\r\n"
+
+
+@pytest.mark.parametrize("edits, message", [
+    # Nothing between the model and the tool validates against the schema, so a weak tool-caller's shapes land here
+    ('[{"old_str": "one", "new_str": "1"}]', "edits must be a list of objects with old_str and new_str, got str."),
+    ({"old_str": "one", "new_str": "1"}, "edits must be a list of objects with old_str and new_str, got dict."),
+    (["one"], "edit 1 of 1: must be an object with old_str and new_str, got str."),
+    ([{"old_str": "one"}], "edit 1 of 1: must be an object with old_str and new_str."),
+    ([_op("one", "1"), {"new_str": "1"}], "edit 2 of 2: must be an object with old_str and new_str."),
+    ([_op("one", 1)], "edit 1 of 1: must be an object with old_str and new_str."),
+])
+def test_multi_edit_string_edits_is_a_clear_error(project, edits, message):
+    (project / "a.txt").write_bytes(b"one\n")
+    with pytest.raises(ValueError) as caught:
+        multi_edit("a.txt", edits)
+    assert str(caught.value) == message
+    assert (project / "a.txt").read_bytes() == b"one\n"
+
+
+def test_multi_edit_call_label_stays_on_one_line():
+    from dostuff.helpers.agent.tool_output import format_call_label
+    edits = [{"old_str": "line\n" * 50, "new_str": "other\n" * 50} for _ in range(20)]
+    label = format_call_label("multi_edit", {"path": "a.py", "edits": edits})
+    assert "\n" not in label and len(label) <= 200 and 'path="a.py"' in label
+
+
+def test_system_instructions_name_multi_edit():
+    from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
+    assert "`multi_edit`" in SYSTEM_INSTRUCTIONS

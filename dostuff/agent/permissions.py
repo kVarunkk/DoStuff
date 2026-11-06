@@ -210,6 +210,9 @@ class PermissionConfig:
     allow: list[str] = field(default_factory=list)
 
 
+_EDIT_TOOLS = ("edit_file", "multi_edit")
+
+
 def _config_allows(tool: str, tokens: list[str] | None, cfg: PermissionConfig) -> bool:
     return _patterns_allow(cfg.allow, tool, tokens)
 
@@ -222,6 +225,11 @@ def _patterns_allow(patterns: list[str], tool: str, tokens: list[str] | None) ->
         elif _shell_pattern_matches(pattern, tokens):
             return True
     return False
+
+
+def _same_grant(tool: str) -> tuple[str, ...]:
+    """The tools a rule for `tool` covers: `edit_file` and `multi_edit` grant the same capability, in both directions."""
+    return _EDIT_TOOLS if tool in _EDIT_TOOLS else (tool,)
 
 
 def _describe_call(tool: str, args: dict[str, Any]) -> str:
@@ -328,7 +336,8 @@ def check(
         return PermissionDecision("ask", prompt=prompt, reason=description)
     if kind == "read" or mode == "auto":
         return PermissionDecision("allow")
-    if session and tool in session.allow:
+    grants = _same_grant(tool)
+    if session and any(name in session.allow for name in grants):
         return PermissionDecision("allow")
 
     if kind == "shell":
@@ -358,9 +367,10 @@ def check(
         pattern = tool
     if session and (session.is_approved(tool, pattern) or pattern in session.allow):
         return PermissionDecision("allow")
-    if mode == "allowlist" and (_config_allows(tool, None, cfg) or _config_allows(pattern, None, cfg)):
+    if mode == "allowlist" and any(_config_allows(name, None, cfg) for name in (*grants, pattern)):
         return PermissionDecision("allow")
-    return PermissionDecision("ask", prompt=prompt, reason=description, approval_keys=[(tool, pattern)])
+    keys = [(name, name) for name in grants] if len(grants) > 1 else [(tool, pattern)]
+    return PermissionDecision("ask", prompt=prompt, reason=description, approval_keys=keys)
 
 
 Answer = Literal["yes", "always", "no", "each"]
@@ -387,7 +397,8 @@ def to_reply(raw: Any) -> ApprovalReply:
 
 
 _ALWAYS_NAMES = {
-    "write_file": "file writes", "edit_file": "file edits", "delete_file": "file deletions",
+    "write_file": "file writes", "edit_file": "file edits", "multi_edit": "file edits",
+    "delete_file": "file deletions",
 }
 
 

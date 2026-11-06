@@ -66,8 +66,8 @@ RESERVED_TYPES = frozenset({"fork"})  # built into the harness (D11); a file can
 CLAUDE_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "Read": ("read_file",),
     "Write": ("write_file",),
-    "Edit": ("edit_file",),
-    "MultiEdit": ("edit_file",),
+    "Edit": ("edit_file", "multi_edit"),
+    "MultiEdit": ("edit_file", "multi_edit"),
     "Glob": ("glob",),
     "Grep": ("grep",),
     "LS": ("list_files",),

@@ -45,7 +45,7 @@ from dostuff.tools.bash.jobs import (
     session_of,
 )
 from dostuff.lib.memory.session_store import SQLiteSessionStore
-from dostuff.lib.checkpoints import UndoResult, get_checkpoint_store
+from dostuff.lib.checkpoints import CHECKPOINT_TOOLS, UndoResult, get_checkpoint_store
 from dostuff.lib.worktree import Worktree, WorktreeError, create_worktree, detect_worktree, has_changes, remove_worktree, worktree_changes
 from dostuff.lib.model import get_model
 from dostuff.lib.tracing import session_id_var, turn_id_var
@@ -4797,7 +4797,7 @@ class DostuffTUI(App):
         if self.current_session_history:
             del self.current_session_history[-min(count, len(self.current_session_history)):]
         changed_files = any(
-            (tc.get("function") or {}).get("name") in ("write_file", "edit_file", "delete_file")
+            (tc.get("function") or {}).get("name") in CHECKPOINT_TOOLS
             for step in dropped for tc in (step.get("tool_calls") or []) if isinstance(tc, dict)
         )
         await self.query_one("#msg-container", Vertical).remove_children()
