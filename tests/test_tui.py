@@ -7422,7 +7422,8 @@ def test_mid_prompt_menu_enter_does_not_submit(tui):
             await _until(pilot, app.adapter.has_pending_confirm)
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
             await _until(pilot, lambda: not app._turn_in_progress)
-            assert _shown(app.steps_history)[0]["content"].startswith("go ahead and /deploy-staging\n\n<skill-mentions>")
+            # The space Tab added stays: it is part of what was sent, and the mention still counts
+            assert _shown(app.steps_history)[0]["content"].startswith("go ahead and /deploy-staging \n\n<skill-mentions>")
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
