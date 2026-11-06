@@ -862,3 +862,13 @@ def test_headless_wake_turn_adds_no_context_step(env, headless_agents, capsys):
     messages = fm.calls_for("[M]")[2]["messages"]
     assert sum("<turn-context>" in str(m.get("content")) for m in messages) == 1
     assert "<environment>\ncwd:" not in messages[0]["content"]
+
+
+def test_print_mode_runs_a_manual_skill(env, headless):
+    skill = Path(".dostuff", "skills", "deploy")
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: deploy\ndescription: d\ndisable-model-invocation: true\n---\n\nShip it.\n",
+                                    encoding="utf-8")
+    result = runner.invoke(env["app"], ["-p", "/deploy", "-q"])
+    assert result.exit_code == 0, result.output
+    assert "Ship it." in headless[-1]["history"][-1]["content"]

@@ -2111,7 +2111,8 @@ class DostuffTUI(App):
         self.query_one("#command-menu", CommandMenu).commands = menu_commands
         inp.commands = menu_commands
         if skills:
-            skill_names = ", ".join(s["name"] for s in skills)
+            skill_names = ", ".join(s["name"] + (" (manual only)" if s.get("disable_model_invocation") else "")
+                                    for s in skills)
             self._append(f"Skills loaded: {len(skills)} — {skill_names}", msg_type="system")
         else:
             self._append("Skills loaded: 0 (add to .dostuff/skills/ or ~/.agents/skills/)", msg_type="system")

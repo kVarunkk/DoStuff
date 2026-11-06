@@ -228,3 +228,60 @@ def test_skills_import_is_light():
             "print(sorted(m for m in ('litellm', 'chromadb', 'mcp') if m in sys.modules))")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=REPO)
     assert out.stdout.strip() == "[]"
+
+
+# --- disable-model-invocation (plan/2026-11-06-skills-and-multi-edit D7 - D9) ----------------------------------
+
+@pytest.mark.parametrize("line, hidden", [
+    ("disable-model-invocation: true", True),
+    ("disable-model-invocation: True", True),
+    ("disable-model-invocation: yes", True),
+    ("disable-model-invocation: on", True),
+    ("disable-model-invocation: 1", True),
+    ("disable-model-invocation: banana", True),  # a typo must not make a protected skill visible
+    ("disable-model-invocation: [a, b]", True),  # not even a string
+    ("disable-model-invocation: {a: b}", True),
+    ("disable-model-invocation: false", False),
+    ("disable-model-invocation: FALSE", False),
+    ("disable-model-invocation: no", False),
+    ("disable-model-invocation: off", False),
+    ("disable-model-invocation: 0", False),
+    ("disable-model-invocation:", False),
+    ("disable-model-invocation: ''", False),
+    ("other-key: true", False),
+])
+def test_disable_model_invocation_values(tmp_path, monkeypatch, line, hidden):
+    skill = _only(tmp_path, monkeypatch, f"name: x\ndescription: d\n{line}")
+    assert skill["disable_model_invocation"] is hidden
+
+
+@pytest.mark.parametrize("line, hidden", [
+    ("disable-model-invocation: true", True),
+    ("disable-model-invocation: banana", True),
+    ("disable-model-invocation: false", False),
+    ("disable-model-invocation:", False),
+    ("", False),
+])
+def test_disable_model_invocation_invalid_yaml(tmp_path, monkeypatch, line, hidden):
+    """A broken SKILL.md must not lose its protection: the regex fallback reads this key too."""
+    description = 'Ship it. Auto-fires on: "deploy" and more'  # the unquoted colon makes this invalid YAML
+    skill = _only(tmp_path, monkeypatch, f"name: x\ndescription: {description}\n{line}")
+    assert skill["description"] == description  # proof the fallback ran
+    assert skill["disable_model_invocation"] is hidden
+
+
+def test_manual_skill_stays_readable(tmp_path, monkeypatch):
+    """Hidden, not blocked (D9): `/name` tells the model to use the files next to SKILL.md."""
+    from dostuff.tools.files.read_file import read_file
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    home_skills = tmp_path / "home-skills"
+    skill_dir = _raw(home_skills, "deploy", "name: deploy\ndescription: d\ndisable-model-invocation: true")
+    (skill_dir / "steps.md").write_text("step one\n", encoding="utf-8")
+    try:
+        (skill,) = _discover(home_skills, monkeypatch)
+        assert skill["dir"] in {str(root) for root in skill_roots()}
+        assert "step one" in read_file(str(skill_dir / "steps.md"))
+    finally:
+        set_skill_roots([])

@@ -35,3 +35,13 @@ def test_skill_prompt_drops_frontmatter(tmp_path):
 def test_slash_suggestion_includes_given_commands():
     assert slash_suggestion("/rel", commands=["/help", "/release-notes"]) == "ease-notes"
     assert slash_suggestion("/rel") == ""
+
+
+def test_manual_skill_is_still_a_command(tmp_path):
+    path = tmp_path / "deploy" / "SKILL.md"
+    path.parent.mkdir()
+    path.write_text("---\nname: deploy\ndescription: d\ndisable-model-invocation: true\n---\n\nShip.\n", encoding="utf-8")
+    skill = {"name": "deploy", "description": "d", "location": str(path), "disable_model_invocation": True}
+    commands = skill_commands([skill])
+    assert list(commands) == ["/deploy"]
+    assert "Ship." in skill_prompt(*parse_skill_command("/deploy now", commands))

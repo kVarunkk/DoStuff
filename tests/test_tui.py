@@ -7006,3 +7006,31 @@ def test_take_back_mentions_undo_after_multi_edit(turn_tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+def test_manual_skill_in_menu_and_runs(tui):
+    cli_tui = tui
+    for name, extra in (("deploy", "disable-model-invocation: true\n"), ("review", "")):
+        folder = Path(".dostuff", "skills", name)
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n{extra}---\n\nDo {name}.\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="manual-skill")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            await _until(pilot, lambda: any("Skills loaded" in t for t in _texts(app)))
+            # The startup line says which ones the model does not see
+            assert any("Skills loaded: 2 — deploy (manual only), review" in t for t in _texts(app)), _texts(app)
+            assert "/deploy" in app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/help"))
+            assert any("/deploy" in t and "Skills" in t for t in _texts(app))
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/deploy"))
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert "Do deploy." in _shown(app.steps_history)[0]["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

@@ -501,3 +501,17 @@ def test_esc_before_first_model_call(agents, fake_model):
     result = asyncio.run(go())
     assert result.split("\n\n")[0] == CANCELLED_RESULT and result.split("\n\n")[1].startswith("agent_id: ")
     assert [r.status for r in agents.runs()] == ["stopped"] and not fake_model.calls_for("[A]")
+
+
+def test_manual_skill_not_in_subagent_prompt(tmp_path, monkeypatch):
+    from dostuff.agent.subagents.definitions import load_definitions
+    from dostuff.agent.subagents.prompt import _sections
+    from dostuff.helpers.skills import discover_skills as ds
+    for name, extra in (("visible", ""), ("manual", "disable-model-invocation: true\n")):
+        folder = tmp_path / "skills" / name
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: the {name} one\n{extra}---\nbody\n",
+                                         encoding="utf-8")
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [str(tmp_path / "skills")])
+    text = _sections(load_definitions(tmp_path, tmp_path).types["general-purpose"], None)
+    assert "the visible one" in text and "the manual one" not in text
