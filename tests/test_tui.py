@@ -456,14 +456,12 @@ def test_thought_chunks_typed_out_and_formatted(tui):
         async with app.run_test() as pilot:
             await pilot.pause()
             app._update_stream_widget("thought", chunk1)
-            await pilot.pause(0.1)
+            # A whole chunk is revealed over several ticks, not at once. Wait for the first tick: a busy
+            # runner can start the timer late, and a tick only ever adds one step, so this cannot overshoot
+            await _until(pilot, lambda: app._thought_shown > 0)
             widget = app._stream_widgets["thought"]
-            # A whole chunk is revealed over several ticks, not at once
-            assert 0 < app._thought_shown < len(chunk1)
-            for _ in range(100):
-                await pilot.pause(0.02)
-                if app._thought_shown == len(chunk1):
-                    break
+            assert app._thought_shown < len(chunk1)
+            await _until(pilot, lambda: app._thought_shown == len(chunk1), tries=200)
             assert app._thought_timer is None
             # The next chunk extends the same widget; ending the call shows it all, formatted
             app._update_stream_widget("thought", chunk2)
@@ -1250,8 +1248,8 @@ def test_roadmap_021_commands_memory_context_doctor_history(tui, tmp_path, monke
             await pilot.press("escape")
             assert "Esc again" in str(inp.border_title) and cli_tui.QUIT_HINT in str(inp.border_title)
             await pilot.press("escape")
-            await _until(pilot, lambda: not app.steps_history)
-            assert inp.text == "/review src/app.py"
+            await _until(pilot, lambda: inp.text)  # filled last, after the transcript is rebuilt
+            assert inp.text == "/review src/app.py" and not app.steps_history
             assert await app.store.load("r021b") == [] and await app.store.load_working_history("r021b") == []
             app._clear_input()
 
@@ -2951,6 +2949,8 @@ def test_agents_command(tui, agents, fake_model):
             submit = lambda text: app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))  # noqa: E731
             picker = app.query_one("#picker", cli_tui.PermissionPrompt)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
+            # The last startup line comes after _backend_ready; `main_before` below must not race it
+            await _until(pilot, lambda: any("Running with local tools only." in t for t in _texts(app)), tries=200)
             submit("/agents")
             await _until(pilot, lambda: any("No agents in this session." in t for t in _texts(app)))
 
@@ -3009,7 +3009,9 @@ def test_agents_command(tui, agents, fake_model):
             # a waiting one: Answer approval shows its prompt now, although the input has text
             assert waiting.status == "waiting_approval"  # still held back: the input has text
             submit("/agents")
-            await _until(pilot, lambda: app._picker_open() and waiting.id in dict(picker._options))
+            # Open in the step that cleared the input: in any gap between the two, W's held-back approval
+            # sees an idle app and comes up on top of the list
+            assert app._picker_open() and waiting.id in dict(picker._options)
             inp.text = "typing"
             await app._picker_callback(waiting.id)
             assert [v for v, _ in picker._options] == ["answer", "stop", "type", "back"]
@@ -6032,9 +6034,9 @@ def test_esc_esc_after_steer(steer_loop, monkeypatch):
             assert not inp.text.strip()
             await pilot.press("escape")
             await pilot.press("escape")
-            await _until(pilot, lambda: not any("<attached_file" in str(s.get("content"))
-                                                for s in app.steps_history))
+            await _until(pilot, lambda: inp.text)  # filled last, after the transcript is rebuilt
             assert inp.text == "check @plan.md", inp.text  # raw, not the expansion
+            assert not any("<attached_file" in str(s.get("content")) for s in app.steps_history)
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -6807,7 +6809,8 @@ def test_sticky_prompt_follows_the_turn_at_the_top(tui):
             assert sticky.display and sticky.target is shell
             assert str(sticky.content) == "! ls -la" and sticky.has_class("-shell")
             top = messages.region.y
-            assert app.screen.get_widget_at(2, top)[0] is sticky
+            # `display` flips at once; the compositor only knows about it after the next layout pass
+            await _until(pilot, lambda: app.screen.get_widget_at(2, top)[0] is sticky)
 
             # While any row of the prompt is on screen the prompt speaks for itself
             await scroll(first.virtual_region.bottom - 1)
