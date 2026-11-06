@@ -7267,3 +7267,236 @@ def test_mention_leaves_instructions_byte_identical(turn_tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- mid-prompt completion (plan/2026-11-06-skills-and-multi-edit Phase 6) ---------------------------------------
+
+def _custom_command(name="standup"):
+    folder = Path(".dostuff", "commands")
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.md").write_text("Say hi.\n", encoding="utf-8")
+
+
+async def _ready(app, pilot, cli_tui):
+    await pilot.pause()
+    await app._backend_ready.wait()
+    menu = app.query_one("#command-menu", cli_tui.CommandMenu)
+    inp = app.query_one("#input", cli_tui.EnterSubmits)
+    await _until(pilot, lambda: "/deploy" in menu.commands)
+    return menu, inp
+
+
+def test_partial_slash(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="partial")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+
+            def at(text, cursor=None):
+                inp.text = text
+                inp.move_cursor(cursor or inp.document.end)
+                return inp.partial_slash()
+
+            assert at("go /de") == "/de"
+            assert at("go /") == "/"
+            assert at("go\n/de") == "/de"  # a new line is whitespace: mid-message all the same
+            assert at("/de") is None  # the start of the message is the existing menu
+            assert at("  /de") is None  # so is one with spaces ahead of it: it parses as a command
+            assert at("\n/de") is None
+            assert at("a/de") is None
+            assert at("go /etc/ho") is None
+            assert at("go /de now") is None  # the cursor is past it
+            assert at("go /deploy now", (0, 7)) == "/dep"  # up to the cursor only
+            assert at("!ls /de") is None  # shell mode
+            assert at("/compact /de") is None  # a built-in's arguments, not a message
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mid_prompt_menu_skills_only(tui):
+    cli_tui = tui
+    _skills_on_disk("deploy", "debug-it")
+    _custom_command("demo")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-menu")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+            assert "/demo" in menu.commands
+
+            await pilot.press(*"go ahead and /de")
+            await _until(pilot, lambda: menu.display)
+            options = [menu.get_option_at_index(i).id for i in range(menu.option_count)]
+            assert menu.mode == "skill" and sorted(options) == ["/debug-it", "/deploy"]  # no /debug?, no /demo
+            await pilot.press(*"p")
+            await _until(pilot, lambda: menu.option_count == 1 and menu.selected_command() == "/deploy")
+            await pilot.press(*"zz")  # closes on no match
+            await _until(pilot, lambda: not menu.display)
+            app._clear_input()
+
+            # A bare "/" lists every skill, and no built-in
+            await pilot.press(*"go /")
+            await _until(pilot, lambda: menu.display)
+            assert menu.option_count == 2
+            app._clear_input()
+            await _until(pilot, lambda: not menu.display)
+
+            # Stays shut: paths, shell mode, a built-in's arguments
+            await pilot.press(*"read /etc/hosts")
+            await pilot.pause()
+            assert not menu.display
+            app._clear_input()
+            await pilot.press(*"!ls /de")
+            await pilot.pause()
+            assert not menu.display
+            app._clear_input()
+
+            # A recalled prompt
+            inp.prompt_history = ["go /de"]
+            inp.focus()
+            await pilot.press("up")
+            await _until(pilot, lambda: inp.text == "go /de")
+            await pilot.pause()
+            assert not menu.display
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mid_prompt_menu_tab_keeps_sentence(tui):
+    cli_tui = tui
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-tab")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+            await pilot.press(*"go ahead and /de")
+            await _until(pilot, lambda: menu.display)
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "go ahead and /deploy ")
+            await _until(pilot, lambda: not menu.display)
+            assert inp.cursor_location == inp.document.end
+
+            # In the middle of the text, with words after it
+            app._clear_input()
+            inp.text = "go /de now please"
+            inp.move_cursor((0, 6))
+            await pilot.press("p")
+            await _until(pilot, lambda: inp.text == "go /dep now please" and menu.display)
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "go /deploy now please")
+            assert inp.cursor_location == (0, 11)  # after the space that was already there
+            await pilot.pause()
+            assert not menu.display
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mid_prompt_menu_enter_does_not_submit(tui):
+    cli_tui = tui
+    _skills_on_disk("deploy", "deploy-staging")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-enter")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+            await pilot.press(*"go ahead and /de")
+            await _until(pilot, lambda: menu.option_count == 2)
+            await pilot.press("down")
+            await pilot.pause()
+            assert inp.completion == "ploy-staging"  # the ghost text follows the menu
+            await pilot.press("enter")
+            await _until(pilot, lambda: inp.text == "go ahead and /deploy-staging ")
+            await pilot.pause(0.1)
+            assert not app._turn_in_progress, "sent"
+            assert _shown(app.steps_history) == []  # nothing was sent, the sentence survives
+
+            # The next Enter, with the menu shut, sends the whole sentence
+            await pilot.press("enter")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert _shown(app.steps_history)[0]["content"].startswith("go ahead and /deploy-staging\n\n<skill-mentions>")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mid_prompt_ghost_text(tui):
+    cli_tui = tui
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-ghost")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+            await pilot.press(*"go /de")
+            await _until(pilot, lambda: inp.completion == "ploy")
+            assert inp.suggestion == "ploy"  # no argument hint: the sentence is the argument
+            app._clear_input()
+
+            await pilot.press(*"go /mo")  # a built-in: nothing
+            await pilot.pause()
+            assert inp.completion == "" and inp.suggestion == ""
+            app._clear_input()
+
+            await pilot.press(*"go /de")  # only with the cursor at the end, as today
+            await _until(pilot, lambda: inp.completion == "ploy")
+            await pilot.press("left")
+            await _until(pilot, lambda: inp.completion == "")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_keys_around_the_mid_prompt_menu(tui):
+    """T6.5: with the menu shut every key does what it did; with it open Esc closes it and keeps the text."""
+    cli_tui = tui
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-keys")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+
+            await pilot.press(*"go /de")
+            await _until(pilot, lambda: menu.display)
+            await pilot.press("escape")
+            await _until(pilot, lambda: not menu.display)
+            assert inp.text == "go /de"
+            app._clear_input()
+
+            # Menu shut: Up recalls, Down comes back to the draft
+            inp.prompt_history = ["earlier"]
+            await pilot.press(*"draft")
+            await pilot.press("up")
+            await _until(pilot, lambda: inp.text == "earlier")
+            await pilot.press("down")
+            await _until(pilot, lambda: inp.text == "draft")
+            app._clear_input()
+
+            # Menu open: Up and Down move in it and leave the input alone
+            await pilot.press(*"go /de")
+            await _until(pilot, lambda: menu.display)
+            await pilot.press("up")
+            await pilot.press("down")
+            await pilot.pause()
+            assert inp.text == "go /de" and menu.display
+            app._clear_input()
+
+            # Menu shut: Enter sends a plain sentence that happens to hold a slash
+            await pilot.press(*"see /tmp/x")
+            await pilot.press("enter")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert _shown(app.steps_history)[0]["content"] == "see /tmp/x"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

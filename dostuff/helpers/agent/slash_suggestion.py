@@ -30,6 +30,15 @@ def slash_suggestion(text: str, highlighted: str | None = None, commands: Iterab
     return flag[len(last):] if last.startswith("-") and flag.startswith(last) else ""
 
 
+def mention_suggestion(partial: str, highlighted: str | None, skills: Iterable[str]) -> str:
+    """The rest of a skill typed mid-message: `highlighted` (the menu's pick), else the first of `skills` that
+    `partial` starts. Skills only, since a built-in cannot run mid-message."""
+    name = partial.lower()
+    match = highlighted if highlighted and highlighted.startswith(name) else next(
+        (s for s in skills if s.startswith(name)), None)
+    return match[len(name):] if match else ""
+
+
 def slash_arg_hint(text: str, commands: Iterable[str] = COMMAND_DESCRIPTIONS) -> str:
     """A hint for the arguments of the command in `text` (e.g. " <title>" after "/rename"), or "".
 

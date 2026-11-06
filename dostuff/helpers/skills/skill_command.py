@@ -12,6 +12,7 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 _NAME_RE = re.compile(r"^[\w.-]+$")
 _MENTION_RE = re.compile(r"(?<=\s)/\S+")
 _MENTION_END = ".,!?:;"
+PARTIAL_SLASH_RE = re.compile(r"(?:^|\s)(/[\w.-]*)$")
 
 
 def skill_commands(skills: list[dict[str, Any]], custom: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
