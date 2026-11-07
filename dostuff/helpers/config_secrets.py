@@ -10,9 +10,16 @@ _SECRET_VALUE = re.compile(
     r"\b(?:sk-[\w-]{20,}|gh[pousr]_\w{20,}|github_pat_\w{20,}|xox[abprs]-[\w-]{10,}|AIza[\w-]{30,}|AKIA[0-9A-Z]{16}"
     r"|gsk_\w{20,}|Bearer\s+[\w.~+/-]{16,})"
 )
-_ENV_REFERENCE = re.compile(r"^\$\{?\w+\}?$")
+_ENV_REFERENCE = re.compile(r"^(?:(?:Bearer|Basic|Token)\s+)?\$\{?\w+\}?$", re.IGNORECASE)
+_ONLY_A_VARIABLE = re.compile(r"^(?:(?:Bearer|Basic|Token)\s+)?\$\{[A-Za-z_]\w*\}$", re.IGNORECASE)
 
 SECRET_HINT = "put the value in .dostuff/.env and name the variable instead (a model's `api_key_env`)"
+MCP_SECRET_HINT = "put the value in .dostuff/.env and write ${NAME} here instead"
+
+
+def names_only_a_variable(value: Any) -> bool:
+    """`${NAME}`, or `Bearer ${NAME}`: safe to show, since it holds a name and no key."""
+    return isinstance(value, str) and bool(_ONLY_A_VARIABLE.match(value.strip()))
 
 
 def find_secrets(data: Any, path: str = "") -> list[str]:
@@ -21,7 +28,7 @@ def find_secrets(data: Any, path: str = "") -> list[str]:
     if isinstance(data, dict):
         for key, value in data.items():
             where = f"{path}.{key}" if path else str(key)
-            named = isinstance(value, str) and value.strip() and _SECRET_KEY.search(str(key))
+            named = isinstance(value, str) and value.strip() and not value.strip().isdigit() and _SECRET_KEY.search(str(key))
             if named and not _ENV_REFERENCE.match(value.strip()):
                 found.append(where)
             else:

@@ -997,32 +997,40 @@ Manage servers with `dostuff mcp list` / `add` / `remove` instead of editing the
     "tavily": {
       "transport": "stdio",
       "command": "npx",
-      "args": ["-y", "@tavily/mcp-server"],
-      "env": { "TAVILY_API_KEY": "tvly-..." }
+      "args": ["-y", "@tavily/mcp-server"]
     },
     "github": {
       "transport": "stdio",
       "command": "uvx",
       "args": ["mcp-server-github"],
-      "env": { "GITHUB_TOKEN": "ghp_..." }
+      "env": { "GITHUB_TOKEN": "${MY_WORK_GITHUB_KEY}" }
     },
     "remote": {
       "transport": "http",
       "url": "https://mcp.example.com/sse",
-      "headers": { "Authorization": "Bearer xxx" }
+      "headers": { "Authorization": "Bearer ${SEARCH_API_KEY}" }
     }
   }
 }
 ```
+
+**Keys go in `.dostuff/.env`, not in this file.** `${NAME}` in `headers` and `env` is replaced from `.env` (or the real environment) when the server connects:
+
+- **HTTP server:** you pick the name. It only links the two files, so `SEARCH_API_KEY=...` in `.env` matches `${SEARCH_API_KEY}` above.
+- **Local (stdio) server:** the server picks the name, so copy it from the server's docs. It inherits `.env`, so a key under that exact name needs no `env` entry (`tavily` above reads `TAVILY_API_KEY`). Use `env` to pass a key you saved under another name (`github` above).
+
+Only the exact form `${NAME}` is replaced, and only in `headers` and `env`. If a variable is missing or empty the server doesn't connect, and the error names it; after adding it, restart dostuff. `dostuff doctor` reports missing variables and plain keys left in the file, and `/config` and `dostuff mcp add` warn about them. On the command line use single quotes, so your shell doesn't expand the name itself: `dostuff mcp add search --url https://mcp.example.com -H 'Authorization: Bearer ${SEARCH_API_KEY}'`.
+
+A server's `url` receives whatever its headers name, so read a project's `.dostuff/mcp_config.json` before you run dostuff in a repository you don't trust, just as you would for a `command` it runs.
 
 | Field       | Required for | Notes                          |
 | ----------- | ------------ | ------------------------------ |
 | `transport` | optional     | `stdio` (default) or `http`    |
 | `command`   | stdio        | Executable (`npx`, `uvx`, ...) |
 | `args`      | stdio        | Argument list                  |
-| `env`       | stdio        | Env vars for the child process |
+| `env`       | stdio        | Env vars for the child process, added to what it inherits; `${NAME}` is read from `.env` |
 | `url`       | http         | Remote MCP server URL          |
-| `headers`   | http         | HTTP headers                   |
+| `headers`   | http         | HTTP headers; `${NAME}` is read from `.env` |
 | `connect_timeout` | optional | Seconds before giving up on this server (default 150, enough for a browser OAuth login) |
 
 MCP servers connect concurrently in the background, so the TUI never blanks during boot. Each server is announced in the chat area upon successful or failed connection.

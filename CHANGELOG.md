@@ -7,13 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The agent can make several edits to a file in one approved step, a skill can be kept for you to run by hand, you can allow a skill for one message by naming it in the sentence, and auto mode no longer stops to ask.
+The agent can make several edits to a file in one approved step, a skill can be kept for you to run by hand, you can allow a skill for one message by naming it in the sentence, auto mode no longer stops to ask, and MCP keys can stay in `.dostuff/.env`.
 
 ### Added
 - **`multi_edit` tool** — several exact-string edits to one file in one call: one approval, one diff, and if any edit fails the file is left untouched. `/undo` restores it like any other file change.
 - **`disable-model-invocation` for skills** — set it in a `SKILL.md` and the model is not told about the skill, so it only runs when you ask. It stays in the `/` menu and `/help`, and the `Skills loaded` line marks it `(manual only)`. This is not a security boundary: the skill's files stay readable, so use a `PreToolUse` hook to guarantee a command never runs.
 - **Skill mentions** — `go ahead and /deploy` makes that skill available for that message, including a manual-only one. The model judges from your wording, so `don't run /deploy yet` works, and a `Skill available for this message: deploy` line confirms it was recognised. Only what you type counts, not a `/deploy` inside an attached file or a collapsed paste. Works in prompts, queued prompts, steering messages and `dostuff -p`.
 - **Skill completion mid-message** — `/` after a space opens the menu with skills only. Tab and Enter replace just that word, so your sentence stays and nothing is sent.
+
+- **`${NAME}` in MCP `headers` and `env`** — an MCP key can now live in `.dostuff/.env`: `"Authorization": "Bearer ${SEARCH_API_KEY}"` is filled in when the server connects. If the variable isn't set, the server doesn't connect and the error names it. `dostuff doctor`, `/config` and `dostuff mcp add` report missing variables and plain keys left in `mcp_config.json`.
 
 ### Changed
 - **Hooks with an `edit_file` matcher now also run for `multi_edit`**, so a guard or a formatter still holds for the same change. The payload says `tool_name: multi_edit` with `tool_input: {path, edits}`: a script that reads `tool_input.path` keeps working, and one that reads `tool_input.old_str` needs to read `edits` for this tool. A hook that rewrites `old_str` / `new_str` makes the `multi_edit` call fail, and nothing is written.

@@ -12,11 +12,11 @@ from typing import Any, Literal
 import yaml
 
 from dostuff.config import RETIRED_STATUS_BAR_ITEMS, STATUS_BAR_ITEMS, get_config
-from dostuff.helpers.config_secrets import SECRET_HINT, find_secrets
+from dostuff.helpers.config_secrets import SECRET_HINT, find_secrets, names_only_a_variable
 from dostuff.helpers.hooks.load_hooks import load_hooks
 from dostuff.helpers.mcp.load_mcp_config import (global_mcp_config_path, project_mcp_config_path, read_mcp_file,
                                                  write_mcp_file)
-from dostuff.helpers.mcp.server_config import build_server_config
+from dostuff.helpers.mcp.server_config import build_server_config, key_warnings
 from dostuff.helpers.tools.diff import diff_stats, plain_diff, report_change, unified_diff
 
 Scope = Literal["user", "project"]
@@ -54,13 +54,13 @@ def _check_scope(scope: str) -> Scope:
 
 
 def redact_servers(servers: dict[str, Any]) -> dict[str, Any]:
-    """Servers with every env / header value hidden: they are usually tokens."""
+    """Servers with every env / header value hidden, as they are usually tokens; a `${NAME}` is only a name."""
     out = copy.deepcopy(servers)
     for cfg in out.values():
         if isinstance(cfg, dict):
             for key in ("env", "headers"):
                 if isinstance(cfg.get(key), dict):
-                    cfg[key] = {k: REDACTED for k in cfg[key]}
+                    cfg[key] = {k: v if names_only_a_variable(v) else REDACTED for k, v in cfg[key].items()}
     return out
 
 
@@ -248,7 +248,7 @@ def check_settings_text(kind: SettingsKind, text: str) -> list[str]:
             warnings.append(f"server name '{name}' contains '__', which breaks its tool names")
         if not cfg.get("command") and not cfg.get("url"):
             warnings.append(f"server '{name}' has neither a command nor a url, so it can't connect")
-    return warnings
+    return warnings + key_warnings(servers)
 
 
 def save_settings_file(kind: SettingsKind, scope: Scope, text: str, adapter: Any = None) -> str:
@@ -310,17 +310,19 @@ def set_mcp_server(
     Give either `command` (a local stdio server) or `url` (an HTTP server). Take the package or
     URL from the server's official docs; never use a placeholder. Most hosted servers sign in with
     OAuth in the browser when they connect, so give only `url` and no `headers` unless the docs
-    require an API key. The user is always asked first. To keep an existing secret, pass
-    "<redacted>" as its value.
+    require an API key. A key goes in .dostuff/.env, which you can't write: pick a variable name,
+    write it as ${NAME} here, and tell the user to add NAME=<key> to .env and restart dostuff.
+    The user is always asked first. To keep an existing secret, pass "<redacted>" as its value.
 
     Args:
         name: Server name; its tools are called <name>__<tool>.
         command: stdio: the program and its arguments, e.g. ["uvx", "mcp-server-git"].
         url: HTTP server URL, e.g. "https://mcp.example.com/mcp".
         transport: stdio | http | sse. Default: stdio for a command, http for a url.
-        env: Environment variables for a stdio server, e.g. {"GITHUB_TOKEN": "..."}.
+        env: Environment variables for a stdio server. It inherits .env already, so this is only
+            for a variable under another name, e.g. {"GITHUB_TOKEN": "${MY_GITHUB_KEY}"}.
         headers: HTTP headers, only when the server's docs require a key, e.g.
-            {"Authorization": "Bearer ..."}. Leave out for OAuth servers.
+            {"Authorization": "Bearer ${SEARCH_API_KEY}"}. Leave out for OAuth servers.
         scope: 'user' for ~/.dostuff/mcp_config.json (all projects), 'project' for
             ./.dostuff/mcp_config.json (this project only).
 
@@ -355,8 +357,10 @@ def set_mcp_server(
     write_mcp_file(path, servers)
     _apply(adapter, "mcp")
     verb = "Updated" if old else "Added"
+    warnings = key_warnings({name: cfg})
     return report_change(f"{verb} MCP server '{name}' (connecting now)", _display(path), before,
-                         json.dumps(redact_servers({name: cfg}), indent=2))
+                         json.dumps(redact_servers({name: cfg}), indent=2)) + (
+        "\nWarnings: " + "; ".join(warnings) if warnings else "")
 
 
 def remove_mcp_server(name: str, scope: Scope = "user", adapter: Any = None) -> str:

@@ -39,6 +39,7 @@ def doctor_checks() -> list[Check]:
     """Config files, the model's API key, MCP config, data dir, memory and permission mode."""
     from dostuff.config import get_config
     from dostuff.helpers.mcp.load_mcp_config import mcp_config_sources, read_mcp_file
+    from dostuff.helpers.mcp.server_config import key_warnings
     from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT, chroma_available, embedding_model_missing
     from dostuff.setup_wizard import missing_api_keys
 
@@ -64,6 +65,7 @@ def doctor_checks() -> list[Check]:
             checks.append(Check(f"MCP config could not be read: {source}: {e}", False, "fix the JSON in that file"))
     checks.append(Check(f"MCP servers: {len(servers)} (`dostuff mcp list`)" if servers
                         else "MCP servers: none configured (optional; `dostuff mcp add`)", None))
+    checks += [Check(warning, False) for warning in key_warnings(servers)]
     checks.append(Check(f"Data dir: {cfg.data_dir}" + ("" if cfg.data_dir.exists() else " (created on first run)"), None))
     if not chroma_available():
         checks.append(Check(f"Long-term memory: off, chromadb not installed (optional; `{MEMORY_INSTALL_HINT}`)", None))
