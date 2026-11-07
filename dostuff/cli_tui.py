@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from bisect import bisect_right
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 from textual.app import App, ComposeResult
@@ -339,27 +340,54 @@ class Transcript(VerticalScroll):
         self._container_size = region.size
         return super()._get_scrollable_region(region)
 
+    _prompt_rows: list[tuple[int, int, Static]] | None = None  # (y, bottom, prompt), top to bottom
+
     def on_mount(self) -> None:
         # Pinned to the bottom, the compositor moves scroll_y with set_reactive and its watchers never fire:
         # what moves the view then is the content growing (virtual_size) or the viewport resizing (on_resize).
         self.watch(self, "scroll_y", self._update_sticky_prompt, init=False)
-        self.watch(self, "virtual_size", self._update_sticky_prompt, init=False)
+        self.watch(self, "virtual_size", self._layout_moved, init=False)
 
     def on_resize(self) -> None:
+        self._layout_moved()
+
+    def _layout_moved(self) -> None:
+        self._prompt_rows = None
         self._update_sticky_prompt()
 
     def _update_sticky_prompt(self) -> None:
         self.query_one("#sticky-prompt", StickyPrompt).show(self._prompt_above_view())
 
+    def _prompt_positions(self) -> list[tuple[int, int, Static]]:
+        """Where the prompts are, kept until the layout moves.
+
+        A scroll only arranges the visible widgets, so asking for an off-screen widget's region makes the
+        compositor arrange the whole conversation. Doing that on each scroll tick is what made a long
+        session lag; a scroll moves nothing inside the conversation, so the answer can be reused."""
+        if self._prompt_rows is not None:
+            return self._prompt_rows
+        rows: list[tuple[int, int, Static]] = []
+        settled = True
+        for widget in self.query_one("#msg-container").children:
+            if isinstance(widget, Static) and (widget.has_class("msg-user") or widget.has_class("msg-shell")):
+                region = widget.virtual_region
+                if region.height:
+                    rows.append((region.y, region.bottom, widget))
+                else:
+                    settled = False  # mounted, not laid out yet: look again next time
+        if settled:
+            self._prompt_rows = rows
+        return rows
+
     def _prompt_above_view(self) -> Static | None:
         """The prompt or `!command` whose turn fills the top row, if it is entirely above that row."""
         top = self.scroll_offset.y
-        for widget in reversed(self.query_one("#msg-container").children):
-            if isinstance(widget, Static) and (widget.has_class("msg-user") or widget.has_class("msg-shell")):
-                region = widget.virtual_region
-                if region.height and region.y <= top:  # no height: mounted, not laid out yet
-                    return widget if region.bottom <= top else None
-        return None
+        rows = self._prompt_positions()
+        index = bisect_right(rows, top, key=lambda row: row[0]) - 1
+        if index < 0:
+            return None
+        _, bottom, widget = rows[index]
+        return widget if bottom <= top else None
 
 
 class _JumpToBottomLabel(Static):

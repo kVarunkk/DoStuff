@@ -6847,6 +6847,99 @@ def test_sticky_prompt_follows_the_turn_at_the_top(tui):
     asyncio.run(scenario())
 
 
+def _long_transcript(app, turns=12):
+    for turn in range(turns):
+        app._append(f"question {turn}", msg_type="user")
+        app._append_tool_result("line\n" * 30)
+        app._append("answer\n\n" * 6, msg_type="agent")
+
+
+def test_scrolling_does_not_arrange_the_whole_transcript(tui, monkeypatch):
+    """The sticky prompt read off-screen regions on each scroll tick, and each read arranged every message.
+
+    Inside one long turn, since the bar changing prompt is a real layout change."""
+    cli_tui = tui
+    from textual._compositor import Compositor
+    from textual.events import MouseScrollDown
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="stickyperf")
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            messages = app.query_one("#messages", cli_tui.VerticalScroll)
+            sticky = app.query_one("#sticky-prompt", cli_tui.StickyPrompt)
+            for turn in range(3):
+                app._append(f"question {turn}", msg_type="user")
+                app._append("answer\n\n" * 100, msg_type="agent")
+            await _until(pilot, lambda: sticky.display)
+            prompt = app.query(".msg-user")[1]
+            messages.scroll_to(y=prompt.virtual_region.bottom + 2, animate=False, immediate=True)
+            await _until(pilot, lambda: sticky.target is prompt)
+            await pilot.pause(0.1)
+
+            full_arranges = []
+            arrange = Compositor._arrange_root
+
+            def counting(self, root, size, visible_only=True):
+                if not visible_only:
+                    full_arranges.append(root)
+                return arrange(self, root, size, visible_only)
+            monkeypatch.setattr(Compositor, "_arrange_root", counting)
+
+            start = messages.scroll_y
+            for _ in range(20):
+                await pilot._post_mouse_events([MouseScrollDown], widget=messages)
+                await pilot.pause()
+            assert messages.scroll_y > start and sticky.target is prompt
+            assert not full_arranges
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_sticky_prompt_positions_follow_the_layout(tui):
+    """Reused positions give the same prompt as asking afresh, at every offset and after the content moves."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="stickycache")
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            messages = app.query_one("#messages", cli_tui.Transcript)
+            sticky = app.query_one("#sticky-prompt", cli_tui.StickyPrompt)
+            _long_transcript(app)
+            await _until(pilot, lambda: sticky.display)
+
+            async def check_every_offset():
+                for y in range(0, messages.max_scroll_y + 1, 3):
+                    messages.scroll_to(y=y, animate=False, immediate=True)
+                    await pilot.pause()
+                    kept = messages._prompt_above_view()
+                    assert sticky.target is kept
+                    messages._prompt_rows = None
+                    assert messages._prompt_above_view() is kept
+
+            await check_every_offset()
+            before = [row[0] for row in messages._prompt_positions()]
+
+            # Everything below the first result moves down without a scroll
+            app.query(cli_tui.ToolResult).first().set_expanded(True)
+            await _until(pilot, lambda: [row[0] for row in messages._prompt_positions()] != before)
+            await check_every_offset()
+
+            # A prompt mounted after the positions were kept is found
+            app._append("newest", msg_type="user")
+            app._append("answer\n\n" * 30, msg_type="agent")
+            await _until(pilot, lambda: len(messages._prompt_positions()) == len(before) + 1)
+            messages.scroll_end(animate=False, immediate=True)
+            await _until(pilot, lambda: str(getattr(sticky.target, "content", "")) == "> newest")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_sticky_prompt_while_pinned_and_after_clear(tui):
     cli_tui = tui
 
