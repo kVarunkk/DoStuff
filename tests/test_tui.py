@@ -6847,6 +6847,99 @@ def test_sticky_prompt_follows_the_turn_at_the_top(tui):
     asyncio.run(scenario())
 
 
+def _long_transcript(app, turns=12):
+    for turn in range(turns):
+        app._append(f"question {turn}", msg_type="user")
+        app._append_tool_result("line\n" * 30)
+        app._append("answer\n\n" * 6, msg_type="agent")
+
+
+def test_scrolling_does_not_arrange_the_whole_transcript(tui, monkeypatch):
+    """The sticky prompt read off-screen regions on each scroll tick, and each read arranged every message.
+
+    Inside one long turn, since the bar changing prompt is a real layout change."""
+    cli_tui = tui
+    from textual._compositor import Compositor
+    from textual.events import MouseScrollDown
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="stickyperf")
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            messages = app.query_one("#messages", cli_tui.VerticalScroll)
+            sticky = app.query_one("#sticky-prompt", cli_tui.StickyPrompt)
+            for turn in range(3):
+                app._append(f"question {turn}", msg_type="user")
+                app._append("answer\n\n" * 100, msg_type="agent")
+            await _until(pilot, lambda: sticky.display)
+            prompt = app.query(".msg-user")[1]
+            messages.scroll_to(y=prompt.virtual_region.bottom + 2, animate=False, immediate=True)
+            await _until(pilot, lambda: sticky.target is prompt)
+            await pilot.pause(0.1)
+
+            full_arranges = []
+            arrange = Compositor._arrange_root
+
+            def counting(self, root, size, visible_only=True):
+                if not visible_only:
+                    full_arranges.append(root)
+                return arrange(self, root, size, visible_only)
+            monkeypatch.setattr(Compositor, "_arrange_root", counting)
+
+            start = messages.scroll_y
+            for _ in range(20):
+                await pilot._post_mouse_events([MouseScrollDown], widget=messages)
+                await pilot.pause()
+            assert messages.scroll_y > start and sticky.target is prompt
+            assert not full_arranges
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_sticky_prompt_positions_follow_the_layout(tui):
+    """Reused positions give the same prompt as asking afresh, at every offset and after the content moves."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="stickycache")
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            messages = app.query_one("#messages", cli_tui.Transcript)
+            sticky = app.query_one("#sticky-prompt", cli_tui.StickyPrompt)
+            _long_transcript(app)
+            await _until(pilot, lambda: sticky.display)
+
+            async def check_every_offset():
+                for y in range(0, messages.max_scroll_y + 1, 3):
+                    messages.scroll_to(y=y, animate=False, immediate=True)
+                    await pilot.pause()
+                    kept = messages._prompt_above_view()
+                    assert sticky.target is kept
+                    messages._prompt_rows = None
+                    assert messages._prompt_above_view() is kept
+
+            await check_every_offset()
+            before = [row[0] for row in messages._prompt_positions()]
+
+            # Everything below the first result moves down without a scroll
+            app.query(cli_tui.ToolResult).first().set_expanded(True)
+            await _until(pilot, lambda: [row[0] for row in messages._prompt_positions()] != before)
+            await check_every_offset()
+
+            # A prompt mounted after the positions were kept is found
+            app._append("newest", msg_type="user")
+            app._append("answer\n\n" * 30, msg_type="agent")
+            await _until(pilot, lambda: len(messages._prompt_positions()) == len(before) + 1)
+            messages.scroll_end(animate=False, immediate=True)
+            await _until(pilot, lambda: str(getattr(sticky.target, "content", "")) == "> newest")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_sticky_prompt_while_pinned_and_after_clear(tui):
     cli_tui = tui
 
@@ -6898,6 +6991,606 @@ def test_sticky_prompt_while_pinned_and_after_clear(tui):
             await _until(pilot, lambda: sticky.display)
             await app.query_one("#msg-container", cli_tui.Vertical).remove_children()
             await _until(pilot, lambda: not sticky.display)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_pin_slash_menu_start_of_input(tui):
+    """The `/` menu at the start of the input, pinned before mid-prompt completion goes in beside it (CON-002)."""
+    cli_tui = tui
+    skill_dir = Path(".dostuff", "skills", "deploy")
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: deploy\ndescription: Ship it\n---\n\nShip.\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin-menu")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            menu = app.query_one("#command-menu", cli_tui.CommandMenu)
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+
+            # Every built-in and the skill
+            await pilot.press("/")
+            await _until(pilot, lambda: menu.display)
+            assert menu.mode == "command" and menu.option_count == len(cli_tui.COMMAND_DESCRIPTIONS) + 1
+
+            # Tab fills the command; no arguments, no space
+            await pilot.press(*"cle")
+            await _until(pilot, lambda: menu.selected_command() == "/clear")
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "/clear")
+            app._clear_input()
+
+            # A command with arguments gets a space, and its hint shows
+            await pilot.press(*"/ren")
+            await _until(pilot, lambda: menu.selected_command() == "/rename")
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "/rename ")
+            assert inp.suggestion == "<title>" and not menu.display
+            app._clear_input()
+
+            # A skill takes arguments too
+            await pilot.press(*"/dep")
+            await _until(pilot, lambda: menu.selected_command() == "/deploy")
+            assert inp.suggestion == "loy [arguments]" and inp.completion == "loy"
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "/deploy ")
+            app._clear_input()
+
+            # Enter submits the highlighted command, whatever was typed of it
+            await pilot.press(*"/dep")
+            await _until(pilot, lambda: menu.selected_command() == "/deploy")
+            await pilot.press("enter")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            assert not menu.display and inp.text == ""
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert "The user ran the /deploy skill." in _shown(app.steps_history)[0]["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_pin_prompt_content_plain(tui):
+    """The stored user step with no skill mention, exactly (REQ-4.3): a mention must be the only thing that adds to it."""
+    cli_tui = tui
+    Path("notes.txt").write_text("alpha\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="pin-content")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            marker = app._pastes.add("line one\nline two\nline three")
+            for prompt in (f"see @notes.txt and {marker}", "/etc/hosts look"):
+                app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(prompt))
+                await _until(pilot, app.adapter.has_pending_confirm)
+                app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+                await _until(pilot, lambda: not app._turn_in_progress)
+            first, _, second, _ = _shown(app.steps_history)
+            assert first == {"role": "user", "content":
+                             "see @notes.txt and line one\nline two\nline three\n\n"
+                             '<attached_file path="notes.txt">\n1\talpha\n</attached_file>'}
+            assert second == {"role": "user", "content": "/etc/hosts look"}
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_take_back_mentions_undo_after_multi_edit(turn_tui):
+    """The hint reads CHECKPOINT_TOOLS, so a tool /undo can restore is one the hint mentions."""
+    cli_tui, seen = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="back-multi")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "change it")
+            await _until(pilot, lambda: not app._turn_in_progress and len(seen) == 1)
+            await app._backend_ready.wait()
+            step = {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "multi_edit", "arguments": "{}"}}]}
+            await app.store.append(app.session_id, step)
+            app.steps_history.append(step)
+            app.current_session_history.append(step)
+            got = _record_appends(app)
+            await app._edit_previous_prompt()
+            assert any("/undo restores them" in text for text, _ in got), got
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_manual_skill_in_menu_and_runs(tui):
+    cli_tui = tui
+    for name, extra in (("deploy", "disable-model-invocation: true\n"), ("review", "")):
+        folder = Path(".dostuff", "skills", name)
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n{extra}---\n\nDo {name}.\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="manual-skill")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            await _until(pilot, lambda: any("Skills loaded" in t for t in _texts(app)))
+            # The startup line says which ones the model does not see
+            assert any("Skills loaded: 2 — deploy (manual only), review" in t for t in _texts(app)), _texts(app)
+            assert "/deploy" in app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/help"))
+            assert any("/deploy" in t and "Skills" in t for t in _texts(app))
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/deploy"))
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert "Do deploy." in _shown(app.steps_history)[0]["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- inline mentions (plan/2026-11-06-skills-and-multi-edit Phase 5) ---------------------------------------------
+
+def _skills_on_disk(*names, extra=""):
+    for name in names:
+        folder = Path(".dostuff", "skills", name)
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: The {name} skill\n{extra}---\n\nDo {name}.\n",
+                                         encoding="utf-8")
+
+
+async def _prompt(pilot, app, cli_tui, text):
+    """One prompt through the approving fake loop; returns the stored user step's content."""
+    before = len(_shown(app.steps_history))
+    app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(text))
+    await _until(pilot, app.adapter.has_pending_confirm)
+    app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+    await _until(pilot, lambda: not app._turn_in_progress)
+    return _shown(app.steps_history)[before]["content"]
+
+
+def test_mention_note_on_prompt(tui):
+    cli_tui = tui
+    _skills_on_disk("deploy", extra="disable-model-invocation: true\n")
+    Path("notes.txt").write_text("alpha\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            sent = await _prompt(pilot, app, cli_tui, "see @notes.txt then /deploy.")
+            attached, _, note = sent.partition("\n\n<skill-mentions>\n")
+            assert attached.startswith("see @notes.txt then /deploy.") and "</attached_file>" in attached  # after the content
+            assert "- name: deploy\n  description: The deploy skill\n" in note  # a manual-only skill is findable
+            assert f"  dir: {Path('.dostuff', 'skills', 'deploy').resolve()}\n</skill-mentions>" in note
+            assert sent.endswith("</skill-mentions>")
+            assert "Skill available for this message: deploy" in _texts(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mention_inside_attachment_ignored(tui):
+    """D11: a `/deploy` that arrived in a file or a paste grants nothing, or a file could grant itself a skill."""
+    cli_tui = tui
+    _skills_on_disk("deploy")
+    Path("notes.txt").write_text("please /deploy now\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention-file")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            marker = app._pastes.add("please /deploy now\nand again /deploy\nthird line")
+            sent = await _prompt(pilot, app, cli_tui, f"see @notes.txt and {marker}")
+            assert "please /deploy now" in sent and "and again /deploy" in sent  # both really did reach the model
+            assert "<skill-mentions>" not in sent
+            assert not any("Skill available" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_start_of_message_skill_not_scanned(tui):
+    cli_tui = tui
+    _skills_on_disk("review", "deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention-start")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            sent = await _prompt(pilot, app, cli_tui, "/review then /deploy")
+            assert "The user ran the /review skill." in sent and "<skill-mentions>" not in sent
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_wake_turn_not_scanned(tui, monkeypatch):
+    """Nobody typed a wake-up turn's text, so it cannot name a skill."""
+    cli_tui = tui
+    _skills_on_disk("deploy")
+    scanned = []
+    monkeypatch.setattr(cli_tui, "skill_mentions", lambda text, commands: scanned.append(text) or [])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention-wake")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            await app._run_turn("job says /deploy now", wake=True)
+            assert scanned == []
+            await _prompt(pilot, app, cli_tui, "typed /deploy")  # the spy does see a typed prompt
+            assert scanned == ["typed /deploy"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mention_note_on_steer(steer_tui):
+    cli_tui, held = steer_tui
+    _skills_on_disk("deploy", "review")
+    Path("notes.md").write_text("please /review too\n", encoding="utf-8")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention-steer")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _submit(app, cli_tui, "start the turn")
+            await _until(pilot, lambda: held.gate is not None, tries=200)
+            _submit(app, cli_tui, "/steer also /deploy and see @notes.md")
+            await _until(pilot, lambda: bool(app._steering.pending())
+                         and app._steering.pending()[0].content is not None)
+            msg = app._steering.pending()[0]
+            assert msg.raw == "also /deploy and see @notes.md"
+            assert msg.content.endswith("</skill-mentions>") and "- name: deploy" in msg.content
+            assert "name: review" not in msg.content  # scanned on what was typed
+            assert "Skill available for this message: deploy" in _texts(app)
+            held.hold = False
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mention_note_on_queued_prompt(queue_mode):
+    cli_tui, held = queue_mode
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention-queue")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _submit(app, cli_tui, "start the turn")
+            await _until(pilot, lambda: held.gate is not None, tries=200)
+            _submit(app, cli_tui, "now /deploy")
+            await _until(pilot, lambda: app._prompt_queue != [])
+            held.hold = False
+            held.release()
+            await _until(pilot, lambda: not app._turn_in_progress and not app._prompt_queue, tries=200)
+            users = [s["content"] for s in _shown(app.steps_history) if s["role"] == "user"]
+            assert users[0] == "start the turn"
+            assert users[1].startswith("now /deploy\n\n<skill-mentions>\n")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mention_note_not_in_transcript(tui):
+    """The user sees what they typed, live and after /resume, for a prompt and for a delivered steering message."""
+    from dostuff.helpers.agent.steering import frame_steered
+    from dostuff.helpers.skills.skill_command import mention_note
+    cli_tui = tui
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention-show")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            await _prompt(pilot, app, cli_tui, "go /deploy")
+            assert not any("skill-mentions" in t for t in _texts(app))
+            assert any("go /deploy" in t for t in _texts(app))
+
+            await app._switch_session("mention-show")
+            await _until(pilot, lambda: any("go /deploy" in t for t in _texts(app)))
+            assert not any("skill-mentions" in t for t in _texts(app))
+
+            got = _record_appends(app)
+            note = mention_note([{"name": "deploy", "description": "d", "dir": "x"}])
+            app.steps_history = [{"role": "user", "content": frame_steered(f"steered /deploy\n\n{note}")}]
+            app._render_history()
+            shown = [text for text, kind in got if kind == "user"]
+            assert any("steered /deploy" in t for t in shown) and not any("skill-mentions" in t for t in shown)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mention_note_everywhere_else_the_content_is_read(turn_tui):
+    """T5.7: the session title, /export and the take-back use the typed text; the model-facing history keeps the note."""
+    from dostuff.helpers.memory.export_session import session_to_markdown
+    cli_tui, seen = turn_tui
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention-reads")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _submit(app, cli_tui, "go /deploy")
+            await _until(pilot, lambda: not app._turn_in_progress and len(seen) == 1)
+
+            sessions = await app.store.list_sessions()
+            assert next(s for s in sessions if s["session_id"] == "mention-reads")["title"] == "go /deploy"
+            exported = session_to_markdown(await app.store.load("mention-reads"), None, "mention-reads")
+            assert "go /deploy" in exported and "skill-mentions" not in exported
+            assert any("<skill-mentions>" in str(s.get("content")) for s in seen[0]["history"])
+
+            # Take-back after a reload, where the raw-prompt map is empty
+            await app._switch_session("mention-reads")
+            app._sent_prompts.clear()
+            await app._edit_previous_prompt()
+            assert app.query_one("#input", cli_tui.EnterSubmits).text == "go /deploy"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mention_leaves_instructions_byte_identical(turn_tui):
+    """CON-003, through a real turn: the system prompt with and without a mention, compared."""
+    cli_tui, seen = turn_tui
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mention-cache")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            for n, prompt in enumerate(("plain", "go /deploy"), start=1):
+                _submit(app, cli_tui, prompt)
+                await _until(pilot, lambda: not app._turn_in_progress and len(seen) == n)
+            assert seen[0]["instructions"] == seen[1]["instructions"]
+            assert "<skill-mentions>" in str(seen[1]["history"]) and "<skill-mentions>" not in seen[1]["instructions"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- mid-prompt completion (plan/2026-11-06-skills-and-multi-edit Phase 6) ---------------------------------------
+
+def _custom_command(name="standup"):
+    folder = Path(".dostuff", "commands")
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.md").write_text("Say hi.\n", encoding="utf-8")
+
+
+async def _ready(app, pilot, cli_tui):
+    await pilot.pause()
+    await app._backend_ready.wait()
+    menu = app.query_one("#command-menu", cli_tui.CommandMenu)
+    inp = app.query_one("#input", cli_tui.EnterSubmits)
+    await _until(pilot, lambda: "/deploy" in menu.commands)
+    return menu, inp
+
+
+def test_partial_slash(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="partial")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+
+            def at(text, cursor=None):
+                inp.text = text
+                inp.move_cursor(cursor or inp.document.end)
+                return inp.partial_slash()
+
+            assert at("go /de") == "/de"
+            assert at("go /") == "/"
+            assert at("go\n/de") == "/de"  # a new line is whitespace: mid-message all the same
+            assert at("/de") is None  # the start of the message is the existing menu
+            assert at("  /de") is None  # so is one with spaces ahead of it: it parses as a command
+            assert at("\n/de") is None
+            assert at("a/de") is None
+            assert at("go /etc/ho") is None
+            assert at("go /de now") is None  # the cursor is past it
+            assert at("go /deploy now", (0, 7)) == "/dep"  # up to the cursor only
+            assert at("!ls /de") is None  # shell mode
+            assert at("/compact /de") is None  # a built-in's arguments, not a message
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mid_prompt_menu_skills_only(tui):
+    cli_tui = tui
+    _skills_on_disk("deploy", "debug-it")
+    _custom_command("demo")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-menu")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+            assert "/demo" in menu.commands
+
+            await pilot.press(*"go ahead and /de")
+            await _until(pilot, lambda: menu.display)
+            options = [menu.get_option_at_index(i).id for i in range(menu.option_count)]
+            assert menu.mode == "skill" and sorted(options) == ["/debug-it", "/deploy"]  # no /debug?, no /demo
+            await pilot.press(*"p")
+            await _until(pilot, lambda: menu.option_count == 1 and menu.selected_command() == "/deploy")
+            await pilot.press(*"zz")  # closes on no match
+            await _until(pilot, lambda: not menu.display)
+            app._clear_input()
+
+            # A bare "/" lists every skill, and no built-in
+            await pilot.press(*"go /")
+            await _until(pilot, lambda: menu.display)
+            assert menu.option_count == 2
+            app._clear_input()
+            await _until(pilot, lambda: not menu.display)
+
+            # Stays shut: paths, shell mode, a built-in's arguments
+            await pilot.press(*"read /etc/hosts")
+            await pilot.pause()
+            assert not menu.display
+            app._clear_input()
+            await pilot.press(*"!ls /de")
+            await pilot.pause()
+            assert not menu.display
+            app._clear_input()
+
+            # A recalled prompt
+            inp.prompt_history = ["go /de"]
+            inp.focus()
+            await pilot.press("up")
+            await _until(pilot, lambda: inp.text == "go /de")
+            await pilot.pause()
+            assert not menu.display
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mid_prompt_menu_tab_keeps_sentence(tui):
+    cli_tui = tui
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-tab")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+            await pilot.press(*"go ahead and /de")
+            await _until(pilot, lambda: menu.display)
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "go ahead and /deploy ")
+            await _until(pilot, lambda: not menu.display)
+            assert inp.cursor_location == inp.document.end
+
+            # In the middle of the text, with words after it
+            app._clear_input()
+            inp.text = "go /de now please"
+            inp.move_cursor((0, 6))
+            await pilot.press("p")
+            await _until(pilot, lambda: inp.text == "go /dep now please" and menu.display)
+            await pilot.press("tab")
+            await _until(pilot, lambda: inp.text == "go /deploy now please")
+            assert inp.cursor_location == (0, 11)  # after the space that was already there
+            await pilot.pause()
+            assert not menu.display
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mid_prompt_menu_enter_does_not_submit(tui):
+    cli_tui = tui
+    _skills_on_disk("deploy", "deploy-staging")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-enter")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+            await pilot.press(*"go ahead and /de")
+            await _until(pilot, lambda: menu.option_count == 2)
+            await pilot.press("down")
+            await pilot.pause()
+            assert inp.completion == "ploy-staging"  # the ghost text follows the menu
+            await pilot.press("enter")
+            await _until(pilot, lambda: inp.text == "go ahead and /deploy-staging ")
+            await pilot.pause(0.1)
+            assert not app._turn_in_progress, "sent"
+            assert _shown(app.steps_history) == []  # nothing was sent, the sentence survives
+
+            # The next Enter, with the menu shut, sends the whole sentence
+            await pilot.press("enter")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            # The space Tab added stays: it is part of what was sent, and the mention still counts
+            assert _shown(app.steps_history)[0]["content"].startswith("go ahead and /deploy-staging \n\n<skill-mentions>")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_mid_prompt_ghost_text(tui):
+    cli_tui = tui
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-ghost")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+            await pilot.press(*"go /de")
+            await _until(pilot, lambda: inp.completion == "ploy")
+            assert inp.suggestion == "ploy"  # no argument hint: the sentence is the argument
+            app._clear_input()
+
+            await pilot.press(*"go /mo")  # a built-in: nothing
+            await pilot.pause()
+            assert inp.completion == "" and inp.suggestion == ""
+            app._clear_input()
+
+            await pilot.press(*"go /de")  # only with the cursor at the end, as today
+            await _until(pilot, lambda: inp.completion == "ploy")
+            await pilot.press("left")
+            await _until(pilot, lambda: inp.completion == "")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_keys_around_the_mid_prompt_menu(tui):
+    """T6.5: with the menu shut every key does what it did; with it open Esc closes it and keeps the text."""
+    cli_tui = tui
+    _skills_on_disk("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="mid-keys")
+        async with app.run_test() as pilot:
+            menu, inp = await _ready(app, pilot, cli_tui)
+
+            await pilot.press(*"go /de")
+            await _until(pilot, lambda: menu.display)
+            await pilot.press("escape")
+            await _until(pilot, lambda: not menu.display)
+            assert inp.text == "go /de"
+            app._clear_input()
+
+            # Menu shut: Up recalls, Down comes back to the draft
+            inp.prompt_history = ["earlier"]
+            await pilot.press(*"draft")
+            await pilot.press("up")
+            await _until(pilot, lambda: inp.text == "earlier")
+            await pilot.press("down")
+            await _until(pilot, lambda: inp.text == "draft")
+            app._clear_input()
+
+            # Menu open: Up and Down move in it and leave the input alone
+            await pilot.press(*"go /de")
+            await _until(pilot, lambda: menu.display)
+            await pilot.press("up")
+            await pilot.press("down")
+            await pilot.pause()
+            assert inp.text == "go /de" and menu.display
+            app._clear_input()
+
+            # Menu shut: Enter sends a plain sentence that happens to hold a slash
+            await pilot.press(*"see /tmp/x")
+            await pilot.press("enter")
+            await _until(pilot, app.adapter.has_pending_confirm)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("y"))
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert _shown(app.steps_history)[0]["content"] == "see /tmp/x"
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

@@ -8,6 +8,9 @@ from dostuff.helpers.hooks.load_hooks import AGENT_EVENTS, TOOL_EVENTS, HookEntr
 from dostuff.helpers.hooks.run_hook import FAILED_REASON, Decision, HookResult, run_hook
 
 SHELL_TOOLS = ("bash_command",)  # the tools an `if` pattern is searched in (tool_input.command)
+# A guard on edit_file must still hold for the same change made through multi_edit. One-way: a hook written for
+# multi_edit knows its `edits` input, which edit_file does not have. The payload keeps the real tool name.
+TOOL_MATCH_ALIASES: dict[str, tuple[str, ...]] = {"multi_edit": ("edit_file",)}
 _RANK: dict[Decision, int] = {"none": 0, "allow": 1, "ask": 2, "deny": 3}
 UNTRUSTED_WARNING = "project hooks not trusted; skipped ({count} from {origin})"
 
@@ -69,6 +72,11 @@ async def report_outcome(
     await loop_emit("hook", {"event": event, "tool": target, "decision": decision, "reason": reason}, adapter=adapter)
 
 
+def _match_names(event: str, target: Any) -> tuple[str, ...]:
+    """The names a matcher is tried against: a tool's own, then its aliases."""
+    return (str(target), *(TOOL_MATCH_ALIASES.get(str(target), ()) if event in TOOL_EVENTS else ()))
+
+
 def _matches(entry: HookEntry, payload: dict[str, Any]) -> bool:
     event = entry.event
     if event in TOOL_EVENTS:
@@ -79,7 +87,7 @@ def _matches(entry: HookEntry, payload: dict[str, Any]) -> bool:
         target = payload.get("agent_type")
     else:
         return True  # UserPromptSubmit / Stop have nothing to match against
-    if entry.matcher_re is not None and not entry.matcher_re.fullmatch(str(target)):
+    if entry.matcher_re is not None and not any(entry.matcher_re.fullmatch(n) for n in _match_names(event, target)):
         return False
     if entry.if_re is not None and payload.get("tool_name") in SHELL_TOOLS:
         tool_input = payload.get("tool_input")

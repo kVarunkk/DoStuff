@@ -80,7 +80,9 @@ def test_loader_keeps_builtins(proj, agents_home):
 @pytest.mark.parametrize("tools, expected, dropped", [
     ("Read, Grep, Bash", ["read_file", "grep", "bash_command"], []),
     ("[Read, Grep, Bash]", ["read_file", "grep", "bash_command"], []),
-    ("Edit, MultiEdit, Write", ["edit_file", "write_file"], []),
+    ("Edit, MultiEdit, Write", ["edit_file", "multi_edit", "write_file"], []),
+    ("Edit", ["edit_file", "multi_edit"], []),
+    ("MultiEdit", ["edit_file", "multi_edit"], []),
     ("Glob, LS, WebFetch, WebSearch", ["glob", "list_files", "web_fetch", "web_search"], []),
     ("mcp__github__search", ["search_mcp_tools", "get_mcp_tool_details", "call_mcp_tool"], []),
     ("read_file, Frobnicate, agent", ["read_file"], ["Frobnicate", "agent"]),
@@ -506,3 +508,15 @@ def test_subagent_restrictions():
     assert tools == () and len(warnings) == 1
     assert "AskUserQuestion" in warnings[0] and "restricted" not in warnings[0]
     assert "not available to subagents" in warnings[0]
+
+
+def test_edit_file_by_its_dostuff_name_stays_alone(proj, agents_home):
+    """Only the Claude Code names widen: a file that says edit_file means exactly that tool (D3)."""
+    _agent_file(proj / ".dostuff" / "agents", "t.md", "b", name="t", description="d", tools="edit_file")
+    assert load_definitions(proj, agents_home).types["t"].tools == ("edit_file",)
+
+
+def test_read_only_types_have_no_edit_tool(proj, agents_home):
+    loaded = load_definitions(proj, agents_home)
+    for name in ("explore", "plan"):
+        assert "multi_edit" not in (loaded.types[name].tools or ())

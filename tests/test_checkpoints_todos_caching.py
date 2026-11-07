@@ -158,3 +158,14 @@ def test_cache_breakpoints_only_for_claude(monkeypatch, provider, model, enabled
     monkeypatch.setattr(call_agent_module, "_supports_reasoning", lambda m: False)
     kwargs = call_agent_module.build_request_kwargs(stream=False)
     assert ("cache_control_injection_points" in kwargs) is expected
+
+
+def test_undo_restores_multi_edit(project):
+    root, store = project
+    (root / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+    call("multi_edit", {"path": "a.txt", "edits": [{"old_str": "one", "new_str": "1"},
+                                                   {"old_str": "two", "new_str": "2"}]})
+    assert (root / "a.txt").read_text(encoding="utf-8") == "1\n2\n"
+    result = store.undo("s1")
+    assert result is not None and result.restored
+    assert (root / "a.txt").read_text(encoding="utf-8") == "one\ntwo\n"

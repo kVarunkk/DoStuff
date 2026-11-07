@@ -25,10 +25,11 @@ def _background_wait(interactive: bool) -> str:
 
 
 def skills_summary(skills: list[dict[str, Any]]) -> str:
-    """The skills list as the system prompt shows it."""
+    """The skills list as the system prompt shows it: every prompt goes through here, so a manual-only skill
+    (`disable-model-invocation`) is left out in this one place."""
     summary = "\n\n".join(
         f"- name: {s['name']}\n  description: {s['description']}\n  dir: {s['dir']}"
-        for s in skills
+        for s in skills if not s.get("disable_model_invocation")
     )
     return summary or "(none available)"
 

@@ -813,8 +813,12 @@ def test_pre_tool_use_deny(home, tmp_path, monkeypatch):
      HookOutcome(decision="allow"), 0, "Plan mode"),
     ("hook deny in auto", "auto", "read_file", {"path": "a.txt"},
      HookOutcome(decision="deny", reason="nope"), 0, "nope"),
-    ("settings still asks", "auto", "edit_config", {"old_str": "", "new_str": "x: 1\n"},
+    ("settings still asks", "ask", "edit_config", {"old_str": "", "new_str": "x: 1\n"},
      HookOutcome(decision="allow"), 1, "User denied"),
+    ("settings run in auto", "auto", "edit_config", {"old_str": "", "new_str": "x: 1\n"},
+     HookOutcome(), 0, None),
+    ("hook ask on settings in auto", "auto", "edit_config", {"old_str": "", "new_str": "x: 1\n"},
+     HookOutcome(decision="ask", reason="check this"), 1, "User denied"),
     ("hook ask in auto", "auto", "read_file", {"path": "a.txt"},
      HookOutcome(decision="ask", reason="check this"), 1, "User denied"),
     ("hook allow skips prompt", "ask", "bash_command", {"command": "rm -rf build"},
@@ -1795,3 +1799,70 @@ def test_readme_documents_agents():
     assert "delegate_to_subagent" not in tools and "`agent`" in tools
     assert "`SubagentStart`" in _section(readme, "\n## Hooks\n")
     assert "**Subagents**" in _section(readme, "## Features")
+
+
+# --- multi_edit: edit_file matchers cover it (plan/2026-11-06-skills-and-multi-edit D5) -------------------------
+
+_MULTI_ARGS = {"path": "a.txt", "edits": [{"old_str": "one", "new_str": "1"}]}
+
+
+def _recorder(tmp_path, seen: Path) -> str:
+    return _script(tmp_path, f"""
+        import json, sys
+        json.dump(json.load(sys.stdin), open({str(seen)!r}, "w"))
+    """)
+
+
+def test_edit_file_matcher_covers_multi_edit(home, proj, tmp_path, monkeypatch):
+    _mode(monkeypatch, "auto")
+    target = proj / "a.txt"
+    target.write_text("one\n", encoding="utf-8")
+
+    # A PreToolUse deny on edit_file blocks multi_edit, and the payload is the truth about the call
+    seen = tmp_path / "pre.json"
+    write_user_config(home, _hooks_block("PreToolUse", _group(_recorder(tmp_path, seen), matcher="edit_file"),
+                                         _group(_stderr_exit2(tmp_path, "no edits"), matcher="edit_file")))
+    assert _run(run_tool("multi_edit", _MULTI_ARGS, adapter=AskAdapter(), **_tool_kwargs())) == "no edits"
+    assert target.read_text(encoding="utf-8") == "one\n"
+    payload = json.loads(seen.read_text())
+    assert payload["tool_name"] == "multi_edit" and payload["tool_input"] == _MULTI_ARGS
+
+    # A PostToolUse hook runs too, in an alternation as much as alone
+    seen = tmp_path / "post.json"
+    write_user_config(home, _hooks_block("PostToolUse", _group(_recorder(tmp_path, seen),
+                                                               matcher="write_file|edit_file")))
+    _run(run_tool("multi_edit", _MULTI_ARGS, adapter=AskAdapter(), **_tool_kwargs()))
+    assert target.read_text(encoding="utf-8") == "1\n"
+    payload = json.loads(seen.read_text())
+    assert payload["tool_name"] == "multi_edit" and payload["tool_input"]["path"] == "a.txt"
+
+
+def test_multi_edit_matcher_skips_edit_file(home, tmp_path):
+    log = tmp_path / "log.txt"
+    write_user_config(home, _hooks_block("PreToolUse", _group(_logger(tmp_path, log, "multi"), matcher="multi_edit")))
+    _run(run_hooks("PreToolUse", _pre("edit_file", {"path": "a"})))
+    assert _log_lines(log) == []
+    _run(run_hooks("PreToolUse", _pre("multi_edit", {"path": "a"})))
+    assert _log_lines(log) == ["multi"]
+
+
+def test_tool_match_alias_is_for_tool_events_only(home, tmp_path):
+    """A subagent type or session source that happens to be called multi_edit is not an edit_file."""
+    log = tmp_path / "log.txt"
+    write_user_config(home, _hooks_block("SubagentStart", _group(_logger(tmp_path, log, "agent"), matcher="edit_file")))
+    payload = payload_for("SubagentStart", session_id="s", turn_id="t", turn_type="interactive_loop",
+                          agent_type="multi_edit", agent_id="a1", prompt="p", background=False)
+    _run(run_hooks("SubagentStart", payload))
+    assert _log_lines(log) == []
+
+
+def test_edit_file_rewrite_hook_on_multi_edit_fails_safely(home, proj, tmp_path, monkeypatch):
+    """A hook written for edit_file rewrites old_str/new_str: multi_edit takes no such args, so nothing is written."""
+    _mode(monkeypatch, "auto")
+    target = proj / "a.txt"
+    target.write_text("one\n", encoding="utf-8")
+    rewrite = _decide(tmp_path, updated={"old_str": "one", "new_str": "hooked"})
+    write_user_config(home, _hooks_block("PreToolUse", {**rewrite, "matcher": "edit_file"}))
+    with pytest.raises(TypeError, match="old_str"):
+        _run(run_tool("multi_edit", _MULTI_ARGS, adapter=AskAdapter(), **_tool_kwargs()))
+    assert target.read_text(encoding="utf-8") == "one\n"

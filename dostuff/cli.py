@@ -202,6 +202,9 @@ def init(force: bool = typer.Option(False, "--force", help="Overwrite an existin
 #   exporter: "otlp"
 """
     config_path.write_text(config_template)
+    ignore = proj_dir / ".gitignore"
+    if not ignore.exists():  # config.yaml can be shared with the team; keys can't
+        ignore.write_text(".env*\nmcp_config.json\n")
     (proj_dir / "skills").mkdir(exist_ok=True)
     typer.echo(f"Initialized project at {cwd}")
 
@@ -559,14 +562,15 @@ def mcp_add(
     command: list[str] = typer.Argument(None, help="stdio: the command and its arguments; put -- before them if any start with -"),
     url: str = typer.Option(None, "--url", help="HTTP server URL (instead of a command)"),
     transport: str = typer.Option(None, "--transport", "-t", help="stdio | http | sse (default: stdio, or http with --url)"),
-    env: list[str] = typer.Option(None, "--env", "-e", help="KEY=VALUE for a stdio server's environment (repeatable)"),
-    header: list[str] = typer.Option(None, "--header", "-H", help="'Name: value' HTTP header (repeatable)"),
+    env: list[str] = typer.Option(None, "--env", "-e", help="KEY=VALUE for a stdio server's environment (repeatable); ${NAME} is read from .env"),
+    header: list[str] = typer.Option(None, "--header", "-H", help="'Name: value' HTTP header (repeatable); ${NAME} is read from .env"),
     project: bool = typer.Option(False, "--project", help="Write to ./.dostuff/mcp_config.json instead of ~/.dostuff/"),
     force: bool = typer.Option(False, "--force", help="Replace a server with the same name"),
 ):
-    """Add a server, e.g. `dostuff mcp add github -e GITHUB_TOKEN=... -- uvx mcp-server-github`."""
+    """Add a server, e.g. `dostuff mcp add search --url https://x/mcp -H 'Authorization: Bearer ${SEARCH_KEY}'`."""
+    from dostuff.config import load_env_files
     from dostuff.helpers.mcp.load_mcp_config import read_mcp_file, write_mcp_file
-    from dostuff.helpers.mcp.server_config import build_server_config
+    from dostuff.helpers.mcp.server_config import build_server_config, key_warnings
     try:
         cfg = build_server_config(
             command=command, url=url, transport=transport,
@@ -583,6 +587,9 @@ def mcp_add(
     servers[name] = cfg
     write_mcp_file(path, servers)
     typer.echo(f"Added '{name}' to {path}. It connects the next time dostuff starts.")
+    load_env_files()
+    for warning in key_warnings({name: cfg}):
+        typer.secho(f"Warning: {warning}", fg=typer.colors.YELLOW, err=True)
 
 
 @mcp_app.command("remove")

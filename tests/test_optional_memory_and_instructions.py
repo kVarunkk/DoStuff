@@ -175,8 +175,8 @@ def test_skill_headers_point_at_the_dir(monkeypatch):
 def test_system_prompt_names_the_skill_dir_exception():
     from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
     section = " ".join(SYSTEM_INSTRUCTIONS.split("## Responding")[0].split())
-    assert "File tools cannot reach outside it, and cannot read .env files or ~/.dostuff" in section
-    assert "can read (not write) the skill dirs" in section
+    assert "File tools cannot reach outside it, except that they can read (not write) `.dostuff`" in section
+    assert "the skill dirs listed under Available skills" in section
 
 
 def test_pin_skills_summary_shape(tmp_path, monkeypatch):
@@ -194,3 +194,27 @@ def test_pin_skills_summary_shape(tmp_path, monkeypatch):
     assert skills_summary(skills) == "\n\n".join(_index_block(s) for s in skills)
     assert all(Path(s["dir"]).is_absolute() and Path(s["dir"]).is_dir() for s in skills)
     assert skills_summary([]) == "(none available)"
+
+
+def _visible_and_manual(root):
+    for name, extra in (("visible", ""), ("manual", "disable-model-invocation: true\n")):
+        folder = root / name
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: the {name} one\n{extra}---\nbody\n",
+                                         encoding="utf-8")
+
+
+def test_manual_skill_not_in_prompt(tmp_path, monkeypatch):
+    from dostuff.agent.instructions import build_base_instructions
+    from dostuff.helpers.skills import discover_skills as ds
+    _visible_and_manual(tmp_path)
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [str(tmp_path)])
+    prompt, skills = build_base_instructions()
+    assert "the visible one" in prompt and "the manual one" not in prompt and str(tmp_path / "manual") not in prompt
+    assert sorted(s["name"] for s in skills) == ["manual", "visible"]  # the / menu and /help are built from this
+
+
+def test_all_skills_manual_shows_none_available():
+    from dostuff.agent.instructions import skills_summary
+    assert skills_summary([{"name": "a", "description": "d", "dir": "x", "disable_model_invocation": True}]) \
+        == "(none available)"

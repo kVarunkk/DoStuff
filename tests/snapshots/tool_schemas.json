@@ -475,6 +475,51 @@
     },
     "type": "function"
   },
+  "multi_edit": {
+    "function": {
+      "description": "Makes several exact-string replacements in one file, in one call. Prefer this over repeated\nedit_file calls when changing one file in several places. All or nothing: if any edit fails, the\nfile is left untouched.",
+      "name": "multi_edit",
+      "parameters": {
+        "properties": {
+          "edits": {
+            "description": "The replacements, applied in order: each one sees the result of the ones before it. Each old_str must occur exactly once unless that edit sets replace_all.",
+            "items": {
+              "properties": {
+                "new_str": {
+                  "description": "Replacement text.",
+                  "type": "string"
+                },
+                "old_str": {
+                  "description": "Exact text to replace, as the file reads after the edits before this one.",
+                  "type": "string"
+                },
+                "replace_all": {
+                  "description": "Replace every occurrence instead of requiring exactly one.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "old_str",
+                "new_str"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "path": {
+            "description": "Path relative to the project root, e.g. 'src/app.py'.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "edits"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
   "read_file": {
     "function": {
       "description": "Read a text file, returning numbered lines (like `cat -n`).",
@@ -672,7 +717,7 @@
   },
   "set_mcp_server": {
     "function": {
-      "description": "Adds an MCP server, or replaces the one with this name, and connects it right away.\nGive either `command` (a local stdio server) or `url` (an HTTP server). Take the package or\nURL from the server's official docs; never use a placeholder. Most hosted servers sign in with\nOAuth in the browser when they connect, so give only `url` and no `headers` unless the docs\nrequire an API key. The user is always asked first. To keep an existing secret, pass\n\"<redacted>\" as its value.",
+      "description": "Adds an MCP server, or replaces the one with this name, and connects it right away.\nGive either `command` (a local stdio server) or `url` (an HTTP server). Take the package or\nURL from the server's official docs; never use a placeholder. Most hosted servers sign in with\nOAuth in the browser when they connect, so give only `url` and no `headers` unless the docs\nrequire an API key. A key goes in .dostuff/.env, which you can't write: pick a variable name,\nwrite it as ${NAME} here, and tell the user to add NAME=<key> to .env and restart dostuff.\nThe user is always asked first. To keep an existing secret, pass \"<redacted>\" as its value.",
       "name": "set_mcp_server",
       "parameters": {
         "properties": {
@@ -702,7 +747,7 @@
                 "type": "null"
               }
             ],
-            "description": "Environment variables for a stdio server, e.g. {\"GITHUB_TOKEN\": \"...\"}."
+            "description": "Environment variables for a stdio server. It inherits .env already, so this is only for a variable under another name, e.g. {\"GITHUB_TOKEN\": \"${MY_GITHUB_KEY}\"}."
           },
           "headers": {
             "anyOf": [
@@ -716,7 +761,7 @@
                 "type": "null"
               }
             ],
-            "description": "HTTP headers, only when the server's docs require a key, e.g. {\"Authorization\": \"Bearer ...\"}. Leave out for OAuth servers."
+            "description": "HTTP headers, only when the server's docs require a key, e.g. {\"Authorization\": \"Bearer ${SEARCH_API_KEY}\"}. Leave out for OAuth servers."
           },
           "name": {
             "description": "Server name; its tools are called <name>__<tool>.",

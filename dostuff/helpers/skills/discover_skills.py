@@ -1,6 +1,7 @@
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -17,26 +18,39 @@ SKILLS_DIRS = [
 ]
 
 
-def _parse_frontmatter(frontmatter: str) -> dict[str, str]:
-    """`name` and `description` as written, when they are strings. BaseLoader keeps scalars as spelled
-    (`name: 1.10`, `name: yes`). Invalid YAML falls back to one regex per field: a malformed third-party
-    SKILL.md degrades, it never drops out of the index."""
+_DISABLE_KEY = "disable-model-invocation"
+_NOT_DISABLED = frozenset({"", "false", "no", "off", "0"})
+
+
+def _parse_frontmatter(frontmatter: str) -> dict[str, Any]:
+    """`name` and `description` as written, when they are strings, and `disable-model-invocation` whatever it
+    is. BaseLoader keeps scalars as spelled (`name: 1.10`, `name: yes`). Invalid YAML falls back to one regex
+    per field: a malformed third-party SKILL.md degrades, it never drops out of the index."""
     try:
         parsed = yaml.load(frontmatter, Loader=yaml.BaseLoader)
     except yaml.YAMLError:
         parsed = None
     if isinstance(parsed, dict):
-        return {key: parsed[key] for key in ("name", "description") if isinstance(parsed.get(key), str)}
+        fields = {key: parsed[key] for key in ("name", "description") if isinstance(parsed.get(key), str)}
+        return {**fields, _DISABLE_KEY: parsed[_DISABLE_KEY]} if _DISABLE_KEY in parsed else fields
     fields = {}
-    for key in ("name", "description"):
+    for key in ("name", "description", _DISABLE_KEY):
         match = re.search(rf"^{key}:[ \t]*(.+)$", frontmatter, re.MULTILINE)
         if match:
             fields[key] = match.group(1)
     return fields
 
 
+def _disabled(value: Any) -> bool:
+    """Only a clear "no" leaves the skill visible to the model: one someone tried to protect must not lose that
+    to a typo, and running it by hand works either way."""
+    if value is None:
+        return False
+    return not (isinstance(value, str) and value.strip().lower() in _NOT_DISABLED)
+
+
 def discover_skills() -> list[dict]:
-    skills = []
+    skills: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     seen_dirs: set[str] = set()
     for SKILLS_DIR in SKILLS_DIRS:
@@ -69,6 +83,7 @@ def discover_skills() -> list[dict]:
                 "description": " ".join(fields.get("description", "").split()),
                 "dir": str(skill_dir),
                 "location": str(skill_dir / "SKILL.md"),
+                "disable_model_invocation": _disabled(fields.get(_DISABLE_KEY)),
             })
     set_skill_roots(s["dir"] for s in skills)
     return skills

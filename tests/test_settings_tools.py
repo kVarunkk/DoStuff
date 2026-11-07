@@ -88,12 +88,16 @@ def test_mcp_servers_add_update_remove_with_redacted_secrets(home):
         settings.remove_mcp_server("github")
 
 
-def test_settings_changes_ask_in_every_mode_without_always(home):
-    auto = PermissionConfig(mode="auto")
-    decision = check("edit_config", "settings", {"old_str": "a", "new_str": "b"}, None, auto)
+def test_settings_changes_ask_without_always_except_in_auto(home):
+    ask, auto = PermissionConfig(mode="ask"), PermissionConfig(mode="auto")
+    decision = check("edit_config", "settings", {"old_str": "a", "new_str": "b"}, None, ask)
     assert decision.action == "ask" and decision.approval_keys == []
     # write_file / edit_file into a .dostuff folder can't get around it
-    assert check("edit_file", "write", {"path": ".dostuff/config.yaml"}, None, auto).action == "ask"
+    decision = check("edit_file", "write", {"path": ".dostuff/config.yaml"}, None, ask)
+    assert decision.action == "ask" and decision.approval_keys == []
+    # auto never waits for the user
+    assert check("edit_config", "settings", {"old_str": "a", "new_str": "b"}, None, auto).action == "allow"
+    assert check("edit_file", "write", {"path": ".dostuff/config.yaml"}, None, auto).action == "deny"  # edit_config's job
     assert check("edit_file", "write", {"path": "src/app.py"}, None, auto).action == "allow"
     assert check("read_settings", "read", {}, None, auto).action == "allow"
 
@@ -105,7 +109,7 @@ def test_settings_changes_ask_in_every_mode_without_always(home):
             prompts.append((message, always_label))
             return "a"  # "always" isn't offered; answering it still only allows this call
 
-    session = SessionPermissions(mode="auto")
+    session = SessionPermissions(mode="ask")
     args = {"old_str": "100", "new_str": "50"}
     assert asyncio.run(authorize_tool("edit_config", args, adapter=Asker(), permissions=session)) is None
     message, always_label = prompts[0]
@@ -114,6 +118,58 @@ def test_settings_changes_ask_in_every_mode_without_always(home):
     asyncio.run(authorize_tool("set_mcp_server", {"name": "git", "command": ["uvx", "mcp-server-git"]},
                                adapter=Asker(), permissions=session))
     assert '"runs": "uvx mcp-server-git"' in prompts[1][0]
+
+
+@pytest.mark.parametrize("new_str", [
+    "models:\n  - name: x\n    api_key: abc123\n",
+    "search:\n  token: abc123\n",
+    'hooks:\n  Stop:\n    - command: "curl -H \'Authorization: Bearer abcdefghijklmnopqrstuv\' x"\n',
+    "search:\n  searxng_url: https://x/?k=sk-abcdefghijklmnopqrstuvwxyz\n",
+])
+def test_edit_config_refuses_a_secret(home, new_str):
+    with pytest.raises(ValueError, match="can't hold secrets") as e:
+        settings.edit_config("", new_str)
+    assert "abc" not in str(e.value)  # the setting is named, the value is not
+    assert not (home / ".dostuff" / "config.yaml").exists()
+    assert "secrets" in settings.settings_preview("edit_config", {"old_str": "", "new_str": new_str})
+
+
+@pytest.mark.parametrize("new_str", [
+    'models:\n  - name: x\n    api_key_env: "MY_KEY"\n',
+    "loop:\n  max_tokens: 4096\n",
+    "ui:\n  status_bar: [tokens, cost]\n",
+    'search:\n  token: "${SEARCH_TOKEN}"\n',
+])
+def test_edit_config_allows_what_only_resembles_a_secret(home, new_str):
+    assert "Settings changed" in settings.edit_config("", new_str)
+
+
+def test_a_secret_already_in_the_file_does_not_block_other_edits(home):
+    (home / ".dostuff" / "config.yaml").write_text("search:\n  token: abc123\nloop:\n  max_iterations: 100\n", encoding="utf-8")
+    result = settings.edit_config("100", "50")
+    assert "search.token looks like a secret" in result and "abc123" not in result.split("Warnings")[1]
+
+
+def test_doctor_fails_on_a_secret_in_config(home):
+    from dostuff.helpers.ui.doctor import _config_secret_checks
+    path = home / ".dostuff" / "config.yaml"
+    path.write_text("search:\n  token: abc123\n", encoding="utf-8")
+    [found] = _config_secret_checks(path)
+    assert found.ok is False and "search.token" in found.label and "abc123" not in found.label
+
+
+@pytest.mark.parametrize("old_str, new_str, expect", [
+    ("mode: ask", "mode: auto", "permissions"),
+    ("  allow: []", "  allow: [rm]", "permissions"),
+    ("project_trust: ask", "project_trust: allow", "hooks.project_trust"),
+])
+def test_auto_refuses_edit_config_on_its_own_limits(home, old_str, new_str, expect):
+    (home / ".dostuff" / "config.yaml").write_text(
+        "permissions:\n  mode: ask\n  allow: []\nhooks:\n  project_trust: ask\nloop:\n  max_iterations: 100\n", encoding="utf-8")
+    session = SessionPermissions(mode="auto")
+    result = asyncio.run(authorize_tool("edit_config", {"old_str": old_str, "new_str": new_str}, permissions=session))
+    assert result.startswith("Auto mode") and expect in result
+    assert asyncio.run(authorize_tool("edit_config", {"old_str": "100", "new_str": "50"}, permissions=session)) is None
 
 
 def test_settings_tools_are_not_given_to_subagents():

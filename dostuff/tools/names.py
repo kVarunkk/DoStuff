@@ -7,7 +7,7 @@ tests/test_subagents_types.py keeps this in step with TOOL_MAP.
 """
 
 BUILTIN_TOOL_NAMES = frozenset({
-    "read_file", "write_file", "edit_file", "delete_file", "list_files", "grep", "glob",
+    "read_file", "write_file", "edit_file", "multi_edit", "delete_file", "list_files", "grep", "glob",
     "get_current_datetime", "web_fetch", "web_search", "todo_write", "save_memory", "save_episode",
     "ask_user",
     "search_mcp_tools", "get_mcp_tool_details", "call_mcp_tool",

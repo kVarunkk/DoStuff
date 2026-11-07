@@ -34,15 +34,15 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **MCP server support** — stdio (npx, uvx) and HTTP transports
 - **`@file` mentions** — type `@` in the prompt to pick a file or folder; its content (or listing) is sent with the message
 - **Project instructions** — `AGENTS.md` / `CLAUDE.md` from `~/.dostuff/`, the repo root and every folder down to the current one, combined
-- **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
+- **Coding tools** — `read_file` (line numbers, offset/limit), `edit_file` (exact replacement), `multi_edit` (several replacements in one file, all or nothing), `write_file`, `grep`, `glob`, `list_files`, `delete_file`, `bash_command`, `web_fetch` (read a URL as text), `web_search` (free, no API key)
 - **`ask_user`** — the agent asks you a real question — up to 4, with 2–4 options each, multi-select and a free-text "Other" — instead of guessing; the answers come back to it as one result and stay readable in `/resume`. See [Asking the user](#asking-the-user)
 - **`/btw` side questions** — ask about the conversation while a turn runs (or idle) without stopping or queuing it: one model call, no tools run, answered in a panel above the input and never added to the history; `f` hands the question to a background agent that can check it with tools. See [Side questions](#side-questions-btw)
 - **Mid-turn steering (`/steer`)** — send a correction to the turn that is running and the model reads it at the next tool boundary instead of waiting for the turn; plain messages steer by default, and `ui.mid_turn_messages: queue` batches them after the turn instead. See [Mid-turn steering](#mid-turn-steering-steer)
 - **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
 - **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
-- **File sandbox** — file tools stay inside the project directory, plus read-only access to discovered skill folders, and never read `.env*` files or the rest of `~/.dostuff/`
-- **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`
+- **File sandbox** — file tools stay inside the project directory, plus read-only access to `.dostuff` (the project's and `~/.dostuff/`) and to discovered skill folders; `.env*` files, `mcp_config.json` and `.dostuff/data` (past sessions and prompts, saved MCP client secrets) are never readable
+- **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`, name one mid-message to allow it for that message, or keep one manual-only with `disable-model-invocation`. See [Skills](#skills)
 - **Subagents** — the `agent` tool starts agents in parallel, in the foreground or the background, from built-in types (`explore`, `plan`, `general-purpose`), your own Markdown agent files (Claude Code's `.claude/agents/` work too) or a `fork` of the conversation; continue one with `send_message`, stop it with `stop_agent`, see them all in `/agents`. See [Subagents](#subagents)
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
 - **Retries with backoff** for rate limits, timeouts and 5xx errors (6 by default, exponential with jitter, honors `Retry-After`; `loop.max_retries` / `loop.retry_max_delay`); auth / bad-request errors fail fast
@@ -210,6 +210,7 @@ In the TUI:
 | `/queue` / `/queue clear` | List the prompts waiting for the current turn: edit one (back into the input), run it next or remove it / drop them all |
 | `/jobs [<id>]` / `/jobs kill <id>` | List this session's background jobs (id, owner, status, runtime, command) / show a job's last 40 lines of output and its log files / stop one (the agent is told). See [Background jobs](#background-jobs) |
 | `/<skill> [args]` | Run a skill: every discovered skill is a command (listed in the `/` menu and `/help`). See [Skills](#skills) |
+| `… /<skill> …` | Mid-message, makes that skill available for this message; the `/` menu offers skills as you type. See [Skills](#skills) |
 | `/<command> [args]` | Run a custom command from `.dostuff/commands/` or `~/.dostuff/commands/`. See [Custom commands](#custom-commands) |
 | `/rename <title>` | Name this session (shown by `dostuff sessions`) |
 | `/export [<path>]` | Save this session as Markdown (default `dostuff-session-<id>.md`) |
@@ -228,7 +229,7 @@ In the TUI:
 - **Sticky prompt** — once a prompt or `!command` scrolls off the top, it stays pinned there on one row while you are in its turn, as the answer streams or when you scroll back through an old one, until the next prompt reaches the top. Click it to go back to the start of the turn; `↓ Jump to bottom` returns you to the latest message
 - **Approvals** — a selector (arrows, a number, or `y` = allow once, `a` = always this session, `n` = deny with an optional note); several calls in one response can be approved together
 - **Turn summary** — `✻ Worked for 1m 5s · $0.01 · done 12:59 PM` after each turn
-- **Diffs** — `write_file` / `edit_file` changes shown as a coloured diff
+- **Diffs** — `write_file` / `edit_file` / `multi_edit` changes shown as a coloured diff
 - **Errors** — red background
 - **Status bar** — `cwd • model • permission mode • context usage %` by default; `help`, `session`, `tokens` and `cost` can be added. Choose and order the items with `ui.status_bar` in `config.yaml`; when the terminal is too narrow (or zoomed in), long items are shortened and the least important dropped (help, session, cwd, tokens, cost, model, context, mode) instead of being cut off
 - **Shells** — while background jobs run, a `⚙ 2 shells` item sits at the end of the status bar whatever `ui.status_bar` says. Click it (or press `↓` in an empty input) to list the session's jobs with when each started and how long it has run, and click it again to close the list; pick one (click or Enter) to see its last 8 lines of output and log path in the same small panel, refresh them, or stop it
@@ -248,7 +249,7 @@ In the TUI:
 | ---- | ---- | ----- |
 | `read_file`, `list_files`, `grep`, `glob`, `get_current_datetime`, `search_mcp_tools`, `get_mcp_tool_details` | read | never |
 | `bash_output`, `kill_shell` | read | never (they only touch the agent's own background jobs) |
-| `write_file`, `edit_file`, `delete_file` | write | yes (shows a diff) |
+| `write_file`, `edit_file`, `multi_edit`, `delete_file` | write | yes (shows a diff; `multi_edit` shows one diff for all its edits) |
 | `bash_command` | shell | yes, unless every part of the command is on the read-only allow-list (`ls`, `cat`, `git status`, `git diff`, …) with no redirection or substitution |
 | `call_mcp_tool` | mcp | yes |
 | `web_fetch` | network | yes; `a` (always) allows that domain for the session |
@@ -256,23 +257,34 @@ In the TUI:
 | `agent`, `send_message`, `stop_agent` | — | no; each subagent's own calls ask, titled with the agent |
 | `ask_user` | read | never (it is the agent talking to you; subagents never get it) |
 | `read_settings` | read | never (MCP `env` / header values are shown as `<redacted>`) |
-| `edit_config`, `set_mcp_server`, `remove_mcp_server`, `create_agent_type` | settings | **always, in every mode, with no "always" option** (shows the diff or the server's command) |
+| `edit_config`, `set_mcp_server`, `remove_mcp_server`, `create_agent_type` | settings | **yes, in every mode but `auto`, with no "always" option** (shows the diff or the server's command) |
 
 File tools writing under a `.dostuff` directory, and `bash_command` calls whose command or `cwd` names `.dostuff`, are
-settings changes too, so they always ask. That way auto mode can't quietly add a hook to `~/.dostuff/config.yaml`. Paths
-into subagent worktrees (`.dostuff/worktrees/…`) are exempt. The shell check matches the text `.dostuff`, so a name the
-command builds indirectly is not caught.
+settings changes too, so `ask` and `allowlist` always prompt for them. Paths into subagent worktrees
+(`.dostuff/worktrees/…`) are exempt, apart from the secrets copied there. The shell check matches the text `.dostuff`,
+so a name the command builds indirectly is not caught.
+
+Reading is not a settings change: a read-only shell command on `.dostuff` (`ls .dostuff/agents`, `cat
+~/.dostuff/config.yaml`) runs like any other, plan mode included. Only the part of a pipeline that names the path has to
+be a read, so `grep FAIL ~/.dostuff/jobs/<session>/<job>.out | sed … | sort -u` is fine. The same paths `read_file` can
+open qualify, so in `ask` and `allowlist` these still ask: `.env*` files and `mcp_config.json` (in a `.dostuff` dir, or
+the legacy one at the project root), a wildcard in the path, a command that changes directory, a `cwd` other than the
+project root, and `grep` / `rg` / `Select-String` over all of a `.dostuff` dir, `.dostuff/worktrees` or one worktree,
+which would reach `.env`.
 
 `permissions.mode` in `config.yaml`:
 
 - `ask` (default) — as in the table above.
 - `allowlist` — as `ask`, plus the patterns in `permissions.allow` run without asking (a shell command prefix such as `npm test`, a tool name such as `write_file`, `call_mcp_tool:<server>__<tool>`, `web_fetch:<domain>`, or `web_search`).
-- `auto` — nothing asks. A red warning is shown at startup.
+- `auto` — nothing asks, so the agent never stops to wait for approval. That includes settings changes: it can add hooks and MCP servers, create agents and skills, and change most of `.dostuff`, so use it only where you would let it do all of that. It refuses two things, and the call fails at once so the agent carries on: secrets (a `.env*` file, `mcp_config.json` or `.dostuff/data` named in a command, or a search that would reach one) and its own limits (`permissions`, `hooks.project_trust`, `trusted_hooks.json`). `config.yaml` changes only through `edit_config`, which can check them. There is no classifier reviewing commands, and the shell checks match text, so this is a guard against mistakes, not a sandbox. A `PreToolUse` hook that asks still prompts, because you configured it, and so does the one-time trust check for project hooks. A red warning is shown at startup.
 - `plan` — read-only: reads and read-only shell commands run; file changes, other shell commands and settings changes are denied with a "plan mode" note, and the model is told to investigate and answer with a plan. Web and MCP calls ask as in `ask`.
 
 In the TUI, `Shift+Tab` cycles the mode for the session (ask → auto → plan → allowlist); `/permissions <mode>` picks one.
 
 Answering `a` (always) approves that tool, or for the shell those commands, for the rest of the session.
+
+`edit_file` and `multi_edit` grant the same thing, so a rule for either covers both: in `permissions.allow`, in
+`--allowed-tools`, and for `a` (always). It stops there: neither covers `write_file` or `delete_file`.
 
 **Changing settings by asking.** Instead of editing `~/.dostuff/config.yaml` or `mcp_config.json` by hand, ask
 the agent: "hide the session id in the status bar", "set max_iterations to 50 for this project", "add the GitHub
@@ -281,13 +293,13 @@ edit that keeps your comments, checked to be valid YAML) and adds, updates or re
 `set_mcp_server` / `remove_mcp_server`, in the user files (`~/.dostuff/`) or the project's (`./.dostuff/`).
 Changes apply at once, without a restart (MCP servers connect or disconnect; tracing changes need a restart).
 Because these files hold the permission rules and an MCP server is a command that runs on your machine, every
-change asks, even in `auto` mode, and so do `write_file` / `edit_file` on anything in a `.dostuff` folder.
+change asks, except in `auto` mode, and so do `write_file` / `edit_file` / `multi_edit` on anything in a `.dostuff` folder.
 API keys stay in `.env` files, which the agent can't read or change. Subagents don't get these tools.
 
 > [!IMPORTANT]
 > File tools are sandboxed to the project directory (the directory the session runs in): paths that resolve
-> outside it are rejected, except that discovered skill folders can be read (never written), and `.env*` files and
-> the rest of `~/.dostuff/` cannot be read. **The shell is not sandboxed**:
+> outside it are rejected, except that `.dostuff` (the project's and `~/.dostuff/`) and discovered skill folders
+> can be read (never written), and `.env*` files, `mcp_config.json` and `.dostuff/data` cannot be read. **The shell is not sandboxed**:
 > `bash_command` can touch anything your user can, which is why non-read-only commands ask first.
 > The shell is Git Bash / `bash` when found, otherwise PowerShell on Windows or `/bin/sh`.
 
@@ -604,7 +616,7 @@ You are a code reviewer. Report findings as a list, most severe first.
 |---|---|
 | `Read` | `read_file` |
 | `Write` | `write_file` |
-| `Edit`, `MultiEdit` | `edit_file` |
+| `Edit`, `MultiEdit` | `edit_file`, `multi_edit` |
 | `Glob` / `Grep` / `LS` | `glob` / `grep` / `list_files` |
 | `Bash` | `bash_command` (plus `bash_output`, `kill_shell`) |
 | `WebFetch` / `WebSearch` | `web_fetch` / `web_search` |
@@ -683,8 +695,15 @@ matcher and tool argument names are renamed (see [the table below](#coming-from-
 
 `matcher` is a Python regex that must match the whole name (`edit_file` does not match `edit_file_v2`); empty or `*`
 matches everything. `if` (tool events only) is searched in a `bash_command`'s `command`. Inline flags such as `(?i)`
-go first in a pattern. `timeout` (default 30 s, 1–300) and `fail_closed` can be set on a group or on one hook. This is
-the example from the spec, and the two scripts it runs are below:
+go first in a pattern. `timeout` (default 30 s, 1–300) and `fail_closed` can be set on a group or on one hook.
+
+A tool matcher that matches `edit_file` also fires for `multi_edit`, so a guard or a formatter on `edit_file` holds for
+the same change made through `multi_edit`. It does not work the other way: a `multi_edit` matcher skips `edit_file`. The
+payload stays true to the call, with `tool_name` set to `multi_edit` and `tool_input` to `{path, edits}`. A script that
+reads `tool_input.path` keeps working; one that reads `tool_input.old_str` gets nothing there and needs to read `edits`.
+A hook that rewrites `old_str` / `new_str` makes a `multi_edit` call fail with a tool error, and nothing is written.
+
+This is the example from the spec, and the two scripts it runs are below:
 
 ```yaml
 hooks:
@@ -840,6 +859,7 @@ nesting are the same. Tool names and some argument names differ, so rename the m
 | `Bash` | `bash_command` | none (`command`, plus `cwd`, `timeout`) |
 | `Write` | `write_file` | `file_path` → `path` |
 | `Edit` | `edit_file` | `file_path` → `path`, `old_string`/`new_string` → `old_str`/`new_str` |
+| `MultiEdit` | `multi_edit` | `file_path` → `path`, and inside `edits`, `old_string`/`new_string` → `old_str`/`new_str` |
 | `Read` | `read_file` | `file_path` → `path` |
 | `Grep` / `Glob` | `grep` / `glob` | per tool |
 | `AskUserQuestion` | `ask_user` | `multiSelect` → `multi_select`; the answers come back as the tool's result |
@@ -910,7 +930,7 @@ See [`config.example.yaml`](https://github.com/kVarunkk/DoStuff/blob/package-str
 
 ### `.env`
 
-**Never put secrets in `config.yaml`.** Use `~/.dostuff/.env` and/or project-local `<cwd>/.dostuff/.env`. Both are read; project values override user values, and real environment variables override both:
+**Never put secrets in `config.yaml`.** `edit_config` refuses them, `/config` warns, and `dostuff doctor` flags any already there. Use `~/.dostuff/.env` and/or project-local `<cwd>/.dostuff/.env`. Both are read; project values override user values, and real environment variables override both:
 
 ```bash
 # ~/.dostuff/.env (chmod 600 on Unix)
@@ -977,32 +997,40 @@ Manage servers with `dostuff mcp list` / `add` / `remove` instead of editing the
     "tavily": {
       "transport": "stdio",
       "command": "npx",
-      "args": ["-y", "@tavily/mcp-server"],
-      "env": { "TAVILY_API_KEY": "tvly-..." }
+      "args": ["-y", "@tavily/mcp-server"]
     },
     "github": {
       "transport": "stdio",
       "command": "uvx",
       "args": ["mcp-server-github"],
-      "env": { "GITHUB_TOKEN": "ghp_..." }
+      "env": { "GITHUB_TOKEN": "${MY_WORK_GITHUB_KEY}" }
     },
     "remote": {
       "transport": "http",
       "url": "https://mcp.example.com/sse",
-      "headers": { "Authorization": "Bearer xxx" }
+      "headers": { "Authorization": "Bearer ${SEARCH_API_KEY}" }
     }
   }
 }
 ```
+
+**Keys go in `.dostuff/.env`, not in this file.** `${NAME}` in `headers` and `env` is replaced from `.env` (or the real environment) when the server connects:
+
+- **HTTP server:** you pick the name. It only links the two files, so `SEARCH_API_KEY=...` in `.env` matches `${SEARCH_API_KEY}` above.
+- **Local (stdio) server:** the server picks the name, so copy it from the server's docs. It inherits `.env`, so a key under that exact name needs no `env` entry (`tavily` above reads `TAVILY_API_KEY`). Use `env` to pass a key you saved under another name (`github` above).
+
+Only the exact form `${NAME}` is replaced, and only in `headers` and `env`. If a variable is missing or empty the server doesn't connect, and the error names it; after adding it, restart dostuff. `dostuff doctor` reports missing variables and plain keys left in the file, and `/config` and `dostuff mcp add` warn about them. On the command line use single quotes, so your shell doesn't expand the name itself: `dostuff mcp add search --url https://mcp.example.com -H 'Authorization: Bearer ${SEARCH_API_KEY}'`.
+
+A server's `url` receives whatever its headers name, so read a project's `.dostuff/mcp_config.json` before you run dostuff in a repository you don't trust, just as you would for a `command` it runs.
 
 | Field       | Required for | Notes                          |
 | ----------- | ------------ | ------------------------------ |
 | `transport` | optional     | `stdio` (default) or `http`    |
 | `command`   | stdio        | Executable (`npx`, `uvx`, ...) |
 | `args`      | stdio        | Argument list                  |
-| `env`       | stdio        | Env vars for the child process |
+| `env`       | stdio        | Env vars for the child process, added to what it inherits; `${NAME}` is read from `.env` |
 | `url`       | http         | Remote MCP server URL          |
-| `headers`   | http         | HTTP headers                   |
+| `headers`   | http         | HTTP headers; `${NAME}` is read from `.env` |
 | `connect_timeout` | optional | Seconds before giving up on this server (default 150, enough for a browser OAuth login) |
 
 MCP servers connect concurrently in the background, so the TUI never blanks during boot. Each server is announced in the chat area upon successful or failed connection.
@@ -1072,6 +1100,20 @@ Detailed instructions for the agent go here.
 ```
 
 **Running a skill yourself:** each skill is also a slash command, `/<name> [arguments]` (e.g. `/my-skill src/app.py`), in the TUI and with `dostuff -p "/my-skill ..."`. The turn's message is the skill's `SKILL.md` body plus your arguments (which can use `@path` mentions), so the model follows it straight away instead of deciding whether to read it. The command shows in the `/` menu marked `(skill)` and in `/help`. Built-in commands win a name clash, the first skill found (in the order above) wins between skills, and names with spaces can't be run this way; the model can still use those skills on its own.
+
+**Manual-only skills:** add `disable-model-invocation: true` to the frontmatter and the model is not told about the skill. It is left out of the system prompt and every subagent's prompt, so it only runs when you ask for it, with `/<name>` or a mention (below). It stays in the `/` menu and `/help`, and the `Skills loaded` line at startup marks it `(manual only)`. Only `false`, `no`, `off`, `0` or an empty value leave a skill visible to the model; anything else, a typo included, hides it.
+
+> [!IMPORTANT]
+> `disable-model-invocation` is **not a security boundary**. It stops the model from discovering and choosing the
+> skill; it does not block anything. The skill's folder stays readable by the file tools, a project skill is an
+> ordinary project file, and the shell can read whatever your user can. To guarantee a dangerous command never runs,
+> put a `PreToolUse` [hook](#hooks) on that command.
+
+**Mentioning a skill:** write `/<name>` inside a message, as in `go ahead and /deploy`, to make that skill available for that message. This is how the model gets to use a manual-only skill, and it works for any skill. The `SKILL.md` is not expanded: the model gets a note after your message with the skill's name, description and folder, and judges from your wording, so `don't run /deploy yet` works. You keep seeing the message as you typed it, plus a line, `Skill available for this message: deploy`; if that line is missing, the name wasn't recognised. It works in prompts, queued prompts, steering messages and `dostuff -p`. The permission lasts for that message, and subagents don't inherit it.
+
+A mention follows a space or a new line, can be any case, and may end in one `.`, `,`, `!`, `?`, `:` or `;`. So `` `/deploy` ``, `(/deploy)` and `/deploy/x` are not mentions, and neither is a path like `/tmp/notes.md`. Custom commands can't be mentioned. Only what you type counts: a `/deploy` inside an `@file` or a paste collapsed to `[Pasted text #1 …]` grants nothing. A message that starts with a skill or custom command is that command's run, so `/review then /deploy` grants nothing for `deploy`.
+
+While you type, `/` after a space opens the menu with skills only. Tab and Enter there replace just that word: your sentence stays and nothing is sent until the next Enter.
 
 Run `dostuff init` to bootstrap a local `.dostuff/skills/` folder. Restart the agent after adding new skills.
 

@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from bisect import bisect_right
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 from textual.app import App, ComposeResult
@@ -45,7 +46,7 @@ from dostuff.tools.bash.jobs import (
     session_of,
 )
 from dostuff.lib.memory.session_store import SQLiteSessionStore
-from dostuff.lib.checkpoints import UndoResult, get_checkpoint_store
+from dostuff.lib.checkpoints import CHECKPOINT_TOOLS, UndoResult, get_checkpoint_store
 from dostuff.lib.worktree import Worktree, WorktreeError, create_worktree, detect_worktree, has_changes, remove_worktree, worktree_changes
 from dostuff.lib.model import get_model
 from dostuff.lib.tracing import session_id_var, turn_id_var
@@ -68,13 +69,15 @@ from dostuff.helpers.agent.turn_context import is_turn_context, make_context_ste
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
 from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers
-from dostuff.helpers.agent.slash_suggestion import slash_arg_hint, slash_suggestion
+from dostuff.helpers.agent.slash_suggestion import mention_suggestion, slash_arg_hint, slash_suggestion
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
 from dostuff.helpers.hooks.dispatch import hook_line
 from dostuff.helpers.hooks.events import blocked_prompt_message, parse_stop_note, session_start, user_prompt_submit
 from dostuff.helpers.mcp.load_mcp_config import load_mcp_config, mcp_config_sources, read_mcp_file
 from dostuff.helpers.skills.custom_commands import discover_commands
-from dostuff.helpers.skills.skill_command import parse_skill_command, skill_commands, skill_prompt
+from dostuff.helpers.skills.skill_command import (
+    PARTIAL_SLASH_RE, mention_line, parse_skill_command, skill_commands, skill_mentions, skill_prompt, with_mention_note,
+)
 from dostuff.setup_wizard import PROVIDERS, missing_api_keys, read_template
 from dostuff.helpers.models.add_model_entry import ModelConfigError, add_model_entry
 from dostuff.helpers.models.list_models import FETCHED_PROVIDERS, ModelListError, provider_models
@@ -337,27 +340,54 @@ class Transcript(VerticalScroll):
         self._container_size = region.size
         return super()._get_scrollable_region(region)
 
+    _prompt_rows: list[tuple[int, int, Static]] | None = None  # (y, bottom, prompt), top to bottom
+
     def on_mount(self) -> None:
         # Pinned to the bottom, the compositor moves scroll_y with set_reactive and its watchers never fire:
         # what moves the view then is the content growing (virtual_size) or the viewport resizing (on_resize).
         self.watch(self, "scroll_y", self._update_sticky_prompt, init=False)
-        self.watch(self, "virtual_size", self._update_sticky_prompt, init=False)
+        self.watch(self, "virtual_size", self._layout_moved, init=False)
 
     def on_resize(self) -> None:
+        self._layout_moved()
+
+    def _layout_moved(self) -> None:
+        self._prompt_rows = None
         self._update_sticky_prompt()
 
     def _update_sticky_prompt(self) -> None:
         self.query_one("#sticky-prompt", StickyPrompt).show(self._prompt_above_view())
 
+    def _prompt_positions(self) -> list[tuple[int, int, Static]]:
+        """Where the prompts are, kept until the layout moves.
+
+        A scroll only arranges the visible widgets, so asking for an off-screen widget's region makes the
+        compositor arrange the whole conversation. Doing that on each scroll tick is what made a long
+        session lag; a scroll moves nothing inside the conversation, so the answer can be reused."""
+        if self._prompt_rows is not None:
+            return self._prompt_rows
+        rows: list[tuple[int, int, Static]] = []
+        settled = True
+        for widget in self.query_one("#msg-container").children:
+            if isinstance(widget, Static) and (widget.has_class("msg-user") or widget.has_class("msg-shell")):
+                region = widget.virtual_region
+                if region.height:
+                    rows.append((region.y, region.bottom, widget))
+                else:
+                    settled = False  # mounted, not laid out yet: look again next time
+        if settled:
+            self._prompt_rows = rows
+        return rows
+
     def _prompt_above_view(self) -> Static | None:
         """The prompt or `!command` whose turn fills the top row, if it is entirely above that row."""
         top = self.scroll_offset.y
-        for widget in reversed(self.query_one("#msg-container").children):
-            if isinstance(widget, Static) and (widget.has_class("msg-user") or widget.has_class("msg-shell")):
-                region = widget.virtual_region
-                if region.height and region.y <= top:  # no height: mounted, not laid out yet
-                    return widget if region.bottom <= top else None
-        return None
+        rows = self._prompt_positions()
+        index = bisect_right(rows, top, key=lambda row: row[0]) - 1
+        if index < 0:
+            return None
+        _, bottom, widget = rows[index]
+        return widget if bottom <= top else None
 
 
 class _JumpToBottomLabel(Static):
@@ -503,7 +533,8 @@ def _fmt_time(iso: str) -> str:
 
 class CommandMenu(OptionList):
     """Suggestions shown above the input: slash commands while it starts with '/', project paths
-    while an `@mention` is typed at the cursor (mode "file")."""
+    while an `@mention` is typed at the cursor (mode "file"), skills while a `/skill` is typed
+    mid-message (mode "skill")."""
 
     can_focus = False
     mode = "command"
@@ -512,7 +543,14 @@ class CommandMenu(OptionList):
     def show_matches(self, prefix: str) -> bool:
         """List commands starting with prefix; returns False (and hides) if none match."""
         self.mode = "command"
-        matches = [c for c in self.commands if c.startswith(prefix.lower())]
+        return self._show_commands([c for c in self.commands if c.startswith(prefix.lower())])
+
+    def show_skills(self, prefix: str, skills: Iterable[str]) -> bool:
+        """List `skills` starting with prefix, for a mention; returns False (and hides) if none match."""
+        self.mode = "skill"
+        return self._show_commands([s for s in skills if s.startswith(prefix.lower())])
+
+    def _show_commands(self, matches: list[str]) -> bool:
         self.clear_options()
         if not matches:
             self.display = False
@@ -1137,6 +1175,9 @@ class EnterSubmits(TextArea):
     A slash command being typed shows the rest of it (or its flag, e.g. /model --active) as
     dim ghost text after the cursor; Tab or Right accepts it. Then a dim hint for its arguments
     (e.g. /rename <title>), which is only shown, never inserted.
+
+    A `/skill` typed mid-message gets the same menu and ghost text, skills only. There Tab and
+    Enter replace just the token: the sentence around it stays, and nothing is sent.
     """
 
     # Ctrl+W / Ctrl+Backspace / Alt+Backspace delete the previous word (TextArea's own bindings)
@@ -1157,6 +1198,7 @@ class EnterSubmits(TextArea):
         self.pastes = PasteStore()
         self.paste_collapse_lines = 0  # set by the app from ui.paste_collapse_lines
         self.commands: Iterable[str] = COMMAND_DESCRIPTIONS  # for ghost text; the app adds the skill commands
+        self.skills: Iterable[str] = ()  # "/name" of each skill, for mentions; the app fills it in
         self.completion = ""  # the part of `suggestion` Tab/Right accept; the rest is the argument hint
 
     def add_history(self, text: str) -> None:
@@ -1193,12 +1235,31 @@ class EnterSubmits(TextArea):
         match = PARTIAL_MENTION_RE.search(self.document.get_line(row)[:col])
         return match.group(1) if match else None
 
+    def partial_slash(self) -> str | None:
+        """The `/...` being typed mid-message right before the cursor (with the "/"), or None.
+
+        None at the start of the message (the "/" menu's case), in `!` shell mode, and after a command, whose
+        text is its arguments: the same messages skill_mentions does not scan.
+        """
+        row, col = self.cursor_location
+        match = PARTIAL_SLASH_RE.search(self.document.get_line(row)[:col])
+        if match is None:
+            return None
+        first_word = self.get_text_range((0, 0), (row, match.start(1))).split(maxsplit=1)[:1]
+        if not first_word or first_word[0].startswith("!") or first_word[0].lower() in self.commands:
+            return None
+        return match.group(1)
+
     def update_suggestion(self, highlighted: str | None = None) -> None:
         """Ghost text for a slash command, only with the cursor at the end (not for recalled prompts)."""
         at_end = self.cursor_location == self.document.end and not self.selected_text
         recalled = self.text == self.recalled_text
         if not at_end or recalled:
             self.completion = self.suggestion = ""
+            return
+        partial = self.partial_slash()
+        if partial is not None:
+            self.completion = self.suggestion = mention_suggestion(partial, highlighted, self.skills)
             return
         self.completion = slash_suggestion(self.text, highlighted, self.commands)
         self.suggestion = self.completion + slash_arg_hint(self.text + self.completion, self.commands)
@@ -1225,6 +1286,18 @@ class EnterSubmits(TextArea):
         if path.endswith("/") and mention.endswith('"'):
             mention = mention[:-1]  # @"my dir/ : keep typing inside the quotes
         self.replace(mention + ("" if path.endswith("/") else " "), (row, col - len(partial)), (row, col))
+
+    def _complete_skill(self, command: str) -> None:
+        """Replace the `/...` at the cursor with `command`, leaving the sentence around it. A space that is already
+        there is reused, so a cursor mid-text ends up past it and the menu stays shut."""
+        partial = self.partial_slash()
+        if partial is None:
+            return
+        row, col = self.cursor_location
+        start = col - len(partial)
+        end = col + 1 if self.document.get_line(row)[col:col + 1] == " " else col
+        self.replace(command + " ", (row, start), (row, end))
+        self.move_cursor((row, start + len(command) + 1))
 
     async def _on_paste(self, event: Paste) -> None:
         """A long paste goes in as `[Pasted text #N +L lines]`; the app swaps the text back on submit."""
@@ -1254,8 +1327,13 @@ class EnterSubmits(TextArea):
                     menu.action_cursor_up()
                 else:
                     menu.action_cursor_down()
-                if menu.mode == "command":
+                if menu.mode != "file":
                     self.update_suggestion(menu.selected_command())
+            elif menu.mode == "skill":
+                command = menu.selected_command()
+                menu.display = False
+                if command:
+                    self._complete_skill(command)
             elif menu.mode == "file":
                 path = menu.selected_command()
                 menu.display = False
@@ -2110,8 +2188,10 @@ class DostuffTUI(App):
             menu_commands[command] = f"({kind}) {description}".rstrip()
         self.query_one("#command-menu", CommandMenu).commands = menu_commands
         inp.commands = menu_commands
+        inp.skills = [c for c, s in self._skill_commands.items() if s.get("kind") != "command"]
         if skills:
-            skill_names = ", ".join(s["name"] for s in skills)
+            skill_names = ", ".join(s["name"] + (" (manual only)" if s.get("disable_model_invocation") else "")
+                                    for s in skills)
             self._append(f"Skills loaded: {len(skills)} — {skill_names}", msg_type="system")
         else:
             self._append("Skills loaded: 0 (add to .dostuff/skills/ or ~/.agents/skills/)", msg_type="system")
@@ -3663,6 +3743,7 @@ class DostuffTUI(App):
         """D5: @mentions and pastes resolved off the UI thread, in submit order; `ready`/`fail` hands
         the entry to the loop. The "Attached …" lines show here, as they do for a prompt."""
         try:
+            mentions = skill_mentions(msg.raw, self._skill_commands)  # what was typed, before anything expands
             expansion = await asyncio.to_thread(expand_file_mentions, msg.raw, self.config.max_tool_output_chars)
             if expansion.attached:
                 self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
@@ -3670,6 +3751,9 @@ class DostuffTUI(App):
                 self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
             content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
                                               self.config.paste_file_lines, self.config.max_tool_output_chars)
+            content = with_mention_note(content, mentions)
+            if mentions:
+                self._append(mention_line(mentions), msg_type="system")
         except Exception as e:  # unreadable mention, broken paste file: reported, never delivered (REQ-2.4)
             self._steering.fail(msg.id, str(e))
             self._render_queue()
@@ -4018,17 +4102,21 @@ class DostuffTUI(App):
         self._start_worker(self._run_turn(text), name=f"turn_{uuid.uuid4().hex[:6]}")
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        """Open the "/" menu while typing a command; tint the input border in "!" shell mode."""
+        """Open the "/" menu while typing a command or mentioning a skill; tint the input border in "!" shell mode."""
         if isinstance(event.text_area, SettingsEditor):
             return
         text = event.text_area.text
         menu = self.query_one("#command-menu", CommandMenu)
         recalled = isinstance(event.text_area, EnterSubmits) and text == event.text_area.recalled_text
-        partial = event.text_area.partial_mention() if isinstance(event.text_area, EnterSubmits) and not recalled else None
+        typed_in = event.text_area if isinstance(event.text_area, EnterSubmits) and not recalled else None
+        partial = typed_in.partial_mention() if typed_in else None
+        skill = typed_in.partial_slash() if typed_in else None
         if text.startswith("/") and " " not in text and "\n" not in text and not recalled:
             menu.show_matches(text)
         elif partial is not None and not text.lstrip().startswith("!"):
             menu.show_paths(mention_candidates(partial[1:]))
+        elif typed_in and skill is not None:
+            menu.show_skills(skill, typed_in.skills)
         else:
             menu.display = False
         event.text_area.set_class(text.lstrip().startswith("!"), "shell-mode")
@@ -4128,6 +4216,7 @@ class DostuffTUI(App):
             if not wake:
                 # `/<skill> args`: only the args get @mentions and pastes; the SKILL.md text goes around them
                 skill_run = parse_skill_command(user_text, self._skill_commands)
+                mentions = skill_mentions(user_text, self._skill_commands)  # what was typed, before anything expands
                 expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else user_text,
                                                     self.config.max_tool_output_chars)
                 if expansion.attached:
@@ -4146,6 +4235,9 @@ class DostuffTUI(App):
                     what = "command" if skill_run[0].get("kind") == "command" else "skill"
                     self._append(f"Running {what} {skill_run[0]['name']} ({_rel_path(skill_run[0]['location'])})",
                                  msg_type="system")
+                content = with_mention_note(content, mentions)
+                if mentions:
+                    self._append(mention_line(mentions), msg_type="system")
 
             # Reset cancel state before the hooks below, so ESC can stop a slow one
             self.adapter._cancelled = False
@@ -4797,7 +4889,7 @@ class DostuffTUI(App):
         if self.current_session_history:
             del self.current_session_history[-min(count, len(self.current_session_history)):]
         changed_files = any(
-            (tc.get("function") or {}).get("name") in ("write_file", "edit_file", "delete_file")
+            (tc.get("function") or {}).get("name") in CHECKPOINT_TOOLS
             for step in dropped for tc in (step.get("tool_calls") or []) if isinstance(tc, dict)
         )
         await self.query_one("#msg-container", Vertical).remove_children()

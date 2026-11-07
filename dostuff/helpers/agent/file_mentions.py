@@ -19,6 +19,10 @@ MENTION_RE = re.compile(r'(?<!\S)@("[^"\n]+"|[^\s"]+)')
 # The mention being typed at the cursor (for completion)
 PARTIAL_MENTION_RE = re.compile(r'(?:^|\s)(@"?[^\s"]*)$')
 ATTACHMENT_RE = re.compile(r'\n*<attached_(file|dir) path="([^"]*)">.*?</attached_\1>', re.S)
+# helpers/skills/skill_command.py writes this block. Matched on its first sentence, so a user asking about the
+# tag is left alone.
+MENTION_NOTE_HEAD = "<skill-mentions>\nThe user named these skills in the message above."
+MENTION_NOTE_RE = re.compile(r"\n*" + re.escape(MENTION_NOTE_HEAD) + r".*?</skill-mentions>", re.S)
 TRAILING_PUNCTUATION = ".,;:!?)]}'"
 MAX_DIR_ENTRIES = 200
 MAX_INDEXED_PATHS = 20000
@@ -113,8 +117,8 @@ def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None
 
 
 def strip_attachments(content: str) -> str:
-    """The prompt as the user typed it (attached blocks removed), for display and export."""
-    return ATTACHMENT_RE.sub("", content)
+    """The prompt as the user typed it (attached blocks and the skill-mention note removed), for display and export."""
+    return MENTION_NOTE_RE.sub("", ATTACHMENT_RE.sub("", content))
 
 
 def attached_paths(content: str) -> list[str]:

@@ -1,4 +1,4 @@
-from dostuff.helpers.agent.slash_suggestion import slash_suggestion
+from dostuff.helpers.agent.slash_suggestion import mention_suggestion, slash_suggestion
 
 
 def test_completes_command_name():
@@ -42,3 +42,13 @@ def test_arg_hint_for_skill_commands():
     from dostuff.helpers.agent.slash_suggestion import slash_arg_hint
     assert slash_arg_hint("/release-notes", ["/help", "/release-notes"]) == " [arguments]"
     assert slash_arg_hint("/release-notes") == ""
+
+
+def test_mention_suggestion():
+    skills = ["/deploy", "/deploy-staging", "/review"]
+    assert mention_suggestion("/de", None, skills) == "ploy"
+    assert mention_suggestion("/DE", None, skills) == "ploy"
+    assert mention_suggestion("/de", "/deploy-staging", skills) == "ploy-staging"  # the menu's pick wins
+    assert mention_suggestion("/deploy", None, skills) == ""  # nothing left of the first match
+    assert mention_suggestion("/mo", None, skills) == ""  # a built-in cannot run mid-message
+    assert mention_suggestion("/zz", None, skills) == ""

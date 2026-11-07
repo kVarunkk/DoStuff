@@ -78,7 +78,7 @@ permissions:
   # plan      — read-only: reads and read-only shell commands run; file changes, other shell commands and
   #             settings changes are denied, so the agent investigates and answers with a plan.
   # In the TUI, Shift+Tab cycles ask → auto → plan → allowlist for the session.
-  # Settings changes by the agent (edit_config, set_mcp_server, remove_mcp_server, edits in .dostuff/) ask in every mode.
+  # Settings changes by the agent (edit_config, set_mcp_server, remove_mcp_server, edits in .dostuff/) ask in every mode but auto.
   mode: ask
   allow: []
   #   - "npm test"       # shell command prefix
@@ -118,7 +118,7 @@ permissions:
 #       hooks:
 #         - { type: command, name: block-main-push, command: "python .dostuff/hooks/block_main_push.py" }
 #   PostToolUse:              # stdout is appended to the tool result the model sees
-#     - matcher: "write_file|edit_file"
+#     - matcher: "write_file|edit_file"   # edit_file also matches multi_edit; its tool_input is {path, edits}
 #       hooks:
 #         - { type: command, name: format, command: "python .dostuff/hooks/format_file.py" }
 #   Stop:                     # exit 2 (or "decision": "block") sends the reason back and the agent continues

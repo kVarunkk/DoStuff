@@ -5,7 +5,7 @@ One checkpoint per turn, under `<data_dir>/checkpoints/<session_id>/<time_ns>_<t
 named by sha256, or "did not exist") and its hash after the latest change. /undo restores the
 newest checkpoint and removes it, so repeated /undo walks back turn by turn.
 
-Only write_file / edit_file / delete_file are tracked; changes made by shell commands are not.
+Only write_file / edit_file / multi_edit / delete_file are tracked; changes made by shell commands are not.
 """
 import hashlib
 import json
@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-CHECKPOINT_TOOLS = frozenset({"write_file", "edit_file", "delete_file"})
+CHECKPOINT_TOOLS = frozenset({"write_file", "edit_file", "multi_edit", "delete_file"})
 MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024
 MAX_CHECKPOINTS_PER_SESSION = 50
 _MANIFEST = "manifest.json"

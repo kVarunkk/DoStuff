@@ -2,7 +2,7 @@
 
 The file is a Markdown file with YAML frontmatter in `.dostuff/agents/` (project) or `~/.dostuff/agents/`
 (user), the same format `/agents types` lists and the `agent` tool starts. A type is a system prompt plus a
-tool grant, so this is a settings change: it asks in every mode, and the prompt shows the whole file.
+tool grant, so this is a settings change: it asks in every mode but auto, and the prompt shows the whole file.
 """
 import re
 from pathlib import Path

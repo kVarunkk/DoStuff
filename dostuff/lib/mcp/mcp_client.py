@@ -13,6 +13,7 @@ import sys
 import os
 from dostuff.helpers.mcp.mcp_oauth import authenticate_via_oauth, refresh_access_token
 from dostuff.helpers.mcp import token_store
+from dostuff.helpers.mcp.server_config import ENV_FIX, expand_env_references, missing_env_references
 from dostuff.lib.mcp.mcp_client_registration_store import MCPClientRegistrationStore
 from dostuff.lib.mcp.mcp_tool_registry_store import MCPToolRegistryStore
 
@@ -100,11 +101,14 @@ class MCPClient:
         """(Re)connects to an MCP server and updates the tool index. Raises if connecting fails."""
         await self._disconnect(server_name)
 
-        req_headers = dict(headers or {})
-        self.server_meta[server_name] = {
+        missing = missing_env_references({"headers": headers, "env": env})
+        if missing:
+            raise ValueError(f"{', '.join(missing)} not set: {ENV_FIX}")
+        req_headers = expand_env_references(headers)
+        self.server_meta[server_name] = {  # as configured: a reconnect expands them again
             "url": url,
             "transport": transport,
-            "headers": req_headers,
+            "headers": dict(headers or {}),
             "command": command,
             "args": args,
             "env": env,
@@ -119,6 +123,7 @@ class MCPClient:
             raise ValueError(f"Server '{server_name}' requires a 'command' for stdio transport.")
 
         conn = _ServerConnection()
+        env = expand_env_references(env)
         ready: asyncio.Future[ClientSession] = asyncio.get_running_loop().create_future()
         conn.task = asyncio.create_task(
             self._serve(server_name, transport, url, req_headers, auth, command, args, env, ready, conn.stop),

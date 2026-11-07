@@ -21,10 +21,25 @@ class Check:
     fix: str = ""
 
 
+def _config_secret_checks(path: Path) -> list[Check]:
+    """A failed check when a config.yaml holds what looks like a key; the check names the setting, never the value."""
+    import yaml
+
+    from dostuff.helpers.config_secrets import SECRET_HINT, find_secrets
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else None
+    except (OSError, yaml.YAMLError):
+        return []  # the config load reports these
+    found = find_secrets(data or {})
+    return [Check(f"Secret in {path}: {', '.join(found)}", False, SECRET_HINT)] if found else []
+
+
 def doctor_checks() -> list[Check]:
     """Config files, the model's API key, MCP config, data dir, memory and permission mode."""
     from dostuff.config import get_config
     from dostuff.helpers.mcp.load_mcp_config import mcp_config_sources, read_mcp_file
+    from dostuff.helpers.mcp.server_config import key_warnings
     from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT, chroma_available, embedding_model_missing
     from dostuff.setup_wizard import missing_api_keys
 
@@ -32,6 +47,8 @@ def doctor_checks() -> list[Check]:
     checks = [Check(f"Global config: {cfg.global_path}", cfg.global_path.exists(), "run `dostuff setup`")]
     proj = Path.cwd() / ".dostuff" / "config.yaml"
     checks.append(Check(f"Project config: {proj}" + ("" if proj.exists() else " (none; `dostuff init` creates one)"), None))
+    for config_file in (cfg.global_path, proj):
+        checks += _config_secret_checks(config_file)
     for env_path in (cfg.global_path.parent / ".env", Path.cwd() / ".dostuff" / ".env"):
         checks.append(Check(f".env: {env_path}" + ("" if env_path.exists() else " (none)"), None))
     model = cfg.model_name
@@ -48,6 +65,7 @@ def doctor_checks() -> list[Check]:
             checks.append(Check(f"MCP config could not be read: {source}: {e}", False, "fix the JSON in that file"))
     checks.append(Check(f"MCP servers: {len(servers)} (`dostuff mcp list`)" if servers
                         else "MCP servers: none configured (optional; `dostuff mcp add`)", None))
+    checks += [Check(warning, False) for warning in key_warnings(servers)]
     checks.append(Check(f"Data dir: {cfg.data_dir}" + ("" if cfg.data_dir.exists() else " (created on first run)"), None))
     if not chroma_available():
         checks.append(Check(f"Long-term memory: off, chromadb not installed (optional; `{MEMORY_INSTALL_HINT}`)", None))
@@ -166,7 +184,7 @@ def hooks_listing() -> str:
     lines = [
         "Hooks run with your privileges, unsandboxed, and are not permission-checked. "
         "Keep project hook scripts in .dostuff/hooks/: trust covers them there, and the model can't edit them "
-        "without a settings prompt.",
+        "without a settings prompt, except in auto mode, where nothing asks.",
         f"Each runs as: {' '.join(argv)} \"<command>\" ({shell}), in {project_root()}",
     ]
     for event in EVENTS:
