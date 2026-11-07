@@ -88,9 +88,9 @@ _TOOLS = [
     ToolSpec("send_message", send_message, "read",
              frozenset({"mcp_client", "session_id", "turn_id", "adapter", "permissions", "fork_context"})),
     ToolSpec("stop_agent", stop_agent, "read", frozenset({"session_id"})),
-    # Writes an agent file (a system prompt + a tool grant): a settings change, asks in every mode
+    # Writes an agent file (a system prompt + a tool grant): a settings change, asks in every mode but auto
     ToolSpec("create_agent_type", create_agent_type, "settings"),
-    # dostuff's own config.yaml and MCP servers; changes ask in every mode (permissions.py)
+    # dostuff's own config.yaml and MCP servers; changes ask in every mode but auto (permissions.py)
     ToolSpec("read_settings", read_settings, "read"),
     ToolSpec("edit_config", edit_config, "settings", frozenset({"adapter"})),
     ToolSpec("set_mcp_server", set_mcp_server, "settings", frozenset({"adapter"})),

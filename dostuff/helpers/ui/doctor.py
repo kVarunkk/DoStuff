@@ -21,6 +21,20 @@ class Check:
     fix: str = ""
 
 
+def _config_secret_checks(path: Path) -> list[Check]:
+    """A failed check when a config.yaml holds what looks like a key; the check names the setting, never the value."""
+    import yaml
+
+    from dostuff.helpers.config_secrets import SECRET_HINT, find_secrets
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else None
+    except (OSError, yaml.YAMLError):
+        return []  # the config load reports these
+    found = find_secrets(data or {})
+    return [Check(f"Secret in {path}: {', '.join(found)}", False, SECRET_HINT)] if found else []
+
+
 def doctor_checks() -> list[Check]:
     """Config files, the model's API key, MCP config, data dir, memory and permission mode."""
     from dostuff.config import get_config
@@ -32,6 +46,8 @@ def doctor_checks() -> list[Check]:
     checks = [Check(f"Global config: {cfg.global_path}", cfg.global_path.exists(), "run `dostuff setup`")]
     proj = Path.cwd() / ".dostuff" / "config.yaml"
     checks.append(Check(f"Project config: {proj}" + ("" if proj.exists() else " (none; `dostuff init` creates one)"), None))
+    for config_file in (cfg.global_path, proj):
+        checks += _config_secret_checks(config_file)
     for env_path in (cfg.global_path.parent / ".env", Path.cwd() / ".dostuff" / ".env"):
         checks.append(Check(f".env: {env_path}" + ("" if env_path.exists() else " (none)"), None))
     model = cfg.model_name
@@ -166,7 +182,7 @@ def hooks_listing() -> str:
     lines = [
         "Hooks run with your privileges, unsandboxed, and are not permission-checked. "
         "Keep project hook scripts in .dostuff/hooks/: trust covers them there, and the model can't edit them "
-        "without a settings prompt.",
+        "without a settings prompt, except in auto mode, where nothing asks.",
         f"Each runs as: {' '.join(argv)} \"<command>\" ({shell}), in {project_root()}",
     ]
     for event in EVENTS:

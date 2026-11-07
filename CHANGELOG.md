@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The agent can make several edits to a file in one approved step, a skill can be kept for you to run by hand, and you can allow a skill for one message by naming it in the sentence.
+The agent can make several edits to a file in one approved step, a skill can be kept for you to run by hand, you can allow a skill for one message by naming it in the sentence, and auto mode no longer stops to ask.
 
 ### Added
 - **`multi_edit` tool** — several exact-string edits to one file in one call: one approval, one diff, and if any edit fails the file is left untouched. `/undo` restores it like any other file change.
@@ -22,6 +22,16 @@ The agent can make several edits to a file in one approved step, a skill can be 
 
 ### Documentation
 - README: `multi_edit` in the tools and name tables, the `edit_file` matcher rule for hooks, and manual-only skills and mentions in the Skills section.
+
+### Fixed
+- **Auto mode never stops to ask** — settings changes used to prompt even in `auto`, so a run could sit waiting for you. They now run without a prompt: `edit_config`, the MCP server tools, `create_agent_type`, and any write in a `.dostuff` folder. This means auto mode can add hooks and MCP servers and change most of `.dostuff`. What must stay closed is refused at once instead of asking, and the agent carries on: secrets, and its own limits (`permissions`, `hooks.project_trust`, `trusted_hooks.json`). `config.yaml` changes only through `edit_config` in auto mode. A `PreToolUse` hook that asks and the project hook trust check still prompt.
+- **Secrets stay out of `config.yaml`** — `edit_config` refuses a new value that looks like a key, `/config` warns about one, and `dostuff doctor` fails on any already there, naming the setting but not the value. `dostuff init` also adds a `.dostuff/.gitignore` so `.env` and `mcp_config.json` aren't committed.
+- **Reading `.dostuff` no longer asks** — read-only shell commands on a `.dostuff` dir, such as `ls .dostuff/agents` or `cat ~/.dostuff/config.yaml`, run without a prompt in every mode, and plan mode allows them. Only the part of a pipeline that names the path has to be a read, so `grep FAIL ~/.dostuff/jobs/<session>/<job>.out | sed … | sort -u` is allowed too. In `ask` and `allowlist`, writes still ask, and so do `.env*` files and `mcp_config.json`, which hold keys and tokens. `2>&1` and `2>/dev/null` no longer make a read-only command ask.
+- **`~/.dostuff/data` stays closed** — it holds your past sessions and prompts from every project and saved MCP client secrets, so file tools and read-only shell commands can't open it, and auto mode refuses it like `.env`.
+- **Editing a subagent worktree is an ordinary file change** — `write_file`, `edit_file`, `multi_edit` and `delete_file` under `.dostuff/worktrees/<name>/` no longer count as settings changes, matching the shell. The worktree's own `.dostuff` still does.
+- **Secrets copied into subagent worktrees are protected** — `grep -r KEY .dostuff/worktrees/<name>` and a trailing-slash `.dostuff/worktrees/` ran without a prompt in every mode and could reach the `.env` copied there. They now ask, and plan mode denies them.
+- **`~/.dostuff` is readable** — `read_file`, `list_files`, `grep` and `glob` can open it like the project's `.dostuff`, so the agent can inspect its own agents, skills, hooks and job logs. It stays read-only, and `.env*` files, `mcp_config.json` and `data` stay closed.
+- `tree -o <file>` writes a file, so it now asks instead of counting as read-only.
 
 ## [0.2.11] - 2026-11-06
 

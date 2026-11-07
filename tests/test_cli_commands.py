@@ -908,3 +908,10 @@ def test_print_mode_scans_what_was_typed_only(env, headless):
     assert headless[-1]["history"][-1]["content"] == "just a prompt"
     runner.invoke(env["app"], ["-p", "/deploy then /deploy", "-q"])
     assert "<skill-mentions>" not in headless[-1]["history"][-1]["content"]
+
+
+def test_init_keeps_keys_out_of_git(tmp_path, monkeypatch):
+    from dostuff.cli import app
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert (tmp_path / ".dostuff" / ".gitignore").read_text().splitlines() == [".env*", "mcp_config.json"]

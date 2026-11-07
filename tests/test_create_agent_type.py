@@ -83,7 +83,8 @@ def test_main_agent_only_and_always_asks():
     assert "create_agent_type" in RESTRICTED_SUBAGENT_TOOLS
     spec = TOOL_MAP["create_agent_type"]
     args = {"name": "rev", "description": "D.", "prompt": "P."}
-    decision = check("create_agent_type", spec.kind, args, None, PermissionConfig(mode="auto"))
+    assert check("create_agent_type", spec.kind, args, None, PermissionConfig(mode="auto")).action == "allow"
+    decision = check("create_agent_type", spec.kind, args, None, PermissionConfig(mode="ask"))
     assert decision.action == "ask"
     assert "Create agent type 'rev' (.dostuff/agents)" in decision.prompt
 

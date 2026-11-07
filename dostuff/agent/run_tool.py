@@ -7,7 +7,7 @@ from typing import Any, cast
 from opentelemetry.trace import get_current_span
 
 from dostuff.agent.permissions import (
-    ApprovalReply, PermissionConfig, PermissionDecision, PermissionMode, SessionPermissions, check,
+    RULES_REFUSAL, ApprovalReply, PermissionConfig, PermissionDecision, PermissionMode, SessionPermissions, check,
     describe_approval_keys, effective_kind, forced_ask, is_read_only_shell, to_reply,
 )
 from dostuff.agent.subagents import read_only_shell
@@ -23,7 +23,7 @@ from dostuff.lib.tracing import content_attr, traced
 from dostuff.tools.definitions import HARNESS_PARAMS, TOOL_MAP, ToolSpec
 from dostuff.tools.files.edit_file import EditFailed
 from dostuff.tools.files.multi_edit import apply_edits, check_edits
-from dostuff.tools.settings import SETTINGS_TOOLS, settings_preview
+from dostuff.tools.settings import SETTINGS_TOOLS, own_rule_changes, settings_preview
 
 # Legacy approval flags a model may still try to pass; always dropped before dispatch.
 APPROVAL_KEYS = frozenset({"_confirmed", "overwrite"})
@@ -92,8 +92,8 @@ def _hook_decision(
         return base  # 1. plan mode: a hook can only tighten it
     if hook.decision == "deny":
         return PermissionDecision("deny", reason=hook.reason or f"Blocked by hook '{hook.decided_by}'.")  # 2.
-    if effective_kind(spec.kind, args) == "settings":
-        return base  # 3. settings changes ask in every mode; a hook allow cannot silence them
+    if base.action == "ask" and effective_kind(spec.kind, args) == "settings":
+        return base  # 3. a settings prompt can't be silenced by a hook allow (auto has no such prompt)
     if hook.decision == "ask":  # 4. even in auto mode and for read-only / allowlisted calls
         note = f"Hook '{hook.decided_by}' asks: {hook.reason}" if hook.reason else f"Hook '{hook.decided_by}' asks"
         return forced_ask(spec.name, args, preview, note)
@@ -113,6 +113,10 @@ def _decide(
         return PermissionDecision("deny", reason=READ_ONLY_SHELL_DENIAL)
     preview = _approval_preview(fn_name, args)
     base = check(fn_name, spec.kind, args, permissions, permission_config(), preview)
+    if fn_name == "edit_config" and base.action == "allow":  # only auto allows a settings tool
+        changed = own_rule_changes(str(args.get("old_str", "")), str(args.get("new_str", "")), str(args.get("scope") or "user"))
+        if changed:
+            base = PermissionDecision("deny", reason=f"Auto mode: not run (changes {', '.join(changed)}). {RULES_REFUSAL}")
     return _hook_decision(hook, spec, args, base, preview)
 
 

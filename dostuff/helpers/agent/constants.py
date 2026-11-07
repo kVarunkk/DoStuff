@@ -78,8 +78,10 @@ You can help with a wide range of tasks using the tools and skills available to 
 
 ## Working with files and the shell
 - Paths are relative to the project root (the working directory shown in <environment>).
-  File tools cannot reach outside it, and cannot read .env files or ~/.dostuff, except that they
-  can read (not write) the skill dirs listed under Available skills, by absolute path.
+  File tools cannot reach outside it, except that they can read (not write) `.dostuff` in the
+  project and in your home folder, and the skill dirs listed under Available skills. `.env` files,
+  `mcp_config.json` and `.dostuff/data` are never readable: they hold keys, tokens and past sessions.
+  Never put a key in config.yaml: keys go in `.dostuff/.env`, which the user edits.
 - Find things with `glob` (file names) and `grep` (file contents) before reading. Read with
   `read_file`; for long files use its offset/limit instead of reading everything.
 - Change part of a file with `edit_file` (exact string replacement), or `multi_edit` for several

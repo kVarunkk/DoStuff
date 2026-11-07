@@ -41,7 +41,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Permission layer** — mutating tool calls ask for approval (allow once / always this session / deny with a note); read-only shell commands run without asking; modes `ask` / `allowlist` / `auto`; `/undo` reverts the agent's file changes
 - **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
-- **File sandbox** — file tools stay inside the project directory, plus read-only access to discovered skill folders, and never read `.env*` files or the rest of `~/.dostuff/`
+- **File sandbox** — file tools stay inside the project directory, plus read-only access to `.dostuff` (the project's and `~/.dostuff/`) and to discovered skill folders; `.env*` files, `mcp_config.json` and `.dostuff/data` (past sessions and prompts, saved MCP client secrets) are never readable
 - **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`, name one mid-message to allow it for that message, or keep one manual-only with `disable-model-invocation`. See [Skills](#skills)
 - **Subagents** — the `agent` tool starts agents in parallel, in the foreground or the background, from built-in types (`explore`, `plan`, `general-purpose`), your own Markdown agent files (Claude Code's `.claude/agents/` work too) or a `fork` of the conversation; continue one with `send_message`, stop it with `stop_agent`, see them all in `/agents`. See [Subagents](#subagents)
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
@@ -257,18 +257,26 @@ In the TUI:
 | `agent`, `send_message`, `stop_agent` | — | no; each subagent's own calls ask, titled with the agent |
 | `ask_user` | read | never (it is the agent talking to you; subagents never get it) |
 | `read_settings` | read | never (MCP `env` / header values are shown as `<redacted>`) |
-| `edit_config`, `set_mcp_server`, `remove_mcp_server`, `create_agent_type` | settings | **always, in every mode, with no "always" option** (shows the diff or the server's command) |
+| `edit_config`, `set_mcp_server`, `remove_mcp_server`, `create_agent_type` | settings | **yes, in every mode but `auto`, with no "always" option** (shows the diff or the server's command) |
 
 File tools writing under a `.dostuff` directory, and `bash_command` calls whose command or `cwd` names `.dostuff`, are
-settings changes too, so they always ask. That way auto mode can't quietly add a hook to `~/.dostuff/config.yaml`. Paths
-into subagent worktrees (`.dostuff/worktrees/…`) are exempt. The shell check matches the text `.dostuff`, so a name the
-command builds indirectly is not caught.
+settings changes too, so `ask` and `allowlist` always prompt for them. Paths into subagent worktrees
+(`.dostuff/worktrees/…`) are exempt, apart from the secrets copied there. The shell check matches the text `.dostuff`,
+so a name the command builds indirectly is not caught.
+
+Reading is not a settings change: a read-only shell command on `.dostuff` (`ls .dostuff/agents`, `cat
+~/.dostuff/config.yaml`) runs like any other, plan mode included. Only the part of a pipeline that names the path has to
+be a read, so `grep FAIL ~/.dostuff/jobs/<session>/<job>.out | sed … | sort -u` is fine. The same paths `read_file` can
+open qualify, so in `ask` and `allowlist` these still ask: `.env*` files and `mcp_config.json` (in a `.dostuff` dir, or
+the legacy one at the project root), a wildcard in the path, a command that changes directory, a `cwd` other than the
+project root, and `grep` / `rg` / `Select-String` over all of a `.dostuff` dir, `.dostuff/worktrees` or one worktree,
+which would reach `.env`.
 
 `permissions.mode` in `config.yaml`:
 
 - `ask` (default) — as in the table above.
 - `allowlist` — as `ask`, plus the patterns in `permissions.allow` run without asking (a shell command prefix such as `npm test`, a tool name such as `write_file`, `call_mcp_tool:<server>__<tool>`, `web_fetch:<domain>`, or `web_search`).
-- `auto` — nothing asks. A red warning is shown at startup.
+- `auto` — nothing asks, so the agent never stops to wait for approval. That includes settings changes: it can add hooks and MCP servers, create agents and skills, and change most of `.dostuff`, so use it only where you would let it do all of that. It refuses two things, and the call fails at once so the agent carries on: secrets (a `.env*` file, `mcp_config.json` or `.dostuff/data` named in a command, or a search that would reach one) and its own limits (`permissions`, `hooks.project_trust`, `trusted_hooks.json`). `config.yaml` changes only through `edit_config`, which can check them. There is no classifier reviewing commands, and the shell checks match text, so this is a guard against mistakes, not a sandbox. A `PreToolUse` hook that asks still prompts, because you configured it, and so does the one-time trust check for project hooks. A red warning is shown at startup.
 - `plan` — read-only: reads and read-only shell commands run; file changes, other shell commands and settings changes are denied with a "plan mode" note, and the model is told to investigate and answer with a plan. Web and MCP calls ask as in `ask`.
 
 In the TUI, `Shift+Tab` cycles the mode for the session (ask → auto → plan → allowlist); `/permissions <mode>` picks one.
@@ -285,13 +293,13 @@ edit that keeps your comments, checked to be valid YAML) and adds, updates or re
 `set_mcp_server` / `remove_mcp_server`, in the user files (`~/.dostuff/`) or the project's (`./.dostuff/`).
 Changes apply at once, without a restart (MCP servers connect or disconnect; tracing changes need a restart).
 Because these files hold the permission rules and an MCP server is a command that runs on your machine, every
-change asks, even in `auto` mode, and so do `write_file` / `edit_file` / `multi_edit` on anything in a `.dostuff` folder.
+change asks, except in `auto` mode, and so do `write_file` / `edit_file` / `multi_edit` on anything in a `.dostuff` folder.
 API keys stay in `.env` files, which the agent can't read or change. Subagents don't get these tools.
 
 > [!IMPORTANT]
 > File tools are sandboxed to the project directory (the directory the session runs in): paths that resolve
-> outside it are rejected, except that discovered skill folders can be read (never written), and `.env*` files and
-> the rest of `~/.dostuff/` cannot be read. **The shell is not sandboxed**:
+> outside it are rejected, except that `.dostuff` (the project's and `~/.dostuff/`) and discovered skill folders
+> can be read (never written), and `.env*` files, `mcp_config.json` and `.dostuff/data` cannot be read. **The shell is not sandboxed**:
 > `bash_command` can touch anything your user can, which is why non-read-only commands ask first.
 > The shell is Git Bash / `bash` when found, otherwise PowerShell on Windows or `/bin/sh`.
 
@@ -922,7 +930,7 @@ See [`config.example.yaml`](https://github.com/kVarunkk/DoStuff/blob/package-str
 
 ### `.env`
 
-**Never put secrets in `config.yaml`.** Use `~/.dostuff/.env` and/or project-local `<cwd>/.dostuff/.env`. Both are read; project values override user values, and real environment variables override both:
+**Never put secrets in `config.yaml`.** `edit_config` refuses them, `/config` warns, and `dostuff doctor` flags any already there. Use `~/.dostuff/.env` and/or project-local `<cwd>/.dostuff/.env`. Both are read; project values override user values, and real environment variables override both:
 
 ```bash
 # ~/.dostuff/.env (chmod 600 on Unix)

@@ -78,7 +78,7 @@ permissions:
   # plan      — read-only: reads and read-only shell commands run; file changes, other shell commands and
   #             settings changes are denied, so the agent investigates and answers with a plan.
   # In the TUI, Shift+Tab cycles ask → auto → plan → allowlist for the session.
-  # Settings changes by the agent (edit_config, set_mcp_server, remove_mcp_server, edits in .dostuff/) ask in every mode.
+  # Settings changes by the agent (edit_config, set_mcp_server, remove_mcp_server, edits in .dostuff/) ask in every mode but auto.
   mode: ask
   allow: []
   #   - "npm test"       # shell command prefix

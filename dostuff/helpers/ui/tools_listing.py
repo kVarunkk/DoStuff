@@ -55,7 +55,7 @@ def tools_listing(mcp_tools: dict[str, dict[str, Any]] | None = None) -> str:
                 lines.append(f"    {info['tool_name']}  {_summary(info['schema'].get('description'))}".rstrip())
     lines += [
         "",
-        "asks? is for the ask mode: /permissions changes it, and settings tools ask in every mode.",
+        "asks? is for the ask mode: /permissions changes it. Settings tools ask in every mode but auto, where nothing asks.",
         "ask_user is the one tool that talks to the user: subagents never get it, and it never needs approval.",
         "In an agent file, tools: takes these names or Claude Code's (Read, Bash, mcp__*...); /agents types shows each type's.",
     ]

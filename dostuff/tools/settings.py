@@ -1,6 +1,6 @@
 """Settings tools: read and change dostuff's own config.yaml and MCP servers on the user's behalf.
 
-Writes always ask, in every permission mode (kind "settings"): config.yaml holds the permission
+Writes ask in every permission mode but auto (kind "settings"): config.yaml holds the permission
 rules and an MCP server is a command that runs on the user's machine. `.env` files (API keys) are
 never read or written here. Each change is applied to the running app through the adapter.
 """
@@ -12,6 +12,7 @@ from typing import Any, Literal
 import yaml
 
 from dostuff.config import RETIRED_STATUS_BAR_ITEMS, STATUS_BAR_ITEMS, get_config
+from dostuff.helpers.config_secrets import SECRET_HINT, find_secrets
 from dostuff.helpers.hooks.load_hooks import load_hooks
 from dostuff.helpers.mcp.load_mcp_config import (global_mcp_config_path, project_mcp_config_path, read_mcp_file,
                                                  write_mcp_file)
@@ -120,6 +121,7 @@ def _config_warnings(data: dict[str, Any]) -> list[str]:
         warnings.append(f"permissions.mode '{mode}' isn't ask, allowlist, auto or plan (it falls back to ask)")
     if "hooks" in data:
         warnings += load_hooks(data["hooks"], source="user", origin="config.yaml")[1]
+    warnings += [f"{where} looks like a secret: {SECRET_HINT}" for where in find_secrets(data)]
     return warnings
 
 
@@ -169,7 +171,35 @@ def _edited_config(old_str: str, new_str: str, scope: str) -> tuple[Path, str, s
         raise ValueError(f"The edit would make {_display(path)} invalid YAML, so nothing was written: {e}") from e
     if data is not None and not isinstance(data, dict):
         raise ValueError("config.yaml must be a mapping of sections; nothing was written.")
+    added = [where for where in find_secrets(data or {}) if where not in find_secrets(_parsed(content))]
+    if added:
+        raise ValueError(f"config.yaml can't hold secrets, so nothing was written: {', '.join(added)}. {SECRET_HINT}.")
     return path, content, updated, data or {}
+
+
+def _parsed(text: str) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def own_rule_changes(old_str: str, new_str: str, scope: str) -> list[str]:
+    """What this `edit_config` call changes of the agent's own limits. An edit that can't apply changes nothing,
+    and the tool reports why. `hooks.project_trust` is only read from the user file, but a project edit is no safer."""
+    try:
+        _, content, _, after = _edited_config(old_str, new_str, scope)
+    except (ValueError, OSError):
+        return []
+    before = _parsed(content)
+
+    def trust(data: dict[str, Any]) -> Any:
+        hooks = data.get("hooks")
+        return hooks.get("project_trust") if isinstance(hooks, dict) else None
+
+    changed = ["permissions"] if before.get("permissions") != after.get("permissions") else []
+    return changed + (["hooks.project_trust"] if trust(before) != trust(after) else [])
 
 
 # ── /config: the user edits a whole settings file in the TUI ──────────────────

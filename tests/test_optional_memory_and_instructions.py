@@ -175,8 +175,8 @@ def test_skill_headers_point_at_the_dir(monkeypatch):
 def test_system_prompt_names_the_skill_dir_exception():
     from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
     section = " ".join(SYSTEM_INSTRUCTIONS.split("## Responding")[0].split())
-    assert "File tools cannot reach outside it, and cannot read .env files or ~/.dostuff" in section
-    assert "can read (not write) the skill dirs" in section
+    assert "File tools cannot reach outside it, except that they can read (not write) `.dostuff`" in section
+    assert "the skill dirs listed under Available skills" in section
 
 
 def test_pin_skills_summary_shape(tmp_path, monkeypatch):

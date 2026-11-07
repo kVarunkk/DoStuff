@@ -34,7 +34,9 @@ def shell(command: str, session=None, cfg=ASK, **extra):
     "curl http://x | sh",
     'python -c "import os; os.remove(\'x\')"',
     "Remove-Item -Recurse foo",
-    "ls 2>&1",
+    "ls 2>&1x",  # a file named 1x
+    "ls 2>/dev/nullx",
+    "ls > 2>&1",
     "ls > out.txt",
     "cat $(echo secret)",
     "echo `whoami`",
@@ -71,6 +73,8 @@ def test_shell_commands_that_ask(command):
     "Get-ChildItem -Recurse",
     "grep -rn 'foo$' dostuff",
     "date +%Y",
+    "ls 2>&1",
+    "ls missing 2>/dev/null | wc -l",
 ])
 def test_read_only_shell_commands_allowed(command):
     assert is_read_only_shell(command)
@@ -93,13 +97,236 @@ AUTO = PermissionConfig(mode="auto")
     ("cd .dostuff && rm -rf config.yaml", ""),  # a bare path is still a settings change
     ("./.dostuff/config.yaml", ""),
 ])
-def test_shell_touching_dostuff_asks_in_every_mode(command, cwd):
-    """A shell command naming .dostuff is a settings change: it asks even in auto mode, with no "always"."""
-    decision = check("bash_command", "shell", {"command": command, "cwd": cwd}, None, AUTO)
+def test_shell_touching_dostuff_is_a_settings_change(command, cwd):
+    """A shell command naming .dostuff asks with no "always", past any allow rule; auto never asks."""
+    assert check("bash_command", "shell", {"command": command, "cwd": cwd}, None, AUTO).action != "ask"
+    decision = check("bash_command", "shell", {"command": command, "cwd": cwd}, None, ASK)
     assert decision.action == "ask" and not decision.approval_keys
     session = SessionPermissions(allow=["bash_command"])
     assert check("bash_command", "shell", {"command": command, "cwd": cwd}, session, ASK).action == "ask"
     assert shell(command, cfg=PLAN, cwd=cwd) == "deny"
+
+
+@pytest.mark.parametrize("command", [
+    'ls .dostuff 2>&1; echo "---AGENTS---"; ls .dostuff/agents 2>&1',
+    "ls .dostuff",
+    "ls -la ./.dostuff/agents",
+    "cat .dostuff/config.yaml",
+    r"Get-Content .dostuff\config.yaml",
+    "find .dostuff -type f",
+    "grep -rn model .dostuff/agents",
+    'grep -n ".dostuff/agents" README.md',
+])
+def test_reading_project_dostuff_never_asks(command):
+    """Reading `.dostuff` runs in every mode: read_file can open these paths too, only a write is a settings change."""
+    assert is_read_only_shell(command)
+    assert shell(command) == "allow"
+    assert shell(command, cfg=AUTO) == "allow"
+    assert shell(command, cfg=PLAN) == "allow"
+    assert shell(command, cwd=".") == "allow"
+
+
+def test_reading_project_dostuff_by_absolute_path():
+    assert shell(f"ls {Path.cwd().as_posix()}/.dostuff/agents", cfg=AUTO) == "allow"
+
+
+@pytest.mark.parametrize("command", [
+    "ls ~/.dostuff",
+    "cat ~/.dostuff/config.yaml",
+    "cat ~/.dostuff/agents/reviewer.md",
+    "ls -la ~/.dostuff/jobs",
+    "tree ~/.dostuff -L 2",
+    "find ~/.dostuff -name '*.md'",
+    "grep -rn model ~/.dostuff/agents",
+])
+def test_reading_home_dostuff_never_asks(command):
+    """`~/.dostuff` reads like the project's: file tools open it too, only writes and MCP tokens are closed."""
+    assert shell(command) == "allow"
+    assert shell(command, cfg=AUTO) == "allow"
+    assert shell(command, cfg=PLAN) == "allow"
+
+
+def test_pipeline_filtering_a_dostuff_read_is_not_a_settings_change():
+    """Reported: `grep FAIL <job log> | sed … | sort -u` asked in auto mode. Only the `grep` segment names
+    `.dostuff`, and `sed` / `sort` just filter its output, so nothing here can write a setting: it is an
+    ordinary shell command, allowed in auto mode like any other."""
+    log = (Path.home() / ".dostuff" / "jobs" / "8fd74c9a49e747e7" / "097fd3bc48f5.out").as_posix()
+    command = f"""grep -a "FAIL" "{log}" | sed 's/\\x1b\\[[0-9;]*m//g' | sort -u"""
+    decision = check("bash_command", "shell", {"command": command}, None, AUTO)
+    assert decision.action == "allow" and not decision.approval_keys
+    # `sed` / `sort` are not on the read-only list, so `ask` and `plan` treat it like any other pipeline;
+    # what changed is that the `.dostuff` path no longer forces a settings prompt of its own
+    assert check("bash_command", "shell", {"command": command}, None, ASK).action == "ask"
+    # ... and the same shape writing to config.yaml is a settings change: `ask` prompts, auto refuses
+    writing = {"command": command + f' | tee "{Path.home().as_posix()}/.dostuff/config.yaml"'}
+    assert check("bash_command", "shell", writing, None, ASK).action == "ask"
+    assert check("bash_command", "shell", writing, None, AUTO).action == "deny"
+
+
+SECRET_COMMANDS = [
+    "cat .dostuff/.env",
+    "cat .dostuff/.e?v",
+    "cat .dostuff/.en*",
+    'cat .dostuff/.e""nv',
+    "cat .dostuff/.{e,}nv",
+    "cat .dostuff/mcp_config.json",  # MCP env / header values are tokens
+    "cat .dostuff/mcp*",
+    "cat ~/.dostuff/mcp_config.json",
+    "cat ~/.dostuff/.env",
+    r"cat .dostuff\.env",
+    "cat .dostuff/.env > out.txt",  # a redirect: no arguments to split, so the path itself is matched
+    "echo KEY=x >> .dostuff/.env",
+    "grep -r KEY .dostuff",  # reaches .dostuff/.env
+    "grep -r KEY .dostuff/",
+    "rg -uu KEY .dostuff",
+    "grep -r KEY .dostuff/worktrees",  # worktrees get a copy of .env
+    "grep -r KEY .dostuff/worktrees/",
+    "grep -r KEY .dostuff/worktrees/wt1",
+    "rg -uu KEY .dostuff/worktrees/wt1",
+    r"grep -r KEY .dostuff\worktrees\wt1",
+    "grep -r KEY .dostuff/worktrees/wt1/.dostuff",
+    "cat .dostuff/worktrees/wt1/.env",
+    "Select-String KEY .dostuff",
+    "grep -r KEY ~/.dostuff",
+    "cat ~/.dostuff/data/mcp_client_registrations.json",  # OAuth client secrets
+    "cat ~/.dostuff/data/mcp_client*",
+    "grep -r secret ~/.dostuff/data",
+    "cat ~/.dostuff/data/prompt_history.jsonl",  # past prompts, from every project
+    "head ~/.dostuff/data/sessions.db",
+    "cat ~/.dostuff/data/*",
+]
+
+
+@pytest.mark.parametrize("command", SECRET_COMMANDS)
+def test_dostuff_secrets_are_refused_in_auto_and_ask_elsewhere(command):
+    """Auto never waits, so a secret is a refusal there; a prompt in `ask`, and read-only code never allows it."""
+    decision = check("bash_command", "shell", {"command": command}, None, AUTO)
+    assert decision.action == "deny" and decision.reason.startswith("Auto mode")
+    decision = check("bash_command", "shell", {"command": command}, None, ASK)
+    assert decision.action == "ask" and not decision.approval_keys
+    assert shell(command, cfg=PLAN) == "deny"
+    assert not is_read_only_shell(command)
+
+
+@pytest.mark.parametrize("command", [
+    'grep -rn ".dostuff" dostuff',  # the pattern, not a path
+    'grep -rn ".dostuff/.env" README.md',
+    "rg .dostuff/mcp_config.json docs",
+    "ls .dostuff/*",  # a listing prints names, not contents
+    "grep -rn model .dostuff/worktrees/wt1/dostuff",  # below the worktree's root, no copied secret
+    'git commit -m "protect .dostuff/.env from reads"',
+])
+def test_auto_does_not_mistake_these_for_secrets(command):
+    assert check("bash_command", "shell", {"command": command}, None, AUTO).action == "allow"
+
+
+@pytest.mark.parametrize("tool", ["write_file", "edit_file", "multi_edit", "delete_file"])
+@pytest.mark.parametrize("path", [".dostuff/.env", "~/.dostuff/.env.local", ".dostuff/mcp_config.json"])
+def test_file_tools_on_dostuff_secrets_are_refused_in_auto(tool, path):
+    assert check(tool, "write", {"path": path}, None, AUTO).action == "deny"
+
+
+@pytest.mark.parametrize("name", ["mcp_client_registrations.json", "sessions.db", "prompt_history.jsonl"])
+def test_dostuff_data_is_closed_to_file_tools(name):
+    with pytest.raises(PathAccessDenied):
+        resolve_safe_path(str(Path.home() / ".dostuff" / "data" / name), for_read=True)
+
+
+@pytest.mark.parametrize("tool, args", [
+    ("write_file", {"path": "~/.dostuff/trusted_hooks.json"}),
+    ("edit_file", {"path": ".dostuff/config.yaml"}),
+    ("delete_file", {"path": "~/.dostuff/config.yaml"}),
+    ("bash_command", {"command": "echo '{}' > ~/.dostuff/trusted_hooks.json"}),
+    ("bash_command", {"command": "echo 'x: 1' >> ~/.dostuff/config.yaml"}),
+    ("bash_command", {"command": "cd .dostuff && rm config.yaml"}),
+    ("bash_command", {"command": "cp evil.yaml config.yaml", "cwd": ".dostuff"}),
+])
+def test_auto_refuses_changing_its_own_rules(tool, args):
+    kind = "shell" if tool == "bash_command" else "write"
+    decision = check(tool, kind, args, None, AUTO)
+    assert decision.action == "deny" and decision.reason.startswith("Auto mode")
+    assert check(tool, kind, args, None, ASK).action == "ask"
+
+
+@pytest.mark.parametrize("tool, kind, args", [
+    ("write_file", "write", {"path": ".dostuff/agents/reviewer.md"}),
+    ("write_file", "write", {"path": "~/.dostuff/skills/x/SKILL.md"}),
+    ("edit_file", "write", {"path": ".dostuff/hooks/format.sh"}),
+    ("bash_command", "shell", {"command": "mkdir -p .dostuff/skills/x"}),
+    ("set_mcp_server", "settings", {"name": "git", "command": ["uvx", "mcp-server-git"]}),
+])
+def test_auto_runs_ordinary_dostuff_changes(tool, kind, args):
+    assert check(tool, kind, args, None, AUTO).action == "allow"
+
+
+def test_reading_trusted_hooks_is_allowed():
+    assert check("bash_command", "shell", {"command": "cat ~/.dostuff/trusted_hooks.json"}, None, AUTO).action == "allow"
+
+
+@pytest.mark.parametrize("path, settings", [
+    (".dostuff/worktrees/wt1/src/app.py", False),
+    (".dostuff/worktrees/wt1/README.md", False),
+    (".dostuff/worktrees/wt1/.dostuff/config.yaml", True),  # the worktree's own settings
+    (".dostuff/worktrees/wt1/../../config.yaml", True),
+    (".dostuff/worktrees", True),
+    (".dostuff/config.yaml", True),
+])
+def test_files_in_a_worktree_are_not_settings(path, settings):
+    decision = check("write_file", "write", {"path": path, "content": ""}, None, ASK)
+    assert decision.action == "ask" and bool(decision.approval_keys) is not settings
+    assert check("write_file", "write", {"path": path, "content": ""}, None, AUTO).action != "ask"
+
+
+@pytest.mark.parametrize("command", ["pushd ../other", "popd", "Set-Location ~", "sl ~", "chdir ~", "Push-Location ~"])
+def test_changing_directory_voids_a_dostuff_read(command):
+    """The relative path then means somewhere else, the same as `cd`: `ask` treats it as a settings change."""
+    args = {"command": f"{command} && cat .dostuff/config.yaml"}
+    session = SessionPermissions(allow=["bash_command"])
+    assert check("bash_command", "shell", args, session, ASK).action == "ask"
+    assert check("bash_command", "shell", args, None, AUTO).action != "ask"
+
+
+@pytest.mark.parametrize("command, cwd", [
+    ("cat ../.dostuff/config.yaml", ""),
+    ("cat other/../.dostuff/config.yaml", ""),
+    ("cd .dostuff && grep -r KEY .", ""),
+    ("cd ~ && cat .dostuff/config.yaml", ""),
+    ("cat .dostuff/config.yaml", str(Path.home())),  # someone else's .dostuff
+    ("ls", ".dostuff"),
+    ("grep --file=~/.dostuff/config.yaml x y", ""),
+    ("tree -o .dostuff/config.yaml", ""),
+    ("tree -ao .dostuff/config.yaml", ""),
+    ("cat .dostuff/config.yaml > out.txt", ""),
+    ("cat .dostuff/config.yaml && rm .dostuff/config.yaml", ""),
+    ("find .dostuff -delete", ""),
+    ("find ~/.dostuff -delete", ""),
+    ("sed -i s/a/b/ ~/.dostuff/config.yaml", ""),
+    ("cat .dostuff/config.yaml 2>&1 >> .dostuff/config.yaml", ""),
+])
+def test_dostuff_commands_that_are_not_plain_reads_ask_except_in_auto(command, cwd):
+    assert check("bash_command", "shell", {"command": command, "cwd": cwd}, None, AUTO).action != "ask"
+    decision = check("bash_command", "shell", {"command": command, "cwd": cwd}, None, ASK)
+    assert decision.action == "ask" and not decision.approval_keys
+    assert shell(command, cfg=PLAN, cwd=cwd) == "deny"
+
+
+def test_tree_writing_a_file_is_not_read_only():
+    assert shell("tree -o out.txt") == "ask"
+    assert shell("tree -a --noreport") == "allow"
+
+
+@pytest.mark.parametrize("path", [
+    ".dostuff/mcp_config.json",
+    "~/.dostuff/mcp_config.json",
+    "mcp_config.json",  # the legacy project-root location
+    ".dostuff/.env",
+    ".dostuff/.env.local",
+])
+def test_mcp_config_and_env_are_never_readable(path):
+    """MCP env / header values are tokens, which `read_settings` redacts: a plain read must not hand them over."""
+    assert check("read_file", "read", {"path": path}, None, AUTO).action == "allow"  # the kind, not the sandbox
+    with pytest.raises(PathAccessDenied):
+        resolve_safe_path(path, for_read=True)
 
 
 @pytest.mark.parametrize("command", [
@@ -446,8 +673,8 @@ def test_skill_roots_never_affect_writes(tmp_path, monkeypatch):
 
 
 def test_every_other_dostuff_path_still_denied(tmp_path, monkeypatch, home_skills):
-    """The one place a rejection is narrowed, so the still-denied list is written out, not derived. Each path
-    twice: from a project the root check stops it first; only with the root at `~` does the predicate decide."""
+    """`~/.dostuff` is readable now, but `.env*`, `mcp_config.json` and `data` stay closed, and writes stay sandboxed.
+    Each path twice: from a project the root check decides; with the root at `~` the read predicate does."""
     from dostuff.helpers.skills.discover_skills import discover_skills
     kept = home_skills / ".dostuff" / "skills" / "kept"
     kept.mkdir()
@@ -459,26 +686,32 @@ def test_every_other_dostuff_path_still_denied(tmp_path, monkeypatch, home_skill
 
     home = home_skills
     assert resolve_safe_path(str(kept / "SKILL.md"), home, for_read=True) == (kept / "SKILL.md").resolve()
-    for path in (home / ".dostuff" / "config.yaml",
-                 home / ".dostuff" / "mcp_config.json",
-                 home / ".dostuff" / "hooks" / "pre.py",
-                 home / ".dostuff" / "data" / "sessions.db",
-                 home / ".dostuff" / "skills" / "not-discovered" / "SKILL.md",
-                 home / ".dostuff" / "skills"):
-        with pytest.raises(PathOutsideProject):
+    for path in (home / ".dostuff" / "mcp_config.json",
+                 home / ".dostuff" / ".env",
+                 home / ".dostuff" / ".env.local",
+                 home / ".dostuff" / "hooks" / ".env",
+                 home / ".dostuff" / "data" / "sessions.db"):
+        with pytest.raises(PathAccessDenied):
             resolve_safe_path(str(path), for_read=True)
         with pytest.raises(PathAccessDenied):
             resolve_safe_path(str(path), home, for_read=True)
+    # the rest of ~/.dostuff opens for reading, and nothing there is writable from a project outside it
+    for path in (home / ".dostuff" / "config.yaml",
+                 home / ".dostuff" / "hooks" / "pre.py",
+                 home / ".dostuff" / "jobs" / "session" / "job.out",
+                 home / ".dostuff" / "skills" / "not-discovered" / "SKILL.md"):
+        assert resolve_safe_path(str(path), for_read=True) == path.resolve()
+        with pytest.raises(PathOutsideProject):
+            resolve_safe_path(str(path))
 
 
 @pytest.mark.parametrize("root", [".dostuff", ".dostuff/skills"])
-def test_a_root_at_or_above_dostuff_skills_admits_nothing_there(home_skills, root):
-    """An entry can be a symlink, so a skill dir can resolve to these: settings must stay denied even then."""
+def test_a_root_at_or_above_dostuff_skills_admits_nothing_extra(home_skills, root):
+    """An entry can be a symlink, so a skill dir can resolve to these: that must not widen what is readable."""
     set_skill_roots([home_skills / root])
-    with pytest.raises(PathAccessDenied):
-        resolve_safe_path(str(home_skills / ".dostuff" / "config.yaml"), home_skills, for_read=True)
-    with pytest.raises(PathAccessDenied):
-        resolve_safe_path(str(home_skills / ".dostuff" / "skills" / "other" / "SKILL.md"), home_skills, for_read=True)
+    for path in (home_skills / ".dostuff" / "mcp_config.json", home_skills / ".dostuff" / ".env"):
+        with pytest.raises(PathAccessDenied):
+            resolve_safe_path(str(path), home_skills, for_read=True)
 
 
 # --- multi_edit (plan/2026-11-06-skills-and-multi-edit) -------------------------------------------------
@@ -523,13 +756,15 @@ def test_multi_edit_always_label():
 
 
 def test_multi_edit_settings_path_asks():
-    """`.dostuff/config.yaml` through multi_edit asks in auto mode, because `path` is the argument the check reads."""
+    """`.dostuff/config.yaml` through multi_edit asks in `ask` mode with no "always", because `path` is the argument
+    the check reads; auto sends it to edit_config."""
     assert "path" in TOOL_MAP["multi_edit"].schema["function"]["parameters"]["properties"]
     kind = TOOL_MAP["multi_edit"].kind
     args = {"path": ".dostuff/config.yaml", "edits": _edits(("a", "b"))}
-    decision = check("multi_edit", kind, args, None, PermissionConfig(mode="auto"))
+    decision = check("multi_edit", kind, args, None, PermissionConfig(mode="ask"))
     assert decision.action == "ask" and decision.approval_keys == []
-    assert check("multi_edit", kind, {**args, "path": "src/a.py"}, None, PermissionConfig(mode="auto")).action == "allow"
+    assert check("multi_edit", kind, args, None, PermissionConfig(mode="auto")).action == "deny"
+    assert check("multi_edit", kind, {**args, "path": "src/a.py"}, None, PermissionConfig(mode="ask")).approval_keys
 
 
 def test_multi_edit_refused_in_plan_mode():

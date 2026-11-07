@@ -202,6 +202,9 @@ def init(force: bool = typer.Option(False, "--force", help="Overwrite an existin
 #   exporter: "otlp"
 """
     config_path.write_text(config_template)
+    ignore = proj_dir / ".gitignore"
+    if not ignore.exists():  # config.yaml can be shared with the team; keys can't
+        ignore.write_text(".env*\nmcp_config.json\n")
     (proj_dir / "skills").mkdir(exist_ok=True)
     typer.echo(f"Initialized project at {cwd}")
 
