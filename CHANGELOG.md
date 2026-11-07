@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The agent can make several edits to a file in one approved step, a skill can be kept for you to run by hand, you can allow a skill for one message by naming it in the sentence, auto mode no longer stops to ask, MCP keys can stay in `.dostuff/.env`, and scrolling stays smooth in long sessions.
+The agent can make several edits to a file in one approved step, a skill can be kept for you to run by hand, you can allow a skill for one message by naming it in the sentence, auto mode no longer stops to ask, MCP keys can stay in `.dostuff/.env`, and scrolling no longer slows down as a session grows.
 
 ### Added
 - **`multi_edit` tool** — several exact-string edits to one file in one call: one approval, one diff, and if any edit fails the file is left untouched. `/undo` restores it like any other file change.
@@ -34,7 +34,7 @@ The agent can make several edits to a file in one approved step, a skill can be 
 - **Secrets copied into subagent worktrees are protected** — `grep -r KEY .dostuff/worktrees/<name>` and a trailing-slash `.dostuff/worktrees/` ran without a prompt in every mode and could reach the `.env` copied there. They now ask, and plan mode denies them.
 - **`~/.dostuff` is readable** — `read_file`, `list_files`, `grep` and `glob` can open it like the project's `.dostuff`, so the agent can inspect its own agents, skills, hooks and job logs. It stays read-only, and `.env*` files, `mcp_config.json` and `data` stay closed.
 - `tree -o <file>` writes a file, so it now asks instead of counting as read-only.
-- **Scrolling no longer lags in long sessions** — since 0.2.11, the pinned prompt made each scroll step slower the longer the conversation got. Scrolling now takes about the same time however long the session is.
+- **Scrolling no longer slows down as a session grows** — since 0.2.11, the pinned prompt made each scroll step do more work the longer the conversation got. That work no longer depends on the length of the session.
 
 ## [0.2.11] - 2026-11-06
 
