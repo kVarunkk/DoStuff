@@ -629,6 +629,32 @@ def test_tui_import_skips_heavy_libraries():
     assert out.stdout.strip() == "[]"
 
 
+def test_first_frame_skips_heavy_libraries(tmp_path):
+    """Booting the app, not just importing it: the status bar and on_mount reach lazy imports on the
+    UI thread before the first frame, and one of those loading the MCP SDK blanked the screen for seconds."""
+    import os
+    import subprocess
+    import sys
+    code = (
+        "import sys\n"
+        "from dostuff.cli_tui import DostuffTUI\n"
+        "async def no_backend(self): pass\n"  # _load_backend is the one place allowed to load them
+        "DostuffTUI._load_backend = no_backend\n"
+        "app = DostuffTUI(session_id='first-frame')\n"
+        "async def stop(pilot):\n"
+        "    await pilot.pause()\n"
+        "    app.exit()\n"
+        "app.run(headless=True, size=(100, 30), auto_pilot=stop)\n"
+        "print(sorted(m for m in ('litellm', 'chromadb', 'mcp') if m in sys.modules))\n"
+    )
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "PYTHONPATH": str(root)}
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120, env=env,
+                         cwd=tmp_path)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip().splitlines()[-1] == "[]"
+
+
 def test_cost_in_status_bar_and_status(tui, tmp_path):
     cli_tui = tui
     from dostuff import config as config_module
