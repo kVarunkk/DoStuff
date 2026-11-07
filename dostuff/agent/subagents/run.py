@@ -1,11 +1,13 @@
 """One subagent run: its loop, the partial report when it stops early, and the worktree close-out (spec D1)."""
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from dostuff.agent.subagents import RESTRICTED_SUBAGENT_TOOLS
 from dostuff.agent.subagents.adapter import SubagentAdapter
 from dostuff.helpers.tools.project_root import project_root
-from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.worktree import Worktree, WorktreeError, remove_worktree, worktree_changes
+
+if TYPE_CHECKING:  # the TUI imports this module before its first frame; the MCP SDK takes seconds
+    from dostuff.lib.mcp.mcp_client import MCPClient
 
 WRAP_UP_PROMPT = (
     "You have run out of steps. Do not call any more tools. Report what you found so far, "
@@ -100,7 +102,7 @@ def resolve_subagent_tools(requested_tools: list[str] | None) -> tuple[list[str]
 
 async def run_agent_loop(
     task: str,
-    mcp_client: MCPClient | None,
+    mcp_client: "MCPClient | None",
     session_id: str,
     turn_id: str,
     adapter: SubagentAdapter,
