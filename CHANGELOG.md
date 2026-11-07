@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.12] - 2026-11-07
 
 The agent can make several edits to a file in one approved step, a skill can be kept for you to run by hand, you can allow a skill for one message by naming it in the sentence, auto mode no longer stops to ask, MCP keys can stay in `.dostuff/.env`, and scrolling no longer slows down as a session grows.
 
