@@ -1423,7 +1423,8 @@ class SettingsEditor(TextArea):
 
 
 def _agent_registry() -> Any:
-    """The subagent registry, imported late: it pulls in the MCP client, which loads after the first frame."""
+    """The subagent registry, imported late. This runs before the first frame (the status bar reads it),
+    so nothing it imports at module level may load the MCP SDK or litellm."""
     from dostuff.agent.subagents.registry import get_agent_registry
     return get_agent_registry()
 
