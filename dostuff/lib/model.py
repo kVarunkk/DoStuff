@@ -1,7 +1,7 @@
 """Active model / provider, read from the Config singleton at call time (never frozen at import)."""
 import uuid
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Literal
 
 from dostuff.config import get_config
 from dostuff.helpers.models.opencode import OPENCODE_PROVIDERS, is_opencode, litellm_route, opencode_kwargs
@@ -62,6 +62,22 @@ def uses_explicit_prompt_caching() -> bool:
     if provider == "anthropic":
         return True
     return provider in ("bedrock", "vertex_ai", "openrouter", *OPENCODE_PROVIDERS) and "claude" in get_model().lower()
+
+
+def model_supports(kind: Literal["vision", "pdf"]) -> bool:
+    """Can the active model read images (`vision`) or PDFs (`pdf`)? config.yaml's `vision` / `pdf_input` win;
+    `auto` asks litellm, and a model litellm doesn't know is False, never an exception (REQ-6.1)."""
+    override = get_config().model_capability("vision" if kind == "vision" else "pdf_input")
+    if override is not None:
+        return override
+    model = get_litellm_model()
+    try:
+        import litellm
+        if kind == "vision":
+            return bool(litellm.supports_vision(model=model))
+        return bool(litellm.get_model_info(model).get("supports_pdf_input"))
+    except Exception:
+        return False
 
 
 def completion_kwargs() -> dict[str, Any]:

@@ -25,7 +25,7 @@ _DRAIN_GRACE_S = 1.0  # keep reading this long after the hook exits (a backgroun
 EVENT_KEYS: dict[str, tuple[str, ...]] = {
     "PreToolUse": ("tool_name", "tool_input", "tool_use_id"),
     "PostToolUse": ("tool_name", "tool_input", "tool_use_id", "tool_response"),
-    "UserPromptSubmit": ("prompt",),
+    "UserPromptSubmit": ("prompt", "attachments"),
     "SessionStart": ("source",),
     "Stop": ("last_assistant_message", "stop_hook_active"),
     "SubagentStart": ("agent_id", "agent_type", "background", "prompt"),

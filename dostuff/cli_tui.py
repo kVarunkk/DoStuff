@@ -52,6 +52,7 @@ from dostuff.lib.model import get_model
 from dostuff.lib.tracing import session_id_var, turn_id_var
 from dostuff.helpers.agent.append_step import append_step
 from dostuff.helpers.agent.loop_check_cancelled import CANCELLED_TURN
+from dostuff.helpers.agent.attachments import delete_attachments, ref_chips, sweep_old_attachments
 from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_paths, expand_file_mentions,
                                                  format_mention, mention_candidates, strip_attachments)
 from dostuff.helpers.agent.model_cost import format_cost
@@ -2145,6 +2146,7 @@ class DostuffTUI(App):
         inp.paste_collapse_lines = self.config.paste_collapse_lines
         try:
             await asyncio.to_thread(sweep_old_pastes, self.config.paste_retention_days)
+            await asyncio.to_thread(sweep_old_attachments, self.config.attachment_retention_days)
         except OSError:
             pass
 
@@ -2382,6 +2384,13 @@ class DostuffTUI(App):
             self._append_call_result(f"{prefix}{step.get('name', '')}: {content}")
             return
         if role == "user":
+            if isinstance(content, list):  # a prompt with images or PDFs: its text, then a chip per attachment
+                self._append(prefix + strip_attachments(content), msg_type="user")
+                attached = attached_paths(content)
+                if attached:
+                    self._append("Attached " + ", ".join(attached), msg_type="system")
+                self._append(ref_chips(content), msg_type="system")
+                return
             shell = _parse_shell_step(content)
             stop_note = parse_stop_note(content)
             notices = parse_notices(content)
@@ -3750,6 +3759,10 @@ class DostuffTUI(App):
                 self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
             if expansion.skipped:
                 self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
+            if expansion.refused:  # an image that can't be sent: reported, never delivered (multimodal CON-006)
+                self._steering.fail(msg.id, "Not attached: " + "; ".join(expansion.refused))
+                self._render_queue()
+                return
             content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
                                               self.config.paste_file_lines, self.config.max_tool_output_chars)
             content = with_mention_note(content, mentions)
@@ -3759,7 +3772,7 @@ class DostuffTUI(App):
             self._steering.fail(msg.id, str(e))
             self._render_queue()
             return
-        self._steering.ready(msg.id, content)
+        self._steering.ready(msg.id, content, expansion.parts)
         self._render_queue()
 
     # ── Approval prompt ────────────────────────────────────────────────────────
@@ -4213,7 +4226,7 @@ class DostuffTUI(App):
             meta = await self.store.get_session_meta(self.session_id) or {}
             working_history = await self.store.load_working_history(self.session_id)
 
-            content = user_text
+            content: str | list[dict[str, Any]] = user_text  # text and image refs once something is attached
             if not wake:
                 # `/<skill> args`: only the args get @mentions and pastes; the SKILL.md text goes around them
                 skill_run = parse_skill_command(user_text, self._skill_commands)
@@ -4224,6 +4237,11 @@ class DostuffTUI(App):
                     self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
                 if expansion.skipped:
                     self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
+                if expansion.refused:
+                    # An image that can't be sent stops the turn before hooks and history (multimodal D4, CON-006)
+                    self._append("Not attached: " + "; ".join(expansion.refused), msg_type="error")
+                    self._put_back_in_input([user_text])
+                    return
                 # After the @mentions, so an "@" inside pasted text isn't taken as one
                 content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
                                                   self.config.paste_file_lines, self.config.max_tool_output_chars)
@@ -4239,6 +4257,9 @@ class DostuffTUI(App):
                 content = with_mention_note(content, mentions)
                 if mentions:
                     self._append(mention_line(mentions), msg_type="system")
+                if expansion.parts:  # text first, then the images (multimodal D10)
+                    content = [{"type": "text", "text": content}, *expansion.parts]
+                    self._append(ref_chips(content), msg_type="system")
 
             # Reset cancel state before the hooks below, so ESC can stop a slow one
             self.adapter._cancelled = False
@@ -4843,6 +4864,9 @@ class DostuffTUI(App):
         for i in range(len(self.steps_history) - 1, -1, -1):
             step = self.steps_history[i]
             content = step.get("content") if isinstance(step, dict) else None
+            if (step.get("role") == "user" and isinstance(content, list) and not is_turn_context(step)
+                    and step.get("meta") != "tool_attachments"):  # a prompt with images (multimodal REQ-1.4)
+                return i
             if (step.get("role") == "user" and isinstance(content, str) and content != EMPTY_RESPONSE_NUDGE
                     and not is_turn_context(step)
                     and not content.startswith("[/undo]") and _parse_shell_step(content) is None
@@ -5073,6 +5097,10 @@ class DostuffTUI(App):
         # 4. Paste files, when loop.paste_retention_days is 0 (otherwise the startup sweep ages them out)
         if self.config.paste_retention_days <= 0:
             self._pastes.delete_files()
+        # Attachments too, with loop.attachment_retention_days 0: this session's images and PDFs
+        if self.config.attachment_retention_days <= 0:
+            with contextlib.suppress(Exception):
+                delete_attachments(self.steps_history)
         # 5. Session DB, after the agent rows and steps still queued for it (subagents D14)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(_agent_registry().flush(), timeout=5.0)

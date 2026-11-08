@@ -7,6 +7,7 @@ import logging
 import re
 from typing import Any
 
+from dostuff.helpers.agent.attachments import content_text, refs
 from dostuff.helpers.hooks.dispatch import report_outcome, run_hooks
 from dostuff.helpers.hooks.load_hooks import SESSION_START_SOURCES
 from dostuff.helpers.hooks.run_hook import payload_for
@@ -41,15 +42,19 @@ def stop_event_for(turn_type: str) -> str:
 
 
 async def user_prompt_submit(
-    prompt: str, *, session_id: str, turn_id: str, turn_type: str = "interactive_loop", adapter: Any = None,
+    prompt: Any, *, session_id: str, turn_id: str, turn_type: str = "interactive_loop", adapter: Any = None,
 ) -> tuple[str | None, str]:
     """(blocked reason or None, extra context) for a prompt about to be appended as the user step.
 
-    A block (exit 2, `decision: block`, or a failed `fail_closed` hook) rejects the prompt; the context rides
-    the turn's hidden context step, never the system prompt (cache-stable context spec D3).
+    `prompt` is the step's content: a string, or text and image / PDF refs. Hooks always get the text as `prompt`
+    (refs as `[Image: name]`) and the refs as `attachments`, so a rule written for text still sees every prompt
+    (multimodal spec D11, CON-009). A block (exit 2, `decision: block`, or a failed `fail_closed` hook) rejects
+    the prompt and its attachments; the context rides the turn's hidden context step, never the system prompt
+    (cache-stable context spec D3).
     """
+    attachments = [{"name": r.get("name", ""), "kind": r.get("kind", ""), "path": r.get("path", "")} for r in refs(prompt)]
     payload = payload_for("UserPromptSubmit", session_id=session_id, turn_id=turn_id, turn_type=turn_type,
-                          prompt=prompt)
+                          prompt=content_text(prompt), attachments=attachments)
     outcome = await run_hooks("UserPromptSubmit", payload, adapter=adapter)
     await report_outcome("UserPromptSubmit", outcome, adapter=adapter, show_block=False)
     if outcome.cancelled:

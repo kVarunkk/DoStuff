@@ -12,6 +12,7 @@ models:
     provider: "gemini"
     active: false
     # api_key_env: "MY_GEMINI_KEY"  # optional: read the key from this env var instead of GEMINI_API_KEY
+    # vision: auto   # can it read images? auto asks litellm; true / false for models litellm doesn't know
 
 loop:
   max_iterations: 100  # max agent turns before forced exit; ESC cancels anytime
@@ -24,6 +25,8 @@ loop:
   paste_file_lines: 200        # TUI pastes longer than this (or over max_tool_output_chars) are saved to .dostuff/pastes/;
                                # the model gets the path + a 20-line preview and reads the rest as needed (0 = always inline)
   paste_retention_days: 7      # paste files older than this are deleted at startup (0 = delete them when dostuff exits)
+  attachment_retention_days: 30  # images in .dostuff/attachments/ older than this are deleted at startup
+                                 # (0 = delete the session's own when dostuff exits)
   auto_compact_threshold: 50   # summarize older history when the context passes this % of the window (1-100, or off);
                                # /compact auto <N|off> changes it for a session. Off still compacts if the window overflows.
 

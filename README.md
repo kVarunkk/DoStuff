@@ -178,7 +178,7 @@ In the TUI:
 | `!<command>`  | Run a shell command directly (no approval); the command and its output are shown to the model on the next turn |
 | `# <note>`    | Add `- <note>` to `AGENTS.md`: you pick this project's or the global one (`~/.dostuff/AGENTS.md`); the agent follows it from the next message |
 | `Shift+Enter` | Insert a newline (multi-line input). If your terminal sends it as plain Enter, use `\` then `Enter`, `Ctrl+Enter`, `Alt+Enter` or `Ctrl+J` |
-| `@path`       | Attach a file (numbered lines) or a folder listing to the message. Typing `@` lists matching project paths: `Tab` / `Enter` completes, a folder opens for the next part. `@"a b.txt"` for spaces. Also works with `dostuff -p`. `.env` files and binaries are never attached |
+| `@path`       | Attach a file (numbered lines) or a folder listing to the message. Typing `@` lists matching project paths: `Tab` / `Enter` completes, a folder opens for the next part. `@"a b.txt"` for spaces. Also works with `dostuff -p`. `.env` files and binaries are never attached. An image (PNG, JPEG, GIF or WebP, told apart by its content, not its extension) is sent to the model as an image when the model can read images, and shows as `[Image #1 · shot.png · 1280×720]`; on a model that can't, or over 3.75 MB, or more than 20 in one message, nothing is sent and your prompt goes back in the input (`-p` exits with code 1). The image is copied to `.dostuff/attachments/` and removed after `loop.attachment_retention_days` (30). For a model dostuff can't tell about, set `vision: true` (or `false`) on its `models:` entry |
 | `Tab`         | While typing a slash command, accept the dim ghost text after the cursor: the rest of the command name, then its flag (`/model ` → `--active`, `/fork ` → `--worktree`). `Right` accepts it too |
 | Paste        | A paste over 10 lines (`ui.paste_collapse_lines`) or 2,000 chars shows as `[Pasted text #1 +243 lines]` and is expanded when you send it. Over 200 lines (`loop.paste_file_lines`) it's saved to `.dostuff/pastes/` and the model reads it from there, so it doesn't fill the context; files are removed after `loop.paste_retention_days` (7) |
 | `Up` / `Down` | On the first / last line of the input: previous / next prompt typed in this directory (saved in `~/.dostuff/data/prompt_history.jsonl`) |
@@ -798,7 +798,7 @@ worktree), with no terminal. stdin is one JSON object:
 | Event | Extra keys |
 |---|---|
 | `PreToolUse`, `PostToolUse` | `tool_name`, `tool_input`, `tool_use_id`; `PostToolUse` also `tool_response` (the result, already truncated) |
-| `UserPromptSubmit` | `prompt` |
+| `UserPromptSubmit` | `prompt` (the text you typed; images and documents appear as `[Image: name]` / `[PDF: name]`), `attachments` (`[{"name", "kind", "path"}]`, empty when there are none) |
 | `SessionStart` | `source` |
 | `Stop`, `SubagentStop` | `last_assistant_message`, `stop_hook_active` (true once a Stop hook already continued this turn) |
 | `SubagentStart` | `agent_id`, `agent_type`, `background`, `prompt` |

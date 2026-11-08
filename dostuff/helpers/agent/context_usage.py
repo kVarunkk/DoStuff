@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from rich.text import Text
 
+from dostuff.helpers.agent.attachments import content_text, is_ref, ref_tokens, refs
 from dostuff.helpers.agent.turn_context import is_turn_context
 
 # The MCP tools the model is given; each server's own tools are found through them, not sent
@@ -17,7 +18,12 @@ PART_STYLES = {
     "Project instructions": "#e5c07b",
     "Summary of earlier messages": "#56b6c2",
     "Messages": "#8ab4f8",
+    "Attachments": "#e06c75",
 }
+
+
+def _style(name: str) -> str:
+    return PART_STYLES.get(name.split(" (")[0], "")  # "Attachments (3)"
 
 
 def count_tokens(text: str, model: str) -> int:
@@ -33,7 +39,12 @@ def count_tokens(text: str, model: str) -> int:
 
 def _message_text(message: dict[str, Any]) -> str:
     content = message.get("content")
-    parts = [content if isinstance(content, str) else json.dumps(content, ensure_ascii=False) if content else ""]
+    if isinstance(content, list):
+        # Images and PDFs are their own row; their parts aren't text
+        text = content_text([p for p in content if not is_ref(p)])
+    else:
+        text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False) if content else ""
+    parts = [text]
     if message.get("tool_calls"):
         parts.append(json.dumps(message["tool_calls"], ensure_ascii=False))
     return "\n".join(p for p in parts if p)
@@ -50,7 +61,8 @@ def context_parts(system_prompt: str, project_instructions: str, tool_schemas: d
     tools = [s for name, s in tool_schemas.items() if name not in MCP_META_TOOLS]
     mcp = [s for name, s in tool_schemas.items() if name in MCP_META_TOOLS]
     context = [m for m in messages if is_turn_context(m)]
-    return [
+    attached = [r for m in messages for r in refs(m.get("content"))]
+    rows = [
         ("System prompt", count(system_prompt)),
         ("Turn context", count(next_context) + sum(count(_message_text(m)) for m in context)),
         ("Tools", count(json.dumps(tools)) if tools else 0),
@@ -59,6 +71,9 @@ def context_parts(system_prompt: str, project_instructions: str, tool_schemas: d
         ("Summary of earlier messages", count(summary)),
         ("Messages", sum(count(_message_text(m)) for m in messages if not is_turn_context(m))),
     ]
+    if attached:  # REQ-7.3, estimated by D9
+        rows.append((f"Attachments ({len(attached)})", sum(ref_tokens(r) for r in attached)))
+    return rows
 
 
 def _fmt(n: int) -> str:
@@ -75,13 +90,13 @@ def render_context(parts: list[tuple[str, int]], limit: int, model: str, last_re
         width = round(n / total * BAR_WIDTH) if n else 0
         width = max(width, 1) if n else 0
         width = min(width, BAR_WIDTH - cells)
-        text.append("█" * width, style=PART_STYLES.get(name, ""))
+        text.append("█" * width, style=_style(name))
         cells += width
     text.append("░" * (BAR_WIDTH - cells), style="#4a4a4a")
     text.append("\n")
     label_width = max(len(name) for name, _ in parts) + 2
     for name, n in parts:
-        text.append("  ■ ", style=PART_STYLES.get(name, ""))
+        text.append("  ■ ", style=_style(name))
         text.append(f"{name.ljust(label_width)}{_fmt(n):>7}  {n / total * 100:5.1f}%\n")
     text.append("  □ ", style="#4a4a4a")
     text.append(f"{'Free'.ljust(label_width)}{_fmt(max(limit - used, 0)):>7}  {max(limit - used, 0) / total * 100:5.1f}%\n")

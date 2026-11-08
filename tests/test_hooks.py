@@ -356,7 +356,7 @@ def test_run_hook_payload_and_env(home, tmp_path):
     base = {"session_id": "s1", "turn_id": "t1", "turn_type": "interactive_loop"}
     cases = {
         "PreToolUse": {"tool_name": "bash_command", "tool_input": {"command": "ls"}, "tool_use_id": "c1"},
-        "UserPromptSubmit": {"prompt": "hello"},
+        "UserPromptSubmit": {"prompt": "hello", "attachments": []},
         "SessionStart": {"source": "startup"},
         "Stop": {"last_assistant_message": "done", "stop_hook_active": False},
     }
@@ -611,7 +611,8 @@ def test_allow_with_rewrite_is_none(home, tmp_path):
 def test_fail_closed(home, tmp_path):
     crash = _script(tmp_path, "import sys; sys.exit(1)")
     slow = _script(tmp_path, "import time; time.sleep(5)")
-    prompt = payload_for("UserPromptSubmit", session_id="s", turn_id="t", turn_type="interactive_loop", prompt="hi")
+    prompt = payload_for("UserPromptSubmit", session_id="s", turn_id="t", turn_type="interactive_loop", prompt="hi",
+                        attachments=[])
     for event, payload, command in (("PreToolUse", _pre(), crash), ("PreToolUse", _pre(), slow),
                                     ("UserPromptSubmit", prompt, crash)):
         write_user_config(home, _hooks_block(event, _group(command, name="g", timeout=1, fail_closed=False)))
@@ -1219,6 +1220,47 @@ def test_user_prompt_submit_helper(home, tmp_path):
     assert log.read_text().splitlines() == ["UserPromptSubmit|fix the tests"]
 
     assert events_module.blocked_prompt_message("nope") == "Prompt blocked by a UserPromptSubmit hook: nope"
+
+
+# --- multimodal T1.6 (plan/2026-11-08-multimodal-input, D11 / CON-009) -------------------------
+
+def _image_prompt(tmp_path, text):
+    from dostuff.helpers.agent.attachments import AttachmentStore
+    from test_attachments import png_bytes
+    ref = AttachmentStore(root=tmp_path).add(png_bytes(), name="bug.png")
+    return [{"type": "text", "text": text}, ref], ref
+
+
+def test_user_prompt_submit_blocks_text_beside_image(home, tmp_path):
+    # The sandbox's no_password.py, verbatim: it reads `prompt` as a string
+    guard = _script(tmp_path, """
+        import json, sys
+        if "password" in json.load(sys.stdin)["prompt"].lower():
+            print("don't paste passwords", file=sys.stderr)
+            sys.exit(2)
+    """)
+    write_user_config(home, _hooks_block("UserPromptSubmit", _group(guard, name="no-password")))
+    content, _ = _image_prompt(tmp_path, "my Password is hunter2, see the screenshot")
+    assert _ups(content) == ("don't paste passwords", "")
+    content, _ = _image_prompt(tmp_path, "what is in this screenshot?")
+    assert _ups(content) == (None, "")
+
+
+def test_hook_payload_lists_attachments(home, tmp_path):
+    log = tmp_path / "ups.json"
+    dump = _script(tmp_path, f"""
+        import json, sys
+        data = json.load(sys.stdin)
+        json.dump({{"prompt": data["prompt"], "attachments": data["attachments"]}}, open({str(log)!r}, "w"))
+    """)
+    write_user_config(home, _hooks_block("UserPromptSubmit", _group(dump)))
+    content, ref = _image_prompt(tmp_path, "look")
+    _ups(content)
+    assert json.loads(log.read_text()) == {
+        "prompt": "look\n[Image: bug.png]",
+        "attachments": [{"name": "bug.png", "kind": "image", "path": ref["path"]}]}
+    _ups("plain text")
+    assert json.loads(log.read_text()) == {"prompt": "plain text", "attachments": []}
 
 
 # --- T3.2 -------------------------------------------------------------------------------------

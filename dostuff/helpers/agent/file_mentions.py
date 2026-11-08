@@ -8,7 +8,10 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from dostuff.helpers.agent import attachments
+from dostuff.helpers.agent.attachments import AttachmentStore, classify_attachment, content_text, image_size, is_ref
 from dostuff.helpers.agent.tool_output import truncate_tool_output
 from dostuff.helpers.tools.resolve_safe_path import is_denied_for_read, resolve_safe_path
 from dostuff.lib.exceptions import PathAccessDenied, PathOutsideProject
@@ -34,6 +37,10 @@ class Expansion:
     content: str  # prompt + attached blocks: what the model gets
     attached: list[str] = field(default_factory=list)  # display paths ("dir/" for folders)
     skipped: list[str] = field(default_factory=list)  # "path: reason", for paths that exist but can't be attached
+    # Images: refs sent next to `content` as parts (REQ-2.4), and why one can't be sent. A refused image stops the
+    # turn (the prompt goes back to the input), so an image is never silently dropped (CON-006)
+    parts: list[dict[str, Any]] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)
 
 
 def _is_binary(path: Path) -> bool:
@@ -82,12 +89,16 @@ def _resolve_mention(raw: str, root: Path) -> Path | None:
 def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None) -> Expansion:
     """Append an <attached_file> / <attached_dir> block for each `@path` in `text`.
 
-    Files come numbered like read_file output and capped at `max_chars` each (0 = no cap).
+    Files come numbered like read_file output and capped at `max_chars` each (0 = no cap). Images go to the
+    attachment store and come back as refs in `parts`, or as reasons in `refused` (the model can't read images,
+    too large, too many); with any refused, nothing is stored.
     """
     root = (root or Path.cwd()).resolve()
     result = Expansion(content=text)
     blocks: list[str] = []
     seen: set[Path] = set()
+    images: list[tuple[str, Path, bytes]] = []  # (attached entry, path, bytes): stored once nothing is refused
+    vision: bool | None = None  # asked once, at the first image
     for match in MENTION_RE.finditer(text):
         path = _resolve_mention(match.group(1), root)
         if path is None or path in seen:
@@ -97,6 +108,30 @@ def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None
         if path.is_dir():
             blocks.append(f'<attached_dir path="{shown}/">\n{_dir_listing(path)}\n</attached_dir>')
             result.attached.append(shown.rstrip("/") + "/")
+            continue
+        if classify_attachment(path) == "image":
+            if is_denied_for_read(path):
+                result.skipped.append(f"{shown}: may contain secrets")
+                continue
+            from dostuff.lib import model as model_lib  # lazy: litellm stays off the TUI's first frame
+            if vision is None:
+                vision = model_lib.model_supports("vision")
+            if not vision:
+                result.refused.append(f"{shown}: {model_lib.get_model()} can't read images")
+                continue
+            try:
+                data = path.read_bytes()
+            except OSError as e:
+                result.refused.append(f"{shown}: {e}")
+                continue
+            problem = attachments.image_problem(data)
+            if problem:
+                result.refused.append(f"{shown}: {problem}")
+                continue
+            size = image_size(data)
+            entry = f"{shown} ({size[0]}×{size[1]})" if size else shown
+            result.attached.append(entry)
+            images.append((entry, path, data))
             continue
         if _is_binary(path):
             result.skipped.append(f"{shown}: binary file")
@@ -111,18 +146,32 @@ def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None
             continue
         blocks.append(f'<attached_file path="{shown}">\n{truncate_tool_output(body, max_chars)}\n</attached_file>')
         result.attached.append(shown)
+    if images and len(images) + len(result.refused) > attachments.MAX_PER_STEP:  # REQ-6.4
+        result.refused = [f"{len(images) + len(result.refused)} images and PDFs; "
+                          f"at most {attachments.MAX_PER_STEP} per message"]
+    if result.refused:  # the turn won't run: store nothing, and don't say the images were attached
+        entries = {entry for entry, _, _ in images}
+        result.attached = [a for a in result.attached if a not in entries]
+    else:
+        store = AttachmentStore(root=root)
+        result.parts = [store.add(data, name=path.name) for _, path, data in images]
     if blocks:
         result.content = text + "\n\n" + "\n\n".join(blocks)
     return result
 
 
-def strip_attachments(content: str) -> str:
+def _typed_text(content: Any) -> str:
+    """The text of a step's content; image / PDF refs are left out (they are shown as chips)."""
+    return content_text([p for p in content if not is_ref(p)]) if isinstance(content, list) else content_text(content)
+
+
+def strip_attachments(content: Any) -> str:
     """The prompt as the user typed it (attached blocks and the skill-mention note removed), for display and export."""
-    return MENTION_NOTE_RE.sub("", ATTACHMENT_RE.sub("", content))
+    return MENTION_NOTE_RE.sub("", ATTACHMENT_RE.sub("", _typed_text(content)))
 
 
-def attached_paths(content: str) -> list[str]:
-    return [m.group(2) for m in ATTACHMENT_RE.finditer(content)]
+def attached_paths(content: Any) -> list[str]:
+    return [m.group(2) for m in ATTACHMENT_RE.finditer(_typed_text(content))]
 
 
 # ── Completion ────────────────────────────────────────────────────────────────

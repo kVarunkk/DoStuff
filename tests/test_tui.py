@@ -7620,3 +7620,117 @@ def test_keys_around_the_mid_prompt_menu(tui):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- multimodal input (plan/2026-11-08-multimodal-input/tasks.md) -------------------------------
+
+@pytest.fixture
+def image_tui(tui, fake_model, monkeypatch):
+    """The TUI on the real loop and the fake model, with `vision(True/False)` and a `shot.png` in the project."""
+    from dostuff.agent import loop as loop_module
+    from dostuff.helpers.agent import file_mentions
+    from dostuff.lib import model as model_module
+    from test_attachments import png_bytes
+    cli_tui = tui
+
+    async def real_loop(*args, **kwargs):
+        return await loop_module.loop(*args, **kwargs)
+    monkeypatch.setattr(cli_tui, "agent_loop", real_loop)
+    monkeypatch.setattr(file_mentions, "_index", {})
+    state = {"vision": True}
+    monkeypatch.setattr(model_module, "model_supports", lambda kind: state["vision"] if kind == "vision" else False)
+    Path("shot.png").write_bytes(png_bytes(1280, 720))
+
+    def vision(value: bool) -> None:
+        state["vision"] = value
+    return cli_tui, fake_model, vision
+
+
+def test_tui_image_mention_sends_parts(image_tui):
+    from dostuff.helpers.agent.attachments import refs
+    cli_tui, model, vision = image_tui
+    vision(True)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="image")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.permissions.mode = "auto"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("what is @shot.png"))
+            await _until(pilot, lambda: bool(model.calls) and not app._turn_in_progress, tries=200)
+            sent = [m for m in model.calls[0]["messages"] if m["role"] == "user"][-1]["content"]
+            assert isinstance(sent, list)
+            assert any(p.get("type") == "image_url" and p["image_url"]["url"].startswith("data:image/png;base64,")
+                       for p in sent)
+            assert not any(p.get("type") == "dostuff_attachment" for p in sent)
+            step = _shown(app.steps_history)[0]
+            assert step["content"][0] == {"type": "text", "text": "what is @shot.png"}
+            assert [r["name"] for r in refs(step["content"])] == ["shot.png"]
+            assert "base64" not in str(app.steps_history)  # CON-004
+            assert any(t == "Attached shot.png (1280×720)" for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tui_refused_image_keeps_prompt(image_tui):
+    cli_tui, model, vision = image_tui
+    vision(False)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="image-refused")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            box = app.query_one("#input", cli_tui.EnterSubmits)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("what is @shot.png"))
+            await _until(pilot, lambda: any(t.startswith("Not attached: shot.png:") for t in _texts(app)), tries=200)
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert any(t == "Not attached: shot.png: openai/gpt-4o-mini can't read images" for t in _texts(app))
+            assert not model.calls and not _shown(app.steps_history)  # nothing sent, nothing stored
+            assert box.text == "what is @shot.png"  # the prompt is back in the input
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_transcript_shows_image_chip(image_tui):
+    cli_tui, model, vision = image_tui
+    vision(True)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="image-chip")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.permissions.mode = "auto"
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("what is @shot.png"))
+            await _until(pilot, lambda: bool(model.calls) and not app._turn_in_progress, tries=200)
+            assert "[Image #1 · shot.png · 1280×720]" in _texts(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_resume_renders_chip(tui, tmp_path):
+    from dostuff.helpers.agent.attachments import AttachmentStore
+    from test_attachments import pdf_bytes, png_bytes
+    cli_tui = tui
+    store = AttachmentStore()
+    image = store.add(png_bytes(1280, 720), name="bug.png")
+    pdf = store.add(pdf_bytes(12), name="report.pdf")
+    step = {"role": "user", "content": [{"type": "text", "text": 'see @bug.png\n\n<attached_file path="a.py">\n1\tx\n</attached_file>'},
+                                        image, pdf]}
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="image-resume")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._render_history_step(step)
+            await pilot.pause()
+            texts = _texts(app)
+            assert "> see @bug.png" in texts and "Attached a.py" in texts
+            assert "[Image #1 · bug.png · 1280×720] [PDF · report.pdf · 12 pages]" in texts
+            assert not any("dostuff_attachment" in t for t in texts)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
