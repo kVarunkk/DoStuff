@@ -350,8 +350,10 @@ def _provider_part(ref: dict[str, Any], root: Path, missing: list[str] | None) -
             missing.append(str(ref.get("name", "attachment")))
         return {"type": "text", "text": f"[attachment unavailable: {ref.get('name', 'attachment')}]"}
     url = f"data:{ref.get('media_type')};base64," + base64.b64encode(data).decode("ascii")
-    if ref.get("kind") == "pdf":
-        return {"type": "file", "file": {"file_data": url}}
+    if ref.get("kind") == "pdf":  # xAI rejects `file_data` without `filename`; OpenAI and the rest accept it
+        name = Path(str(ref.get("name") or "document")).name
+        filename = name if name.lower().endswith(".pdf") else f"{name}.pdf"
+        return {"type": "file", "file": {"filename": filename, "file_data": url}}
     return {"type": "image_url", "image_url": {"url": url}}
 
 

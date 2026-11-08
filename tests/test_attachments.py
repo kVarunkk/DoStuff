@@ -133,6 +133,18 @@ def test_hydrate_refs_to_data_uri(tmp_path):
     assert step["content"][1] is ref  # history untouched (CON-004)
 
 
+def test_hydrate_pdf_names_the_file(tmp_path):
+    """xAI refuses a `file` part whose `file_data` has no `filename` (grok: "input_file.filename is required")."""
+    import base64
+    from dostuff.helpers.agent.attachments import AttachmentStore, hydrate
+    store = AttachmentStore(root=tmp_path)
+    for name, expected in (("report.pdf", "report.pdf"), ("Image #1", "Image #1.pdf"), ("sub/dir/R.PDF", "R.PDF")):
+        ref = store.add(pdf_bytes(), name=name)
+        out = hydrate([{"role": "user", "content": [ref]}], root=tmp_path)
+        assert out[0]["content"][0] == {"type": "file", "file": {
+            "filename": expected, "file_data": "data:application/pdf;base64," + base64.b64encode(pdf_bytes()).decode()}}
+
+
 def test_hydrate_is_deterministic(tmp_path):
     import json
     from dostuff.helpers.agent.attachments import hydrate
