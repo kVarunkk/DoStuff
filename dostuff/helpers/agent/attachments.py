@@ -204,9 +204,13 @@ def ref_label(ref: dict[str, Any]) -> str:
     return f"[{'PDF' if ref.get('kind') == 'pdf' else 'Image'}: {ref.get('name', 'attachment')}]"
 
 
+_PASTED_NAME_RE = re.compile(r"Image #\d+")  # the name a clipboard image gets (helpers/agent/clipboard.py)
+
+
 def ref_chips(content: Any) -> str:
     """The attachments of a step as the transcript shows them (REQ-7.1):
-    `[Image #1 · bug.png · 1280×720] [PDF · report.pdf · 12 pages]`; images numbered in order."""
+    `[Image #1 · bug.png · 1280×720] [PDF · report.pdf · 12 pages]`; images numbered in order, except a pasted
+    one, which shows the number of its `[Image #N]`: `[Image #3 · 800×600]`."""
     chips = []
     number = 0
     for ref in refs(content):
@@ -215,8 +219,11 @@ def ref_chips(content: Any) -> str:
             pages = int(ref.get("pages") or 0)
             chips.append(f"[PDF · {name}" + (f" · {pages} page{'s' if pages != 1 else ''}]" if pages else "]"))
             continue
-        number += 1
         size = f" · {ref['width']}×{ref['height']}" if ref.get("width") and ref.get("height") else ""
+        if _PASTED_NAME_RE.fullmatch(str(name)):  # alt+v: the number the prompt's `[Image #N]` uses
+            chips.append(f"[{name}{size}]")
+            continue
+        number += 1
         chips.append(f"[Image #{number} · {name}{size}]")
     return " ".join(chips)
 

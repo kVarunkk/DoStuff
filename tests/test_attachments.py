@@ -356,12 +356,13 @@ def test_mention_too_many_images(tmp_path, vision, monkeypatch):
 
 def _steer_app(tmp_path):
     from types import SimpleNamespace
+    from dostuff.helpers.agent.clipboard import PastedImages
     from dostuff.helpers.agent.pastes import PasteStore
     from dostuff.helpers.agent.steering import SteeringQueue
     shown: list = []
     return SimpleNamespace(
         _append=lambda text, msg_type="": shown.append((msg_type, text)), _steering=SteeringQueue(),
-        _pastes=PasteStore(), _skill_commands={}, _render_queue=lambda: None, session_id="s1",
+        _pastes=PasteStore(), _images=PastedImages(), _skill_commands={}, _render_queue=lambda: None, session_id="s1",
         config=SimpleNamespace(max_tool_output_chars=0, paste_file_lines=0)), shown
 
 
@@ -443,3 +444,209 @@ def test_attachment_retention_config(tmp_path, monkeypatch):
     assert cfg.attachment_retention_days == 30
     cfg = _config(tmp_path, monkeypatch, "loop:\n  attachment_retention_days: 0\n")
     assert cfg.attachment_retention_days == 0
+
+
+# --- T2.1 clipboard readers ---------------------------------------------------------------------
+
+class _Run:
+    """A stubbed subprocess.run: pops one result per call, records the argv."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls: list[list[str]] = []
+        self.kwargs: dict = {}
+
+    def __call__(self, argv, **kwargs):
+        import subprocess
+        self.calls.append(argv)
+        self.kwargs = kwargs
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        code, out = result
+        return subprocess.CompletedProcess(argv, code, stdout=out, stderr=b"")
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin", "linux"])
+def test_clipboard_reader_order(monkeypatch, platform):
+    import base64
+    from dostuff.helpers.agent import clipboard
+    png = png_bytes(4, 3)
+    # Pillow first: when it has the image, no command runs
+    run = _Run()
+    monkeypatch.setattr(clipboard.subprocess, "run", run)
+    monkeypatch.setattr(clipboard, "_pillow_grab", lambda: png)
+    assert clipboard.read_clipboard_image(platform=platform) == (png, "")
+    assert run.calls == []
+    # No Pillow (or nothing from it): the platform's command, its stdout decoded
+    monkeypatch.setattr(clipboard, "_pillow_grab", lambda: None)
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: f"/bin/{name}")
+    out = {"win32": base64.b64encode(png),
+           "darwin": "«data PNGf".encode() + png.hex().upper().encode() + "»\n".encode(),
+           "linux": png}[platform]
+    run = _Run((0, out))
+    monkeypatch.setattr(clipboard.subprocess, "run", run)
+    assert clipboard.read_clipboard_image(platform=platform) == (png, "")
+    assert run.calls[0][0] == {"win32": "/bin/powershell", "darwin": "/bin/osascript", "linux": "/bin/wl-paste"}[platform]
+    assert run.kwargs["timeout"] == clipboard.CLIPBOARD_TIMEOUT_S
+    # Nothing on the clipboard: a message, no bytes
+    run = _Run((1, b""), (1, b""))
+    monkeypatch.setattr(clipboard.subprocess, "run", run)
+    assert clipboard.read_clipboard_image(platform=platform) == (None, "No image on the clipboard")
+
+
+def test_clipboard_linux_falls_back_to_xclip(monkeypatch):
+    from dostuff.helpers.agent import clipboard
+    png = png_bytes()
+    monkeypatch.setattr(clipboard, "_pillow_grab", lambda: None)
+    run = _Run((1, b"No suitable type of content copied"), (0, png))
+    monkeypatch.setattr(clipboard.subprocess, "run", run)
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert clipboard.read_clipboard_image(platform="linux") == (png, "")
+    assert [c[0] for c in run.calls] == ["/usr/bin/wl-paste", "/usr/bin/xclip"]
+    # Only xclip installed: wl-paste isn't tried
+    run = _Run((0, png))
+    monkeypatch.setattr(clipboard.subprocess, "run", run)
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: "/usr/bin/xclip" if name == "xclip" else None)
+    assert clipboard.read_clipboard_image(platform="linux") == (png, "")
+    assert [c[0] for c in run.calls] == ["/usr/bin/xclip"]
+    # Neither: say what to install
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: None)
+    assert clipboard.read_clipboard_image(platform="linux") == (None, "Clipboard images need wl-paste or xclip")
+
+
+def test_clipboard_windows_powershell_off_path(monkeypatch, tmp_path):
+    """Git Bash and some terminals have no `powershell` on PATH; Windows always installs it under SYSTEMROOT."""
+    from dostuff.helpers.agent import clipboard
+    exe = tmp_path / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"")
+    monkeypatch.setenv("SYSTEMROOT", str(tmp_path))
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: None)
+    assert clipboard._find("powershell", "win32") == str(exe)
+    exe.unlink()
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: "/opt/pwsh" if name == "pwsh" else None)
+    assert clipboard._find("powershell", "win32") == "/opt/pwsh"
+    assert clipboard._find("powershell", "linux") is None
+
+
+def test_clipboard_text_is_not_an_image(monkeypatch):
+    from dostuff.helpers.agent import clipboard
+    monkeypatch.setattr(clipboard, "_pillow_grab", lambda: None)
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(clipboard.subprocess, "run", _Run((0, b"just some text"), (0, b"")))
+    assert clipboard.read_clipboard_image(platform="linux") == (None, "No image on the clipboard")
+
+
+def test_clipboard_timeout(monkeypatch):
+    import subprocess
+    from dostuff.helpers.agent import clipboard
+    monkeypatch.setattr(clipboard, "_pillow_grab", lambda: None)
+    monkeypatch.setattr(clipboard.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(clipboard.subprocess, "run", _Run(subprocess.TimeoutExpired("powershell", 5)))
+    data, message = clipboard.read_clipboard_image(platform="win32")
+    assert data is None and message == "Reading the clipboard timed out after 5 s"
+
+
+def test_clipboard_pillow_grab(monkeypatch, tmp_path):
+    """Pillow's grabclipboard gives an Image, a list of copied files, or None; it is imported only when asked."""
+    import types
+    from dostuff.helpers.agent import clipboard
+    png = png_bytes(3, 2)
+
+    class FakeImage:
+        def save(self, buffer, format):
+            assert format == "PNG"
+            buffer.write(png)
+
+    grab = types.SimpleNamespace(grabclipboard=lambda: FakeImage())
+    monkeypatch.setitem(sys.modules, "PIL", types.SimpleNamespace(ImageGrab=grab))
+    monkeypatch.setitem(sys.modules, "PIL.ImageGrab", grab)
+    assert clipboard._pillow_grab() == png
+    (tmp_path / "notes.txt").write_text("x")
+    (tmp_path / "shot.png").write_bytes(png)
+    grab.grabclipboard = lambda: [str(tmp_path / "notes.txt"), str(tmp_path / "shot.png")]  # copied in Explorer
+    assert clipboard._pillow_grab() == png
+    grab.grabclipboard = lambda: None
+    assert clipboard._pillow_grab() is None
+
+    def broken():
+        raise OSError("xclip not found")
+    grab.grabclipboard = broken  # Linux Pillow shells out itself: a failure falls through to our commands
+    assert clipboard._pillow_grab() is None
+    monkeypatch.setitem(sys.modules, "PIL", None)
+    monkeypatch.setitem(sys.modules, "PIL.ImageGrab", None)
+    assert clipboard._pillow_grab() is None
+
+
+# --- T2.2 / T2.3 pasted images: numbered placeholders, refs on submit ---------------------------
+
+def test_pasted_images_numbering():
+    from dostuff.helpers.agent.clipboard import PastedImages
+    images = PastedImages()
+    assert images.add(png_bytes(1, 1)) == "[Image #1]"
+    assert images.add(png_bytes(2, 2)) == "[Image #2]"
+    assert images.get(2) == png_bytes(2, 2) and images.get(3) is None
+
+
+def test_placeholders_become_refs_in_order(tmp_path, vision):
+    from dostuff.helpers.agent.attachments import ref_chips
+    from dostuff.helpers.agent.clipboard import PastedImages
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    images = PastedImages()
+    images.add(png_bytes(10, 20))
+    images.add(png_bytes(30, 40))
+    (tmp_path / "shot.png").write_bytes(png_bytes(5, 5))
+    vision(True)
+    text = "compare [Image #2] with @shot.png and [Image #1], again [Image #2]"
+    exp = expand_file_mentions(text, root=tmp_path, images=images)
+    assert exp.refused == [] and exp.content == text  # the placeholders stay in the text (D10)
+    assert [p["name"] for p in exp.parts] == ["Image #2", "shot.png", "Image #1"]  # prompt order, once each
+    assert (tmp_path / exp.parts[0]["path"]).read_bytes() == png_bytes(30, 40)
+    assert exp.attached == ["Image #2 (30×40)", "shot.png (5×5)", "Image #1 (10×20)"]
+    content = [{"type": "text", "text": text}, *exp.parts]
+    # A pasted image keeps its own number; mentioned ones are numbered in order
+    assert ref_chips(content) == "[Image #2 · 30×40] [Image #1 · shot.png · 5×5] [Image #1 · 10×20]"
+
+
+def test_placeholder_refused_without_vision(tmp_path, vision):
+    from dostuff.helpers.agent.clipboard import PastedImages
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    images = PastedImages()
+    images.add(png_bytes())
+    vision(False)
+    exp = expand_file_mentions("what is [Image #1]", root=tmp_path, images=images)
+    assert exp.parts == [] and exp.refused == ["Image #1: test/model can't read images"]
+    assert not (tmp_path / ".dostuff" / "attachments").exists()
+
+
+def test_unknown_placeholder_stays_text(tmp_path, vision):
+    from dostuff.helpers.agent.clipboard import PastedImages
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    vision(True)
+    for images in (PastedImages(), None):  # recalled after a restart / no store at all (-p)
+        exp = expand_file_mentions("what was [Image #9]?", root=tmp_path, images=images)
+        assert exp.content == "what was [Image #9]?" and exp.parts == [] and exp.refused == [] and exp.attached == []
+
+
+# --- T2.4 drag-and-drop -------------------------------------------------------------------------
+
+@pytest.mark.parametrize("pasted, platform, expected", [
+    ("/home/me/shot.png", "linux", "/home/me/shot.png"),
+    ("  /home/me/shot.png \n", "linux", "/home/me/shot.png"),
+    ("'/home/me/my shot.png' ", "linux", "/home/me/my shot.png"),  # GNOME Terminal
+    ('"/home/me/my shot.png"', "linux", "/home/me/my shot.png"),
+    ("/Users/me/my\\ shot\\ (1).png ", "darwin", "/Users/me/my shot (1).png"),  # Terminal.app / iTerm escape
+    ("file:///home/me/my%20shot.png", "linux", "/home/me/my shot.png"),
+    ("C:\\Users\\me\\shot.png", "win32", "C:\\Users\\me\\shot.png"),
+    ('"C:\\Users\\me\\my shot.png"', "win32", "C:\\Users\\me\\my shot.png"),  # Windows Terminal
+    ("two\nlines.png", "linux", None),
+    ("", "linux", None),
+    ("see /home/me/shot.png", "linux", None),
+    ("/home/me/my shot.png", "linux", "/home/me/my shot.png"),  # unquoted: the caller checks the file exists
+    ("C:\\Users\\a b\\shot.png", "win32", "C:\\Users\\a b\\shot.png"),
+    ("shot.png", "win32", None),
+])
+def test_dropped_path_text(pasted, platform, expected):
+    from dostuff.helpers.agent.clipboard import dropped_path_text
+    assert dropped_path_text(pasted, platform=platform) == expected

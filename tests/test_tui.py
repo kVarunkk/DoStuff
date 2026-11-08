@@ -7734,3 +7734,142 @@ def test_resume_renders_chip(tui, tmp_path):
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
+
+
+# --- multimodal Phase 2: alt+v and drag-and-drop ------------------------------------------------
+
+def _clipboard(monkeypatch, data, message=""):
+    from dostuff.helpers.agent import clipboard
+    calls = []
+
+    def read(*args, **kwargs):
+        calls.append(1)
+        return data, message
+    monkeypatch.setattr(clipboard, "read_clipboard_image", read)
+    return calls
+
+
+def test_alt_v_inserts_image_placeholder(image_tui, monkeypatch):
+    from test_attachments import png_bytes
+    cli_tui, model, vision = image_tui
+    vision(True)
+    calls = _clipboard(monkeypatch, png_bytes(800, 600))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="alt-v")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.permissions.mode = "auto"
+            box = app.query_one("#input", cli_tui.EnterSubmits)
+            box.insert("why is ")
+            await pilot.press("alt+v")
+            await _until(pilot, lambda: "[Image #1]" in box.text)
+            box.insert(" broken")
+            await pilot.press("alt+v")
+            await _until(pilot, lambda: "[Image #2]" in box.text)
+            assert box.text == "why is [Image #1] broken[Image #2]" and len(calls) == 2
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(box.text))
+            await _until(pilot, lambda: bool(model.calls) and not app._turn_in_progress, tries=200)
+            sent = [m for m in model.calls[0]["messages"] if m["role"] == "user"][-1]["content"]
+            assert {"type": "text", "text": "why is [Image #1] broken[Image #2]"} in sent
+            assert [p["type"] for p in sent if p["type"] == "image_url"] == ["image_url", "image_url"]
+            step = _shown(app.steps_history)[0]
+            assert [p.get("name") for p in step["content"][1:]] == ["Image #1", "Image #2"]
+            assert "[Image #1 · 800×600] [Image #2 · 800×600]" in _texts(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_alt_v_no_image_notice(image_tui, monkeypatch):
+    cli_tui, model, vision = image_tui
+    _clipboard(monkeypatch, None, "No image on the clipboard")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="alt-v-none")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.query_one("#input", cli_tui.EnterSubmits)
+            box.insert("hello")
+            await pilot.press("alt+v")
+            await _until(pilot, lambda: box.border_title == "No image on the clipboard")
+            assert box.text == "hello"  # nothing inserted
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_alt_v_refused_image_keeps_placeholder(image_tui, monkeypatch):
+    """A text-only model: the turn doesn't run, and the prompt goes back with its placeholder still meaning the
+    image, so a /model switch and Enter sends it."""
+    from test_attachments import png_bytes
+    cli_tui, model, vision = image_tui
+    vision(False)
+    _clipboard(monkeypatch, png_bytes())
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="alt-v-refused")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            app.permissions.mode = "auto"
+            box = app.query_one("#input", cli_tui.EnterSubmits)
+            await pilot.press("alt+v")
+            await _until(pilot, lambda: box.text == "[Image #1]")
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(box.text))
+            await _until(pilot, lambda: any(t.startswith("Not attached: Image #1:") for t in _texts(app)), tries=200)
+            await _until(pilot, lambda: not app._turn_in_progress)
+            assert not model.calls and box.text == "[Image #1]"
+            vision(True)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(box.text))
+            await _until(pilot, lambda: bool(model.calls) and not app._turn_in_progress, tries=200)
+            assert [p.get("name") for p in _shown(app.steps_history)[0]["content"][1:]] == ["Image #1"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_pasted_image_path_becomes_mention(image_tui, monkeypatch, tmp_path_factory):
+    from textual.events import Paste
+    from test_attachments import png_bytes
+    cli_tui, model, vision = image_tui
+    vision(True)
+    Path("my shot.png").write_bytes(png_bytes())
+    Path("notes.py").write_text("x = 1\n")
+    outside = tmp_path_factory.mktemp("desktop") / "outside.png"
+    outside.write_bytes(png_bytes(7, 9))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="drop")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.query_one("#input", cli_tui.EnterSubmits)
+            for pasted, expected in [
+                (str(Path("shot.png").resolve()), "@shot.png "),  # plain
+                (f'"{Path("my shot.png").resolve()}"', '@"my shot.png" '),  # quoted, with a space
+                (str(Path("notes.py").resolve()), str(Path("notes.py").resolve())),  # not an attachment: text
+                ("just words", "just words"),
+                (f'"{outside}"', "[Image #1]"),  # outside the project: read now, like a clipboard image
+            ]:
+                box.text = ""
+                app.post_message(Paste(pasted))
+                await _until(pilot, lambda: box.text != "")
+                assert box.text == expected, pasted
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_help_lists_alt_v(tui):
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="help-alt-v")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/help"))
+            await _until(pilot, lambda: any("Shortcuts:" in t for t in _texts(app)))
+            assert any("Alt+V paste an image from the clipboard" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())

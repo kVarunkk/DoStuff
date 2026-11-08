@@ -12,6 +12,7 @@ from typing import Any
 
 from dostuff.helpers.agent import attachments
 from dostuff.helpers.agent.attachments import AttachmentStore, classify_attachment, content_text, image_size, is_ref
+from dostuff.helpers.agent.clipboard import PLACEHOLDER_RE, PastedImages
 from dostuff.helpers.agent.tool_output import truncate_tool_output
 from dostuff.helpers.tools.resolve_safe_path import is_denied_for_read, resolve_safe_path
 from dostuff.lib.exceptions import PathAccessDenied, PathOutsideProject
@@ -86,19 +87,44 @@ def _resolve_mention(raw: str, root: Path) -> Path | None:
     return None
 
 
-def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None) -> Expansion:
+def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None,
+                         images: PastedImages | None = None) -> Expansion:
     """Append an <attached_file> / <attached_dir> block for each `@path` in `text`.
 
-    Files come numbered like read_file output and capped at `max_chars` each (0 = no cap). Images go to the
-    attachment store and come back as refs in `parts`, or as reasons in `refused` (the model can't read images,
-    too large, too many); with any refused, nothing is stored.
+    Files come numbered like read_file output and capped at `max_chars` each (0 = no cap). Images — mentioned, or
+    an `[Image #N]` that `images` holds (alt+v, REQ-3.2) — go to the attachment store and come back as refs in
+    `parts`, in prompt order, or as reasons in `refused` (the model can't read images, too large, too many); with
+    any refused, nothing is stored. An `[Image #N]` that `images` doesn't hold stays plain text.
     """
     root = (root or Path.cwd()).resolve()
     result = Expansion(content=text)
     blocks: list[str] = []
     seen: set[Path] = set()
-    images: list[tuple[str, Path, bytes]] = []  # (attached entry, path, bytes): stored once nothing is refused
+    # (position in text, attached entry, name, bytes): stored once nothing is refused
+    found: list[tuple[int, str, str, bytes]] = []
     vision: bool | None = None  # asked once, at the first image
+
+    def check_image(shown: str, data: bytes) -> bool:
+        """False (and the reason in `refused`) when this image can't be sent."""
+        nonlocal vision
+        from dostuff.lib import model as model_lib  # lazy: litellm stays off the TUI's first frame
+        if vision is None:
+            vision = model_lib.model_supports("vision")
+        if not vision:
+            result.refused.append(f"{shown}: {model_lib.get_model()} can't read images")
+            return False
+        problem = attachments.image_problem(data)
+        if problem:
+            result.refused.append(f"{shown}: {problem}")
+            return False
+        return True
+
+    def add_image(position: int, shown: str, name: str, data: bytes) -> None:
+        size = image_size(data)
+        entry = f"{shown} ({size[0]}×{size[1]})" if size else shown
+        result.attached.append(entry)
+        found.append((position, entry, name, data))
+
     for match in MENTION_RE.finditer(text):
         path = _resolve_mention(match.group(1), root)
         if path is None or path in seen:
@@ -113,25 +139,13 @@ def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None
             if is_denied_for_read(path):
                 result.skipped.append(f"{shown}: may contain secrets")
                 continue
-            from dostuff.lib import model as model_lib  # lazy: litellm stays off the TUI's first frame
-            if vision is None:
-                vision = model_lib.model_supports("vision")
-            if not vision:
-                result.refused.append(f"{shown}: {model_lib.get_model()} can't read images")
-                continue
             try:
                 data = path.read_bytes()
             except OSError as e:
                 result.refused.append(f"{shown}: {e}")
                 continue
-            problem = attachments.image_problem(data)
-            if problem:
-                result.refused.append(f"{shown}: {problem}")
-                continue
-            size = image_size(data)
-            entry = f"{shown} ({size[0]}×{size[1]})" if size else shown
-            result.attached.append(entry)
-            images.append((entry, path, data))
+            if check_image(shown, data):
+                add_image(match.start(), shown, path.name, data)
             continue
         if _is_binary(path):
             result.skipped.append(f"{shown}: binary file")
@@ -146,15 +160,31 @@ def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None
             continue
         blocks.append(f'<attached_file path="{shown}">\n{truncate_tool_output(body, max_chars)}\n</attached_file>')
         result.attached.append(shown)
-    if images and len(images) + len(result.refused) > attachments.MAX_PER_STEP:  # REQ-6.4
-        result.refused = [f"{len(images) + len(result.refused)} images and PDFs; "
+    if images is not None:
+        numbers: set[int] = set()
+        for match in PLACEHOLDER_RE.finditer(text):
+            number = int(match.group(1))
+            pasted = images.get(number)
+            if pasted is None or number in numbers:
+                continue
+            numbers.add(number)
+            name = f"Image #{number}"
+            if check_image(name, pasted):
+                add_image(match.start(), name, name, pasted)
+        if numbers:  # in prompt order, mentioned and pasted ones together (D10); files keep their place
+            found.sort(key=lambda image: image[0])
+            in_order = iter([image[1] for image in found])
+            image_entries = {image[1] for image in found}
+            result.attached = [next(in_order) if a in image_entries else a for a in result.attached]
+    if found and len(found) + len(result.refused) > attachments.MAX_PER_STEP:  # REQ-6.4
+        result.refused = [f"{len(found) + len(result.refused)} images and PDFs; "
                           f"at most {attachments.MAX_PER_STEP} per message"]
     if result.refused:  # the turn won't run: store nothing, and don't say the images were attached
-        entries = {entry for entry, _, _ in images}
+        entries = [image[1] for image in found]
         result.attached = [a for a in result.attached if a not in entries]
     else:
         store = AttachmentStore(root=root)
-        result.parts = [store.add(data, name=path.name) for _, path, data in images]
+        result.parts = [store.add(data, name=name) for _, _, name, data in found]
     if blocks:
         result.content = text + "\n\n" + "\n\n".join(blocks)
     return result
