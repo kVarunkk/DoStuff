@@ -2,10 +2,24 @@ from typing import Any
 
 import litellm
 from litellm import acompletion
+from dostuff.helpers.agent.attachments import content_text, hydrate
 from dostuff.tools.definitions import TOOL_SCHEMAS, default_tool_names
 from dostuff.lib.model import completion_kwargs, uses_explicit_prompt_caching
 from dostuff.lib.tracing import content_attr, tracer
 from opentelemetry.trace import Status, StatusCode
+
+
+# Names of attachments whose stored file was gone when a request was built (REQ-1.3); the loop reports each once
+unavailable_attachments: list[str] = []
+_reported_unavailable: set[str] = set()
+
+
+def take_unavailable_attachments() -> list[str]:
+    """Missing attachments not reported yet in this process (every later request still sends the stand-in)."""
+    names = [n for n in dict.fromkeys(unavailable_attachments) if n not in _reported_unavailable]
+    unavailable_attachments.clear()
+    _reported_unavailable.update(names)
+    return names
 
 
 # Two breakpoints: the system prompt (tools + instructions, stable across turns) and the last
@@ -73,7 +87,9 @@ async def call_agent(steps_history: list, system_instruction: str, tool_names: l
     if tool_names is None:
         tool_names = default_tool_names()
     active_schemas = [TOOL_SCHEMAS[name] for name in tool_names if name in TOOL_SCHEMAS]
-    messages = [{"role": "system", "content": system_instruction}] + provider_messages(steps_history)
+    # History holds attachment refs; only the request carries their bytes (CON-004)
+    messages = [{"role": "system", "content": system_instruction}] + hydrate(provider_messages(steps_history),
+                                                                             missing=unavailable_attachments)
     request = build_request_kwargs(stream)
 
     span = tracer.start_span("model_call")
@@ -82,7 +98,7 @@ async def call_agent(steps_history: list, system_instruction: str, tool_names: l
     last_msg = steps_history[-1] if steps_history else None
     if last_msg:
         span.set_attribute("model.input.last_message_role", last_msg.get("role", ""))
-        span.set_attribute("model.input.last_message", content_attr(last_msg.get("content") or last_msg.get("tool_calls") or ""))
+        span.set_attribute("model.input.last_message", content_attr(content_text(last_msg.get("content")) or last_msg.get("tool_calls") or ""))
     span.set_attribute("model.input.step_count", len(steps_history))
 
     try:

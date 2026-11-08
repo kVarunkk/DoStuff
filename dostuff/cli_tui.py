@@ -52,11 +52,15 @@ from dostuff.lib.model import get_model
 from dostuff.lib.tracing import session_id_var, turn_id_var
 from dostuff.helpers.agent.append_step import append_step
 from dostuff.helpers.agent.loop_check_cancelled import CANCELLED_TURN
+from dostuff.helpers.agent import clipboard
+from dostuff.helpers.agent.attachments import classify_attachment, delete_attachments, ref_chips, sweep_old_attachments
+from dostuff.helpers.agent.tool_attachments import is_tool_attachment_step
 from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_paths, expand_file_mentions,
                                                  format_mention, mention_candidates, strip_attachments)
 from dostuff.helpers.agent.model_cost import format_cost
 from dostuff.helpers.agent.notices import WAKE_LIMIT, agent_notice_line, fmt_agent_runtime, format_notices, get_notice_queue, parse_notices
 from dostuff.helpers.agent.pastes import PasteStore, sweep_old_pastes
+from dostuff.helpers.tools.resolve_safe_path import is_denied_for_read
 from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, unframe_steered
 from dostuff.helpers.agent.side_question import (
     BTW_FORK_DESCRIPTION, BTW_FORK_PROMPT, add_exchange, answer_side_question, discard_snapshot, kept_prompt,
@@ -1196,6 +1200,7 @@ class EnterSubmits(TextArea):
         self._draft = ""
         self.recalled_text: str | None = None  # last text put in by recall (keeps the "/" menu shut)
         self.pastes = PasteStore()
+        self.images = clipboard.PastedImages()  # alt+v and dropped images; the app shares its own
         self.paste_collapse_lines = 0  # set by the app from ui.paste_collapse_lines
         self.commands: Iterable[str] = COMMAND_DESCRIPTIONS  # for ghost text; the app adds the skill commands
         self.skills: Iterable[str] = ()  # "/name" of each skill, for mentions; the app fills it in
@@ -1300,15 +1305,42 @@ class EnterSubmits(TextArea):
         self.move_cursor((row, start + len(command) + 1))
 
     async def _on_paste(self, event: Paste) -> None:
-        """A long paste goes in as `[Pasted text #N +L lines]`; the app swaps the text back on submit."""
+        """A long paste goes in as `[Pasted text #N +L lines]`; the app swaps the text back on submit. A paste that
+        is just the path of an image or document (a file dragged into the terminal) goes in as its mention."""
         text = event.text.replace("\r\n", "\n").replace("\r", "\n")
-        if self.read_only or not self.pastes.should_collapse(text, self.paste_collapse_lines):
+        if self.read_only:
             return  # Textual runs TextArea._on_paste next (handlers go down the MRO), which inserts it
+        dropped = clipboard.dropped_path_text(text)
+        replacement = await asyncio.to_thread(self._dropped_file, dropped) if dropped else None
+        if replacement is None:
+            if not self.pastes.should_collapse(text, self.paste_collapse_lines):
+                return
+            replacement = self.pastes.add(text)
         event.stop()
         event.prevent_default()
-        if result := self._replace_via_keyboard(self.pastes.add(text), *self.selection):
+        self.insert_at_cursor(replacement)
+
+    def insert_at_cursor(self, text: str) -> None:
+        """`text` in place of the selection, as typing would put it (undo works)."""
+        if result := self._replace_via_keyboard(text, *self.selection):
             self.move_cursor(result.end_location)
             self.focus()
+
+    def _dropped_file(self, raw: str) -> str | None:
+        """What a dropped file goes in as (multimodal REQ-3.3): `@path ` inside the project, so the mention handles
+        it on submit; an image outside it is read now and goes in as `[Image #N]`, like alt+v (a mention can't
+        reach outside the project). None: not an existing image or document, so the paste stays text."""
+        try:
+            path = Path(raw).expanduser().resolve()
+            kind = classify_attachment(path) if path.is_file() else None
+            if kind is None or is_denied_for_read(path):
+                return None
+            try:
+                return format_mention(path.relative_to(Path.cwd().resolve()).as_posix()) + " "
+            except ValueError:
+                return self.images.add(path.read_bytes()) if kind == "image" else None
+        except (OSError, ValueError):
+            return None
 
     def _menu(self) -> CommandMenu | None:
         try:
@@ -1893,6 +1925,7 @@ class DostuffTUI(App):
         Binding("ctrl+o", "toggle_tool_results", "Expand tool output", priority=True),
         Binding("shift+tab", "cycle_permission_mode", "Cycle permission mode", priority=True),
         Binding("ctrl+r", "history_search", "Search prompt history", priority=True),
+        Binding("alt+v", "paste_image", "Paste an image from the clipboard"),
         Binding("ctrl+b", "background_jobs", "Move running commands to the background", priority=True),
     ]
 
@@ -1983,6 +2016,7 @@ class DostuffTUI(App):
         self._tool_results_expanded = False  # Ctrl+O; new results follow it
         self._history_path = self.config.get_data_dir() / "prompt_history.jsonl"
         self._pastes = PasteStore()  # collapsed pastes in the input (helpers/agent/pastes.py)
+        self._images = clipboard.PastedImages()  # alt+v images in the input, `[Image #N]` (multimodal REQ-3)
         self.worktree: Worktree | None = None  # set while the cwd is a dostuff git worktree
         self.exit_note = ""  # printed by cli.py after the TUI closes (e.g. a kept worktree)
         self._notify_kind = self.config.notifications  # /notifications changes it for the session
@@ -2142,9 +2176,11 @@ class DostuffTUI(App):
         _agent_registry().attach_store(self.store)  # agent rows and transcripts (subagents D14)
         inp.prompt_history = load_history(self._history_path, os.getcwd())
         inp.pastes = self._pastes
+        inp.images = self._images
         inp.paste_collapse_lines = self.config.paste_collapse_lines
         try:
             await asyncio.to_thread(sweep_old_pastes, self.config.paste_retention_days)
+            await asyncio.to_thread(sweep_old_attachments, self.config.attachment_retention_days)
         except OSError:
             pass
 
@@ -2382,6 +2418,16 @@ class DostuffTUI(App):
             self._append_call_result(f"{prefix}{step.get('name', '')}: {content}")
             return
         if role == "user":
+            if is_tool_attachment_step(step):  # what read_file / an MCP tool opened: the chips the live view showed
+                self._append(prefix + ref_chips(content), msg_type="system")
+                return
+            if isinstance(content, list):  # a prompt with images or PDFs: its text, then a chip per attachment
+                self._append(prefix + strip_attachments(content), msg_type="user")
+                attached = attached_paths(content)
+                if attached:
+                    self._append("Attached " + ", ".join(attached), msg_type="system")
+                self._append(ref_chips(content), msg_type="system")
+                return
             shell = _parse_shell_step(content)
             stop_note = parse_stop_note(content)
             notices = parse_notices(content)
@@ -3669,6 +3715,7 @@ class DostuffTUI(App):
                 "Shift+Tab cycle permission mode (ask → auto → plan → allowlist) · "
                 "Ctrl+Backspace / Ctrl+W delete word · Ctrl+Delete delete next word · "
                 "Ctrl+O expand/collapse tool output (or click one) · Ctrl+R search prompt history · "
+                "Alt+V paste an image from the clipboard · "
                 "Esc Esc (empty input) edit the previous prompt · / command menu",
                 msg_type="system",
             )
@@ -3745,11 +3792,16 @@ class DostuffTUI(App):
         the entry to the loop. The "Attached …" lines show here, as they do for a prompt."""
         try:
             mentions = skill_mentions(msg.raw, self._skill_commands)  # what was typed, before anything expands
-            expansion = await asyncio.to_thread(expand_file_mentions, msg.raw, self.config.max_tool_output_chars)
+            expansion = await asyncio.to_thread(expand_file_mentions, msg.raw, self.config.max_tool_output_chars,
+                                                images=self._images, file_lines=self.config.paste_file_lines)
             if expansion.attached:
                 self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
             if expansion.skipped:
                 self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
+            if expansion.refused:  # an image that can't be sent: reported, never delivered (multimodal CON-006)
+                self._steering.fail(msg.id, "Not attached: " + "; ".join(expansion.refused))
+                self._render_queue()
+                return
             content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
                                               self.config.paste_file_lines, self.config.max_tool_output_chars)
             content = with_mention_note(content, mentions)
@@ -3759,7 +3811,7 @@ class DostuffTUI(App):
             self._steering.fail(msg.id, str(e))
             self._render_queue()
             return
-        self._steering.ready(msg.id, content)
+        self._steering.ready(msg.id, content, expansion.parts)
         self._render_queue()
 
     # ── Approval prompt ────────────────────────────────────────────────────────
@@ -4213,17 +4265,23 @@ class DostuffTUI(App):
             meta = await self.store.get_session_meta(self.session_id) or {}
             working_history = await self.store.load_working_history(self.session_id)
 
-            content = user_text
+            content: str | list[dict[str, Any]] = user_text  # text and image refs once something is attached
             if not wake:
                 # `/<skill> args`: only the args get @mentions and pastes; the SKILL.md text goes around them
                 skill_run = parse_skill_command(user_text, self._skill_commands)
                 mentions = skill_mentions(user_text, self._skill_commands)  # what was typed, before anything expands
                 expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else user_text,
-                                                    self.config.max_tool_output_chars)
+                                                    self.config.max_tool_output_chars, images=self._images,
+                                                    file_lines=self.config.paste_file_lines)
                 if expansion.attached:
                     self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
                 if expansion.skipped:
                     self._append("Not attached: " + "; ".join(expansion.skipped), msg_type="error")
+                if expansion.refused:
+                    # An image that can't be sent stops the turn before hooks and history (multimodal D4, CON-006)
+                    self._append("Not attached: " + "; ".join(expansion.refused), msg_type="error")
+                    self._put_back_in_input([user_text])
+                    return
                 # After the @mentions, so an "@" inside pasted text isn't taken as one
                 content = await asyncio.to_thread(self._pastes.resolve, expansion.content, self.session_id,
                                                   self.config.paste_file_lines, self.config.max_tool_output_chars)
@@ -4239,6 +4297,9 @@ class DostuffTUI(App):
                 content = with_mention_note(content, mentions)
                 if mentions:
                     self._append(mention_line(mentions), msg_type="system")
+                if expansion.parts:  # text first, then the images (multimodal D10)
+                    content = [{"type": "text", "text": content}, *expansion.parts]
+                    self._append(ref_chips(content), msg_type="system")
 
             # Reset cancel state before the hooks below, so ESC can stop a slow one
             self.adapter._cancelled = False
@@ -4843,6 +4904,9 @@ class DostuffTUI(App):
         for i in range(len(self.steps_history) - 1, -1, -1):
             step = self.steps_history[i]
             content = step.get("content") if isinstance(step, dict) else None
+            if (step.get("role") == "user" and isinstance(content, list) and not is_turn_context(step)
+                    and not is_tool_attachment_step(step)):  # a prompt with images (multimodal REQ-1.4)
+                return i
             if (step.get("role") == "user" and isinstance(content, str) and content != EMPTY_RESPONSE_NUDGE
                     and not is_turn_context(step)
                     and not content.startswith("[/undo]") and _parse_shell_step(content) is None
@@ -4927,6 +4991,18 @@ class DostuffTUI(App):
 
         self._show_picker("Search prompt history", [(f"h{i}", label(p)) for i, p in enumerate(prompts)], choose,
                           filterable=True)
+
+    async def action_paste_image(self) -> None:
+        """Alt+V: the clipboard's image goes in the input as `[Image #N]` (multimodal REQ-3.1); the terminal's own
+        paste (Ctrl+V) only ever carries text."""
+        inp = self.query_one("#input", EnterSubmits)
+        if not inp.display or inp.read_only:
+            return
+        data, message = await asyncio.to_thread(clipboard.read_clipboard_image)
+        if data is None:
+            self._flash_input_hint(message, seconds=4)
+            return
+        inp.insert_at_cursor(self._images.add(data))
 
     # ── Exit ───────────────────────────────────────────────────────────────────
 
@@ -5073,6 +5149,10 @@ class DostuffTUI(App):
         # 4. Paste files, when loop.paste_retention_days is 0 (otherwise the startup sweep ages them out)
         if self.config.paste_retention_days <= 0:
             self._pastes.delete_files()
+        # Attachments too, with loop.attachment_retention_days 0: this session's images and PDFs
+        if self.config.attachment_retention_days <= 0:
+            with contextlib.suppress(Exception):
+                delete_attachments(self.steps_history)
         # 5. Session DB, after the agent rows and steps still queued for it (subagents D14)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(_agent_registry().flush(), timeout=5.0)

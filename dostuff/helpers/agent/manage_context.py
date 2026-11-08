@@ -1,5 +1,7 @@
 import json
 from litellm import acompletion, ModelResponse
+from dostuff.helpers.agent.attachments import content_text, is_ref, ref_tokens, refs
+from dostuff.helpers.agent.tool_attachments import is_tool_attachment_step
 from dostuff.helpers.agent.turn_context import is_turn_context
 from dostuff.lib.model import completion_kwargs
 
@@ -12,16 +14,23 @@ def estimate_tokens(step: dict) -> int:
     """Rough token estimate for a single step dict. Not exact — real tokenization
     isn't a fixed chars-per-token ratio — but good enough for deciding a trim boundary.
     """
-    text = json.dumps(step, default=str)
-    return len(text) // 4
+    content = step.get("content")
+    attached = refs(content)
+    if not isinstance(content, list) or not attached:
+        return len(json.dumps(step, default=str)) // 4
+    # An image ref costs what the image does, not its JSON (D9)
+    rest = {**step, "content": [p for p in content if not is_ref(p)]}
+    return len(json.dumps(rest, default=str)) // 4 + sum(ref_tokens(r) for r in attached)
 
 
 def _exchanges(steps_history: list[dict]) -> list[list[dict]]:
     """Group steps into units that must stay together: an assistant tool-call step plus its
-    tool results is one unit; every other step is its own unit."""
+    tool results is one unit, with the step carrying the images those tools opened (multimodal D8); every other
+    step is its own unit."""
     units: list[list[dict]] = []
     for step in steps_history:
-        if step.get("role") == "tool" and units and (units[-1][0].get("tool_calls") or units[-1][0].get("role") == "tool"):
+        joins = step.get("role") == "tool" or is_tool_attachment_step(step)
+        if joins and units and (units[-1][0].get("tool_calls") or units[-1][0].get("role") == "tool"):
             units[-1].append(step)
         else:
             units.append([step])
@@ -53,7 +62,7 @@ def split_by_token_budget(
 
     recent_units = units[len(units) - kept_units:]
     recent_steps = [step for unit in recent_units for step in unit]
-    while recent_steps and recent_steps[0].get("role") == "tool":
+    while recent_steps and (recent_steps[0].get("role") == "tool" or is_tool_attachment_step(recent_steps[0])):
         recent_steps.pop(0)
     split_index = len(steps_history) - len(recent_steps)
     return steps_history[:split_index], steps_history[split_index:]
@@ -66,6 +75,9 @@ def _chunk_steps(steps: list[dict], chunk_token_budget: int) -> list[str]:
     current_tokens = 0
     max_chars = chunk_token_budget * 4
     for step in steps:
+        if isinstance(step.get("content"), list):
+            # Images go to the summary as their names: the summary model may not read images (multimodal REQ-7.2)
+            step = {**step, "content": content_text(step["content"])}
         text = json.dumps(step, default=str)
         if len(text) > max_chars:  # one huge step (e.g. a big tool result): keep head and tail
             half = max_chars // 2

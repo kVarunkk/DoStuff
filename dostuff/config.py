@@ -18,6 +18,7 @@ RETIRED_STATUS_BAR_ITEMS = ("timer", "jobs")
 PASTE_COLLAPSE_LINES = 10
 PASTE_FILE_LINES = 200
 PASTE_RETENTION_DAYS = 7
+ATTACHMENT_RETENTION_DAYS = 30
 AUTO_COMPACT_THRESHOLD = 50  # percent of the context window
 NOTIFY_KINDS = ("off", "bell", "osc9")
 NOTIFY_AFTER_SECONDS = 30.0
@@ -116,6 +117,9 @@ class Config:
         self.paste_file_lines = max(int(file_lines), 0) if file_lines is not None else PASTE_FILE_LINES
         days = loop_cfg.get("paste_retention_days")
         self.paste_retention_days = max(float(days), 0.0) if days is not None else PASTE_RETENTION_DAYS
+        # Images / PDFs copied into .dostuff/attachments/ (helpers/agent/attachments.py); 0 = delete with the session
+        days = loop_cfg.get("attachment_retention_days")
+        self.attachment_retention_days = max(float(days), 0.0) if days is not None else ATTACHMENT_RETENTION_DAYS
         # Model-call retries on rate limits / timeouts / 5xx: exponential backoff (or Retry-After), capped per wait
         retries = loop_cfg.get("max_retries")
         self.max_retries = max(int(retries), 0) if retries is not None else MAX_RETRIES
@@ -204,6 +208,27 @@ class Config:
              "api_key_env": str(e.get("api_key_env") or "")}
             for e in raw_models if isinstance(e, dict) and e.get("name")
         ]
+
+    def model_capability(self, key: str) -> bool | None:
+        """`vision` / `pdf_input` for the active model from config.yaml: True / False, or None for `auto` (unset).
+
+        Read from the `models:` entry with the active model's name, else the `model:` block, for models litellm
+        has no metadata for (multimodal spec REQ-6.2)."""
+        name = self._raw_model_name()
+        entries = self.raw.get("models") or []
+        entry = next((e for e in entries if isinstance(e, dict) and e.get("name") and str(e["name"]) in (name, self.model_name)),
+                     None) if isinstance(entries, list) else None
+        if entry is None:
+            entry = _block(self.raw, "model")
+        value = entry.get(key, "auto")
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("true", "yes", "on", "1"):
+            return True
+        if text in ("false", "no", "off", "0"):
+            return False
+        return None
 
     def use_model(self, name: str, provider: str = "", api_key_env: str = "") -> None:
         """Switch the model for the rest of this process (/model); config.yaml is not changed."""

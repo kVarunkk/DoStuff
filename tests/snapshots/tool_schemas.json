@@ -522,7 +522,7 @@
   },
   "read_file": {
     "function": {
-      "description": "Read a text file, returning numbered lines (like `cat -n`).",
+      "description": "Read a file, returning numbered lines (like `cat -n`).\n\nImages (png, jpeg, gif, webp) are shown to you in the next message when this model can view images; so are PDFs\nwhen it can read them, otherwise you get their text. Word, Excel and PowerPoint files (.docx, .xlsx, .pptx) are\nconverted to text, and offset/limit apply to that text.",
       "name": "read_file",
       "parameters": {
         "properties": {

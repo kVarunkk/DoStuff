@@ -60,8 +60,19 @@ memory = [
 search = [
     "ddgs>=9.0",
 ]
+# Clipboard and oversized images: downscaled to fit the model's per-image limit
+images = [
+    "Pillow>=10",
+]
+# Word, Excel, PowerPoint and PDF files, converted to text for the model
+docs = [
+    "pypdf>=4",
+    "python-docx>=1",
+    "openpyxl>=3.1",
+    "python-pptx>=0.6",
+]
 full = [
-    "dostuff[memory,search]",
+    "dostuff[memory,search,images,docs]",
     "onnxruntime>=1.16",
     "grpcio>=1.52",
 ]

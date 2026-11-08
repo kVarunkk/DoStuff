@@ -1302,3 +1302,59 @@ def test_compaction_with_only_context_steps_old(monkeypatch):
     steps = [make_context_step("<turn-context>b</turn-context>"), {"role": "user", "content": "the prompt"}]
     assert _compact(steps) == (steps, "")
     assert requests == []
+
+
+def test_steer_carries_image_parts(monkeypatch, tmp_path):
+    """Multimodal (spec §4 Unchanged, steering): a steered message with an image is delivered framed, with its
+    refs after the text; the hook sees the text and the refs, like a prompt."""
+    from dostuff.helpers.agent.attachments import AttachmentStore
+    from dostuff.helpers.agent.steering import SteeringQueue
+    from test_attachments import png_bytes
+    ref = AttachmentStore(root=tmp_path).add(png_bytes(), name="bug.png")
+    q = SteeringQueue()
+    msg = q.put("look at @bug.png")
+    q.ready(msg.id, "look at @bug.png", [ref])
+    seen: list = []
+
+    async def recording(prompt, **kw):
+        seen.append(prompt)
+        return (None, "")
+
+    run = _steer_run(monkeypatch, [_msg(content="ok"), _msg(content="ok")], q, prompt_hook=recording)
+    delivered = [s for s in run.working if isinstance(s.get("content"), list)]
+    assert len(delivered) == 1
+    assert delivered[0]["content"] == [{"type": "text", "text": loop_module.frame_steered("look at @bug.png")}, ref]
+    assert seen == [[{"type": "text", "text": "look at @bug.png"}, ref]]
+
+
+def test_missing_attachment_warns_once(fake_model, monkeypatch, tmp_path):
+    """Multimodal REQ-1.3: a resumed session whose stored image is gone sends a text stand-in, and the user is
+    told once, not on every model call."""
+    from conftest import fake_response, fake_tool_call
+    from dostuff.agent import call_agent as call_agent_module
+    from dostuff.helpers.agent.attachments import AttachmentStore
+    from dostuff.helpers.hooks import HookOutcome
+    from test_attachments import png_bytes
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(call_agent_module, "unavailable_attachments", [])
+    monkeypatch.setattr(call_agent_module, "_reported_unavailable", set())
+    ref = AttachmentStore().add(png_bytes(), name="gone.png")
+    (tmp_path / ref["path"]).unlink()
+
+    async def no_hooks(*args, **kwargs):
+        return HookOutcome()
+    monkeypatch.setattr(loop_module, "run_hooks", no_hooks)
+    (tmp_path / "a.txt").write_text("x")
+    fake_model.script(None, fake_response(tool_calls=[fake_tool_call("read_file", {"path": "a.txt"})]),
+                      fake_response("done"))
+    adapter = Adapter()
+    working = [{"role": "user", "content": [{"type": "text", "text": "look"}, ref]}]
+    asyncio.run(loop(
+        turn_id="t1", user_text="look", mcp_client=None, working_history=working, turn_type="interactive_loop",
+        stream=False, max_iterations=5, adapter=adapter, steps_history=[], current_session_history=[],
+        store=_Store(), dynamic_system_instruction="sys", session_id="s1"))
+    assert len(fake_model.calls) == 2
+    sent = fake_model.calls[0]["messages"][1]["content"]
+    assert sent[1] == {"type": "text", "text": "[attachment unavailable: gone.png]"}
+    warnings = [d for e, d in adapter.events if e == "error" and "gone.png" in str(d)]
+    assert warnings == ["Attachment unavailable: gone.png (no longer in .dostuff/attachments/)"]

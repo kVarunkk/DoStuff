@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+You can show the agent images, PDFs and Word, Excel and PowerPoint files: mention them with `@`, paste a screenshot with `Alt+V`, drag a file into the terminal, or let the agent open one with `read_file`.
+
+### Added
+- **Images in `@path` mentions**: a PNG, JPEG, GIF or WebP is sent as an image to a model that can read images, and shows as `[Image #1 · shot.png · 1280×720]`. If the model can't read images, the image is over 3.75 MB, or a message has more than 20, nothing is sent: your prompt goes back in the input with the reason, and `dostuff -p` exits with code 1.
+- **`Alt+V` pastes an image from the clipboard**, such as a screenshot. It shows as `[Image #1]` in the input and follows the same rules as a mention. Tested on Windows. macOS (`osascript`) and Linux (`wl-paste` / `xclip`) are untested.
+- **Drag and drop**: dropping an image or document into the terminal turns it into an `@path` mention. An image from outside the project is attached the same way as with `Alt+V`.
+- **PDFs**: sent as a document to models that read PDFs (up to 32 MB and 100 pages), and shown as `[PDF · report.pdf · 12 pages]`. Other models get the text.
+- **Word, Excel and PowerPoint** (`.docx`, `.xlsx`, `.pptx`) are attached as text, with headings and tables as markdown, one section per sheet or slide, and slide notes. A long one is saved to `.dostuff/attachments/` and the model reads it from there. The old `.doc` / `.xls` / `.ppt` formats are refused, and the reason is shown.
+- **`read_file` opens images, PDFs and Office files** the same way, so the agent can look at a screenshot or a spreadsheet by itself. Images returned by MCP tools also reach the model.
+- **New extras**: `dostuff[docs]` (needed to convert Office files and PDFs to text) and `dostuff[images]` (Pillow: downscales images over 1568 px or 3.75 MB, and reads the clipboard directly). `dostuff[full]` includes both.
+- **`vision` / `pdf_input`** on a `models:` entry, for a model dostuff can't identify, and `loop.attachment_retention_days` (30 by default), after which stored attachments are deleted.
+
+### Changed
+- **`UserPromptSubmit` hooks** get an `attachments` list (`name`, `kind`, `path`). In `prompt`, images and documents appear as `[Image: name]` / `[PDF: name]`.
+
 ## [0.2.13] - 2026-11-08
 
 The TUI appears about twice as fast when you start it.

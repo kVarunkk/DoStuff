@@ -915,3 +915,53 @@ def test_init_keeps_keys_out_of_git(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
     assert (tmp_path / ".dostuff" / ".gitignore").read_text().splitlines() == [".env*", "mcp_config.json"]
+
+
+# --- multimodal T1.11 (plan/2026-11-08-multimodal-input): images in -p ---------------------------
+
+def _headless_vision(monkeypatch, value: bool):
+    from dostuff.lib import model as model_module
+    monkeypatch.setattr(model_module, "model_supports", lambda kind: value if kind == "vision" else False)
+
+
+def test_headless_image_mention(env, headless_agents, monkeypatch, capsys):
+    from conftest import fake_response
+    from test_attachments import png_bytes
+    fm = headless_agents
+    Path("shot.png").write_bytes(png_bytes(1280, 720))
+    _headless_vision(monkeypatch, True)
+    fm.script(None, fake_response("a red square"))
+    assert _run_headless("what is @shot.png") == 0
+    out, err = capsys.readouterr()
+    assert out.strip() == "a red square"
+    sent = [m for m in fm.calls[0]["messages"] if m["role"] == "user"][-1]["content"]
+    assert any(p.get("type") == "image_url" for p in sent)
+    assert "Attached shot.png (1280×720)" in err
+
+
+def test_headless_refused_image_exits_1(env, headless_agents, monkeypatch, capsys):
+    fm = headless_agents
+    from test_attachments import png_bytes
+    Path("shot.png").write_bytes(png_bytes())
+    _headless_vision(monkeypatch, False)
+    assert _run_headless("what is @shot.png") == 1
+    out, err = capsys.readouterr()
+    assert "Not attached: shot.png: openai/gpt-4o-mini can't read images" in err
+    assert out == "" and not fm.calls  # nothing sent
+
+
+def test_headless_xlsx_mention_spills(env, headless_agents, monkeypatch, capsys):
+    """-p converts a spreadsheet and, over loop.paste_file_lines, hands the model the stored text's path."""
+    from conftest import fake_response, requires_extra
+    from test_attachments import make_xlsx
+    requires_extra("docs")
+    fm = headless_agents
+    make_xlsx(Path("b.xlsx"), rows=300)
+    _headless_vision(monkeypatch, False)
+    fm.script(None, fake_response("done"))
+    assert _run_headless("total of @b.xlsx") == 0
+    _, err = capsys.readouterr()
+    assert "Attached b.xlsx" in err
+    sent = [m for m in fm.calls[0]["messages"] if m["role"] == "user"][-1]["content"]
+    assert isinstance(sent, str) and 'converted_from="xlsx" file=".dostuff/attachments/' in sent
+    assert "| row299 |" not in sent

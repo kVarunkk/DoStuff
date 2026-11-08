@@ -10,7 +10,8 @@ later, so a message whose attachments are still being read holds back the ones s
 the reverse.
 """
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -20,6 +21,7 @@ class SteerMessage:
     raw: str                   # what the user typed (shown, re-queued as a leftover, put back on Esc)
     content: str | None = None # prepared text for the model (D5); None until ready
     failed: str | None = None  # preparation error, shown instead of delivering
+    parts: list[dict[str, Any]] = field(default_factory=list)  # image refs sent after the text (multimodal REQ-2.4)
 
 
 class SteeringQueue:
@@ -34,11 +36,12 @@ class SteeringQueue:
         self._entries.append(msg)
         return msg
 
-    def ready(self, msg_id: str, content: str) -> None:
+    def ready(self, msg_id: str, content: str, parts: list[dict[str, Any]] | None = None) -> None:
         """Preparation finished: this entry can be delivered at the next tool boundary."""
         for msg in self._entries:
             if msg.id == msg_id:
                 msg.content = content
+                msg.parts = list(parts or [])
                 return
 
     def fail(self, msg_id: str, error: str) -> None:

@@ -10,6 +10,33 @@ import pytest
 _hook_ids = itertools.count()
 
 
+# --- optional extras (plan/2026-11-08-multimodal-input, CON-010) -------------------------------
+
+EXTRA_MODULES = {
+    "images": ["PIL"],
+    "docs": ["pypdf", "docx", "openpyxl", "pptx"],
+}
+
+
+def requires_extra(name: str) -> None:
+    """Skip the calling test when `dostuff[name]` isn't installed — or fail it, when DOSTUFF_REQUIRE_EXTRAS=1
+    (CI), so a broken extra can't quietly turn into skipped tests."""
+    import importlib
+    import os
+    missing = []
+    for module in EXTRA_MODULES[name]:
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            missing.append(module)
+    if not missing:
+        return
+    reason = f"needs dostuff[{name}] (missing: {', '.join(missing)})"
+    if os.environ.get("DOSTUFF_REQUIRE_EXTRAS") == "1":
+        pytest.fail(reason)
+    pytest.skip(reason)
+
+
 @pytest.fixture
 def hook_cmd(tmp_path):
     """`hook_cmd(body)`: write a hook script and return a shell command running it with this interpreter.

@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import aiosqlite
+from dostuff.helpers.agent.attachments import content_text, is_ref
 from dostuff.helpers.agent.file_mentions import strip_attachments
 from dostuff.helpers.agent.turn_context import HIDDEN_LIKE_PATTERN
 from dostuff.helpers.memory.shell_step import parse_shell_step
@@ -498,6 +499,9 @@ def _session_title(step_json: str | None) -> str:
         content = json.loads(step_json).get("content")
     except (json.JSONDecodeError, AttributeError):
         return ""
+    if isinstance(content, list):  # a prompt with images (multimodal spec REQ-1.4)
+        title = " ".join(strip_attachments(content).split())
+        return title or " ".join(content_text([p for p in content if is_ref(p)]).split())
     if not isinstance(content, str):
         return ""
     shell = parse_shell_step(content)

@@ -46,6 +46,11 @@ class _Refused(Exception):
     or an untrusted fail_closed project hook can't be asked about. Nothing is stored."""
 
 
+class _NotAttached(Exception):
+    """An @mentioned image can't be sent (the model can't read images, too large, too many): exit code 1, before
+    hooks and before anything is stored or sent (multimodal spec REQ-2.3)."""
+
+
 class HeadlessAdapter:
     """Prints loop() events to stderr and asks for approval on the terminal (if any)."""
 
@@ -341,15 +346,19 @@ async def run_headless(
         skill_run = parse_skill_command(prompt, commands)  # `-p "/<name> args"`
         mentions = skill_mentions(prompt, commands)  # what was typed, before anything expands
         expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else prompt,
-                                            config.max_tool_output_chars)
+                                            config.max_tool_output_chars, file_lines=config.paste_file_lines)
         if expansion.attached:
             adapter._progress("Attached " + ", ".join(expansion.attached))
         if expansion.skipped:
             adapter.emit("error", "Not attached: " + "; ".join(expansion.skipped))
-        content = await asyncio.to_thread(skill_prompt, skill_run[0], expansion.content) if skill_run else expansion.content
-        content = with_mention_note(content, mentions)
+        if expansion.refused:
+            raise _NotAttached("Not attached: " + "; ".join(expansion.refused))
+        text = await asyncio.to_thread(skill_prompt, skill_run[0], expansion.content) if skill_run else expansion.content
+        text = with_mention_note(text, mentions)
         if mentions:
             adapter._progress(mention_line(mentions))
+        # Text first, then the images (multimodal D10); a plain string when nothing visual is attached (CON-007)
+        content: str | list[dict[str, Any]] = [{"type": "text", "text": text}, *expansion.parts] if expansion.parts else text
         # SessionStart, then UserPromptSubmit: both before the user step is appended (hooks spec D1)
         session_hook_context: dict[str, str] = {}
         await session_start("resume" if meta else "startup", session_hook_context, session_id=session_id,
@@ -406,6 +415,9 @@ async def run_headless(
     except _Refused as e:
         _err(str(e))
         code = 2
+    except _NotAttached as e:
+        _err(str(e))
+        code = 1
     except Exception as e:
         _err(f"Error: {e}")
         code = 1
