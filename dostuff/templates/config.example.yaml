@@ -13,6 +13,7 @@ models:
     active: false
     # api_key_env: "MY_GEMINI_KEY"  # optional: read the key from this env var instead of GEMINI_API_KEY
     # vision: auto   # can it read images? auto asks litellm; true / false for models litellm doesn't know
+    # pdf_input: auto  # can it read PDFs itself? if not, dostuff sends their text (needs dostuff[docs])
 
 loop:
   max_iterations: 100  # max agent turns before forced exit; ESC cancels anytime
