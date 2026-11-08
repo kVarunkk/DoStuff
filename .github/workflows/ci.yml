@@ -21,8 +21,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install
-        run: python -m pip install -e ".[dev,memory]"
+        run: python -m pip install -e ".[dev,memory,docs,images]"
       - name: Type check
         run: python -m mypy dostuff --ignore-missing-imports
       - name: Tests
         run: python -m pytest -q tests
+        env:
+          # tests that need an extra fail instead of skipping (tests/conftest.py requires_extra)
+          DOSTUFF_REQUIRE_EXTRAS: "1"
