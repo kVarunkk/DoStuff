@@ -29,7 +29,10 @@ OFFICE_MEMBERS = {"word/document.xml": "docx", "xl/workbook.xml": "xlsx", "ppt/p
 
 # REQ-6.3 / REQ-6.4: Anthropic's caps (5 MB of base64 per image), the strictest of the providers LiteLLM reaches
 MAX_IMAGE_BYTES = 5 * 1024 * 1024 * 3 // 4
+MAX_PDF_BYTES = 32 * 1024 * 1024
+MAX_PDF_PAGES = 100
 MAX_PER_STEP = 20
+RESIZE_LONG_EDGE = 1568  # D5: with Pillow, wider images are downscaled to this before they are stored
 
 # D9: Anthropic's documented image formula, capped; close enough for other providers
 IMAGE_TOKENS_MAX = 1600
@@ -142,12 +145,79 @@ def _has_pillow() -> bool:
     return True
 
 
-def image_problem(data: bytes) -> str | None:
-    """Why this image can't be sent as it is (too large), or None (REQ-6.3)."""
+def _encode(img: Any, fmt: str, **options: Any) -> bytes:
+    import io
+    buf = io.BytesIO()
+    img.save(buf, fmt, **options)
+    return buf.getvalue()
+
+
+def _resized(data: bytes) -> bytes:
+    """`data` downscaled to a RESIZE_LONG_EDGE long edge, in its own format; as JPEG when that is still over
+    MAX_IMAGE_BYTES and the image has no transparency (D5). Needs Pillow."""
+    import io
+    from PIL import Image
+    with Image.open(io.BytesIO(data)) as img:
+        img.load()
+        fmt = (img.format or "PNG").upper()
+        img.thumbnail((RESIZE_LONG_EDGE, RESIZE_LONG_EDGE))
+        alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+        if fmt == "JPEG":
+            out = _encode(img.convert("RGB"), "JPEG", quality=85)
+        elif fmt == "WEBP":
+            out = _encode(img, "WEBP", quality=85)
+        else:  # PNG, and a GIF (only resized when it is too large) loses its animation
+            out = _encode(img if fmt == "PNG" else img.convert("RGBA" if alpha else "RGB"), "PNG", optimize=True)
+        if len(out) > MAX_IMAGE_BYTES and not alpha:
+            out = _encode(img.convert("RGB"), "JPEG", quality=80)
+        return out
+
+
+def prepare_image(data: bytes) -> tuple[bytes, str | None]:
+    """The bytes to send for an image, and why it can't be sent (too large), or None (REQ-6.3).
+
+    With Pillow, an image over the size limit or with a long edge over RESIZE_LONG_EDGE (providers downscale those
+    anyway; a GIF only when over the size limit) is downscaled first; without it, an image is sent as it is."""
+    pillow = _has_pillow()
+    size = image_size(data)
+    wide = size is not None and max(size) > RESIZE_LONG_EDGE and _image_format(data[:16]) != "gif"
+    if pillow and (len(data) > MAX_IMAGE_BYTES or wide):
+        try:
+            data = _resized(data)
+        except Exception:  # Pillow can't read it: send it as it is when it fits, else refuse below
+            pass
     if len(data) <= MAX_IMAGE_BYTES:
-        return None
+        return data, None
     reason = f"{_megabytes(len(data))} is over the {_megabytes(MAX_IMAGE_BYTES)} image limit"
-    return reason if _has_pillow() else reason + "; install dostuff[images] to resize"
+    return data, reason if pillow else reason + "; install dostuff[images] to resize"
+
+
+def pdf_problem(data: bytes) -> str | None:
+    """Why this PDF can't go to the model as a document (over the native limits), or None (REQ-6.3)."""
+    if len(data) > MAX_PDF_BYTES:
+        return f"{_megabytes(len(data))} is over the {_megabytes(MAX_PDF_BYTES)} PDF limit"
+    pages = pdf_page_count(data)
+    if pages > MAX_PDF_PAGES:
+        return f"{pages} pages is over the {MAX_PDF_PAGES}-page PDF limit"
+    return None
+
+
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+LEGACY_OFFICE = {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}
+
+
+def legacy_office_reason(path: Path) -> str | None:
+    """Why an old binary Office file (.doc / .xls / .ppt) isn't attached, or None for anything else (REQ-4.4)."""
+    newer = LEGACY_OFFICE.get(path.suffix.lower())
+    if newer is None:
+        return None
+    try:
+        with path.open("rb") as f:
+            if f.read(8) != _OLE_MAGIC:
+                return None
+    except OSError:
+        return None
+    return f"{path.suffix.lower()} files aren't supported; save it as {newer}"
 
 
 class AttachmentStore:
@@ -173,12 +243,7 @@ class AttachmentStore:
         else:
             raise ValueError(f"{name}: not an image or a PDF")
         digest = hashlib.sha256(data).hexdigest()[:16]
-        folder = self.root / ATTACHMENT_DIR
-        folder.mkdir(parents=True, exist_ok=True)
-        ignore = folder / ".gitignore"
-        if not ignore.exists():
-            ignore.write_text("*\n", encoding="utf-8")  # keep attachments out of git without touching the repo's
-        path = folder / f"{digest}.{EXTENSIONS[media_type]}"
+        path = self._folder() / f"{digest}.{EXTENSIONS[media_type]}"
         if not path.is_file():
             path.write_bytes(data)
         ref: dict[str, Any] = {"type": REF_TYPE, "id": digest, "kind": kind, "media_type": media_type, "name": name,
@@ -190,6 +255,23 @@ class AttachmentStore:
         else:
             ref["pages"] = pdf_page_count(data)
         return ref
+
+    def add_text(self, text: str) -> str:
+        """Store a converted document's text as `<sha16>.md` and return its path relative to the root (REQ-4.2)."""
+        data = text.encode("utf-8")
+        folder = self._folder()
+        path = folder / f"{hashlib.sha256(data).hexdigest()[:16]}.md"
+        if not path.is_file():
+            path.write_bytes(data)
+        return (ATTACHMENT_DIR / path.name).as_posix()
+
+    def _folder(self) -> Path:
+        folder = self.root / ATTACHMENT_DIR
+        folder.mkdir(parents=True, exist_ok=True)
+        ignore = folder / ".gitignore"
+        if not ignore.exists():
+            ignore.write_text("*\n", encoding="utf-8")  # keep attachments out of git without touching the repo's
+        return folder
 
 
 def is_ref(part: Any) -> bool:

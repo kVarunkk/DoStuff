@@ -13,16 +13,18 @@ from typing import Any
 from dostuff.helpers.agent import attachments
 from dostuff.helpers.agent.attachments import AttachmentStore, classify_attachment, content_text, image_size, is_ref
 from dostuff.helpers.agent.clipboard import PLACEHOLDER_RE, PastedImages
+from dostuff.helpers.agent.pastes import PREVIEW_LINES
 from dostuff.helpers.agent.tool_output import truncate_tool_output
 from dostuff.helpers.tools.resolve_safe_path import is_denied_for_read, resolve_safe_path
 from dostuff.lib.exceptions import PathAccessDenied, PathOutsideProject
-from dostuff.tools.files.read_file import read_file
+from dostuff.tools.files.read_file import number_lines, read_file
 from dostuff.tools.search.walk import display_path, is_excluded_dir
 
 MENTION_RE = re.compile(r'(?<!\S)@("[^"\n]+"|[^\s"]+)')
 # The mention being typed at the cursor (for completion)
 PARTIAL_MENTION_RE = re.compile(r'(?:^|\s)(@"?[^\s"]*)$')
-ATTACHMENT_RE = re.compile(r'\n*<attached_(file|dir) path="([^"]*)">.*?</attached_\1>', re.S)
+# A converted document's block has more attributes after the path (converted_from, file, lines)
+ATTACHMENT_RE = re.compile(r'\n*<attached_(file|dir) path="([^"]*)"[^>\n]*>.*?</attached_\1>', re.S)
 # helpers/skills/skill_command.py writes this block. Matched on its first sentence, so a user asking about the
 # tag is left alone.
 MENTION_NOTE_HEAD = "<skill-mentions>\nThe user named these skills in the message above."
@@ -87,43 +89,80 @@ def _resolve_mention(raw: str, root: Path) -> Path | None:
     return None
 
 
+def converted_block(shown: str, kind: str, body: str, store: AttachmentStore, max_chars: int = 0,
+                    file_lines: int = 0) -> str:
+    """A converted document as an <attached_file> block (REQ-4.2): inline, numbered like read_file output and capped
+    at `max_chars`; or, over `file_lines` lines / `max_chars` chars, saved to the store as `<id>.md` with a preview,
+    for the model to read with read_file or grep (the pastes pattern). `file_lines` 0 keeps it inline."""
+    lines = body.splitlines()
+    head = f'<attached_file path="{shown}" converted_from="{kind}"'
+    if file_lines <= 0 or (len(lines) <= file_lines and (max_chars <= 0 or len(body) <= max_chars)):
+        return f"{head}>\n{truncate_tool_output(number_lines(lines), max_chars)}\n</attached_file>"
+    stored = store.add_text(body)
+    return (f'{head} file="{stored}" lines="{len(lines)}">\n'
+            f"{shown} was converted from {kind} to text: {len(lines):,} lines, saved to {stored} instead of being "
+            "included here, to save context. Read the parts you need with read_file (offset/limit) or search it "
+            f"with grep, rather than reading the whole file at once. Preview:\n"
+            f"{number_lines(lines, 1, PREVIEW_LINES)}\n</attached_file>")
+
+
 def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None,
-                         images: PastedImages | None = None) -> Expansion:
+                         images: PastedImages | None = None, file_lines: int = 0) -> Expansion:
     """Append an <attached_file> / <attached_dir> block for each `@path` in `text`.
 
-    Files come numbered like read_file output and capped at `max_chars` each (0 = no cap). Images — mentioned, or
-    an `[Image #N]` that `images` holds (alt+v, REQ-3.2) — go to the attachment store and come back as refs in
-    `parts`, in prompt order, or as reasons in `refused` (the model can't read images, too large, too many); with
-    any refused, nothing is stored. An `[Image #N]` that `images` doesn't hold stays plain text.
+    Files come numbered like read_file output and capped at `max_chars` each (0 = no cap). Images and PDFs the
+    model can read — mentioned, or an `[Image #N]` that `images` holds (alt+v, REQ-3.2) — go to the attachment
+    store and come back as refs in `parts`, in prompt order, or as reasons in `refused` (the model can't read
+    images, too large, too many); with any refused, nothing is stored. Word, Excel and PowerPoint files, and PDFs
+    the model can't read, are converted to text (`converted_block`, spilled over `file_lines`). An `[Image #N]`
+    that `images` doesn't hold stays plain text.
     """
     root = (root or Path.cwd()).resolve()
     result = Expansion(content=text)
-    blocks: list[str] = []
+    # Text blocks, and converted documents as (shown, kind, text): those are written out once nothing is refused
+    blocks: list[str | tuple[str, str, str]] = []
     seen: set[Path] = set()
     # (position in text, attached entry, name, bytes): stored once nothing is refused
     found: list[tuple[int, str, str, bytes]] = []
-    vision: bool | None = None  # asked once, at the first image
+    capable: dict[str, bool] = {}  # asked once, at the first image / PDF
 
-    def check_image(shown: str, data: bytes) -> bool:
-        """False (and the reason in `refused`) when this image can't be sent."""
-        nonlocal vision
+    def supports(kind: str) -> bool:
         from dostuff.lib import model as model_lib  # lazy: litellm stays off the TUI's first frame
-        if vision is None:
-            vision = model_lib.model_supports("vision")
-        if not vision:
+        if kind not in capable:
+            capable[kind] = model_lib.model_supports("vision" if kind == "vision" else "pdf")
+        return capable[kind]
+
+    def check_image(shown: str, data: bytes) -> bytes | None:
+        """The bytes to send (downscaled when Pillow is there), or None and the reason in `refused`."""
+        from dostuff.lib import model as model_lib
+        if not supports("vision"):
             result.refused.append(f"{shown}: {model_lib.get_model()} can't read images")
-            return False
-        problem = attachments.image_problem(data)
+            return None
+        data, problem = attachments.prepare_image(data)
         if problem:
             result.refused.append(f"{shown}: {problem}")
-            return False
-        return True
+            return None
+        return data
 
-    def add_image(position: int, shown: str, name: str, data: bytes) -> None:
-        size = image_size(data)
-        entry = f"{shown} ({size[0]}×{size[1]})" if size else shown
+    def add_visual(position: int, shown: str, name: str, data: bytes) -> None:
+        if data.startswith(b"%PDF-"):
+            pages = attachments.pdf_page_count(data)
+            entry = f"{shown} ({pages} page{'s' if pages != 1 else ''})"
+        else:
+            size = image_size(data)
+            entry = f"{shown} ({size[0]}×{size[1]})" if size else shown
         result.attached.append(entry)
         found.append((position, entry, name, data))
+
+    def convert(path: Path, shown: str, kind: str) -> None:
+        from dostuff.helpers.agent.convert_document import convert_document  # lazy: the [docs] libraries
+        try:
+            body = convert_document(path, kind)
+        except (ImportError, OSError, ValueError) as e:  # MissingExtra is an ImportError and names the extra
+            result.refused.append(f"{shown}: {e}")
+            return
+        blocks.append((shown, kind, body))
+        result.attached.append(shown)
 
     for match in MENTION_RE.finditer(text):
         path = _resolve_mention(match.group(1), root)
@@ -135,17 +174,31 @@ def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None
             blocks.append(f'<attached_dir path="{shown}/">\n{_dir_listing(path)}\n</attached_dir>')
             result.attached.append(shown.rstrip("/") + "/")
             continue
-        if classify_attachment(path) == "image":
-            if is_denied_for_read(path):
-                result.skipped.append(f"{shown}: may contain secrets")
-                continue
+        kind = classify_attachment(path)
+        legacy = attachments.legacy_office_reason(path) if kind is None else None
+        if (kind or legacy) and is_denied_for_read(path):
+            result.skipped.append(f"{shown}: may contain secrets")
+            continue
+        if legacy:  # REQ-4.4: reported, not guessed at
+            result.refused.append(f"{shown}: {legacy}")
+            continue
+        if kind in ("image", "pdf"):
             try:
                 data = path.read_bytes()
             except OSError as e:
                 result.refused.append(f"{shown}: {e}")
                 continue
-            if check_image(shown, data):
-                add_image(match.start(), shown, path.name, data)
+            if kind == "image":
+                prepared = check_image(shown, data)
+                if prepared is not None:
+                    add_visual(match.start(), shown, path.name, prepared)
+            elif supports("pdf") and attachments.pdf_problem(data) is None:
+                add_visual(match.start(), shown, path.name, data)
+            else:  # a model that can't read PDFs, or one over the native limits: its text (REQ-2.2)
+                convert(path, shown, "pdf")
+            continue
+        if kind is not None:  # docx / xlsx / pptx
+            convert(path, shown, kind)
             continue
         if _is_binary(path):
             result.skipped.append(f"{shown}: binary file")
@@ -169,8 +222,9 @@ def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None
                 continue
             numbers.add(number)
             name = f"Image #{number}"
-            if check_image(name, pasted):
-                add_image(match.start(), name, name, pasted)
+            prepared = check_image(name, pasted)
+            if prepared is not None:
+                add_visual(match.start(), name, name, prepared)
         if numbers:  # in prompt order, mentioned and pasted ones together (D10); files keep their place
             found.sort(key=lambda image: image[0])
             in_order = iter([image[1] for image in found])
@@ -182,11 +236,13 @@ def expand_file_mentions(text: str, max_chars: int = 0, root: Path | None = None
     if result.refused:  # the turn won't run: store nothing, and don't say the images were attached
         entries = [image[1] for image in found]
         result.attached = [a for a in result.attached if a not in entries]
+        rendered = [b for b in blocks if isinstance(b, str)]
     else:
         store = AttachmentStore(root=root)
         result.parts = [store.add(data, name=name) for _, _, name, data in found]
-    if blocks:
-        result.content = text + "\n\n" + "\n\n".join(blocks)
+        rendered = [b if isinstance(b, str) else converted_block(*b, store, max_chars, file_lines) for b in blocks]
+    if rendered:
+        result.content = text + "\n\n" + "\n\n".join(rendered)
     return result
 
 

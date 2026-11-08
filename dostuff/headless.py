@@ -346,7 +346,7 @@ async def run_headless(
         skill_run = parse_skill_command(prompt, commands)  # `-p "/<name> args"`
         mentions = skill_mentions(prompt, commands)  # what was typed, before anything expands
         expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else prompt,
-                                            config.max_tool_output_chars)
+                                            config.max_tool_output_chars, file_lines=config.paste_file_lines)
         if expansion.attached:
             adapter._progress("Attached " + ", ".join(expansion.attached))
         if expansion.skipped:

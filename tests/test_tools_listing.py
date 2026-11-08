@@ -16,7 +16,7 @@ def test_every_offered_tool_is_listed_with_how_it_asks_and_subagent_access():
     assert "never" in _row(text, "read_file")
     assert "unless read-only" in _row(text, "bash_command")
     assert "always" in _row(text, "edit_config")
-    assert "Read a text file" in _row(text, "read_file")  # first sentence of the description
+    assert "Read a file, returning numbered lines" in _row(text, "read_file")  # first sentence of the description
 
 
 def test_mcp_tools_are_grouped_per_server():

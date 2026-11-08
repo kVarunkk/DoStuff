@@ -9,10 +9,12 @@ from dostuff.helpers.agent.manage_context import compact_context
 from dostuff.agent.call_agent import call_agent, take_unavailable_attachments
 from opentelemetry.trace import Status, StatusCode
 from dostuff.helpers.agent.append_step import append_step
+from dostuff.helpers.agent.attachments import ref_chips
+from dostuff.helpers.agent.tool_attachments import collecting, tool_attachment_step
 import asyncio
 import inspect
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, PLAN_MODE_OFF_INSTRUCTION, SessionPermissions
 from dostuff.agent.run_tool import (
     CANCELLED_RESULT, authorize_batch, authorize_tool, dispatch_tool, post_tool_use, pre_tool_use,
@@ -106,6 +108,8 @@ class _ToolCall:
     error: str | None = None  # set when the call can't run (bad JSON, unavailable tool, denied)
     result: str | None = None
     hook: HookOutcome | None = None  # its PreToolUse outcome, an input to the permission check
+    # Images / PDFs the call opened (read_file, MCP), sent in one user step after the tool results (multimodal D8)
+    attachments: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _parse_tool_calls(tool_calls: list[Any], tool_names: list[str] | None) -> list[_ToolCall]:
@@ -571,10 +575,16 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         cancelled = True
                         break
 
+                async def dispatch_collecting(call: _ToolCall, fork: ForkContext | None) -> Any:
+                    # Its own collector: in this task's context, so parallel calls don't mix their images (D8)
+                    with collecting() as found:
+                        call.attachments = found
+                        return await dispatch_tool(call.name, dict(call.args), mcp_client=mcp_client, session_id=session_id, turn_id=turn_id, adapter=adapter, permissions=permissions, owner=owner, fork_context=fork)
+
                 def start(call: _ToolCall) -> asyncio.Task:
                     fork = fork_context() if call.name in _FORK_TOOLS else None
                     return asyncio.ensure_future(asyncio.wait_for(
-                        dispatch_tool(call.name, dict(call.args), mcp_client=mcp_client, session_id=session_id, turn_id=turn_id, adapter=adapter, permissions=permissions, owner=owner, fork_context=fork),
+                        dispatch_collecting(call, fork),
                         timeout=None if call.name in _UNTIMED_TOOLS else TOOL_TIMEOUT_S,
                     ))
 
@@ -584,8 +594,11 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     for call, task in zip(batch, tasks):
                         if task.cancelled():
                             call.result = CANCELLED_RUNNING_RESULT if _is_thread_tool(call.name) else CANCELLED_RESULT
+                            call.attachments = []
                             continue
                         exc = task.exception()
+                        if exc is not None:
+                            call.attachments = []
                         if isinstance(exc, asyncio.TimeoutError):
                             call.result = f"Error: tool '{call.name}' timed out after {TOOL_TIMEOUT_S:.0f}s."
                         elif exc is not None:
@@ -627,6 +640,11 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         "content": truncate_tool_output(result_text, max_tool_output_chars),
                     }
                     await append_step(result_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
+                attached = [ref for call in calls for ref in call.attachments]
+                if attached:  # after every tool step, so the provider sees tool results, then the images (D8)
+                    attachment_step = tool_attachment_step(attached)
+                    await append_step(attachment_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
+                    await loop_emit("system", ref_chips(attachment_step["content"]), adapter=adapter)
                 iter_span.set_status(Status(StatusCode.OK))
 
                 if cancelled or is_cancelled(adapter):

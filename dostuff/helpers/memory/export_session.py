@@ -4,6 +4,7 @@ from typing import Any
 
 from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE
 from dostuff.helpers.agent.attachments import content_text, refs
+from dostuff.helpers.agent.tool_attachments import is_tool_attachment_step
 from dostuff.helpers.agent.file_mentions import attached_paths, strip_attachments
 from dostuff.helpers.agent.turn_context import is_turn_context
 from dostuff.helpers.memory.shell_step import parse_shell_step
@@ -48,6 +49,9 @@ def session_to_markdown(steps: list[dict[str, Any]], meta: dict[str, Any] | None
             continue
         role = step.get("role")
         content = step.get("content") or ""
+        if is_tool_attachment_step(step):  # images / PDFs the tools above opened, not a prompt (multimodal D8)
+            lines += ["_Attached by the tools: " + ", ".join(f"`{r.get('name', '')}`" for r in refs(content)) + "_", ""]
+            continue
         if role == "user" and isinstance(content, list):  # a prompt with images: text, then what was attached
             names = attached_paths(content) + [str(r.get("name", "")) for r in refs(content)]
             lines += ["## User", "", strip_attachments(content), ""]

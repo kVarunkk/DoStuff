@@ -274,6 +274,15 @@ def test_export_list_content(tmp_path):
     assert "dostuff_attachment" not in md and "base64" not in md
 
 
+def test_export_tool_attachment_step(tmp_path):
+    from dostuff.helpers.agent.attachments import AttachmentStore
+    from dostuff.helpers.agent.tool_attachments import tool_attachment_step
+    from dostuff.helpers.memory.export_session import session_to_markdown
+    step = tool_attachment_step([AttachmentStore(root=tmp_path).add(png_bytes(), name="diagram.png")])
+    md = session_to_markdown([step], None, "s1")
+    assert "_Attached by the tools: `diagram.png`_" in md and "## User" not in md
+
+
 def test_recall_finds_list_prompt(tmp_path):
     from types import SimpleNamespace
     from dostuff.cli_tui import DostuffTUI
@@ -650,3 +659,452 @@ def test_unknown_placeholder_stays_text(tmp_path, vision):
 def test_dropped_path_text(pasted, platform, expected):
     from dostuff.helpers.agent.clipboard import dropped_path_text
     assert dropped_path_text(pasted, platform=platform) == expected
+
+
+# --- Phase 3 fixtures: documents built with the extras' own libraries ----------------------------
+
+def text_pdf(pages: list[str]) -> bytes:
+    """A real PDF with one line of text per page (Helvetica), which pypdf can extract."""
+    n = len(pages)
+    objects = ["<< /Type /Catalog /Pages 2 0 R >>",
+               "<< /Type /Pages /Kids [" + " ".join(f"{4 + 2 * i} 0 R" for i in range(n)) + f"] /Count {n} >>",
+               "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    for i, text in enumerate(pages):
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET"
+        objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {5 + 2 * i} 0 R "
+                       "/Resources << /Font << /F1 3 0 R >> >> >>")
+        objects.append(f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream")
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n{body}\nendobj\n".encode("latin-1")
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    out += "".join(f"{o:010d} 00000 n \n" for o in offsets).encode()
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return out
+
+
+def make_docx(path: Path) -> None:
+    import docx
+    doc = docx.Document()
+    doc.add_heading("Intro", level=1)
+    doc.add_paragraph("Plain words.")
+    doc.add_heading("Detail", level=2)
+    table = doc.add_table(rows=2, cols=2)
+    for r, row in enumerate([("name", "qty"), ("apple | red", "3")]):
+        for c, value in enumerate(row):
+            table.cell(r, c).text = value
+    doc.add_paragraph("After the table.")
+    doc.save(str(path))
+
+
+def make_xlsx(path: Path, rows: int = 2) -> None:
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Budget"
+    ws.append(["item", "cost"])
+    for i in range(rows):
+        ws.append([f"row{i}", i * 10])
+    ws["C1"] = "=1+2"  # a formula: the converter shows values, never the formula text
+    other = wb.create_sheet("Notes")
+    other.append(["hello"])
+    wb.create_sheet("Empty")
+    wb.save(str(path))
+
+
+def make_pptx(path: Path) -> None:
+    import pptx
+    prs = pptx.Presentation()
+    for title, body, notes in [("Kickoff", "Goals for Q1", "Say hello"), ("Plan", "Ship it", "")]:
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        slide.shapes.title.text = title
+        slide.placeholders[1].text = body
+        if notes:
+            slide.notes_slide.notes_text_frame.text = notes
+    prs.save(str(path))
+
+
+# --- T3.2 converters ----------------------------------------------------------------------------
+
+def test_convert_docx_headings_tables(tmp_path):
+    requires_extra("docs")
+    from dostuff.helpers.agent.convert_document import convert_document
+    make_docx(tmp_path / "r.docx")
+    text = convert_document(tmp_path / "r.docx", "docx")
+    assert "# Intro\n" in text and "## Detail\n" in text and "Plain words." in text
+    assert "| name | qty |\n| --- | --- |\n| apple \\| red | 3 |" in text
+    assert text.index("Plain words.") < text.index("| name") < text.index("After the table.")  # body order
+
+
+def test_convert_xlsx_sheets(tmp_path):
+    requires_extra("docs")
+    from dostuff.helpers.agent.convert_document import convert_document
+    make_xlsx(tmp_path / "b.xlsx")
+    text = convert_document(tmp_path / "b.xlsx", "xlsx")
+    assert "## Sheet: Budget" in text and "## Sheet: Notes" in text and "## Sheet: Empty\n(empty sheet)" in text
+    assert "| item | cost |" in text and "| row1 | 10 |" in text
+    assert "=1+2" not in text  # values, not formulas
+
+
+def test_convert_xlsx_caps_rows(tmp_path, monkeypatch):
+    requires_extra("docs")
+    from dostuff.helpers.agent import convert_document as conv
+    monkeypatch.setattr(conv, "MAX_SHEET_ROWS", 5)
+    make_xlsx(tmp_path / "b.xlsx", rows=20)
+    text = conv.convert_document(tmp_path / "b.xlsx", "xlsx")
+    assert "| row3 |" in text and "| row4 |" not in text and "[… 16 more rows]" in text
+
+
+def test_convert_pptx_slides_notes(tmp_path):
+    requires_extra("docs")
+    from dostuff.helpers.agent.convert_document import convert_document
+    make_pptx(tmp_path / "d.pptx")
+    text = convert_document(tmp_path / "d.pptx", "pptx")
+    assert "--- Slide 1 ---\n# Kickoff\nGoals for Q1\nNotes: Say hello" in text
+    assert "--- Slide 2 ---\n# Plan\nShip it" in text and text.count("Notes:") == 1
+
+
+def test_convert_pdf_pages(tmp_path):
+    requires_extra("docs")
+    from dostuff.helpers.agent.convert_document import convert_document
+    (tmp_path / "p.pdf").write_bytes(text_pdf(["Hello first", "Second page"]))
+    text = convert_document(tmp_path / "p.pdf", "pdf")
+    assert text.index("--- Page 1 ---") < text.index("Hello first") < text.index("--- Page 2 ---")
+    assert "Second page" in text
+
+
+def test_convert_without_extra(tmp_path, monkeypatch):
+    from dostuff.helpers.agent.convert_document import MissingExtra, convert_document
+    monkeypatch.setitem(sys.modules, "docx", None)
+    (tmp_path / "r.docx").write_bytes(office_bytes("word/document.xml"))
+    with pytest.raises(MissingExtra, match=r"install dostuff\[docs\]"):
+        convert_document(tmp_path / "r.docx", "docx")
+
+
+def test_convert_broken_file_is_value_error(tmp_path):
+    requires_extra("docs")
+    from dostuff.helpers.agent.convert_document import convert_document
+    (tmp_path / "r.docx").write_bytes(office_bytes("word/document.xml"))  # a zip, but no real document
+    with pytest.raises(ValueError):
+        convert_document(tmp_path / "r.docx", "docx")
+
+
+# --- T3.3 converted mentions --------------------------------------------------------------------
+
+def test_mention_xlsx_inline(tmp_path, vision, monkeypatch):
+    requires_extra("docs")
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions, strip_attachments
+    monkeypatch.chdir(tmp_path)
+    make_xlsx(tmp_path / "b.xlsx")
+    vision(False)  # converted attachments don't need a vision model
+    exp = expand_file_mentions("sum @b.xlsx", root=tmp_path, file_lines=200)
+    assert exp.refused == [] and exp.skipped == [] and exp.parts == [] and exp.attached == ["b.xlsx"]
+    assert '<attached_file path="b.xlsx" converted_from="xlsx">' in exp.content and "| row1 | 10 |" in exp.content
+    assert strip_attachments(exp.content) == "sum @b.xlsx"  # display and export still see the typed text
+    assert not (tmp_path / ".dostuff" / "attachments").exists()
+
+
+def test_mention_big_xlsx_spills_to_store(tmp_path, vision, monkeypatch):
+    requires_extra("docs")
+    import re
+    from dostuff.helpers.agent.file_mentions import attached_paths, expand_file_mentions, strip_attachments
+    from dostuff.tools.files.read_file import read_file
+    monkeypatch.chdir(tmp_path)
+    make_xlsx(tmp_path / "b.xlsx", rows=60)
+    vision(False)
+    exp = expand_file_mentions("@b.xlsx", root=tmp_path, file_lines=20)
+    assert exp.refused == [] and exp.attached == ["b.xlsx"]
+    spilled = re.search(r'file="(\.dostuff/attachments/[0-9a-f]{16}\.md)"', exp.content).group(1)
+    assert "read_file" in exp.content and "| row0 | 0 |" in exp.content  # path, how to read it, a preview
+    assert "| row59 |" not in exp.content
+    assert "| row59 | 590 |" in read_file(spilled, offset=60)  # the rest, by offset
+    assert strip_attachments(exp.content) == "@b.xlsx" and attached_paths(exp.content) == ["b.xlsx"]
+
+
+def test_mention_docx_without_extra(tmp_path, vision, monkeypatch):
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    monkeypatch.setitem(sys.modules, "docx", None)
+    (tmp_path / "r.docx").write_bytes(office_bytes("word/document.xml"))
+    exp = expand_file_mentions("@r.docx", root=tmp_path)
+    assert exp.refused == ["r.docx: install dostuff[docs] to read .docx files"] and exp.attached == []
+
+
+def test_mention_legacy_doc_unsupported(tmp_path, vision):
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    (tmp_path / "old.doc").write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 64)
+    (tmp_path / "old.xls").write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 64)
+    exp = expand_file_mentions("@old.doc @old.xls", root=tmp_path)
+    assert exp.refused == ["old.doc: .doc files aren't supported; save it as .docx",
+                           "old.xls: .xls files aren't supported; save it as .xlsx"]
+
+
+def test_mention_secret_document_skipped(tmp_path, vision):
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    (tmp_path / ".env.docx").write_bytes(office_bytes("word/document.xml"))
+    exp = expand_file_mentions("@.env.docx", root=tmp_path)
+    assert exp.skipped == [".env.docx: may contain secrets"] and exp.refused == []
+
+
+# --- T3.4 native PDF ----------------------------------------------------------------------------
+
+def test_pdf_native_when_supported(tmp_path, vision):
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    (tmp_path / "r.pdf").write_bytes(pdf_bytes(3))
+    vision(True, pdf=True)
+    exp = expand_file_mentions("summarise @r.pdf", root=tmp_path)
+    assert exp.refused == [] and exp.attached == ["r.pdf (3 pages)"]
+    assert [(p["kind"], p["pages"]) for p in exp.parts] == [("pdf", 3)]
+    assert "<attached_file" not in exp.content
+
+
+def test_pdf_falls_back_to_text(tmp_path, vision, monkeypatch):
+    requires_extra("docs")
+    from dostuff.helpers.agent import attachments
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "r.pdf").write_bytes(text_pdf(["Hello first", "Second page"]))
+    vision(True, pdf=False)
+    exp = expand_file_mentions("@r.pdf", root=tmp_path)
+    assert exp.parts == [] and exp.refused == [] and exp.attached == ["r.pdf"]
+    assert 'converted_from="pdf"' in exp.content and "--- Page 1 ---" in exp.content
+    # Over the native limits on a PDF model: text too, rather than a request the provider rejects
+    monkeypatch.setattr(attachments, "MAX_PDF_PAGES", 1)
+    vision(True, pdf=True)
+    exp = expand_file_mentions("@r.pdf", root=tmp_path)
+    assert exp.parts == [] and 'converted_from="pdf"' in exp.content
+
+
+def test_pdf_fallback_without_extra(tmp_path, vision, monkeypatch):
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    monkeypatch.setitem(sys.modules, "pypdf", None)
+    (tmp_path / "r.pdf").write_bytes(pdf_bytes(1))
+    vision(True, pdf=False)
+    exp = expand_file_mentions("@r.pdf", root=tmp_path)
+    assert exp.refused == ["r.pdf: install dostuff[docs] to read .pdf files"]
+
+
+# --- T3.5 resize --------------------------------------------------------------------------------
+
+def _noise_png(width: int, height: int) -> bytes:
+    import io
+    import os
+    from PIL import Image
+    img = Image.frombytes("RGB", (width, height), os.urandom(width * height * 3))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def test_resize_long_edge_1568(tmp_path, vision):
+    requires_extra("images")
+    from dostuff.helpers.agent.attachments import image_size, prepare_image
+    from dostuff.helpers.agent.file_mentions import expand_file_mentions
+    data, problem = prepare_image(_noise_png(3000, 1000))
+    assert problem is None and image_size(data) == (1568, 523)
+    small = _noise_png(100, 50)
+    assert prepare_image(small) == (small, None)  # within the limits: the bytes are left alone
+    (tmp_path / "wide.png").write_bytes(_noise_png(2000, 400))
+    vision(True)
+    exp = expand_file_mentions("@wide.png", root=tmp_path)
+    assert exp.refused == [] and (exp.parts[0]["width"], exp.parts[0]["height"]) == (1568, 314)
+    assert exp.attached == ["wide.png (1568×314)"]
+
+
+def test_resize_still_too_large(monkeypatch):
+    requires_extra("images")
+    from dostuff.helpers.agent import attachments
+    monkeypatch.setattr(attachments, "MAX_IMAGE_BYTES", 50)
+    _, problem = attachments.prepare_image(_noise_png(40, 40))
+    assert problem is not None and "over the" in problem and "install" not in problem
+
+
+def test_oversized_without_pillow(monkeypatch):
+    from dostuff.helpers.agent import attachments
+    monkeypatch.setitem(sys.modules, "PIL", None)
+    wide = png_bytes(3000, 2)
+    assert attachments.prepare_image(wide) == (wide, None)  # no Pillow: sent as it is when it fits
+    monkeypatch.setattr(attachments, "MAX_IMAGE_BYTES", 10)
+    _, problem = attachments.prepare_image(wide)
+    assert problem is not None and problem.endswith("install dostuff[images] to resize")
+
+
+# --- T4.1 read_file -----------------------------------------------------------------------------
+
+def test_read_file_image_returns_note(tmp_path, vision, monkeypatch):
+    from dostuff.helpers.agent.tool_attachments import collecting
+    from dostuff.tools.files.read_file import read_file
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "diagram.png").write_bytes(png_bytes(800, 600))
+    vision(True)
+    with collecting() as found:
+        out = read_file("docs/diagram.png")
+    assert out == "Image docs/diagram.png (800×600) is attached in the next message."
+    assert [(r["kind"], r["name"], r["width"]) for r in found] == [("image", "diagram.png", 800)]
+    assert (tmp_path / found[0]["path"]).read_bytes() == png_bytes(800, 600)
+
+
+def test_read_file_image_without_vision(tmp_path, vision, monkeypatch):
+    from dostuff.helpers.agent.tool_attachments import collecting
+    from dostuff.tools.files.read_file import read_file
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "diagram.png").write_bytes(png_bytes())
+    vision(False)
+    with collecting() as found:
+        assert read_file("docs/diagram.png") == "This model can't view images; docs/diagram.png was not read."
+    assert found == [] and not (tmp_path / ".dostuff" / "attachments").exists()
+
+
+def test_read_file_image_outside_a_turn(tmp_path, vision, monkeypatch):
+    from dostuff.tools.files.read_file import read_file
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.png").write_bytes(png_bytes())
+    vision(True)
+    # no loop collecting: never claims it was attached
+    assert read_file("a.png") == "a.png was not attached (it can only be attached during an agent turn); it was not read."
+
+
+def test_read_file_docx_converted_with_offset(tmp_path, vision, monkeypatch):
+    requires_extra("docs")
+    from dostuff.tools.files.read_file import read_file
+    monkeypatch.chdir(tmp_path)
+    make_docx(tmp_path / "r.docx")
+    full = read_file("r.docx")
+    assert full.startswith(" 1\t# Intro\n 2\t\n 3\tPlain words.")  # numbers padded to the widest (11 lines)
+    part = read_file("r.docx", offset=3, limit=1)
+    assert part.splitlines()[0] == "3\tPlain words." and "continue with offset=4" in part
+
+
+def test_read_file_docx_without_extra(tmp_path, monkeypatch):
+    from dostuff.tools.files.read_file import read_file
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(sys.modules, "docx", None)
+    (tmp_path / "r.docx").write_bytes(office_bytes("word/document.xml"))
+    with pytest.raises(ImportError, match=r"install dostuff\[docs\]"):
+        read_file("r.docx")
+
+
+def test_read_file_legacy_and_pdf(tmp_path, vision, monkeypatch):
+    from dostuff.helpers.agent.tool_attachments import collecting
+    from dostuff.tools.files.read_file import read_file
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "old.ppt").write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 64)
+    with pytest.raises(ValueError, match=r"\.ppt files aren't supported"):
+        read_file("old.ppt")
+    (tmp_path / "r.pdf").write_bytes(pdf_bytes(2))
+    vision(True, pdf=True)
+    with collecting() as found:
+        assert read_file("r.pdf") == "PDF r.pdf (2 pages) is attached in the next message."
+    assert [r["kind"] for r in found] == ["pdf"]
+
+
+def test_read_file_pdf_as_text(tmp_path, vision, monkeypatch):
+    requires_extra("docs")
+    from dostuff.helpers.agent.tool_attachments import collecting
+    from dostuff.tools.files.read_file import read_file
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "r.pdf").write_bytes(text_pdf(["Hello first", "Second page"]))
+    vision(True, pdf=False)
+    with collecting() as found:
+        out = read_file("r.pdf")
+    assert found == [] and "1\t--- Page 1 ---" in out and "Second page" in out
+
+
+def test_read_file_denied_image(tmp_path, vision, monkeypatch):
+    from dostuff.lib.exceptions import PathAccessDenied
+    from dostuff.tools.files.read_file import read_file
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env.png").write_bytes(png_bytes())
+    vision(True)
+    with pytest.raises(PathAccessDenied):
+        read_file(".env.png")  # CON-008: the sandbox decides before the file is classified
+
+
+# --- T4.2 the follow-up step --------------------------------------------------------------------
+
+def _tool_turn(tmp_path, monkeypatch, fake_model, calls, adapter=None):
+    import asyncio
+    from conftest import fake_response, fake_tool_call
+    from dostuff.agent.loop import loop
+    monkeypatch.chdir(tmp_path)
+    fake_model.script(None, fake_response(tool_calls=[fake_tool_call(n, a, f"c{i}") for i, (n, a) in
+                                                      enumerate(calls)]),
+                      fake_response("it is red"))
+    working: list = [{"role": "user", "content": "look at the diagram"}]
+    result = asyncio.run(loop(session_id="s", turn_id="t", user_text="look", dynamic_system_instruction="sys",
+                              mcp_client=None, working_history=working, turn_type="subagent_loop", stream=False,
+                              max_iterations=5, tool_names=["read_file"], adapter=adapter))
+    return result, working
+
+
+def test_loop_appends_tool_attachment_step(tmp_path, vision, monkeypatch, fake_model):
+    import json
+    from conftest import FakeAdapter
+    (tmp_path / "shot.png").write_bytes(png_bytes(800, 600))
+    (tmp_path / "a.txt").write_text("hello\n")
+    vision(True)
+    adapter = FakeAdapter(auto="allow")
+    result, working = _tool_turn(tmp_path, monkeypatch, fake_model,
+                                 [("read_file", {"path": "shot.png"}), ("read_file", {"path": "a.txt"})], adapter)
+    assert result == "it is red"
+    assert [s["role"] for s in working] == ["user", "assistant", "tool", "tool", "user", "assistant"]
+    step = working[4]
+    assert step["meta"] == "tool_attachments"
+    assert [p["type"] for p in step["content"]] == ["text", "dostuff_attachment"]
+    assert "shot.png" in step["content"][0]["text"]
+    assert "base64" not in json.dumps(working)  # CON-004: refs in history, bytes only in the request
+    sent = fake_model.calls[1]["messages"]
+    assert [m["role"] for m in sent[-4:]] == ["assistant", "tool", "tool", "user"]
+    assert "meta" not in sent[-1] and [p["type"] for p in sent[-1]["content"]] == ["text", "image_url"]
+    assert ("system", "[Image #1 · shot.png · 800×600]") in adapter.events  # the chip under the tool call
+
+
+def test_loop_no_attachment_step_without_images(tmp_path, vision, monkeypatch, fake_model):
+    (tmp_path / "a.txt").write_text("hello\n")
+    vision(True)
+    _, working = _tool_turn(tmp_path, monkeypatch, fake_model, [("read_file", {"path": "a.txt"})])
+    assert [s["role"] for s in working] == ["user", "assistant", "tool", "assistant"]
+
+
+def test_exchanges_keep_tool_attachment_step(tmp_path):
+    from dostuff.helpers.agent.manage_context import _exchanges, split_by_token_budget
+    ref = {"type": "dostuff_attachment", "id": "x", "kind": "image", "media_type": "image/png", "name": "a.png",
+           "path": ".dostuff/attachments/x.png", "width": 10, "height": 10}
+    steps = [{"role": "user", "content": "q"},
+             {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+             {"role": "tool", "tool_call_id": "c1", "content": "Image a.png is attached in the next message."},
+             {"role": "user", "content": [{"type": "text", "text": "a.png"}, ref], "meta": "tool_attachments"},
+             {"role": "assistant", "content": "x" * 4000}]
+    assert [len(u) for u in _exchanges(steps)] == [1, 3, 1]
+    for budget in (1, 50, 100_000):
+        _, recent = split_by_token_budget(steps, budget)
+        assert not recent or recent[0].get("meta") != "tool_attachments"
+
+
+# --- T4.3 MCP -----------------------------------------------------------------------------------
+
+def test_mcp_image_content_becomes_ref(tmp_path, vision, monkeypatch):
+    import base64
+    from types import SimpleNamespace
+    from dostuff.helpers.agent.tool_attachments import collecting
+    from dostuff.tools.mcp.call_mcp_tool import _format_tool_result
+    monkeypatch.chdir(tmp_path)
+    data = base64.b64encode(png_bytes(4, 3)).decode()
+    result = SimpleNamespace(content=[SimpleNamespace(type="text", text="a chart"),
+                                      SimpleNamespace(type="image", data=data, mimeType="image/png")])
+    vision(True)
+    with collecting() as found:
+        out = _format_tool_result(result)
+    assert out == "a chart\nImage 1 from the tool (4×3) is attached in the next message."
+    assert [r["kind"] for r in found] == ["image"]
+    vision(False)
+    with collecting() as found:
+        assert _format_tool_result(result) == "a chart\n[image left out: this model can't view images]"
+    assert found == []
+    only_image = SimpleNamespace(content=[SimpleNamespace(type="image", data="!!not base64", mimeType="image/png")])
+    with collecting():
+        assert _format_tool_result(only_image) == "[image left out: not a valid image]"

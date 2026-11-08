@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import json
 import time
 from typing import Any
@@ -17,9 +19,33 @@ def _extract_text_from_block(block: Any) -> str | None:
     return None
 
 
+def _image_from_block(block: Any, number: int) -> str:
+    """An `ImageContent` block, stored and handed to the loop like an image read_file opened (multimodal REQ-5.3);
+    returns the text that stands in the result for it."""
+    from dostuff.helpers.agent.attachments import image_media_type
+    from dostuff.helpers.agent.tool_attachments import attach_ref, size_text
+    try:
+        data = base64.b64decode(getattr(block, "data", "") or "", validate=True)
+    except (binascii.Error, ValueError):
+        data = b""
+    if not image_media_type(data):  # by its bytes, whatever mimeType says
+        return "[image left out: not a valid image]"
+    ref, reason = attach_ref(data, f"tool image {number}")
+    if ref is None:
+        return f"[image left out: {reason}]"
+    return f"Image {number} from the tool{size_text(ref)} is attached in the next message."
+
+
 def _format_tool_result(result) -> str:
-    text_parts = [text for block in result.content if (text := _extract_text_from_block(block)) is not None]
-    return "\n".join(text_parts) if text_parts else "Tool executed successfully."
+    parts = []
+    images = 0
+    for block in result.content:
+        if getattr(block, "type", None) == "image":
+            images += 1
+            parts.append(_image_from_block(block, images))
+        elif (text := _extract_text_from_block(block)) is not None:
+            parts.append(text)
+    return "\n".join(parts) if parts else "Tool executed successfully."
 
 
 def _status_code(err: BaseException) -> int | None:

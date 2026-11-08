@@ -1,6 +1,7 @@
 import json
 from litellm import acompletion, ModelResponse
 from dostuff.helpers.agent.attachments import content_text, is_ref, ref_tokens, refs
+from dostuff.helpers.agent.tool_attachments import is_tool_attachment_step
 from dostuff.helpers.agent.turn_context import is_turn_context
 from dostuff.lib.model import completion_kwargs
 
@@ -24,10 +25,12 @@ def estimate_tokens(step: dict) -> int:
 
 def _exchanges(steps_history: list[dict]) -> list[list[dict]]:
     """Group steps into units that must stay together: an assistant tool-call step plus its
-    tool results is one unit; every other step is its own unit."""
+    tool results is one unit, with the step carrying the images those tools opened (multimodal D8); every other
+    step is its own unit."""
     units: list[list[dict]] = []
     for step in steps_history:
-        if step.get("role") == "tool" and units and (units[-1][0].get("tool_calls") or units[-1][0].get("role") == "tool"):
+        joins = step.get("role") == "tool" or is_tool_attachment_step(step)
+        if joins and units and (units[-1][0].get("tool_calls") or units[-1][0].get("role") == "tool"):
             units[-1].append(step)
         else:
             units.append([step])
@@ -59,7 +62,7 @@ def split_by_token_budget(
 
     recent_units = units[len(units) - kept_units:]
     recent_steps = [step for unit in recent_units for step in unit]
-    while recent_steps and recent_steps[0].get("role") == "tool":
+    while recent_steps and (recent_steps[0].get("role") == "tool" or is_tool_attachment_step(recent_steps[0])):
         recent_steps.pop(0)
     split_index = len(steps_history) - len(recent_steps)
     return steps_history[:split_index], steps_history[split_index:]

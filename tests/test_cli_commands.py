@@ -948,3 +948,20 @@ def test_headless_refused_image_exits_1(env, headless_agents, monkeypatch, capsy
     out, err = capsys.readouterr()
     assert "Not attached: shot.png: openai/gpt-4o-mini can't read images" in err
     assert out == "" and not fm.calls  # nothing sent
+
+
+def test_headless_xlsx_mention_spills(env, headless_agents, monkeypatch, capsys):
+    """-p converts a spreadsheet and, over loop.paste_file_lines, hands the model the stored text's path."""
+    from conftest import fake_response, requires_extra
+    from test_attachments import make_xlsx
+    requires_extra("docs")
+    fm = headless_agents
+    make_xlsx(Path("b.xlsx"), rows=300)
+    _headless_vision(monkeypatch, False)
+    fm.script(None, fake_response("done"))
+    assert _run_headless("total of @b.xlsx") == 0
+    _, err = capsys.readouterr()
+    assert "Attached b.xlsx" in err
+    sent = [m for m in fm.calls[0]["messages"] if m["role"] == "user"][-1]["content"]
+    assert isinstance(sent, str) and 'converted_from="xlsx" file=".dostuff/attachments/' in sent
+    assert "| row299 |" not in sent

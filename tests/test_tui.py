@@ -7736,6 +7736,30 @@ def test_resume_renders_chip(tui, tmp_path):
     asyncio.run(scenario())
 
 
+def test_resume_tool_attachment_step_is_a_chip(tui, tmp_path):
+    """T4.4: the step carrying what read_file opened is shown as its chip, never as a prompt, and Esc Esc skips it."""
+    from dostuff.helpers.agent.attachments import AttachmentStore
+    from dostuff.helpers.agent.tool_attachments import tool_attachment_step
+    from test_attachments import png_bytes
+    cli_tui = tui
+    step = tool_attachment_step([AttachmentStore().add(png_bytes(800, 600), name="diagram.png")])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="tool-image-resume")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._render_history_step(step)
+            await pilot.pause()
+            texts = _texts(app)
+            assert "[Image #1 · diagram.png · 800×600]" in texts
+            assert not any(t.startswith(">") and "diagram" in t for t in texts)
+            app.steps_history = [{"role": "user", "content": "look at it"}, step]
+            assert app._last_prompt_index() == 0
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 # --- multimodal Phase 2: alt+v and drag-and-drop ------------------------------------------------
 
 def _clipboard(monkeypatch, data, message=""):

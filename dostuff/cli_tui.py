@@ -54,6 +54,7 @@ from dostuff.helpers.agent.append_step import append_step
 from dostuff.helpers.agent.loop_check_cancelled import CANCELLED_TURN
 from dostuff.helpers.agent import clipboard
 from dostuff.helpers.agent.attachments import classify_attachment, delete_attachments, ref_chips, sweep_old_attachments
+from dostuff.helpers.agent.tool_attachments import is_tool_attachment_step
 from dostuff.helpers.agent.file_mentions import (PARTIAL_MENTION_RE, attached_paths, expand_file_mentions,
                                                  format_mention, mention_candidates, strip_attachments)
 from dostuff.helpers.agent.model_cost import format_cost
@@ -2417,6 +2418,9 @@ class DostuffTUI(App):
             self._append_call_result(f"{prefix}{step.get('name', '')}: {content}")
             return
         if role == "user":
+            if is_tool_attachment_step(step):  # what read_file / an MCP tool opened: the chips the live view showed
+                self._append(prefix + ref_chips(content), msg_type="system")
+                return
             if isinstance(content, list):  # a prompt with images or PDFs: its text, then a chip per attachment
                 self._append(prefix + strip_attachments(content), msg_type="user")
                 attached = attached_paths(content)
@@ -3789,7 +3793,7 @@ class DostuffTUI(App):
         try:
             mentions = skill_mentions(msg.raw, self._skill_commands)  # what was typed, before anything expands
             expansion = await asyncio.to_thread(expand_file_mentions, msg.raw, self.config.max_tool_output_chars,
-                                                images=self._images)
+                                                images=self._images, file_lines=self.config.paste_file_lines)
             if expansion.attached:
                 self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
             if expansion.skipped:
@@ -4267,7 +4271,8 @@ class DostuffTUI(App):
                 skill_run = parse_skill_command(user_text, self._skill_commands)
                 mentions = skill_mentions(user_text, self._skill_commands)  # what was typed, before anything expands
                 expansion = await asyncio.to_thread(expand_file_mentions, skill_run[1] if skill_run else user_text,
-                                                    self.config.max_tool_output_chars, images=self._images)
+                                                    self.config.max_tool_output_chars, images=self._images,
+                                                    file_lines=self.config.paste_file_lines)
                 if expansion.attached:
                     self._append("Attached " + ", ".join(expansion.attached), msg_type="system")
                 if expansion.skipped:
@@ -4900,7 +4905,7 @@ class DostuffTUI(App):
             step = self.steps_history[i]
             content = step.get("content") if isinstance(step, dict) else None
             if (step.get("role") == "user" and isinstance(content, list) and not is_turn_context(step)
-                    and step.get("meta") != "tool_attachments"):  # a prompt with images (multimodal REQ-1.4)
+                    and not is_tool_attachment_step(step)):  # a prompt with images (multimodal REQ-1.4)
                 return i
             if (step.get("role") == "user" and isinstance(content, str) and content != EMPTY_RESPONSE_NUDGE
                     and not is_turn_context(step)
