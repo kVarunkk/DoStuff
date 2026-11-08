@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.14] - 2026-11-08
 
 You can show the agent images, PDFs and Word, Excel and PowerPoint files: mention them with `@`, paste a screenshot with `Alt+V`, drag a file into the terminal, or let the agent open one with `read_file`.
 
