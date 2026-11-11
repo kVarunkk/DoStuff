@@ -11,6 +11,7 @@ for a range of similarity floors, which is how a shipped floor gets changed.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -87,13 +88,12 @@ class Seeded:
             await self.sem.upsert_fact(USER_ID, {**fact, "source": "user_message"})
         # Project facts go in the way the commit under test stores them: with a scope when it has one, otherwise as
         # the user-wide rows a model writes today (the cross-project leak this set measures)
-        scoped = "scope" in self.sem.upsert_fact.__code__.co_varnames
+        scoped = "scope" in inspect.signature(self.sem.upsert_fact).parameters
         for proj, rows in self.data["project_facts"].items():
             for fact in rows:
                 row = {**fact, "source": "user_message"}
-                if scoped:
-                    row.update(scope="project", working_dir=str(self.projects[proj]))
-                await self.sem.upsert_fact(USER_ID, row)
+                scope = {"scope": "project", "working_dir": str(self.projects[proj])} if scoped else {}
+                await self.sem.upsert_fact(USER_ID, row, **scope)
         now = int(time.time())
         for proj, rows in self.data["episodes"].items():
             batch = []
@@ -120,6 +120,13 @@ class Seeded:
             text = await build_turn_context(prompt, memory_store=self.sem, episodic_store=self.epi, user_id=USER_ID)
         finally:
             os.chdir(old)
+        try:  # the facts step the loop sends before the call, when the commit under test has one
+            from dostuff.helpers.agent.turn_context import facts_step_content
+        except ImportError:
+            pass
+        else:
+            here = str(self.projects[proj])
+            text += "\n" + facts_step_content(await self.sem.list_all(USER_ID, working_dir=here), here)[0]
         facts: set[str] = set()
         episodes: list[str] = []
         for tag, body in SECTION.findall(text):
@@ -214,10 +221,11 @@ def test_case_file_is_well_formed():
     assert len(negatives) >= 20
 
 
-# Today's numbers (package-structure, before the memory-recall work). Raise them as the work lands; never lower one
-# without a sweep table in the PR that says why.
-FLOORS = {"fact recall": 18, "episode recall": 15}
-CEILINGS = {"false hits": 10, "leaky cases": 8}
+# Raised by memory recall phase 1 (facts step): every fact below the cap is delivered and project facts stay in their
+# project (was 18 / 15 / 10 / 8 on package-structure before). Never lower one without a sweep table in the PR that
+# says why.
+FLOORS = {"fact recall": 34, "episode recall": 15}
+CEILINGS = {"false hits": 2, "leaky cases": 0}
 
 
 @pytest.mark.parametrize("measure", list(FLOORS))

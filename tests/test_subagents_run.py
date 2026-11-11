@@ -263,7 +263,7 @@ def test_subagent_prompt_has_project_rules(agents, fake_model, monkeypatch, tmp_
         positions = [text.find(p) for p in parts]
         assert -1 not in positions, (marker, [p for p, i in zip(parts, positions) if i == -1])
         assert positions == sorted(positions), marker
-        assert "<relevant_user_facts>" not in text and "<past_episodes>" not in text
+        assert "<other_relevant_facts>" not in text and "<past_episodes>" not in text
         assert skills_summary(discover_skills()) in text  # the same block as the main prompt, `dir:` included
         assert "  dir: " in text and "  location: " not in text
     assert "git worktree" not in system_of("[A]")

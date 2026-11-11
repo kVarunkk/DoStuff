@@ -91,11 +91,11 @@ class FakeMemory:
         self.upserts = []
         self.min_similarity = None
 
-    async def query(self, user_id, text, top_k=3, min_similarity=0.0):
+    async def query(self, user_id, text, top_k=3, min_similarity=0.0, scope=None, working_dir=None):
         self.min_similarity = min_similarity
         return self.similar
 
-    async def upsert_fact(self, user_id, fact):
+    async def upsert_fact(self, user_id, fact, scope="user", working_dir=None):
         self.upserts.append(fact)
 
 

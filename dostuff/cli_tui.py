@@ -4526,6 +4526,9 @@ class DostuffTUI(App):
                 steering=self._steering,
                 # What the system prompt lists: a skill or agent type that differs is announced (mid-run refresh D2)
                 capabilities_baseline=self._capabilities_baseline,
+                # Every saved fact in a facts step, re-sent only when the list changes (memory recall D2)
+                memory_store=self.memory_store, memory_user_id=self.user_id,
+                facts_project=str(Path.cwd().resolve()),
             )
 
             agent_text = result or "(no response)"

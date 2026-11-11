@@ -31,7 +31,8 @@ from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
 from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, frame_steered
 from dostuff.helpers.agent.turn_context import (
-    PROMPT_CONTEXT_HEADER, delivered_capabilities, delivered_plan_mode, make_capability_step, make_plan_mode_step,
+    PROMPT_CONTEXT_HEADER, delivered_capabilities, delivered_facts, delivered_plan_mode, facts_step_content,
+    make_capability_step, make_facts_step, make_plan_mode_step,
 )
 from dostuff.agent.capabilities import ALL_KINDS, delta_text, take_snapshot
 from dostuff.helpers.agent.side_question import (
@@ -199,7 +200,7 @@ def _job_events(owner: str, adapter: Any) -> Iterator[None]:
         registry.remove_listener(on_job)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None, capabilities_baseline: tuple[str, ...] | None = None, capability_kinds: tuple[str, ...] = ALL_KINDS) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None, capabilities_baseline: tuple[str, ...] | None = None, capability_kinds: tuple[str, ...] = ALL_KINDS, memory_store: Any = None, memory_user_id: str | None = None, facts_project: str | None = None) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction).
 
     `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
@@ -217,6 +218,11 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     or agent type that differs from it, or from the newest capability step, is announced in a hidden step before the
     next model call. None never announces (and never looks). `capability_kinds` limits it: a typed subagent's prompt
     lists skills only (D10).
+
+    `memory_store` (the semantic store; None when memory is off or for a run that gets no memory) and
+    `facts_project` (the project root whose project facts apply) turn on the facts step (memory recall spec D2):
+    every saved fact, re-sent whenever the list differs from the newest facts step in the history.
+    `memory_user_id` defaults to the configured user.
     """
     current_session_id.set(session_id)
     owner = owner or session_id
@@ -275,6 +281,31 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             return
         step = make_plan_mode_step(plan_mode, PLAN_MODE_INSTRUCTION if plan_mode else PLAN_MODE_OFF_INSTRUCTION)
         await append_step(step, steps_history, working_history, current_session_history, session_id, store, turn_type)
+        publish_snapshot(session_id, fork_context())
+
+    facts_error_reported = False
+
+    async def sync_facts() -> None:
+        """Send the saved facts when they differ from what the newest facts step delivered (memory recall D2):
+        the first call of a session, after a save or forget, after a compaction dropped the step. A store error
+        is reported once per turn and the call goes ahead without facts (CON-004)."""
+        nonlocal facts_error_reported
+        if memory_store is None or facts_project is None:
+            return
+        try:
+            user_id = memory_user_id or config.get_user_id()
+            facts = await memory_store.list_all(user_id, working_dir=facts_project)
+        except Exception as e:
+            if not facts_error_reported:
+                facts_error_reported = True
+                await loop_emit("error", f"Could not load saved facts, continuing without them: {e}", adapter=adapter)
+            return
+        text, fingerprint = facts_step_content(facts, facts_project)
+        belief = delivered_facts(working_history)
+        if belief == fingerprint or (belief is None and not fingerprint):
+            return
+        await append_step(make_facts_step(text, fingerprint), steps_history, working_history,
+                          current_session_history, session_id, store, turn_type)
         publish_snapshot(session_id, fork_context())
 
     async def sync_capabilities() -> None:
@@ -405,6 +436,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     progress = StreamProgress()
                     await sync_plan_mode()  # here, so a retry after an overflow compaction is covered too
                     await sync_capabilities()  # after it: rarer, so the plan step keeps its place (D6)
+                    await sync_facts()  # last: changes only on a save or forget (memory recall D2)
                     try:
                         interaction, model_span = await call_agent(
                             steps_history=working_history,

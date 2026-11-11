@@ -11,7 +11,7 @@ from dostuff.helpers.agent.constants import (
 from dostuff.helpers.agent.environment_context import build_environment_block
 from dostuff.helpers.agent.load_identity import load_identity
 from dostuff.helpers.agent.load_project_instructions import load_project_instructions
-from dostuff.helpers.agent.turn_context import compose_turn_context
+from dostuff.helpers.agent.turn_context import compose_turn_context, select_injected_facts
 from dostuff.helpers.skills.discover_skills import model_visible_skills
 from dostuff.helpers.ui.emit import emit
 from dostuff.lib.memory import chroma
@@ -79,10 +79,28 @@ def build_system_instructions(base: str) -> str:
     return base
 
 
+# Facts past the facts step's cap recalled per turn by similarity (memory recall spec D3)
+OVERFLOW_FACTS_RECALLED = 3
+
+
+async def _overflow_facts(memory_store: Any, user_id: str, user_text: str, min_similarity: float) -> list[dict]:
+    """The facts the facts step leaves out that are most relevant to `user_text`; [] below the cap, with no
+    query at all (every fact is in the facts step already). Never another project's facts."""
+    here = str(Path.cwd().resolve())
+    facts = await memory_store.list_all(user_id, working_dir=here)
+    _, overflow = select_injected_facts(facts)
+    if not overflow:
+        return []
+    wanted = {(f["scope"], f["key"]) for f in overflow}
+    ranked = await memory_store.query(user_id, query_text=user_text, top_k=len(facts),
+                                      min_similarity=min_similarity, working_dir=here)
+    return [m for m in ranked if (m.get("scope", "user"), m["key"]) in wanted][:OVERFLOW_FACTS_RECALLED]
+
+
 async def build_turn_context(user_text: str, *, memory_store: Any, episodic_store: Any, user_id: str,
                              prompt_context: str = "") -> str:
-    """The turn's hidden context step: the environment block, memories and past episodes relevant to user_text,
-    and UserPromptSubmit context.
+    """The turn's hidden context step: the environment block, saved facts past the facts step's cap and past
+    episodes relevant to user_text, and UserPromptSubmit context.
 
     The stores are None when long-term memory is off (chromadb not installed): no recall then.
     """
@@ -94,7 +112,7 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
         # Not at module level: the store module pulls in litellm, which the TUI loads after its first frame
         from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
         try:
-            memories = await memory_store.query(user_id, query_text=user_text, top_k=5, min_similarity=MIN_FACT_SIMILARITY)
+            memories = await _overflow_facts(memory_store, user_id, user_text, MIN_FACT_SIMILARITY)
             episodes = await episodic_store.query(
                 user_id=user_id,
                 query_text=user_text,
