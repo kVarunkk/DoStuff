@@ -691,8 +691,8 @@ def test_episodes_and_forget_commands(tui):
         async def list_all(self, user_id):
             return [{"key": k, "value": "Uses VS Code", "source": "user_message"} for k in sorted(self.keys)]
 
-        async def delete(self, user_id, key):
-            if key not in self.keys:
+        async def delete(self, user_id, key, scope="user", working_dir=None):
+            if scope != "user" or key not in self.keys:
                 return False
             self.keys.discard(key)
             return True
@@ -734,6 +734,53 @@ def test_episodes_and_forget_commands(tui):
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/forget"))
             await pilot.pause()
             assert any(t.startswith("Usage: /forget") for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_forget_prefers_this_projects_fact(tui):
+    """memory recall T1.4 decision: a key saved as both a user and a project fact → this project's goes first."""
+    cli_tui = tui
+    here = str(Path.cwd().resolve())
+
+    class ScopedFacts:
+        def __init__(self):
+            self.rows = {("user", None, "linter"), ("project", here, "linter"), ("project", "/elsewhere", "linter"),
+                         ("user", None, "name")}
+
+        async def list_all(self, user_id, scope=None, working_dir=None):
+            return [{"key": k} for s, _, k in self.rows if s == "user"]
+
+        async def delete(self, user_id, key, scope="user", working_dir=None):
+            row = (scope, working_dir if scope == "project" else None, key)
+            if row not in self.rows:
+                return False
+            self.rows.discard(row)
+            return True
+
+    class NoEpisodes:
+        async def list_all(self, user_id, working_dir=None):
+            return []
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="forget-scope")
+        async with app.run_test():
+            await app._backend_ready.wait()
+            app.memory_store, app.episodic_store = ScopedFacts(), NoEpisodes()
+            await app._forget("linter")
+            assert any(t.startswith("Forgot this project's memory 'linter'.") and "/forget user:linter" in t
+                       for t in _texts(app))
+            assert ("project", here, "linter") not in app.memory_store.rows
+            assert ("user", None, "linter") in app.memory_store.rows
+            await app._forget("user:linter")
+            assert "Forgot memory 'linter'." in _texts(app)
+            await app._forget("name")  # only a user fact: no qualifier needed
+            assert "Forgot memory 'name'." in _texts(app)
+            assert app.memory_store.rows == {("project", "/elsewhere", "linter")}
+            app.memory_store.rows.add(("project", here, "linter"))
+            await app._forget("linter")  # no user-wide one left: no hint
+            assert "Forgot this project's memory 'linter'." in _texts(app)
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

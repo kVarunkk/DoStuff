@@ -3656,13 +3656,22 @@ class DostuffTUI(App):
                      + "\n\nForget one with /forget <id>.", msg_type="system")
 
     async def _forget(self, target: str) -> None:
-        """Delete the fact with this key, else the episode with this id (or its last part)."""
+        """Delete this project's fact with this key, else the user fact (`user:<key>` skips the project one),
+        else the episode with this id (or its last part)."""
         if not await self._memory_ready():
             return
         assert self.memory_store is not None and self.episodic_store is not None
         try:
-            if await self.memory_store.delete(self.user_id, target):
-                self._append(f"Forgot memory '{target}'.", msg_type="system")
+            user_only = target.startswith("user:")
+            key = target.removeprefix("user:")
+            if not user_only and await self.memory_store.delete(
+                    self.user_id, key, scope="project", working_dir=str(Path.cwd().resolve())):
+                user_keys = {f["key"] for f in await self.memory_store.list_all(self.user_id, scope="user")}
+                note = f" A user-wide '{key}' is still saved: /forget user:{key} removes it." if key in user_keys else ""
+                self._append(f"Forgot this project's memory '{key}'.{note}", msg_type="system")
+                return
+            if await self.memory_store.delete(self.user_id, key):
+                self._append(f"Forgot memory '{key}'.", msg_type="system")
                 return
             episodes = await self.episodic_store.list_all(self.user_id)
             matches = [ep for ep in episodes if ep["id"] == target or ep["id"].endswith(f"_{target}")]
