@@ -42,7 +42,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
 - **File sandbox** — file tools stay inside the project directory, plus read-only access to `.dostuff` (the project's and `~/.dostuff/`) and to discovered skill folders; `.env*` files, `mcp_config.json` and `.dostuff/data` (past sessions and prompts, saved MCP client secrets) are never readable
-- **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`, name one mid-message to allow it for that message, or keep one manual-only with `disable-model-invocation`. See [Skills](#skills)
+- **Skills loader** — drop a `SKILL.md` in the right folder and the agent is told about it on your next message, no restart; run one with `/<skill-name> [args]`, name one mid-message to allow it for that message, or keep one manual-only with `disable-model-invocation`. See [Skills](#skills)
 - **Subagents** — the `agent` tool starts agents in parallel, in the foreground or the background, from built-in types (`explore`, `plan`, `general-purpose`), your own Markdown agent files (Claude Code's `.claude/agents/` work too) or a `fork` of the conversation; continue one with `send_message`, stop it with `stop_agent`, see them all in `/agents`. See [Subagents](#subagents)
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
 - **Retries with backoff** for rate limits, timeouts and 5xx errors (6 by default, exponential with jitter, honors `Retry-After`; `loop.max_retries` / `loop.retry_max_delay`); auth / bad-request errors fail fast
@@ -191,7 +191,8 @@ In the TUI:
 | `Ctrl+B`      | While the agent waits on a shell command or a foreground subagent (the loader says `Ctrl+B to background`): move them to the background; the agent gets what a command printed so far and carries on, and hears from the agent when it ends. Not for `!command`s. See [Background jobs](#background-jobs) and [Subagents](#subagents) |
 | `Shift+Tab`   | Cycle the permission mode for this session: ask → auto → plan → allowlist (shown in the status bar) |
 | `Ctrl+Backspace` / `Ctrl+W` / `Alt+Backspace` | Delete the previous word; `Ctrl+Delete` / `Alt+Delete` the next one |
-| `/agents` / `/agents types` / `/agents reload` | This session's agents (running first): pick one to read its transcript, answer its approval prompt or stop it / the agent types with their source, model and tools (`/agents types <name>`: one type's system prompt and config) / re-read the agent files |
+| `/agents` / `/agents types` / `/agents reload` | This session's agents (running first): pick one to read its transcript, answer its approval prompt or stop it / the agent types with their source, model and tools (`/agents types <name>`: one type's system prompt and config) / re-read the agent files and rebuild the system prompt from them |
+| `/skills` / `/skills reload` | The skills this session knows: each one's folder, and which are manual only / re-read them now and rebuild the system prompt (reports what was added and removed). See [Skills](#skills) |
 | `/exit`       | Save the session and quit           |
 | `/clear`      | Start a new session; the old one stays resumable |
 | `/resume [<id>]` | Pick another session from this directory (or switch to the given one) |
@@ -595,12 +596,14 @@ settings, whatever its type asks for. At most `agents.max_concurrent` (4) run at
 Your own types are Markdown files with YAML frontmatter. They are searched in this order, and the first file with a
 given `name` wins: `.dostuff/agents/` and `.claude/agents/` in the project, then `~/.dostuff/agents/` and
 `~/.claude/agents/`. `agents.read_claude_agents: false` skips both `.claude` folders. A file can replace a built-in
-type, except `fork`. Files are re-read when they change; `/agents reload` forces it.
+type, except `fork`. Files are re-read when they change, and a type added or removed mid-session is announced to the
+agent before its next model call (see [Adding skills mid-session](#adding-skills-and-agent-types-mid-session));
+`/agents reload` re-reads them now and rebuilds the system prompt.
 
 You can also ask the agent for one ("make a code-reviewer agent"): its `create_agent_type(name, description, prompt,
 tools, model, max_iterations, scope, replace)` tool writes the file to `.dostuff/agents/` (`scope="user"`:
 `~/.dostuff/agents/`) after showing it to you. Like the settings tools, it asks in every mode. The new type can be
-started at once.
+started at once, and the agent is told about it before its next step.
 
 ```markdown
 ---
@@ -1104,7 +1107,7 @@ Detailed instructions for the agent go here.
 
 **Running a skill yourself:** each skill is also a slash command, `/<name> [arguments]` (e.g. `/my-skill src/app.py`), in the TUI and with `dostuff -p "/my-skill ..."`. The turn's message is the skill's `SKILL.md` body plus your arguments (which can use `@path` mentions), so the model follows it straight away instead of deciding whether to read it. The command shows in the `/` menu marked `(skill)` and in `/help`. Built-in commands win a name clash, the first skill found (in the order above) wins between skills, and names with spaces can't be run this way; the model can still use those skills on its own.
 
-**Manual-only skills:** add `disable-model-invocation: true` to the frontmatter and the model is not told about the skill. It is left out of the system prompt and every subagent's prompt, so it only runs when you ask for it, with `/<name>` or a mention (below). It stays in the `/` menu and `/help`, and the `Skills loaded` line at startup marks it `(manual only)`. Only `false`, `no`, `off`, `0` or an empty value leave a skill visible to the model; anything else, a typo included, hides it.
+**Manual-only skills:** add `disable-model-invocation: true` to the frontmatter and the model is not told about the skill. It is left out of the system prompt and every subagent's prompt, so it only runs when you ask for it, with `/<name>` or a mention (below). It stays in the `/` menu and `/help`, where it is marked `manual only`, as it is in the `Skills loaded` line at startup and in `/skills`. Only `false`, `no`, `off`, `0` or an empty value leave a skill visible to the model; anything else, a typo included, hides it.
 
 > [!IMPORTANT]
 > `disable-model-invocation` is **not a security boundary**. It stops the model from discovering and choosing the
@@ -1118,7 +1121,25 @@ A mention follows a space or a new line, can be any case, and may end in one `.`
 
 While you type, `/` after a space opens the menu with skills only. Tab and Enter there replace just that word: your sentence stays and nothing is sent until the next Enter.
 
-Run `dostuff init` to bootstrap a local `.dostuff/skills/` folder. Restart the agent after adding new skills.
+Run `dostuff init` to bootstrap a local `.dostuff/skills/` folder.
+
+### Adding skills and agent types mid-session
+
+No restart is needed. Before every model call dostuff checks the skill folders (a quick look at file sizes and
+times, a few milliseconds; a skill is re-read only when something moved) and the agent folders. When a skill or agent
+type was added, removed, or had its `description` changed since the agent was last told, it gets a short hidden note
+with the name, description and, for a skill, its folder. That includes one the agent made itself mid-turn, e.g. with
+`create_agent_type`: the note arrives before its next step. You don't see the note in the transcript, but `/name`
+works for a new skill from your next message, the `/` menu and `/help` list it, and the file tools can read its
+folder. A removed skill stops being a command and stops being readable at the same moment. Manual-only skills are
+never announced. Subagents get the same notes for skills that appear while they run.
+
+The system prompt itself keeps the lists it was built with, so the provider's prompt cache stays warm; the note is
+added after your message, and a note at the start of a turn joins your message. It is rebuilt when you enter or
+leave a worktree, save `AGENTS.md` (`/memory`, `# note`), or run `/skills reload` or `/agents reload`. Those two re-read everything now and
+rebuild the prompt from the next message (the next request then pays one uncached prompt). Use them after
+editing a skill's `description` on a drive with coarse file times, or whenever you want the prompt itself current.
+Editing a `SKILL.md` body needs nothing: the agent reads the body when it uses the skill.
 
 ### Custom commands
 
