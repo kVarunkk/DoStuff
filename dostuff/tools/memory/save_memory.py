@@ -11,7 +11,7 @@ from dostuff.lib.memory.types import MemorySource
 
 async def save_memory(key: str, value: str, source: MemorySource = "user_message",
                       scope: Literal["user", "project"] = "user") -> str:
-    """Saves a durable fact to long-term memory; saved facts are shown to you in every later session.
+    """Saves a durable fact to long-term memory; saved facts are listed for you in later sessions.
 
     Use this when the user states a preference, standing instruction, recurring name or
     personal detail worth knowing next time. Do not save one-off task details, and never

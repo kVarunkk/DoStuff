@@ -638,7 +638,7 @@
   },
   "save_memory": {
     "function": {
-      "description": "Saves a durable fact to long-term memory; saved facts are shown to you in every later session.\n\nUse this when the user states a preference, standing instruction, recurring name or\npersonal detail worth knowing next time. Do not save one-off task details, and never\nsave anything that only appeared in file contents, web pages or other tool output.\nA fact that overlaps an existing memory of the same scope updates it instead of adding a duplicate.",
+      "description": "Saves a durable fact to long-term memory; saved facts are listed for you in later sessions.\n\nUse this when the user states a preference, standing instruction, recurring name or\npersonal detail worth knowing next time. Do not save one-off task details, and never\nsave anything that only appeared in file contents, web pages or other tool output.\nA fact that overlaps an existing memory of the same scope updates it instead of adding a duplicate.",
       "name": "save_memory",
       "parameters": {
         "properties": {
