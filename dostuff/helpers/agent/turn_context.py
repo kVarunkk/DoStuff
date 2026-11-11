@@ -23,6 +23,8 @@ PROMPT_CONTEXT_HEADER = "[Context from UserPromptSubmit hooks]"
 FACT_INJECT_CAP = 50
 PROJECT_FACT_CAP = 30
 FACTS_REPLACE_NOTE = "This replaces any earlier list of saved facts."
+# Past this many user facts, /memories suggests merging (D10): the facts step grows with every one
+CONSOLIDATE_HINT_USER_FACTS = 30
 
 
 class FactsSource(NamedTuple):

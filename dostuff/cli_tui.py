@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from bisect import bisect_right
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 from textual.app import App, ComposeResult
@@ -69,7 +70,7 @@ from dostuff.helpers.agent.side_question import (
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
-from dostuff.helpers.agent.turn_context import is_turn_context, make_context_step
+from dostuff.helpers.agent.turn_context import CONSOLIDATE_HINT_USER_FACTS, is_turn_context, make_context_step
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
 from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers
@@ -3620,16 +3621,34 @@ class DostuffTUI(App):
         if not await self._memory_ready():
             return
         assert self.memory_store is not None
+        here = Path.cwd().resolve()
         try:
-            facts = await self.memory_store.list_all(self.user_id)
+            facts = await self.memory_store.list_all(self.user_id, working_dir=str(here))
         except Exception as e:
             self._append(f"Could not load memories: {e}", msg_type="error")
             return
         if not facts:
             self._append("No saved memories.", msg_type="system")
             return
-        lines = [f"- {f['key']}: {f['value']}  ({f['source']})" for f in facts]
-        self._append(f"Saved memories ({len(facts)}):\n" + "\n".join(lines) + "\n\nForget one with /forget <key>.", msg_type="system")
+
+        def row(fact: dict) -> str:
+            epoch = fact.get("updated_at_epoch") or 0
+            when = datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d") if epoch else "no date"
+            return f"- {fact['key']}: {fact['value']}  ({when})"
+
+        user = [f for f in facts if f.get("scope", "user") == "user"]
+        project = [f for f in facts if f.get("scope") == "project"]
+        sections = []
+        if user:
+            sections.append(f"User ({len(user)}):\n" + "\n".join(row(f) for f in user))
+        if project:
+            sections.append(f"This project, {here.name} ({len(project)}):\n" + "\n".join(row(f) for f in project))
+        text = f"Saved memories ({len(facts)}), newest first:\n" + "\n\n".join(sections)
+        text += "\n\nForget one with /forget <key> (/forget user:<key> for a user fact when this project has the same key)."
+        if len(user) > CONSOLIDATE_HINT_USER_FACTS:
+            text += (f"\n\nYou have {len(user)} user facts. Merging overlapping ones keeps the list every session "
+                     "starts with short; /forget the ones you no longer need.")
+        self._append(text, msg_type="system")
 
     def _episodes_dir(self) -> str | None:
         """The directory episodes are recalled from (None = all), as `memory.episodic_scope` says."""
