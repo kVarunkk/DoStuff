@@ -8,7 +8,8 @@ whole cached prefix. The model reads them; a user never sees them. Every reader 
 Light on import: the TUI loads this before its first frame.
 """
 import hashlib
-from typing import Any
+from contextvars import ContextVar
+from typing import Any, NamedTuple
 
 TURN_CONTEXT_MARKER = "turn_context"
 # `step_data` is JSON text, so the title queries match the marker with this. A prompt quoting the same words can't
@@ -22,6 +23,18 @@ PROMPT_CONTEXT_HEADER = "[Context from UserPromptSubmit hooks]"
 FACT_INJECT_CAP = 50
 PROJECT_FACT_CAP = 30
 FACTS_REPLACE_NOTE = "This replaces any earlier list of saved facts."
+
+
+class FactsSource(NamedTuple):
+    """Where the main session's facts step reads from: the semantic store, the user, the project root."""
+    store: Any
+    user_id: str
+    project: str
+
+
+# Set by the main session's loop; a typed subagent started from it (its task copies this context) reads the same
+# facts, read-only, with the main project even when it runs in a worktree (memory recall D14)
+facts_source: ContextVar[FactsSource | None] = ContextVar("dostuff_facts_source", default=None)
 
 
 def is_turn_context(step: object) -> bool:

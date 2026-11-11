@@ -20,6 +20,7 @@ from dostuff.config import DEFAULT_AGENTS_MAX_CONCURRENT
 from dostuff.agent.subagents.run import _close_worktree, resolve_subagent_tools, run_agent_loop
 from dostuff.helpers.hooks.events import SUBAGENT_START_CONTEXT, subagent_start
 from dostuff.helpers.agent.notices import AgentNotice, agent_notice_line, fmt_agent_runtime, get_notice_queue
+from dostuff.helpers.agent.turn_context import facts_source
 from dostuff.helpers.tools.project_root import project_root, use_project_root
 from dostuff.lib.model import current_model, is_main_provider
 from dostuff.lib.worktree import Worktree, create_worktree, detect_worktree
@@ -431,6 +432,8 @@ class AgentRegistry:
             system, baseline = await build_subagent_prompt(agent_def, run.worktree)
             kinds = SKILL_KINDS
             first_steps = [{"role": "user", "content": ctx.prompt}]
+        # Typed agents read the main session's facts, keyed on its project even in a worktree (memory recall D14)
+        facts = facts_source.get() if fork is None and not agent_def.omit_memory else None
         adapter = SubagentAdapter(ctx.adapter, run, self._set_status)
         with use_project_root(run.worktree.path) if run.worktree else contextlib.nullcontext():
             hook_context = await subagent_start(
@@ -457,7 +460,7 @@ class AgentRegistry:
                     agent_def.max_iterations or get_config().agents_max_iterations,
                     store=transcript, compaction_notes=run.compaction_notes, inbox=run.inbox,
                     session_hook_context=fork.session_hook_context if fork is not None else None,
-                    capabilities_baseline=baseline, capability_kinds=kinds,
+                    capabilities_baseline=baseline, capability_kinds=kinds, facts=facts,
                 )
         finally:
             # Its jobs die with it: nobody is left to read them or hear when they end (background shell D8)

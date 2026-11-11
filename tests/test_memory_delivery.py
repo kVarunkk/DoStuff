@@ -10,6 +10,7 @@ import litellm
 from dostuff.agent import loop as loop_module
 from dostuff.agent.call_agent import provider_messages
 from dostuff.helpers.agent.turn_context import make_context_step
+from conftest import fake_response
 from tests.test_loop import _interactive, _msg, _tc, Adapter
 
 USER = "u1"
@@ -244,3 +245,101 @@ def test_over_cap_newest_50_and_overflow_in_bundle(monkeypatch, tmp_path):
     assert q["min_similarity"] == 0.25 and q["working_dir"] == here and q["scope"] is None
     assert "<other_relevant_facts>\n- k02: v2\n- linter: ruff\n- k00: v0\n</other_relevant_facts>" in bundle
     assert "k54" not in bundle and "<relevant_user_facts>" not in bundle
+
+
+# T1.12 typed subagents get facts, read-only (D14) -----------------------------------------------------------
+
+def _subagent_store():
+    return (FakeFacts().add("name", "Admiral Nemo", updated=2)
+            .add("linter", "ruff", "project", PROJ_A, updated=1)
+            .add("linter", "eslint", "project", PROJ_B, updated=1))
+
+
+def _run_subagents(agents, fake_model, store, *starts):
+    """Start each (marker, kwargs) as a subagent of a main session whose facts come from `store` in PROJ_A."""
+    from dostuff.helpers.agent.turn_context import FactsSource, facts_source
+
+    async def go():
+        facts_source.set(FactsSource(store, USER, PROJ_A))
+        for marker, kwargs in starts:
+            fake_model.script(marker, fake_response("report"))
+            kwargs = {"owner": "s1", "agent_type": "general-purpose", "description": "d", **kwargs}
+            run = await agents.start(prompt=f"{marker} look into it", **kwargs)
+            await run.done
+    asyncio.run(go())
+
+
+def _user_texts(call):
+    return "\n".join(str(m.get("content")) for m in call["messages"] if m.get("role") == "user")
+
+
+def test_typed_subagent_gets_facts_step(agents, fake_model, agents_home):
+    _run_subagents(agents, fake_model, _subagent_store(), ("[A]", {}))
+    first = _user_texts(fake_model.calls_for("[A]")[0])
+    assert '<user_facts shown="1" saved="1">\n- name: Admiral Nemo\n</user_facts>' in first
+    assert '<project_facts project="proj-a" shown="1" saved="1">\n- linter: ruff\n</project_facts>' in first
+    assert "eslint" not in first
+
+
+def test_omit_memory_type_gets_none(agents, fake_model, agents_home):
+    from dostuff.agent.subagents import definitions
+    (agents_home / ".dostuff" / "agents" / "quiet.md").write_text(
+        "---\nname: quiet\ndescription: Keeps to itself.\nomit_memory: true\n---\nYou work alone.\n", encoding="utf-8")
+    definitions.reload()
+    assert definitions.get_definitions()["quiet"].omit_memory
+    assert definitions.BUILTIN_TYPES["explore"].omit_memory and definitions.BUILTIN_TYPES["plan"].omit_memory
+    assert not definitions.BUILTIN_TYPES["general-purpose"].omit_memory
+    _run_subagents(agents, fake_model, _subagent_store(), ("[E]", {"agent_type": "explore"}),
+                   ("[P]", {"agent_type": "plan"}), ("[Q]", {"agent_type": "quiet"}))
+    for marker in ("[E]", "[P]", "[Q]"):
+        assert "facts>" not in _user_texts(fake_model.calls_for(marker)[0]), marker
+
+
+def test_subagent_no_episodes_no_save_tools(agents, fake_model, agents_home):
+    _run_subagents(agents, fake_model, _subagent_store(), ("[A]", {}))
+    for call in fake_model.calls_for("[A]"):
+        texts = _user_texts(call)
+        assert "<past_episodes>" not in texts and "<other_relevant_facts>" not in texts
+        tools = {t["function"]["name"] for t in call.get("tools") or []}
+        assert tools and not tools & {"save_memory", "save_episode"}
+
+
+def test_worktree_subagent_uses_main_project_facts(agents, fake_model, agents_home, tmp_path, monkeypatch):
+    from dostuff.lib.worktree import create_worktree
+    from tests.test_subagents_run import _git_repo
+    repo = _git_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+    store = _subagent_store().add("linter", "black", "project", str(repo), updated=1)
+
+    from dostuff.helpers.agent.turn_context import FactsSource, facts_source
+
+    async def go():
+        facts_source.set(FactsSource(store, USER, str(repo)))
+        fake_model.script("[W]", fake_response("report"))
+        run = await agents.start(owner="s1", agent_type="general-purpose", description="d",
+                                 prompt="[W] look", worktree=create_worktree("agent-facts", repo))
+        await run.done
+    asyncio.run(go())
+    first = _user_texts(fake_model.calls_for("[W]")[0])
+    assert f'<project_facts project="{repo.name}"' in first and "- linter: black" in first
+
+
+def test_fork_unchanged(agents, fake_model, agents_home):
+    """A fork inherits the main conversation, facts step included, and gets no second one."""
+    from dostuff.agent.subagents.fork import ForkContext
+    from dostuff.helpers.agent.turn_context import FactsSource, facts_source, facts_step_content, make_facts_step
+    store = _subagent_store()
+    text, fingerprint = facts_step_content(asyncio.run(store.list_all(USER, working_dir=PROJ_A)), PROJ_A)
+    main_history = [{"role": "user", "content": "hi"}, make_facts_step(text, fingerprint),
+                    {"role": "assistant", "content": "hello"}]
+    store.add("editor", "Neovim", updated=3)  # saved since: only a fork that read facts itself would see it
+
+    async def go():
+        facts_source.set(FactsSource(store, USER, PROJ_A))
+        fake_model.script("[F]", fake_response("report"))
+        run = await agents.start(owner="s1", agent_type="fork", description="d", prompt="[F] look",
+                                 fork=ForkContext("sys", "", main_history, ["read_file"], None))
+        await run.done
+    asyncio.run(go())
+    texts = _user_texts(fake_model.calls_for("[F]")[0])
+    assert texts.count("<user_facts") == 1 and "Neovim" not in texts

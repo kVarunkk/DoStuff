@@ -539,3 +539,14 @@ def test_subagent_run_passes_own_baseline(agents, fake_model, monkeypatch):
         return await run.done
     assert asyncio.run(go()) == "ok"
     assert seen == [(("skill:own:1",), ("skill",))]
+
+
+def test_claude_code_memory_field_warns(tmp_path):
+    """memory recall D14: Claude Code's `memory: user|project|local` is a per-agent folder dostuff doesn't have."""
+    from dostuff.agent.subagents.definitions import parse_agent_file
+    path = tmp_path / "reviewer.md"
+    path.write_text("---\nname: reviewer\ndescription: Reviews.\nmemory: project\n---\nReview.\n", encoding="utf-8")
+    agent_def, warnings = parse_agent_file(path)
+    assert agent_def is not None and not agent_def.omit_memory
+    assert warnings == [f"{path}: memory 'project' ignored: dostuff has no per-agent memory "
+                        "(saved facts reach typed subagents unless omit_memory: true)"]

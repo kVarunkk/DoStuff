@@ -31,8 +31,8 @@ from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
 from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, frame_steered
 from dostuff.helpers.agent.turn_context import (
-    PROMPT_CONTEXT_HEADER, delivered_capabilities, delivered_facts, delivered_plan_mode, facts_step_content,
-    make_capability_step, make_facts_step, make_plan_mode_step,
+    PROMPT_CONTEXT_HEADER, FactsSource, delivered_capabilities, delivered_facts, delivered_plan_mode, facts_source,
+    facts_step_content, make_capability_step, make_facts_step, make_plan_mode_step,
 )
 from dostuff.agent.capabilities import ALL_KINDS, delta_text, take_snapshot
 from dostuff.helpers.agent.side_question import (
@@ -231,6 +231,9 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     iteration = 0
     token_limit = get_model_token_limit()
     config = get_config()
+    facts_user = (memory_user_id or config.get_user_id()) if memory_store is not None and facts_project else ""
+    if turn_type == "interactive_loop":  # what a typed subagent started in this turn reads (D14); None turns it off
+        facts_source.set(FactsSource(memory_store, facts_user, facts_project) if facts_user and facts_project else None)
     threshold_percent = getattr(config, "compact_threshold", AUTO_COMPACT_THRESHOLD)  # None: auto-compaction off (overflow still compacts)
     context_token_threshold = int(token_limit * threshold_percent / 100) if threshold_percent else None
     keep_recent_token_budget = min(int(token_limit * 0.15), 20000)
@@ -290,11 +293,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
         the first call of a session, after a save or forget, after a compaction dropped the step. A store error
         is reported once per turn and the call goes ahead without facts (CON-004)."""
         nonlocal facts_error_reported
-        if memory_store is None or facts_project is None:
+        if not facts_user or not facts_project:
             return
         try:
-            user_id = memory_user_id or config.get_user_id()
-            facts = await memory_store.list_all(user_id, working_dir=facts_project)
+            facts = await memory_store.list_all(facts_user, working_dir=facts_project)
         except Exception as e:
             if not facts_error_reported:
                 facts_error_reported = True

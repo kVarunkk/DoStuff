@@ -585,6 +585,10 @@ and can stop one with `stop_agent`.
 A subagent can never start, message or stop agents, delete files, save memories, write the todo list or change
 settings, whatever its type asks for. At most `agents.max_concurrent` (4) run at once; more are queued.
 
+A typed subagent sees your saved facts (user facts and this project's, read-only) before its first step, the same
+list the main agent gets; `explore`, `plan` and any type with `omit_memory: true` don't. It never gets past episodes.
+A fork already has them in the conversation it inherits.
+
 ### Agent types
 
 | Type | Tools | For |
@@ -613,6 +617,7 @@ description: Reviews a diff for bugs and missing tests. Use after a change.
 tools: Read, Grep, Glob, Bash   # omit for every subagent tool
 model: fast                     # inherit (default), an alias from agents.models, or a litellm model string
 max_iterations: 30              # optional; default agents.max_iterations
+omit_memory: true               # optional; leave out your saved facts (default false)
 ---
 You are a code reviewer. Report findings as a list, most severe first.
 ```
@@ -633,7 +638,8 @@ Unknown and forbidden names are dropped with a warning naming the file; `/agents
 source, resolved model, tools and any warnings, and `/agents types <name>` shows one type's whole config: its
 system prompt, model, tools and max iterations (for `fork`, the task message it gets). `model:` aliases come from `agents.models`; Claude Code's `sonnet`,
 `opus` and `haiku` are looked up there too and fall back to the main model (with a warning in the report) when they
-aren't defined. The call's `model=` wins over the type's `model:`.
+aren't defined. The call's `model=` wins over the type's `model:`. Claude Code's `memory:` field (a per-agent memory
+folder) is ignored with a warning: DoStuff has no per-agent memory.
 
 ### Background agents
 
