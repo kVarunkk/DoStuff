@@ -861,7 +861,8 @@ def test_headless_wake_turn_adds_no_context_step(env, headless_agents, capsys):
     assert _run_headless("[M] start it") == 0
     capsys.readouterr()
     messages = fm.calls_for("[M]")[2]["messages"]
-    assert sum("<turn-context>" in str(m.get("content")) for m in messages) == 1
+    # Not the system prompt: it names `<turn-context>` notes when it explains how new skills are announced
+    assert sum("<turn-context>" in str(m.get("content")) for m in messages if m.get("role") != "system") == 1
     assert "<environment>\ncwd:" not in messages[0]["content"]
 
 
