@@ -2277,6 +2277,7 @@ class DostuffTUI(App):
                 self._note_memory_off()
             else:
                 await self._ensure_embedding_model()
+                await self._warn_if_memory_index_damaged()
         except Exception as e:
             self._backend_error = str(e)
             self._append(f"Startup failed: {e}", msg_type="error")
@@ -2318,6 +2319,30 @@ class DostuffTUI(App):
                          "Memory recall is off until it succeeds (it retries on the next start).", msg_type="error")
             return
         self._append("Embedding model ready.", msg_type="system")
+
+    async def _warn_if_memory_index_damaged(self) -> None:
+        """Say the memory index needs a rebuild, instead of letting recall quietly return less.
+
+        Chroma can leave a row in its SQLite metadata but not in its HNSW graph (chroma-core/chroma#7032),
+        which makes filtered queries fail until the collection is rebuilt. Reads then fall back to
+        scanning metadata, so memory still works but finds less; without this notice that looks like
+        the agent just forgetting things.
+        """
+        from dostuff.helpers.memory.repair_index import check_collection
+        from dostuff.lib.memory.stores import memory_collections
+
+        damaged = []
+        for name, collection, where in await asyncio.to_thread(memory_collections):
+            if await asyncio.to_thread(check_collection, collection, where):
+                damaged.append(name)
+        if damaged:
+            self._append(
+                "Long-term memory needs a rebuild: "
+                f"{', '.join(damaged)} {'has' if len(damaged) == 1 else 'have'} a vector index that is out of "
+                "sync with its metadata, so recall and saving may miss entries.\n"
+                "Nothing was lost. Run `dostuff memory repair` (stop dostuff first) to rebuild it.",
+                msg_type="error",
+            )
 
     async def _wait_for_backend(self, keep_loader: bool = False) -> bool:
         """Wait for _load_backend (with a loader if it's still running); False if it failed.

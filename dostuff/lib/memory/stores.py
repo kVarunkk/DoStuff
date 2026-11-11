@@ -42,3 +42,28 @@ def make_tool_registry_store() -> "MCPToolRegistryStore | None":
         return None
     from dostuff.lib.mcp.mcp_tool_registry_store import MCPToolRegistryStore
     return MCPToolRegistryStore(persist_path=_persist_path())
+
+
+def memory_collections() -> list[tuple[str, object, dict | None]]:
+    """(name, collection, filter a real query uses) for a health check, skipping empty/missing ones.
+
+    The filter matters: an unfiltered query can succeed where the filtered one callers run fails.
+    Returns [] without chromadb.
+    """
+    if not chroma.chroma_available():
+        return []
+    client = chroma.get_chroma_client(_persist_path())
+    existing = {collection.name for collection in client.list_collections()}
+    user_id = get_config().get_user_id()
+    found: list[tuple[str, object, dict | None]] = []
+    for name in ("semantic_memory", "episodic_memory", "mcp_tools_index"):
+        if name not in existing:
+            continue
+        collection = client.get_collection(name)
+        if collection.count() <= 0:
+            continue
+        # mcp_tools_index is keyed by server rather than user; check_collection picks a real
+        # server_name from the rows, since an empty filter would test a different code path
+        where = None if name == "mcp_tools_index" else {"user_id": user_id}
+        found.append((name, collection, where))
+    return found
