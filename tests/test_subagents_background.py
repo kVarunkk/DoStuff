@@ -203,7 +203,7 @@ def test_main_prompt_background_guidance(monkeypatch):
     from dostuff.config import get_config
 
     def section(interactive: bool) -> str:
-        base, _ = build_base_instructions(interactive=interactive)
+        base, _, _ = build_base_instructions(interactive=interactive)
         return base.split("## Delegating to subagents", 1)[1].split("\n## ", 1)[0]
     monkeypatch.setattr(get_config(), "agents_wake_on_end", True)
     for interactive in (True, False):

@@ -224,7 +224,7 @@ def test_main_prompt_fork_guidance(monkeypatch):
     for wake in (True, False):
         monkeypatch.setattr(get_config(), "agents_wake_on_end", wake)
         for interactive in (True, False):
-            base, _ = build_base_instructions(interactive=interactive)
+            base, _, _ = build_base_instructions(interactive=interactive)
             text = base.split("## Delegating to subagents", 1)[1].split("\n## ", 1)[0]
             assert 'subagent_type="fork"' in text
             assert "needs this conversation" in text

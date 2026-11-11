@@ -458,7 +458,7 @@ def test_main_prompt_lists_types(proj, agents_home, monkeypatch):
     _agent_file(folder, "rev.md", "b", name="code-reviewer", description="Reviews a diff for bugs.")
     _agent_file(folder, "explore.md", "b", name="explore", description="My own explorer.")
     with use_project_root(proj):
-        base, _ = build_base_instructions()
+        base, _, _ = build_base_instructions()
     section = base.split("## Delegating to subagents", 1)[1].split("\n## ", 1)[0]
     assert "- code-reviewer: Reviews a diff for bugs." in section
     assert "- explore: My own explorer." in section and section.count("- explore:") == 1

@@ -1358,3 +1358,336 @@ def test_missing_attachment_warns_once(fake_model, monkeypatch, tmp_path):
     assert sent[1] == {"type": "text", "text": "[attachment unavailable: gone.png]"}
     warnings = [d for e, d in adapter.events if e == "error" and "gone.png" in str(d)]
     assert warnings == ["Attachment unavailable: gone.png (no longer in .dostuff/attachments/)"]
+
+
+# --- Mid-run skill and agent-type refresh (plan/2026-11-11-mid-run-skill-agent-refresh/tasks.md, phases 2-3) ------
+
+@pytest.fixture
+def disk(tmp_path, monkeypatch):
+    """A project (the cwd) and a home under tmp_path; skills are searched in the project's .dostuff/skills and in
+    ~/.agents/skills (outside the project root, and not ~/.dostuff, so only the skill roots make it readable)."""
+    from pathlib import Path
+    from dostuff.agent import capabilities as caps
+    from dostuff.agent.subagents import definitions as agent_defs
+    from dostuff.helpers.skills import discover_skills as ds
+    from dostuff.helpers.tools.resolve_safe_path import set_skill_roots
+    home, proj = tmp_path / "home", tmp_path / "proj"
+    home.mkdir()
+    proj.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(proj)
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [".dostuff/skills", str(home / ".agents" / "skills")])
+    caps.reset_cache()
+    agent_defs._cache = None
+    set_skill_roots([])
+    yield SimpleNamespace(home=home, proj=proj)
+    caps.reset_cache()
+    agent_defs._cache = None
+    set_skill_roots([])
+
+
+def _write_skill(root, name, desc="Ship the app to staging.", manual=False):
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    extra = "\ndisable-model-invocation: true" if manual else ""
+    (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {desc}{extra}\n---\nbody\n", encoding="utf-8")
+    return d
+
+
+def _project_skill(disk, name, **kw):
+    return _write_skill(disk.proj / ".dostuff" / "skills", name, **kw)
+
+
+def _home_skill(disk, name, **kw):
+    return _write_skill(disk.home / ".agents" / "skills", name, **kw)
+
+
+def _write_agent(disk, name, desc="Audits code for security holes."):
+    d = disk.proj / ".dostuff" / "agents"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.md").write_text(f"---\nname: {name}\ndescription: {desc}\n---\nYou audit.\n", encoding="utf-8")
+
+
+def _now(kinds=("skill", "agent")):
+    from dostuff.agent.capabilities import take_snapshot
+    return take_snapshot(kinds).capabilities
+
+
+def _cap_steps(history):
+    return [s for s in history if "capabilities" in (s.get("meta") or {})]
+
+
+def test_loop_baseline_none_never_announces(disk, monkeypatch):
+    from dostuff.helpers.skills import discover_skills as ds
+    _project_skill(disk, "deploy")
+
+    def no_stat_pass():
+        raise AssertionError("baseline None must not even look")
+    monkeypatch.setattr(ds, "skills_signature", no_stat_pass)
+    _, working, _ = _interactive(monkeypatch, [_msg(content="ok")])
+    assert _cap_steps(working) == []
+
+
+def test_capability_step_appended_once_at_turn_start(disk, monkeypatch):
+    baseline = _now()
+    _project_skill(disk, "deploy")
+    adapter = Adapter()
+    _, working, calls = _interactive(monkeypatch, [_msg(tool_calls=[_read_call()]), _msg(content="ok")],
+                                     dispatch=_read_dispatch, capabilities_baseline=baseline, adapter=adapter)
+    [step] = _cap_steps(working)
+    assert "New skill:\n- name: deploy\n  description: Ship the app to staging." in step["content"]
+    assert calls[0]["history"][-1] == step
+    assert len(_cap_steps(calls[1]["history"])) == 1  # only on change
+    assert tuple(step["meta"]["capabilities"]) == _now()
+
+
+def test_no_change_appends_nothing(disk, monkeypatch):
+    _project_skill(disk, "deploy")
+    adapter = Adapter()
+    _, working, calls = _interactive(monkeypatch, [_msg(tool_calls=[_read_call()]), _msg(content="ok")],
+                                     dispatch=_read_dispatch, capabilities_baseline=_now(), adapter=adapter)
+    assert len(calls) == 2 and _cap_steps(working) == []
+    assert not [e for e, _ in adapter.events if e == "capabilities_changed"]
+
+
+def test_capability_step_after_plan_step(disk, monkeypatch):
+    from dostuff.agent.permissions import SessionPermissions
+    baseline = _now()
+    _project_skill(disk, "deploy")
+    _, working, _ = _interactive(monkeypatch, [_msg(content="ok")], capabilities_baseline=baseline,
+                                 permissions=SessionPermissions(mode="plan"))
+    [plan] = _plan_steps(working)
+    [note] = _cap_steps(working)
+    assert working.index(plan) + 1 == working.index(note)
+
+
+def test_capability_step_after_prompt(disk, monkeypatch):
+    from dostuff.helpers.agent.turn_context import make_context_step
+    baseline = _now()
+    _project_skill(disk, "deploy")
+    working = [make_context_step("<turn-context>ENV</turn-context>"), {"role": "user", "content": "deploy it"}]
+    _, working, _ = _interactive(monkeypatch, [_msg(content="ok")], working=working, capabilities_baseline=baseline)
+    assert [s.get("content") for s in working[:2]] == ["<turn-context>ENV</turn-context>", "deploy it"]
+    assert working[2] == _cap_steps(working)[0]
+
+
+def test_agent_type_created_by_tool_reaches_next_call(disk, monkeypatch):
+    """The case that started this: a tool writes an agent file mid-turn, and the very next call is told."""
+    from dostuff.agent.call_agent import provider_messages
+    baseline = _now()
+
+    async def dispatch(name, args, **kw):
+        _write_agent(disk, "security-auditor")
+        return "wrote it"
+    _, working, calls = _interactive(monkeypatch, [_msg(tool_calls=[_read_call()]), _msg(content="ok")],
+                                     dispatch=dispatch, capabilities_baseline=baseline)
+    assert _cap_steps(calls[0]["history"]) == []
+    messages = provider_messages(calls[1]["history"])
+    assert messages[-2]["role"] == "tool"
+    assert messages[-1]["role"] == "user" and "- name: security-auditor" in messages[-1]["content"]
+    assert "New agent type" in messages[-1]["content"]
+
+
+def test_turn_start_note_merges_into_prompt_message(disk, monkeypatch):
+    from dostuff.agent.call_agent import provider_messages
+    from dostuff.helpers.agent.turn_context import make_context_step
+    baseline = _now()
+    _project_skill(disk, "deploy")
+    working = [make_context_step("<turn-context>ENV</turn-context>"), {"role": "user", "content": "deploy it"}]
+    _, _, calls = _interactive(monkeypatch, [_msg(content="ok")], working=working, capabilities_baseline=baseline)
+    [message] = provider_messages(calls[0]["history"])
+    assert message["role"] == "user"
+    assert message["content"].startswith("<turn-context>ENV</turn-context>\n\ndeploy it\n\n<turn-context>\n## Skills")
+
+
+def test_removed_skill_announced_and_unreadable(disk, monkeypatch):
+    from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path
+    from dostuff.lib.exceptions import PathOutsideProject
+    d = _home_skill(disk, "deploy")
+    (d / "notes.md").write_text("n", encoding="utf-8")
+    baseline = _now()
+    assert resolve_safe_path(str(d / "notes.md"), for_read=True)  # readable while it is a skill
+    (d / "SKILL.md").unlink()
+    _, working, _ = _interactive(monkeypatch, [_msg(content="ok")], capabilities_baseline=baseline)
+    [note] = _cap_steps(working)
+    assert "No longer available: skill 'deploy'." in note["content"]
+    with pytest.raises(PathOutsideProject):
+        resolve_safe_path(str(d / "notes.md"), for_read=True)
+
+
+def test_capability_redelivered_after_compaction_drops_step(disk, monkeypatch):
+    from dostuff.agent.capabilities import delta_text, take_snapshot
+    from dostuff.helpers.agent.turn_context import make_capability_step
+    baseline = _now()
+    _project_skill(disk, "deploy")
+    now = take_snapshot()
+    told = make_capability_step(delta_text(baseline, now), now.capabilities)
+    working = [{"role": "user", "content": "old"}, told, {"role": "user", "content": "hi"}]
+
+    async def fake_compact(steps, keep_budget, notes, limit):
+        return [{"role": "user", "content": "hi"}], "SUMMARY"  # the capability step went with the old steps
+    monkeypatch.setattr(loop_module, "compact_context", fake_compact)
+    overflow = litellm.ContextWindowExceededError("x", "m", "openai")
+    _, _, calls = _interactive(monkeypatch, [overflow, _msg(content="ok")], working=working,
+                               capabilities_baseline=baseline)
+    assert len(_cap_steps(calls[0]["history"])) == 1  # still believed: nothing new
+    [again] = _cap_steps(calls[1]["history"])
+    assert again["content"] == told["content"]  # the full difference against the baseline, verbatim
+    assert calls[1]["history"][-1] == again
+
+
+def test_retry_after_overflow_compaction_covered(disk, monkeypatch):
+    baseline = _now()
+
+    async def fake_compact(steps, keep_budget, notes, limit):
+        return list(steps), "SUMMARY"
+    monkeypatch.setattr(loop_module, "compact_context", fake_compact)
+    overflow = litellm.ContextWindowExceededError("x", "m", "openai")
+    _, _, calls = _interactive(monkeypatch, [overflow, _msg(content="ok")], capabilities_baseline=baseline,
+                               on_call=lambda n: _project_skill(disk, "deploy") if n == 1 else None)
+    assert _cap_steps(calls[0]["history"]) == []
+    assert len(_cap_steps(calls[1]["history"])) == 1
+
+
+def test_capability_step_in_published_snapshot(disk, monkeypatch, btw):
+    baseline = _now()
+    _project_skill(disk, "deploy")
+    seen = []
+    _interactive(monkeypatch, [_msg(content="ok")], capabilities_baseline=baseline,
+                 on_call=lambda n: seen.append(btw.snapshot("s1")))
+    assert len(_cap_steps(seen[0].history)) == 1
+    assert seen[0].capabilities_baseline == baseline
+
+
+def test_capabilities_changed_event_only_on_append(disk, monkeypatch):
+    baseline = _now()
+    _project_skill(disk, "deploy")
+    adapter = Adapter()
+    _interactive(monkeypatch, [_msg(tool_calls=[_read_call()]), _msg(content="ok")], dispatch=_read_dispatch,
+                 capabilities_baseline=baseline, adapter=adapter)
+    events = [d for e, d in adapter.events if e == "capabilities_changed"]
+    assert events == [{"capabilities": list(_now())}]
+
+
+def test_manual_only_skill_appearing_appends_nothing(disk, monkeypatch):
+    baseline = _now()
+    _project_skill(disk, "release", manual=True)
+    adapter = Adapter()
+    _, working, _ = _interactive(monkeypatch, [_msg(content="ok")], capabilities_baseline=baseline, adapter=adapter)
+    assert _cap_steps(working) == [] and not [e for e, _ in adapter.events if e == "capabilities_changed"]
+
+
+def test_fork_context_carries_baseline(disk, monkeypatch):
+    seen = []
+
+    async def dispatch(name, args, **kw):
+        seen.append(kw.get("fork_context"))
+        return "started"
+    call = _tc("agent", json.dumps({"description": "d", "prompt": "p", "subagent_type": "fork"}), "c1")
+    _interactive(monkeypatch, [_msg(tool_calls=[call]), _msg(content="ok")], dispatch=dispatch,
+                 tool_names=["agent"], capabilities_baseline=("skill:x:1",))
+    assert seen[0].capabilities_baseline == ("skill:x:1",)
+
+
+def test_two_loops_different_baselines(disk, monkeypatch):
+    """REQ-2.4: the baseline is a parameter, not module state."""
+    from dostuff.helpers.hooks import HookOutcome
+    _project_skill(disk, "deploy")
+
+    async def fake_call_agent(steps_history, system_instruction, tool_names=None, stream=False):
+        await asyncio.sleep(0)
+        return _msg(content="ok"), None
+
+    async def no_hooks(*args, **kwargs):
+        return HookOutcome()
+    monkeypatch.setattr(loop_module, "call_agent", fake_call_agent)
+    monkeypatch.setattr(loop_module, "run_hooks", no_hooks)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+    current = _now()
+
+    async def run(sid, baseline):
+        working = [{"role": "user", "content": "hi"}]
+        await loop(session_id=sid, turn_id="t", user_text="hi", dynamic_system_instruction="sys", mcp_client=None,
+                   working_history=working, turn_type="interactive_loop", stream=False, max_iterations=3,
+                   capabilities_baseline=baseline)
+        return working
+
+    async def both():
+        return await asyncio.gather(run("a", ()), run("b", current))
+    told, untold = asyncio.run(both())
+    assert len(_cap_steps(told)) == 1 and _cap_steps(untold) == []
+
+
+def test_resume_does_not_reannounce(disk, monkeypatch):
+    """A reopened session whose newest capability step matches the disk announces nothing (D2)."""
+    from dostuff.agent.capabilities import delta_text, take_snapshot
+    from dostuff.helpers.agent.turn_context import make_capability_step
+    _project_skill(disk, "deploy")
+    now = take_snapshot()
+    stored = [{"role": "user", "content": "earlier"}, make_capability_step(delta_text((), now), now.capabilities),
+              {"role": "assistant", "content": "noted"}, {"role": "user", "content": "hi"}]
+    _, working, _ = _interactive(monkeypatch, [_msg(content="ok")], working=stored, capabilities_baseline=())
+    assert len(_cap_steps(working)) == 1
+
+
+def test_typed_subagent_first_call_appends_nothing(disk, agents, fake_model):
+    """D10: a typed subagent's baseline is its own skills, and it is never told about agent types."""
+    from conftest import fake_response
+    _project_skill(disk, "deploy")
+    _write_agent(disk, "security-auditor")
+    fake_model.script("[A]", fake_response("report"))
+
+    async def go():
+        run = await agents.start(owner="s1", agent_type="general-purpose", description="d", prompt="[A] x")
+        return await run.done
+    assert asyncio.run(go()) == "report"
+    [call] = fake_model.calls_for("[A]")
+    assert "Skills and agent types: changes" not in json.dumps(call["messages"])
+    assert "deploy" in call["messages"][0]["content"]  # in its own prompt's list
+
+
+def test_subagent_sees_skill_added_mid_run(disk, agents, fake_model, monkeypatch):
+    from conftest import fake_response, fake_tool_call
+    from dostuff.agent.permissions import SessionPermissions
+    tick = fake_tool_call("get_current_datetime", {})
+    fake_model.script("[A]", fake_response(tool_calls=[tick]), fake_response("report"))
+    real = fake_model.acompletion
+
+    async def writes_skill_on_first_call(**kwargs):
+        if not fake_model.calls:
+            _project_skill(disk, "deploy")
+        return await real(**kwargs)
+    monkeypatch.setattr(fake_model, "acompletion", writes_skill_on_first_call)
+    from dostuff.agent import call_agent as call_agent_module
+    monkeypatch.setattr(call_agent_module, "acompletion", writes_skill_on_first_call)
+
+    async def go():
+        run = await agents.start(owner="s1", agent_type="general-purpose", description="d", prompt="[A] x",
+                                 permissions=SessionPermissions(mode="auto"))
+        return await run.done
+    assert asyncio.run(go()) == "report"
+    first, second = fake_model.calls_for("[A]")
+    assert "Skills and agent types: changes" not in json.dumps(first["messages"])
+    last = second["messages"][-1]
+    assert last["role"] == "user" and "- name: deploy" in last["content"] and "New agent type" not in last["content"]
+
+
+def test_fork_does_not_reannounce_parent_delta(disk, agents, fake_model):
+    """A fork inherits the main agent's baseline and its history's capability step: nothing new to say."""
+    from conftest import fake_response
+    from dostuff.agent.capabilities import delta_text, take_snapshot
+    from dostuff.agent.subagents.fork import ForkContext
+    from dostuff.helpers.agent.turn_context import make_capability_step
+    baseline = _now()
+    _project_skill(disk, "deploy")
+    now = take_snapshot()
+    history = [{"role": "user", "content": "[MAIN] go"}, make_capability_step(delta_text(baseline, now), now.capabilities)]
+    fake_model.script("[F]", fake_response("fork report"))
+
+    async def go():
+        fork = ForkContext("MAIN SYSTEM", "", history, ["read_file"], None, baseline)
+        run = await agents.start(owner="s1", agent_type="fork", description="d", prompt="[F] x", fork=fork)
+        return await run.done
+    assert asyncio.run(go()) == "fork report"
+    [call] = fake_model.calls_for("[F]")
+    assert json.dumps(call["messages"]).count("Skills and agent types: changes") == 1  # the parent's, once
