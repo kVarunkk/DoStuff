@@ -36,6 +36,21 @@ def download_embedding_model() -> None:
     ONNXMiniLM_L6_V2()(["warm up"])
 
 
+def is_index_divergence(error: BaseException) -> bool:
+    """True if `error` is Chroma's HNSW-vs-metadata divergence ("Error finding id").
+
+    Chroma keeps vectors in an HNSW segment and text/metadata in SQLite. When a row exists in
+    SQLite but not in the HNSW graph, any query that walks the graph raises InternalError
+    ("Error executing plan: Internal error: Error finding id <id>") instead of skipping the row.
+    Chroma 1.5.x has no typed exception for it, so the message is the only signal. Match the precise
+    phrase: "Error executing plan" alone prefixes more planner failures, and treating those as
+    divergence would silently downgrade a genuine problem instead of reporting it.
+
+    `get()` is unaffected (no graph walk), so callers can fall back to it or rebuild the index.
+    """
+    return "Error finding id" in str(error)
+
+
 def get_chroma_client(persist_path: str) -> Any:
     import chromadb
     key = str(Path(persist_path).expanduser().resolve())

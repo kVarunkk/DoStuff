@@ -4,6 +4,7 @@ from typing import Any
 
 from dostuff.helpers.memory.resolve_memory_operation import resolve_memory_operation
 from dostuff.lib.memory.chroma import get_chroma_client
+from dostuff.lib.memory.safe_query import safe_query
 
 # Facts less similar than this to the prompt aren't recalled: unrelated prompts like "hi" score
 # ~0.0-0.2 against stored facts, relevant ones ~0.3-0.5 (Chroma's default MiniLM embeddings)
@@ -42,14 +43,9 @@ class SemanticMemoryStore(MemoryStore):
 
     async def query(self, user_id: str, query_text: str, top_k: int = 3, min_similarity: float = 0.0) -> list[dict]:
         """Memories at least `min_similarity` similar to `query_text`, as {key, value, source} dicts."""
-        def _query() -> Any:
-            # n_results larger than the collection makes Chroma warn; cap it
-            n = min(top_k, self._collection.count())
-            if n <= 0:
-                return {}
-            return self._collection.query(query_texts=[query_text], n_results=n, where={"user_id": user_id})
-
-        results = await asyncio.to_thread(_query)
+        # safe_query caps n_results at the collection size and survives a broken HNSW index,
+        # so a save or a recall degrades instead of failing (chroma-core/chroma#7032)
+        results = await asyncio.to_thread(safe_query, self._collection, query_text, top_k, {"user_id": user_id})
         raw_metas = results.get("metadatas") or [[]]
         raw_dists = results.get("distances") or [[]]
         metadatas = raw_metas[0] if raw_metas and raw_metas[0] is not None else []

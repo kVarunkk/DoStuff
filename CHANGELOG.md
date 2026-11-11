@@ -9,8 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 A skill or agent type you add while a session is running reaches the agent on your next message, with no restart, and one the agent creates itself mid-turn reaches it before its next step.
 
+Long-term memory keeps working when Chroma's vector index gets out of sync, and `dostuff memory check` / `repair` find and fix it.
+
 ### Added
 - **`/skills`** lists the session's skills with their folders, marking the manual-only ones. **`/skills reload`** re-reads them now, rebuilds the system prompt from the next message, and reports which skills were added and removed.
+- **`dostuff memory check`** reports, for each memory collection (facts, episodes and the MCP tool index), whether it can answer queries. It exits with code 1 when one needs a rebuild.
+- **`dostuff memory repair`** backs a broken collection up to `~/.dostuff/data/chroma-backups/`, then rebuilds it from its stored rows. Rows that can't be rebuilt are left out but kept in the backup, and if the rebuild fails the original is left as it was. It asks first; `-y` skips the question.
+- **A warning when the TUI starts** if a memory index is out of sync, telling you to run `dostuff memory repair`.
 
 ### Changed
 - **`/agents reload`** now also rebuilds the system prompt, so the agent's list of types matches the files from the next message.
@@ -20,6 +25,7 @@ A skill or agent type you add while a session is running reaches the agent on yo
 - **Skills and agent types added mid-session are no longer invisible to the agent.** Before every model call dostuff checks the skill and agent folders (a few milliseconds). If something was added, removed or had its description changed, the agent gets a short hidden note with the name, description and the skill's folder. Before, the list was fixed when the session started, so the agent kept saying a new skill didn't exist until you restarted or changed directory. This includes a type made with `create_agent_type`, which the agent could start but was never told about. The system prompt itself is not rebuilt for this, so the prompt cache stays warm. Manual-only skills are never announced. Subagents get the same notes for skills that appear while they run. `dostuff -p` behaves the same way.
 - **A new skill is usable as `/name` from your next message**, and the `/` menu and `/help` show it, with no restart. A deleted skill stops being a command.
 - **A skill added mid-session can be read by the file tools.** Before, its `SKILL.md` was refused as outside the project until a restart. A removed skill's folder stops being readable at the same time.
+- **Memory no longer fails with "Error finding id"**. Chroma can drop a row from its vector index while keeping it in its database (chroma-core/chroma#7032); recall, saving a fact and MCP tool search then failed outright. They now fall back to a slower scan and keep working, though they can find less until the index is repaired.
 
 ### Documentation
 - README: a new *Adding skills and agent types mid-session* section, the `/skills` row in the TUI controls, and the restart advice for skills removed.

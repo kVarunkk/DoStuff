@@ -23,6 +23,9 @@ def _lookup_session_dir(session_id: str) -> tuple[bool, str | None]:
 
 PERMISSION_MODES = ("ask", "allowlist", "auto", "plan")
 
+# The three Chroma collections long-term memory uses; they share one PersistentClient
+MEMORY_COLLECTIONS = ("semantic_memory", "episodic_memory", "mcp_tools_index")
+
 
 def _print_version(value: bool) -> None:
     if value:
@@ -231,6 +234,85 @@ def config():
     typer.echo(f"User ID: {_read_user_id(cfg)}")
     typer.echo(f"Model: {cfg.model_name}")
     typer.echo(f"Permission mode: {cfg.permission_mode}")
+
+
+@app.command()
+def memory(
+    action: str = typer.Argument("check", help="'check' to diagnose, 'repair' to rebuild the indexes."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Repair without asking for confirmation."),
+):
+    """Check long-term memory's vector index, or rebuild it after 'Error finding id' failures."""
+    from dostuff.config import get_config
+    from dostuff.lib.memory import chroma
+    from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
+
+    if action not in ("check", "repair"):
+        typer.secho(f"Unknown action '{action}'; use 'check' or 'repair'.", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+    if not chroma.chroma_available():
+        typer.echo(f"Long-term memory is off: chromadb is not installed ({MEMORY_INSTALL_HINT}).")
+        raise typer.Exit(code=1)
+
+    from dostuff.helpers.memory.repair_index import check_collection, rebuild_collection
+
+    cfg = get_config()
+    client = chroma.get_chroma_client(str(cfg.get_data_dir() / "chroma"))
+    user_id = cfg.get_user_id()
+
+    broken: list[str] = []
+    for name in MEMORY_COLLECTIONS:
+        collection = client.get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
+        if collection.count() == 0:
+            typer.echo(f"  {name}: empty")
+            continue
+        # Filter on user_id for the two per-user collections, as real recall queries do
+        where = {"user_id": user_id} if name != "mcp_tools_index" else None
+        error = check_collection(collection, where)
+        if error:
+            broken.append(name)
+            typer.secho(f"  {name}: BROKEN ({error})", fg=typer.colors.RED)
+        else:
+            typer.secho(f"  {name}: ok ({collection.count()} rows)", fg=typer.colors.GREEN)
+
+    if not broken:
+        if action == "repair":
+            typer.echo("Nothing to repair.")
+        else:
+            typer.echo("\nVector index is healthy.")
+        return
+
+    if action == "check":
+        typer.echo(f"\n{len(broken)} collection(s) need a rebuild. Back up {cfg.get_data_dir() / 'chroma'}, then run:")
+        typer.echo("  dostuff memory repair")
+        raise typer.Exit(code=1)
+
+    if not yes and not typer.confirm(f"Rebuild {', '.join(broken)}? See the backup note below."):
+        raise typer.Exit(code=1)
+    backup_dir = cfg.get_data_dir() / "chroma-backups"
+    typer.echo(f"Backing up to {backup_dir} before changing anything.")
+    failed: list[str] = []
+    for name in broken:
+        try:
+            summary = rebuild_collection(client, name, backup_dir=backup_dir)
+        except Exception as error:
+            failed.append(name)
+            typer.secho(f"  {name}: rebuild failed, original left untouched: {error}", fg=typer.colors.RED)
+            continue
+        skipped = []
+        if summary["orphans"]:
+            skipped.append(f"{summary['orphans']} orphaned")
+        if summary["missing_metadata"]:
+            skipped.append(f"{summary['missing_metadata']} without metadata")
+        typer.echo(
+            f"  {name}: rebuilt, kept {summary['kept']} of {summary['before']}"
+            + (f", skipped {' and '.join(skipped)} (in the backup)" if skipped else "")
+        )
+        if summary["error"]:
+            failed.append(name)
+            typer.secho(f"  {name}: still failing: {summary['error']}", fg=typer.colors.RED)
+    if failed:
+        raise typer.Exit(code=1)
+    typer.secho("Rebuilt. Restart any running dostuff sessions so they reopen the collections.", fg=typer.colors.GREEN)
 
 
 @app.command()
