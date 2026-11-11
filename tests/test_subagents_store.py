@@ -315,7 +315,7 @@ def test_main_prompt_follow_ups(monkeypatch):
     for wake in (True, False):
         monkeypatch.setattr(get_config(), "agents_wake_on_end", wake)
         for interactive in (True, False):
-            base, _ = build_base_instructions(interactive=interactive)
+            base, _, _ = build_base_instructions(interactive=interactive)
             text = base.split("## Delegating to subagents", 1)[1].split("\n## ", 1)[0]
             assert "send_message" in text and "agent_id" in text
             assert "instead of starting a new agent" in text

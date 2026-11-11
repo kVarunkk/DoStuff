@@ -6415,7 +6415,8 @@ def turn_tui(tui, monkeypatch):
 
     async def fake(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
                    current_session_history, steps_history, store, adapter=None, **kwargs):
-        seen.append({"text": user_text, "instructions": instructions, "history": [dict(s) for s in working_history]})
+        seen.append({"text": user_text, "instructions": instructions, "history": [dict(s) for s in working_history],
+                     "baseline": kwargs.get("capabilities_baseline")})
         text = f"answer to {user_text}"
         await append_step({"role": "assistant", "content": text}, steps_history, working_history,
                           current_session_history, session_id, store, turn_type)
@@ -7894,6 +7895,641 @@ def test_help_lists_alt_v(tui):
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/help"))
             await _until(pilot, lambda: any("Shortcuts:" in t for t in _texts(app)))
             assert any("Alt+V paste an image from the clipboard" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- Mid-run skill and agent-type refresh (plan/2026-11-11-mid-run-skill-agent-refresh/tasks.md) ----------------
+
+def _reset_capability_caches():
+    from dostuff.agent import capabilities as caps
+    from dostuff.agent.subagents import definitions as agent_defs
+    from dostuff.helpers.tools.resolve_safe_path import set_skill_roots
+    caps.reset_cache()
+    agent_defs._cache = None
+    set_skill_roots([])
+
+
+@pytest.fixture
+def skills_tui(turn_tui):
+    """turn_tui with the skill / agent-type caches cleared around the test."""
+    _reset_capability_caches()
+    yield turn_tui
+    _reset_capability_caches()
+
+
+@pytest.fixture
+def real_loop_tui(tui, monkeypatch):
+    """(cli_tui, calls, responses): the TUI on the real loop(), with call_agent faked. Each call records the history
+    and the system string it was given; `responses` is a script, then "ok" answers."""
+    from dostuff.agent import loop as loop_module
+    calls: list[dict] = []
+    responses: list = []
+
+    async def fake_call_agent(steps_history, system_instruction, tool_names=None, stream=False):
+        calls.append({"history": [dict(s) for s in steps_history], "system": system_instruction})
+        if responses:
+            item = responses.pop(0)
+            return (await item() if callable(item) else item), None
+        message = types.SimpleNamespace(content="ok", tool_calls=None)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)], usage=None), None
+
+    async def real(*args, **kwargs):
+        return await loop_module.loop(*args, **kwargs)
+    monkeypatch.setattr(loop_module, "call_agent", fake_call_agent)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+    monkeypatch.setattr(tui, "agent_loop", real)
+    _reset_capability_caches()
+    yield tui, calls, responses
+    _reset_capability_caches()
+
+
+def _new_skill(name, desc="Ship the app.", manual=False, root=None):
+    folder = Path(root or Path(".dostuff", "skills"), name)
+    folder.mkdir(parents=True, exist_ok=True)
+    extra = "disable-model-invocation: true\n" if manual else ""
+    (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {desc}\n{extra}---\n\nDo {name}.\n",
+                                     encoding="utf-8")
+    return folder
+
+
+def _new_agent_type(name, desc="Audits code for security holes."):
+    folder = Path(".dostuff", "agents")
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.md").write_text(f"---\nname: {name}\ndescription: {desc}\n---\nYou audit.\n", encoding="utf-8")
+
+
+def _cap_steps(history):
+    return [s for s in history if "capabilities" in (s.get("meta") or {})]
+
+
+def _tool_call_response(name="read_file", args='{"path": "a.txt"}'):
+    tc = types.SimpleNamespace(id="c1", type="function", function=types.SimpleNamespace(name=name, arguments=args))
+    tc.model_dump = lambda: {"id": "c1", "type": "function", "function": {"name": name, "arguments": args}}
+    message = types.SimpleNamespace(content=None, tool_calls=[tc])
+    return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)], usage=None)
+
+
+async def _turn(app, cli_tui, pilot, text, calls, n):
+    _submit(app, cli_tui, text)
+    await _until(pilot, lambda: not app._turn_in_progress and len(calls) >= n)
+
+
+# T0.1 / REQ-4.1 / CON-003
+
+def test_pin_system_prompt_stable_across_three_turns(real_loop_tui):
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-stable")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for n, prompt in enumerate(("one", "two", "three"), start=1):
+                await _turn(app, cli_tui, pilot, prompt, calls, n)
+                if n == 1:
+                    _new_skill("deploy")  # announced, never folded into the prompt
+            assert len(calls) == 3 and calls[0]["system"] == calls[1]["system"] == calls[2]["system"]
+            assert len(_cap_steps(calls[2]["history"])) == 1
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T0.5 / REQ-6.5
+
+def test_pin_skills_loaded_line_once(skills_tui):
+    cli_tui, seen = skills_tui
+    _new_skill("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-loaded")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for n, prompt in enumerate(("one", "two"), start=1):
+                _submit(app, cli_tui, prompt)
+                await _until(pilot, lambda: not app._turn_in_progress and len(seen) == n)
+                if n == 1:
+                    _new_skill("release")
+            assert sum("Skills loaded" in t for t in _texts(app)) == 1
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T0.6 the bug: fixed by T3.x
+
+def test_new_skill_reaches_model_mid_session(real_loop_tui):
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-skill")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            prompt_before = app._build_instructions()
+            _new_skill("deploy")
+            await _turn(app, cli_tui, pilot, "hello", calls, 1)
+            [note] = _cap_steps(calls[0]["history"])
+            assert "- name: deploy" in note["content"] and "Ship the app." in note["content"]
+            assert calls[0]["system"].startswith(prompt_before)  # the prompt itself never moved
+            assert "name: deploy" not in prompt_before
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_new_agent_type_reaches_model_mid_turn(real_loop_tui, monkeypatch):
+    from dostuff.agent import loop as loop_module
+    cli_tui, calls, responses = real_loop_tui
+
+    async def dispatch(name, args, **kw):
+        _new_agent_type("security-auditor")  # what create_agent_type does
+        return "done"
+    monkeypatch.setattr(loop_module, "dispatch_tool", dispatch)
+    responses.append(_tool_call_response())
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-agent")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _turn(app, cli_tui, pilot, "make an auditor", calls, 2)
+            assert _cap_steps(calls[0]["history"]) == []
+            last = calls[1]["history"][-1]
+            assert _cap_steps([last]) and "- name: security-auditor" in last["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T2.3
+
+def test_tui_stores_baseline_on_mount(skills_tui):
+    from dostuff.agent.capabilities import take_snapshot
+    cli_tui, seen = skills_tui
+    _new_skill("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-mount")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._capabilities_baseline == take_snapshot().capabilities
+            assert any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert seen[0]["baseline"] == app._capabilities_baseline
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_move_to_refreshes_baseline(skills_tui, tmp_path):
+    cli_tui, _ = skills_tui
+    other = tmp_path / "other"
+    _new_skill("deploy", root=other / ".dostuff" / "skills")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-move")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            assert not any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            await app._move_to(other)
+            assert any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            assert "name: deploy" in app._system_instructions and "/deploy" in app._skill_commands
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_reload_instructions_refreshes_baseline(skills_tui):
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-reload-ins")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            app._reload_instructions()  # what an AGENTS.md save does
+            assert any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            assert "name: deploy" in app._system_instructions
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_clear_keeps_baseline(skills_tui):
+    """/clear is not a rebuild site (CON-003): same prompt, same baseline, a fresh history."""
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-clear")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            baseline, prompt = app._capabilities_baseline, app._system_instructions
+            _new_skill("deploy")
+            await app._clear_session()
+            assert app._capabilities_baseline == baseline and app._system_instructions == prompt
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T4.1 - T4.5
+
+def test_capabilities_changed_prints_nothing(skills_tui):
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-event")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            app.adapter.emit("capabilities_changed", {"capabilities": ["skill:deploy:x"]})
+            await pilot.pause()
+            assert not any("CAPABILITIES" in t for t in _texts(app))
+            assert "/deploy" in app._skill_commands  # the event refreshed the view
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_new_skill_parses_as_command_next_message(skills_tui):
+    cli_tui, seen = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-command")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _new_skill("deploy")
+            got = _record_appends(app)
+            _submit(app, cli_tui, "/deploy")  # a lone /word: a command now, not "Unknown command"
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert not any("Unknown command" in text for text, _ in got), got
+            assert "Do deploy." in str(seen[0]["history"][-1]["content"])
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_inline_mention_of_new_skill_recognised(skills_tui):
+    from dostuff.helpers.agent.file_mentions import MENTION_NOTE_HEAD
+    cli_tui, seen = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-mention")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            _submit(app, cli_tui, "please use /deploy for this")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert MENTION_NOTE_HEAD in str(seen[0]["history"][-1]["content"])
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_menu_and_help_list_new_skill(skills_tui):
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-menu")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/help")
+            await pilot.pause()
+            assert app.query_one("#command-menu", cli_tui.CommandMenu).commands["/deploy"] == "(skill) Ship the app."
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            assert "/deploy" in inp.skills and "/deploy" in inp.commands
+            assert any("Skills (/<skill>" in t and "/deploy" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_manual_only_marked_in_menu_and_help(skills_tui):
+    cli_tui, _ = skills_tui
+    _new_skill("deploy", manual=True)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-manual")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            menu = app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            assert menu["/deploy"] == "(skill, manual only) Ship the app."
+            _submit(app, cli_tui, "/help")
+            await pilot.pause()
+            assert any("/deploy  (manual only)" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_removed_skill_stops_being_command(skills_tui):
+    import shutil
+    cli_tui, _ = skills_tui
+    folder = _new_skill("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-removed")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "/deploy" in app._skill_commands
+            shutil.rmtree(folder)
+            got = _record_appends(app)
+            _submit(app, cli_tui, "/deploy")
+            await pilot.pause()
+            assert ("Unknown command /deploy. Type / to see commands.", "error") in got
+            assert "/deploy" not in app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_queued_prompt_naming_removed_skill_is_plain_text(skills_tui):
+    import shutil
+    cli_tui, seen = skills_tui
+    folder = _new_skill("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-queued")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            shutil.rmtree(folder)
+            got = _record_appends(app)
+            app._turn_in_progress = True
+            await app._run_turn("/deploy now")  # how a queued prompt runs
+            assert seen[-1]["history"][-1]["content"] == "/deploy now"
+            assert not any("Turn error" in text for text, _ in got), got
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_new_skill_md_and_neighbour_readable_after_refresh(skills_tui, monkeypatch, tmp_path):
+    from dostuff.helpers.skills import discover_skills
+    from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path
+    from dostuff.lib.exceptions import PathOutsideProject
+    cli_tui, seen = skills_tui
+    outside = tmp_path / "home" / ".agents" / "skills"  # outside the project, and not ~/.dostuff
+    monkeypatch.setattr(discover_skills, "SKILLS_DIRS", [".dostuff/skills", str(outside)])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-read")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            folder = _new_skill("deploy", root=outside)
+            (folder / "steps.md").write_text("step one", encoding="utf-8")
+            with pytest.raises(PathOutsideProject):
+                resolve_safe_path(str(folder / "SKILL.md"), for_read=True)
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            for name in ("SKILL.md", "steps.md"):
+                assert resolve_safe_path(str(folder / name), for_read=True).read_text(encoding="utf-8")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T4.6, T4.7
+
+def test_esc_esc_takes_capability_step_with_prompt(real_loop_tui):
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-back")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _turn(app, cli_tui, pilot, "first", calls, 1)
+            _new_skill("deploy")
+            await _turn(app, cli_tui, pilot, "second", calls, 2)
+            assert len(_cap_steps(app.steps_history)) == 1
+            await app._edit_previous_prompt()
+            assert _cap_steps(app.steps_history) == []
+            assert _cap_steps(await app.store.load(app.session_id)) == []
+            assert app.query_one("#input", cli_tui.EnterSubmits).text == "second"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_capability_step_not_rendered(tui):
+    from dostuff.helpers.agent.turn_context import make_capability_step
+
+    async def scenario():
+        app = tui.DostuffTUI(session_id="cap-render")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.steps_history = [{"role": "user", "content": "the prompt"},
+                                 make_capability_step("## Skills and agent types: changes\nNew skill: x", ("s",)),
+                                 {"role": "assistant", "content": "the answer"}]
+            app._render_history()
+            await pilot.pause()
+            texts = "\n".join(_texts(app))
+            assert "the prompt" in texts and "Skills and agent types" not in texts and "<turn-context>" not in texts
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T5.1 - T5.5
+
+def test_skills_command_lists_dir_and_manual_only(skills_tui):
+    cli_tui, _ = skills_tui
+    _new_skill("deploy")
+    _new_skill("release", manual=True)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-list")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/skills")
+            await _until(pilot, lambda: any(t.startswith("Skills (2)") for t in _texts(app)))
+            text = next(t for t in _texts(app) if t.startswith("Skills (2)"))
+            deploy, release = (line for line in text.splitlines() if "deploy" in line or "release  ·" in line)
+            assert str(Path(".dostuff", "skills", "deploy")) in deploy and "manual only" not in deploy
+            assert str(Path(".dostuff", "skills", "release")) in release and "manual only" in release
+            assert "/skills reload" in text
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def _reloaded(app):
+    return next((t for t in _texts(app) if t.startswith("Reloaded:")), None)
+
+
+def test_skills_reload_rebuilds_prompt_and_view(skills_tui):
+    cli_tui, seen = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-skills-reload")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            before = app._system_instructions
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            assert app._system_instructions != before and "name: deploy" in app._system_instructions
+            assert any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            assert "/deploy" in app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert "name: deploy" in seen[0]["instructions"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_skills_reload_reports_added_removed(skills_tui):
+    import shutil
+    cli_tui, _ = skills_tui
+    old = _new_skill("old-deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-skills-report")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            shutil.rmtree(old)
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            assert _reloaded(app).startswith("Reloaded: 1 skill(s) — added deploy; removed old-deploy.")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_reload_edits_no_history(skills_tui):
+    cli_tui, seen = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-reload-history")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            stored = await app.store.load(app.session_id)
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            assert await app.store.load(app.session_id) == stored and app.steps_history == stored
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_after_reload_no_change_no_step(real_loop_tui):
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-after-reload")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            await _turn(app, cli_tui, pilot, "hello", calls, 1)
+            assert _cap_steps(calls[0]["history"]) == []  # the rebuilt prompt already lists it
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_after_reload_at_most_one_redundant_note(real_loop_tui):
+    """D2: a note older than the reload, then a change, then the reload: one redundant note, then none."""
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-redundant")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            await _turn(app, cli_tui, pilot, "one", calls, 1)  # announces deploy
+            _new_skill("release")
+            _submit(app, cli_tui, "/skills reload")  # the prompt now lists both
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            await _turn(app, cli_tui, pilot, "two", calls, 2)
+            await _turn(app, cli_tui, pilot, "three", calls, 3)
+            assert [len(_cap_steps(c["history"])) for c in calls] == [1, 2, 2]
+            assert "- name: release" in _cap_steps(calls[1]["history"])[-1]["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_reload_mid_turn_leaves_running_request_alone(real_loop_tui, monkeypatch):
+    """D12 / REQ-7.3: the running turn keeps the prompt it started with; the next turn gets the rebuilt one."""
+    from dostuff.agent import loop as loop_module
+    cli_tui, calls, responses = real_loop_tui
+    release = asyncio.Event()
+
+    async def dispatch(name, args, **kw):
+        await release.wait()
+        return "done"
+    monkeypatch.setattr(loop_module, "dispatch_tool", dispatch)
+    responses.append(_tool_call_response())
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-mid-reload")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "work")
+            await _until(pilot, lambda: len(calls) == 1)
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")  # not refused mid-turn: no new refusal (REQ-7.3)
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            release.set()
+            await _until(pilot, lambda: not app._turn_in_progress and len(calls) == 2)
+            assert calls[0]["system"] == calls[1]["system"] and "name: deploy" not in calls[1]["system"]
+            await _turn(app, cli_tui, pilot, "next", calls, 3)
+            assert "name: deploy" in calls[2]["system"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_agents_reload_rebuilds_prompt_and_skill_view(skills_tui):
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-agents-reload")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _new_agent_type("security-auditor")
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/agents reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            assert _reloaded(app).startswith("Reloaded: 4 agent types")
+            assert "security-auditor" in app._system_instructions
+            assert any(c.startswith("agent:security-auditor:") for c in app._capabilities_baseline)
+            assert "/deploy" in app._skill_commands
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_skills_and_agents_in_command_tables(skills_tui):
+    from dostuff.helpers.agent.constants import COMMAND_ARGS, COMMAND_DESCRIPTIONS
+    assert "/skills reload" in COMMAND_DESCRIPTIONS["/skills"] and COMMAND_ARGS["/skills"] == "[reload]"
+    assert "rebuilds the system prompt" in COMMAND_DESCRIPTIONS["/agents"] and "reload" in COMMAND_ARGS["/agents"]
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-tables")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "/skills" in app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            _submit(app, cli_tui, "/help")
+            await pilot.pause()
+            assert any("/skills" in t and "/agents" in t for t in _texts(app))
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

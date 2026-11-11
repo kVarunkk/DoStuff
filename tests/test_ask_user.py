@@ -551,7 +551,7 @@ def test_subagent_prompt_has_no_asking_section():
     from dostuff.agent.subagents.definitions import BUILTIN_TYPES
     from dostuff.agent.subagents.prompt import build_subagent_prompt
 
-    prompt = asyncio.run(build_subagent_prompt(BUILTIN_TYPES["general-purpose"]))
+    prompt, _ = asyncio.run(build_subagent_prompt(BUILTIN_TYPES["general-purpose"]))
     # The project's own AGENTS.md may mention `ask_user` (this repo's does), so the pin is on the section
     # and on D12's own words, not on the bare tool name.
     assert "## Asking the user" not in prompt

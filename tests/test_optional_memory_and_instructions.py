@@ -30,7 +30,7 @@ def test_without_chromadb_memory_is_off(no_chroma):
     assert not MEMORY_TOOLS & set(names)
     assert set(names) | MEMORY_TOOLS == set(TOOL_SCHEMAS)
 
-    base, _ = build_base_instructions()
+    base, _, _ = build_base_instructions()
     assert "save_memory" not in base and "## Long-term memory" not in base
     turn = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="user"))
     assert "<environment>" in turn and "<relevant_user_facts>" not in turn
@@ -165,7 +165,7 @@ def test_skill_headers_point_at_the_dir(monkeypatch):
     from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
     from dostuff.helpers.skills import discover_skills as ds
     monkeypatch.setattr(ds, "SKILLS_DIRS", [])
-    subagent = _sections(BUILTIN_TYPES["general-purpose"], None)
+    subagent, _ = _sections(BUILTIN_TYPES["general-purpose"], None)
     for text in (" ".join(SYSTEM_INSTRUCTIONS.split()), " ".join(subagent.split())):
         assert "read the SKILL.md in its dir" in text
         assert "the files it refers to are relative to that dir" in text
@@ -209,7 +209,7 @@ def test_manual_skill_not_in_prompt(tmp_path, monkeypatch):
     from dostuff.helpers.skills import discover_skills as ds
     _visible_and_manual(tmp_path)
     monkeypatch.setattr(ds, "SKILLS_DIRS", [str(tmp_path)])
-    prompt, skills = build_base_instructions()
+    prompt, skills, _ = build_base_instructions()
     assert "the visible one" in prompt and "the manual one" not in prompt and str(tmp_path / "manual") not in prompt
     assert sorted(s["name"] for s in skills) == ["manual", "visible"]  # the / menu and /help are built from this
 

@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+A skill or agent type you add while a session is running reaches the agent on your next message, with no restart, and one the agent creates itself mid-turn reaches it before its next step.
+
+### Added
+- **`/skills`** lists the session's skills with their folders, marking the manual-only ones. **`/skills reload`** re-reads them now, rebuilds the system prompt from the next message, and reports which skills were added and removed.
+
+### Changed
+- **`/agents reload`** now also rebuilds the system prompt, so the agent's list of types matches the files from the next message.
+- **Manual-only skills are marked `manual only`** in the `/` menu and `/help`, not just in the startup `Skills loaded` line.
+
+### Fixed
+- **Skills and agent types added mid-session are no longer invisible to the agent.** Before every model call dostuff checks the skill and agent folders (a few milliseconds). If something was added, removed or had its description changed, the agent gets a short hidden note with the name, description and the skill's folder. Before, the list was fixed when the session started, so the agent kept saying a new skill didn't exist until you restarted or changed directory. This includes a type made with `create_agent_type`, which the agent could start but was never told about. The system prompt itself is not rebuilt for this, so the prompt cache stays warm. Manual-only skills are never announced. Subagents get the same notes for skills that appear while they run. `dostuff -p` behaves the same way.
+- **A new skill is usable as `/name` from your next message**, and the `/` menu and `/help` show it, with no restart. A deleted skill stops being a command.
+- **A skill added mid-session can be read by the file tools.** Before, its `SKILL.md` was refused as outside the project until a restart. A removed skill's folder stops being readable at the same time.
+
+### Documentation
+- README: a new *Adding skills and agent types mid-session* section, the `/skills` row in the TUI controls, and the restart advice for skills removed.
+
 ## [0.2.14] - 2026-11-08
 
 You can show the agent images, PDFs and Word, Excel and PowerPoint files: mention them with `@`, paste a screenshot with `Alt+V`, drag a file into the terminal, or let the agent open one with `read_file`.

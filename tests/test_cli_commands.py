@@ -298,7 +298,8 @@ def headless(env, monkeypatch):
     async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
                         current_session_history, steps_history, store, adapter=None, permissions=None, **kwargs):
         calls.append({"text": user_text, "history": list(working_history), "mode": permissions.mode,
-                      "allow": permissions.allow, "max_iterations": kwargs.get("max_iterations")})
+                      "allow": permissions.allow, "max_iterations": kwargs.get("max_iterations"),
+                      "capabilities_baseline": kwargs.get("capabilities_baseline")})
         reply = await adapter.ask("Allow write_file?")
         adapter.emit("tool_call", "write_file(path=a.txt)")
         adapter.emit("usage", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
@@ -965,3 +966,37 @@ def test_headless_xlsx_mention_spills(env, headless_agents, monkeypatch, capsys)
     sent = [m for m in fm.calls[0]["messages"] if m["role"] == "user"][-1]["content"]
     assert isinstance(sent, str) and 'converted_from="xlsx" file=".dostuff/attachments/' in sent
     assert "| row299 |" not in sent
+
+
+# --- mid-run skill and agent-type refresh (plan/2026-11-11-mid-run-skill-agent-refresh D11) ------------------
+
+def test_headless_passes_baseline(env, headless, monkeypatch):
+    from dostuff.agent.capabilities import take_snapshot
+    from dostuff.helpers.skills import discover_skills as ds
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [".dostuff/skills"])
+    result = runner.invoke(env["app"], ["-p", "say hi"])
+    assert result.exit_code == 0, result.output
+    assert headless[-1]["capabilities_baseline"] == take_snapshot().capabilities
+
+
+def test_headless_skill_written_mid_run_reaches_next_call(env, headless_agents, monkeypatch):
+    from conftest import fake_response, fake_tool_call
+    from dostuff.agent import call_agent as call_agent_module
+    from dostuff.helpers.skills import discover_skills as ds
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [".dostuff/skills"])
+    fm = headless_agents
+    fm.script("[M]", fake_response(tool_calls=[fake_tool_call("get_current_datetime", {})]), fake_response("used it"))
+    real = fm.acompletion
+
+    async def writes_skill(**kwargs):
+        if not fm.calls:  # what a write_file of the agent's would do, between its two calls
+            d = Path.cwd() / ".dostuff" / "skills" / "deploy"
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text("---\nname: deploy\ndescription: Ship it.\n---\nbody\n", encoding="utf-8")
+        return await real(**kwargs)
+    monkeypatch.setattr(call_agent_module, "acompletion", writes_skill)
+    assert _run_headless("[M] make a skill, then use it", quiet=True) == 0
+    first, second = fm.calls_for("[M]")
+    assert "Skills and agent types: changes" not in json.dumps(first["messages"])
+    last = second["messages"][-1]
+    assert last["role"] == "user" and "- name: deploy" in last["content"] and "Ship it." in last["content"]

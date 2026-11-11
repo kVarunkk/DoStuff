@@ -335,7 +335,7 @@ async def run_headless(
         servers = load_mcp_config()
         if servers:
             await _connect_mcp(mcp_client, servers, adapter)
-        base, skills = build_base_instructions()
+        base, skills, capabilities_baseline = build_base_instructions()
         meta = await store.get_session_meta(session_id) or {}
         if meta:
             await get_agent_registry().load(session_id, store)  # continuable with send_message (subagents D14)
@@ -392,6 +392,8 @@ async def run_headless(
                 max_iterations=max_turns or config.max_iterations,
                 permissions=permissions,
                 session_hook_context=session_hook_context,
+                # A skill or agent type written mid-run reaches the next model call (mid-run refresh D11)
+                capabilities_baseline=capabilities_baseline,
             )
         result = await turn(prompt, turn_instructions, meta)
         # Background agents are waited for: each batch of their notices gets a turn, like the TUI's wake-up

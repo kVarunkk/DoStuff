@@ -513,5 +513,29 @@ def test_manual_skill_not_in_subagent_prompt(tmp_path, monkeypatch):
         (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: the {name} one\n{extra}---\nbody\n",
                                          encoding="utf-8")
     monkeypatch.setattr(ds, "SKILLS_DIRS", [str(tmp_path / "skills")])
-    text = _sections(load_definitions(tmp_path, tmp_path).types["general-purpose"], None)
+    text, _ = _sections(load_definitions(tmp_path, tmp_path).types["general-purpose"], None)
     assert "the visible one" in text and "the manual one" not in text
+
+
+# --- mid-run skill refresh D10: each run announces against its own prompt's lists ----------------------------
+
+def test_subagent_run_passes_own_baseline(agents, fake_model, monkeypatch):
+    from dostuff.agent.subagents import registry as registry_module
+    seen = []
+    real = registry_module.run_agent_loop
+
+    async def spy(*args, **kwargs):
+        seen.append((kwargs.get("capabilities_baseline"), kwargs.get("capability_kinds")))
+        return await real(*args, **kwargs)
+
+    async def prompt(agent_def, worktree=None):
+        return "SUB SYSTEM", ("skill:own:1",)
+    monkeypatch.setattr(registry_module, "run_agent_loop", spy)
+    monkeypatch.setattr(registry_module, "build_subagent_prompt", prompt)
+    fake_model.script("[A]", fake_response("ok"))
+
+    async def go():
+        run = await _start(agents, "[A] x")
+        return await run.done
+    assert asyncio.run(go()) == "ok"
+    assert seen == [(("skill:own:1",), ("skill",))]
