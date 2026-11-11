@@ -126,14 +126,6 @@ def check_collection(collection: Any, where: dict | None = None) -> str | None:
     return None
 
 
-def index_problem(collection: Any, where: dict | None = None) -> str | None:
-    """A short, user-facing description of a damaged index, or None when it is healthy."""
-    error = check_collection(collection, where)
-    if not error:
-        return None
-    return "the vector index is out of sync with its metadata, so some lookups skip rows"
-
-
 def stage_collection(client: Any, name: str, ids: list[str], documents: list[str],
                      metadatas: list[dict], space: str) -> int:
     """Build the replacement under a temporary name. Returns the number of rows it holds."""
