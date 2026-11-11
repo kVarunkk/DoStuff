@@ -219,3 +219,74 @@ def test_memory_instructions_name_new_blocks():
     assert "<user_facts>" in MEMORY_INSTRUCTIONS and "<project_facts>" in MEMORY_INSTRUCTIONS
     assert 'scope="project"' in MEMORY_INSTRUCTIONS
     assert "<relevant_user_facts>" not in MEMORY_INSTRUCTIONS
+
+
+# T1.14 `dostuff memory repair --reembed` ------------------------------------------------------------------------
+
+@pytest.fixture
+def legacy_home(tmp_path, monkeypatch):
+    """A fake ~ whose fact store holds two rows written before this spec ("User's …" documents, no scope)."""
+    from pathlib import Path
+
+    from dostuff import config as config_module
+    from dostuff.lib.memory import chroma
+
+    home = tmp_path / "home"
+    (home / ".dostuff").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(chroma, "_clients", {})
+    config_module.reset_config()
+    user = config_module.get_config().get_user_id()
+    collection = chroma.get_chroma_client(str(home / ".dostuff" / "data" / "chroma")).get_or_create_collection(
+        "semantic_memory", metadata={"hnsw:space": "cosine"})
+    metas = [{"user_id": user, "key": "editor", "value": "Neovim", "source": "user_message"},
+             {"user_id": user, "key": "name", "value": "Admiral Nemo", "source": "user_message"}]
+    collection.upsert(ids=[f"{user}:editor", f"{user}:name"],
+                      documents=["User's editor is Neovim", "User's name is Admiral Nemo"], metadatas=metas)
+    yield {"home": home, "collection": collection, "metas": metas, "user": user}
+    config_module.reset_config()
+
+
+def _documents(collection):
+    rows = collection.get(include=["documents", "metadatas"])
+    return dict(zip(rows["ids"], rows["documents"])), dict(zip(rows["ids"], rows["metadatas"]))
+
+
+def test_reembed_rewrites_documents_from_metadata(legacy_home):
+    import json
+
+    from typer.testing import CliRunner
+
+    from dostuff.cli import app
+    result = CliRunner().invoke(app, ["memory", "repair", "--reembed", "--yes"])
+    assert result.exit_code == 0, result.output
+    user = legacy_home["user"]
+    documents, metadatas = _documents(legacy_home["collection"])
+    assert documents == {f"{user}:editor": "Neovim", f"{user}:name": "Admiral Nemo"}
+    assert metadatas[f"{user}:editor"] == legacy_home["metas"][0]  # metadata untouched
+    assert "Re-embedded 2 of 2 facts" in result.output
+    backup = legacy_home["home"] / ".dostuff" / "data" / "chroma-backups" / "semantic_memory.json"
+    assert "User's editor is Neovim" in json.loads(backup.read_text(encoding="utf-8"))["documents"]
+    # A second run has nothing left to do
+    again = CliRunner().invoke(app, ["memory", "repair", "--reembed", "--yes"])
+    assert again.exit_code == 0 and "Re-embedded 0 of 2 facts" in again.output
+
+
+def test_reembed_confirms_unless_yes(legacy_home):
+    from typer.testing import CliRunner
+
+    from dostuff.cli import app
+    declined = CliRunner().invoke(app, ["memory", "repair", "--reembed"], input="n\n")
+    assert declined.exit_code == 1 and "Re-embed 2 facts" in declined.output
+    assert _documents(legacy_home["collection"])[0][f"{legacy_home['user']}:editor"] == "User's editor is Neovim"
+    accepted = CliRunner().invoke(app, ["memory", "repair", "--reembed"], input="y\n")
+    assert accepted.exit_code == 0, accepted.output
+    assert _documents(legacy_home["collection"])[0][f"{legacy_home['user']}:editor"] == "Neovim"
+
+
+def test_reembed_only_with_repair(legacy_home):
+    from typer.testing import CliRunner
+
+    from dostuff.cli import app
+    result = CliRunner().invoke(app, ["memory", "check", "--reembed"])
+    assert result.exit_code == 2 and "--reembed goes with 'repair'" in result.output

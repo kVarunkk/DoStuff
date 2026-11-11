@@ -240,6 +240,8 @@ def config():
 def memory(
     action: str = typer.Argument("check", help="'check' to diagnose, 'repair' to rebuild the indexes."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Repair without asking for confirmation."),
+    reembed: bool = typer.Option(False, "--reembed", help="With 'repair': re-embed saved facts as their value alone "
+                                 "(older facts were embedded as \"User's <key> is <value>\")."),
 ):
     """Check long-term memory's vector index, or rebuild it after 'Error finding id' failures."""
     from dostuff.config import get_config
@@ -248,6 +250,9 @@ def memory(
 
     if action not in ("check", "repair"):
         typer.secho(f"Unknown action '{action}'; use 'check' or 'repair'.", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+    if reembed and action != "repair":
+        typer.secho("--reembed goes with 'repair': dostuff memory repair --reembed", fg=typer.colors.RED)
         raise typer.Exit(code=2)
     if not chroma.chroma_available():
         typer.echo(f"Long-term memory is off: chromadb is not installed ({MEMORY_INSTALL_HINT}).")
@@ -274,9 +279,23 @@ def memory(
         else:
             typer.secho(f"  {name}: ok ({collection.count()} rows)", fg=typer.colors.GREEN)
 
+    def reembed_facts_now() -> None:
+        from dostuff.helpers.memory.repair_index import facts_to_reembed, reembed_facts
+        facts = client.get_or_create_collection(name="semantic_memory", metadata={"hnsw:space": "cosine"})
+        raw, pending, total = facts_to_reembed(facts)
+        if pending and not yes and not typer.confirm(
+                f"Re-embed {len(pending)} facts as their value alone? A backup is written first."):
+            raise typer.Exit(code=1)
+        if pending:
+            backup = reembed_facts(facts, raw, pending, cfg.get_data_dir() / "chroma-backups")
+            typer.echo(f"Backed up to {backup}.")
+        typer.secho(f"Re-embedded {len(pending)} of {total} facts.", fg=typer.colors.GREEN)
+
     if not broken:
         if action == "repair":
             typer.echo("Nothing to repair.")
+            if reembed:
+                reembed_facts_now()
         else:
             typer.echo("\nVector index is healthy.")
         return
@@ -312,6 +331,8 @@ def memory(
             typer.secho(f"  {name}: still failing: {summary['error']}", fg=typer.colors.RED)
     if failed:
         raise typer.Exit(code=1)
+    if reembed:
+        reembed_facts_now()
     typer.secho("Rebuilt. Restart any running dostuff sessions so they reopen the collections.", fg=typer.colors.GREEN)
 
 
