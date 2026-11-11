@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from dostuff.lib.memory.chroma import get_chroma_client
+from dostuff.lib.memory.safe_query import safe_query
 
 # Episodes less similar than this to the prompt are left out: without a floor, the top_k nearest
 # are recalled even for an unrelated prompt like "hi" (unrelated prompts score ~0.0-0.2)
@@ -68,10 +69,7 @@ class EpisodicMemoryStore(EpisodicStore):
             where = {"$and": [{"user_id": user_id}, {"working_dir": working_dir}]}
 
         def _query() -> Any:
-            n = min(candidate_k, self._collection.count())
-            if n <= 0:
-                return {}
-            return self._collection.query(query_texts=[query_text], n_results=n, where=where)
+            return safe_query(self._collection, query_text, candidate_k, where)
 
         results = await asyncio.to_thread(_query)
 
@@ -125,9 +123,7 @@ class EpisodicMemoryStore(EpisodicStore):
         where = {"$and": [{"user_id": user_id}, {"working_dir": working_dir}]}
 
         def _query() -> Any:
-            if self._collection.count() <= 0:
-                return {}
-            return self._collection.query(query_texts=[vector_text], n_results=1, where=where)
+            return safe_query(self._collection, vector_text, 1, where)
 
         results = await asyncio.to_thread(_query)
         ids = (results.get("ids") or [[]])[0] or []

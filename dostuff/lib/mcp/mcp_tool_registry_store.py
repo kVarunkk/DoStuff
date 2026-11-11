@@ -1,6 +1,7 @@
 import asyncio
 import json
 from dostuff.lib.memory.chroma import get_chroma_client
+from dostuff.lib.memory.safe_query import safe_query
 from typing import List, Dict, Any
 
 
@@ -52,13 +53,11 @@ class MCPToolRegistryStore:
             return []
 
         def _sync_query():
-            n = min(top_k, self._collection.count())
-            if n <= 0:
-                return {}
-            kwargs: dict[str, Any] = {"query_texts": [user_intent], "n_results": n}
+            where: dict[str, Any] = {}
             if server_names is not None:
-                kwargs["where"] = {"server_name": {"$in": list(server_names)}}
-            return self._collection.query(**kwargs)
+                where = {"server_name": {"$in": list(server_names)}}
+            # safe_query caps n_results and survives a broken HNSW index (#7032)
+            return safe_query(self._collection, user_intent, top_k, where)
 
         results = await asyncio.to_thread(_sync_query)
 
