@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Long-term memory keeps working when Chroma's vector index gets out of sync, and `dostuff memory check` / `repair` find and fix it.
+
+### Added
+- **`dostuff memory check`** reports, for each memory collection (facts, episodes and the MCP tool index), whether it can answer queries. It exits with code 1 when one needs a rebuild.
+- **`dostuff memory repair`** backs a broken collection up to `~/.dostuff/data/chroma-backups/`, then rebuilds it from its stored rows. Rows that can't be rebuilt are left out but kept in the backup, and if the rebuild fails the original is left as it was. It asks first; `-y` skips the question.
+- **A warning when the TUI starts** if a memory index is out of sync, telling you to run `dostuff memory repair`.
+
+### Fixed
+- **Memory no longer fails with "Error finding id"**. Chroma can drop a row from its vector index while keeping it in its database (chroma-core/chroma#7032); recall, saving a fact and MCP tool search then failed outright. They now fall back to a slower scan and keep working, though they can find less until the index is repaired.
+
 ## [0.2.14] - 2026-11-08
 
 You can show the agent images, PDFs and Word, Excel and PowerPoint files: mention them with `@`, paste a screenshot with `Alt+V`, drag a file into the terminal, or let the agent open one with `read_file`.
