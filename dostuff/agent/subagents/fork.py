@@ -28,6 +28,9 @@ class ForkContext:
     history: list[dict[str, Any]]  # a copy of the main working history, without the in-flight assistant step
     tool_names: list[str]  # the main agent's tools
     session_hook_context: dict[str, str] | None = field(default=None)  # SessionStart context, as the main sees it
+    # The capability set the copied system prompt lists (mid-run refresh D10): the fork announces against the main's
+    # baseline and history, so it never re-announces what the main agent was already told. None: never announces.
+    capabilities_baseline: tuple[str, ...] | None = field(default=None)
 
     def fork_tools(self) -> list[str]:
         """The main agent's tools minus D12."""

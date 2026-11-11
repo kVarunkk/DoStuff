@@ -50,6 +50,22 @@ def make_plan_mode_step(plan_mode: bool, text: str) -> dict[str, Any]:
     return {"role": "user", "content": _wrap(text), "meta": {"hidden": TURN_CONTEXT_MARKER, "plan_mode": plan_mode}}
 
 
+def make_capability_step(text: str, capabilities: tuple[str, ...]) -> dict[str, Any]:
+    """The hidden step that tells the model which skills and agent types changed since it was last told
+    (plan/2026-11-11-mid-run-skill-agent-refresh D3). `capabilities` is the set it announced: the next belief."""
+    return {"role": "user", "content": _wrap(text),
+            "meta": {"hidden": TURN_CONTEXT_MARKER, "capabilities": list(capabilities)}}
+
+
+def delivered_capabilities(history: list) -> tuple[str, ...] | None:
+    """The capability set the newest capability step announced; None when the history has none (never told, or
+    compaction dropped it), and the caller falls back to the prompt's baseline."""
+    for step in reversed(history):
+        if is_turn_context(step) and "capabilities" in step["meta"]:
+            return tuple(step["meta"]["capabilities"])
+    return None
+
+
 def delivered_plan_mode(history: list) -> bool:
     """The newest plan step's state; False when the history has none."""
     for step in reversed(history):

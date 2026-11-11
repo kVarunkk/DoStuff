@@ -26,7 +26,7 @@
             "type": "boolean"
           },
           "subagent_type": {
-            "description": "Which agent type to start; the system prompt lists them. \"fork\" starts a copy of you that inherits this conversation.",
+            "description": "Which agent type to start: one from the system prompt's list (as of when it was written) or from a later turn-context note announcing a new type. \"fork\" starts a copy of you that inherits this conversation.",
             "type": "string"
           }
         },

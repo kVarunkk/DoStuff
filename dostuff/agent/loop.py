@@ -30,7 +30,10 @@ from dostuff.tools.definitions import TOOL_MAP, default_tool_names
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
 from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, frame_steered
-from dostuff.helpers.agent.turn_context import PROMPT_CONTEXT_HEADER, delivered_plan_mode, make_plan_mode_step
+from dostuff.helpers.agent.turn_context import (
+    PROMPT_CONTEXT_HEADER, delivered_capabilities, delivered_plan_mode, make_capability_step, make_plan_mode_step,
+)
+from dostuff.agent.capabilities import ALL_KINDS, delta_text, take_snapshot
 from dostuff.helpers.agent.side_question import (
     compose_system_instruction, plan_mode_on, publish_snapshot, published_snapshot, usage_dict as build_usage_dict,
 )
@@ -196,7 +199,7 @@ def _job_events(owner: str, adapter: Any) -> Iterator[None]:
         registry.remove_listener(on_job)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None, capabilities_baseline: tuple[str, ...] | None = None, capability_kinds: tuple[str, ...] = ALL_KINDS) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction).
 
     `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
@@ -209,6 +212,11 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
 
     `steering` is the TUI's mid-turn messages (steering spec D1): read at the next tool boundary, inside this
     turn. Main session only — a `subagent_loop` never delivers one (CON-008), and `run_agent_loop` doesn't pass it.
+
+    `capabilities_baseline` is the capability set `dynamic_system_instruction` lists (mid-run refresh spec D2): a skill
+    or agent type that differs from it, or from the newest capability step, is announced in a hidden step before the
+    next model call. None never announces (and never looks). `capability_kinds` limits it: a typed subagent's prompt
+    lists skills only (D10).
     """
     current_session_id.set(session_id)
     owner = owner or session_id
@@ -269,6 +277,27 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
         await append_step(step, steps_history, working_history, current_session_history, session_id, store, turn_type)
         publish_snapshot(session_id, fork_context())
 
+    async def sync_capabilities() -> None:
+        """Tell the model which skills and agent types differ from what it was last told (mid-run refresh D3, D6):
+        the newest capability step, else the prompt's baseline. Cumulative, not an event: a change missed for any
+        reason is announced on the next call, and a compaction that dropped the step re-states the whole difference.
+        A stat pass when nothing moved; the system prompt never changes for it, so the cache holds."""
+        if capabilities_baseline is None:
+            return
+        snapshot = await asyncio.to_thread(take_snapshot, capability_kinds)
+        belief = delivered_capabilities(working_history)
+        if belief is None:
+            belief = capabilities_baseline
+        if set(belief) == set(snapshot.capabilities):
+            return
+        text = delta_text(belief, snapshot)
+        if not text:
+            return
+        step = make_capability_step(text, snapshot.capabilities)
+        await append_step(step, steps_history, working_history, current_session_history, session_id, store, turn_type)
+        publish_snapshot(session_id, fork_context())
+        await loop_emit("capabilities_changed", {"capabilities": list(snapshot.capabilities)}, adapter=adapter)
+
     async def deliver_steer(messages: list[SteerMessage]) -> int:
         """D6's drain body, shared by the top-of-iteration drain and D7's final-answer path: a failed
         or blocked message is reported and appended nowhere, the rest is written framed and once
@@ -326,6 +355,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             history=[dict(step) for step in working_history],
             tool_names=list(tool_names) if tool_names is not None else default_tool_names(),
             session_hook_context=dict(session_hook_context) if session_hook_context is not None else None,
+            capabilities_baseline=capabilities_baseline,
         )
 
     async def check_cancelled() -> bool:
@@ -374,6 +404,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     model_span = None
                     progress = StreamProgress()
                     await sync_plan_mode()  # here, so a retry after an overflow compaction is covered too
+                    await sync_capabilities()  # after it: rarer, so the plan step keeps its place (D6)
                     try:
                         interaction, model_span = await call_agent(
                             steps_history=working_history,

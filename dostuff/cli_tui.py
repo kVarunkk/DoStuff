@@ -1574,6 +1574,10 @@ class TuiAdapter:
         if event_type == "hook" and isinstance(data, dict):
             app._append(hook_line(data), msg_type="system")
             return
+        if event_type == "capabilities_changed":
+            # The loop told the model a skill or agent type changed: follow with `/name`, never a transcript line (D9)
+            app._sync_skill_view()
+            return
         if event_type == "settings_changed":  # the settings tools changed config.yaml or the MCP servers
             app._apply_settings(mcp=data == "mcp")
             return
@@ -1968,6 +1972,8 @@ class DostuffTUI(App):
         self._pending_session_start: str | None = None
         self._setup_done = False
         self._system_instructions: str = ""
+        # The capability set _system_instructions lists (mid-run refresh D2): loop() announces what differs from it
+        self._capabilities_baseline: tuple[str, ...] | None = None
         self._loader_widget: Static | None = None  # loader widget at bottom of stream
         self._loader_label = ""  # loader text without the elapsed time / queue count
         self._stream_widgets: dict[str, Static] = {}  # "answer" / "thought" → live widget
@@ -2008,6 +2014,10 @@ class DostuffTUI(App):
         self._agent_view_refreshing = False
         # "/name" → skill or custom command (helpers/skills/skill_command.py)
         self._skill_commands: dict[str, dict[str, Any]] = {}
+        self._custom_commands: list[dict[str, Any]] = []  # .dostuff/commands/, found at mount (not re-read: OUT-007)
+        self._skills_view: list[dict[str, Any]] = []  # the skills behind _skill_commands, manual-only ones included
+        self._prompt_skills: list[dict[str, Any]] = []  # the skills _system_instructions was built with
+        self._skill_view_key: tuple = ()  # what _skills_view was built from, to rebuild only when it moved
         self._mcp_configured: list[str] = []
         self._mcp_server_configs: dict[str, dict] = {}  # as connected; diffed when the settings change
         self._mcp_files_signature: tuple[tuple[int, int] | None, ...] = ()  # set when the backend connects MCP
@@ -2184,7 +2194,9 @@ class DostuffTUI(App):
         except OSError:
             pass
 
-        self._system_instructions, skills = build_base_instructions(interactive=True)
+        built = build_base_instructions(interactive=True)
+        self._take_prompt(built)  # the view again below, once the custom commands are found
+        skills = built[1]
         self.user_id = self.config.get_user_id()
         existing_meta = await self._load_session(self.session_id)
 
@@ -2215,17 +2227,8 @@ class DostuffTUI(App):
             self._append(f" New session '{self.session_id}'.")
 
         custom = await asyncio.to_thread(discover_commands)
-        self._skill_commands = skill_commands(skills, custom)
-        menu_commands = dict(COMMAND_DESCRIPTIONS)
-        for command, skill in self._skill_commands.items():
-            description = " ".join(str(skill.get("description", "")).split())
-            if len(description) > SKILL_MENU_DESCRIPTION_CHARS:
-                description = description[:SKILL_MENU_DESCRIPTION_CHARS - 1] + "…"
-            kind = f"{skill['scope']} command" if skill.get("kind") == "command" else "skill"
-            menu_commands[command] = f"({kind}) {description}".rstrip()
-        self.query_one("#command-menu", CommandMenu).commands = menu_commands
-        inp.commands = menu_commands
-        inp.skills = [c for c, s in self._skill_commands.items() if s.get("kind") != "command"]
+        self._custom_commands = custom
+        self._apply_skill_view(skills)
         if skills:
             skill_names = ", ".join(s["name"] + (" (manual only)" if s.get("disable_model_invocation") else "")
                                     for s in skills)
@@ -2704,7 +2707,8 @@ class DostuffTUI(App):
     async def _move_to(self, path: Path) -> None:
         """chdir the session to path; tools, the status bar and the system prompt follow the cwd."""
         os.chdir(path)
-        self._system_instructions, _ = await asyncio.to_thread(build_base_instructions, True)
+        # The new cwd's .dostuff/skills: the prompt, its baseline and `/name` follow
+        self._take_prompt(await asyncio.to_thread(build_base_instructions, True))
         meta = await self.store.get_session_meta(self.session_id)
         if meta:
             await self.store.save_session_meta(
@@ -3033,7 +3037,104 @@ class DostuffTUI(App):
 
     def _reload_instructions(self) -> None:
         """Rebuild the system prompt, e.g. after an AGENTS.md change, so the next message sees it."""
-        self._system_instructions, _ = build_base_instructions(interactive=True)
+        self._take_prompt(build_base_instructions(interactive=True))
+
+    # ── Skills as slash commands, and what the session knows of them (mid-run refresh D9, REQ-6) ─────────────
+
+    @staticmethod
+    def _skill_key(skills: list[dict[str, Any]]) -> tuple:
+        return tuple((s.get("name"), s.get("description"), s.get("dir"), bool(s.get("disable_model_invocation")))
+                     for s in skills)
+
+    def _apply_skill_view(self, skills: list[dict[str, Any]]) -> None:
+        """`/name` commands, the "/" menu, ghost text and `/help` from `skills` (+ the custom commands found at mount).
+        Mount, the reloads, a cd and a skill appearing mid-session all come through here."""
+        self._skills_view = list(skills)
+        self._skill_view_key = self._skill_key(skills)
+        self._skill_commands = skill_commands(skills, self._custom_commands)
+        menu_commands = dict(COMMAND_DESCRIPTIONS)
+        for command, skill in self._skill_commands.items():
+            description = " ".join(str(skill.get("description", "")).split())
+            if len(description) > SKILL_MENU_DESCRIPTION_CHARS:
+                description = description[:SKILL_MENU_DESCRIPTION_CHARS - 1] + "…"
+            if skill.get("kind") == "command":
+                kind = f"{skill['scope']} command"
+            else:
+                kind = "skill, manual only" if skill.get("disable_model_invocation") else "skill"
+            menu_commands[command] = f"({kind}) {description}".rstrip()
+        try:
+            self.query_one("#command-menu", CommandMenu).commands = menu_commands
+            inp = self.query_one("#input", EnterSubmits)
+        except Exception:  # not mounted (yet, or any more): the commands themselves are what matter
+            return
+        inp.commands = menu_commands
+        inp.skills = [c for c, s in self._skill_commands.items() if s.get("kind") != "command"]
+
+    def _sync_skill_view(self) -> bool:
+        """Re-read the skills if their files moved (a stat pass, a few ms; discovery only on a change) and rebuild
+        the view when they differ. True if it changed. Blocking but cheap: for the input path, before a `/name` is
+        judged unknown."""
+        from dostuff.agent.capabilities import current_skills
+        return self._take_skill_view(current_skills())
+
+    async def _refresh_skill_view(self) -> bool:
+        """_sync_skill_view off the event loop: at turn start, before the prompt is parsed (REQ-6.1)."""
+        from dostuff.agent.capabilities import current_skills
+        return self._take_skill_view(await asyncio.to_thread(current_skills))
+
+    def _take_skill_view(self, skills: list[dict[str, Any]]) -> bool:
+        if self._skill_key(skills) == self._skill_view_key:
+            return False
+        self._apply_skill_view(skills)
+        return True
+
+    def _skills_listing(self) -> str:
+        """`/skills`: each skill with its dir and whether it is manual only, then how to reload."""
+        skills = self._skills_view
+        if not skills:
+            lines = ["No skills (add one to .dostuff/skills/<name>/SKILL.md or ~/.agents/skills/<name>/SKILL.md)."]
+        else:
+            lines = [f"Skills ({len(skills)}):"]
+            for s in skills:
+                manual = "  (manual only: /" + str(s["name"]) + " runs it, the agent is not told)" \
+                    if s.get("disable_model_invocation") else ""
+                lines.append(f"  {s['name']}  ·  {_rel_path(str(s.get('dir', '')))}{manual}")
+        lines += ["", "A skill added or removed mid-session is picked up on the next message; "
+                      "/skills reload re-reads them now and rebuilds the system prompt."]
+        return "\n".join(lines)
+
+    async def _skills_command(self, arg: str) -> None:
+        """/skills lists the skills; /skills reload re-reads them and rebuilds the system prompt (REQ-7.1, 7.2). A
+        running turn keeps the prompt it started with; the next one gets the new one (D12)."""
+        word = arg.strip().lower()
+        if word not in ("", "reload", "r"):
+            self._append("Usage: /skills [reload]", msg_type="error")
+            return
+        if not word:
+            await self._refresh_skill_view()
+            self._append(self._skills_listing(), msg_type="system")
+            return
+        # Against what the system prompt listed, not the view: a mid-session skill is in the view already
+        before = {str(s["name"]) for s in self._prompt_skills}
+        await self._rebuild_prompt()
+        after = {str(s["name"]) for s in self._prompt_skills}
+        added, removed = sorted(after - before), sorted(before - after)
+        changes = "; ".join(part for part in (
+            f"added {', '.join(added)}" if added else "", f"removed {', '.join(removed)}" if removed else "") if part)
+        self._append(f"Reloaded: {len(after)} skill(s){' — ' + changes if changes else ', no change'}. "
+                     "The system prompt lists them from the next message.", msg_type="system")
+
+    async def _rebuild_prompt(self) -> None:
+        """A manual reload: discovery, the system prompt and its baseline, and the skill view, off the event loop.
+        Pays one cold prompt cache on the next call, which is what the user asked for (D12)."""
+        self._take_prompt(await asyncio.to_thread(build_base_instructions, True))
+
+    def _take_prompt(self, built: tuple[str, list[dict[str, Any]], tuple[str, ...]]) -> None:
+        """A freshly built system prompt (build_base_instructions()), with the skills and the baseline it lists. Every
+        rebuild site comes through here, so prompt, baseline and `/name` commands never disagree."""
+        self._system_instructions, skills, self._capabilities_baseline = built
+        self._prompt_skills = list(skills)
+        self._apply_skill_view(skills)
 
     # ── /memory and `# note`: the AGENTS.md instruction files ──────────────────
 
@@ -3286,8 +3387,10 @@ class DostuffTUI(App):
             return
         if word in ("reload", "r"):
             loaded = await asyncio.to_thread(agent_defs.reload)
+            await self._rebuild_prompt()  # so the model's list matches, from the next message (REQ-7.5)
             note = f" · {len(loaded.warnings)} warning(s), see /agents types" if loaded.warnings else ""
-            self._append(f"Reloaded: {len(loaded.types)} agent types{note}.", msg_type="system")
+            self._append(f"Reloaded: {len(loaded.types)} agent types{note}. The system prompt lists them from the "
+                         "next message.", msg_type="system")
             return
         if name:
             await self._show_agent_type(name)
@@ -3603,6 +3706,10 @@ class DostuffTUI(App):
         if cmd == "/memories":
             self._start_worker(self._show_memories(), name="memories")
             return
+        if cmd.startswith("/"):
+            # Skills added or removed since the last look (a stat pass): a new one is a command, not a typo, and a
+            # removed one is not run (REQ-6.1, REQ-6.4); /help and the menu list what is there now (REQ-6.2)
+            self._sync_skill_view()
         name, _, arg = text.strip().partition(" ")
         name, arg = name.lower(), arg.strip()
         if name in ("/resume", "/model", "/fork", "/worktree", "/config", "/memory") and self._turn_in_progress:
@@ -3652,6 +3759,9 @@ class DostuffTUI(App):
             return
         if name == "/jobs":
             self._start_worker(self._jobs_command(arg), name="jobs")
+            return
+        if name == "/skills":
+            self._start_worker(self._skills_command(arg), name="skills")
             return
         if name == "/agents":
             if arg.strip():
@@ -3704,7 +3814,8 @@ class DostuffTUI(App):
                              if s.get("kind") == "command")
             if custom:
                 custom = f"\n\nCustom commands (/<name> [arguments]; $ARGUMENTS in the file is replaced):{custom}"
-            skills = "".join(f"\n  {c}" for c, s in self._skill_commands.items() if s.get("kind") != "command")
+            skills = "".join(f"\n  {c}" + ("  (manual only)" if s.get("disable_model_invocation") else "")
+                             for c, s in self._skill_commands.items() if s.get("kind") != "command")
             if skills:
                 skills = f"\n\nSkills (/<skill> [arguments] runs one):{skills}"
             self._append(
@@ -4164,6 +4275,8 @@ class DostuffTUI(App):
         typed_in = event.text_area if isinstance(event.text_area, EnterSubmits) and not recalled else None
         partial = typed_in.partial_mention() if typed_in else None
         skill = typed_in.partial_slash() if typed_in else None
+        if typed_in and (text == "/" or skill == "/"):
+            self._sync_skill_view()  # the menu is opening: offer a skill added since the last look (REQ-6.2)
         if text.startswith("/") and " " not in text and "\n" not in text and not recalled:
             menu.show_matches(text)
         elif partial is not None and not text.lstrip().startswith("!"):
@@ -4267,6 +4380,8 @@ class DostuffTUI(App):
 
             content: str | list[dict[str, Any]] = user_text  # text and image refs once something is attached
             if not wake:
+                # Skills added or removed since the last look, before `/name` and inline mentions are read (REQ-6.1)
+                await self._refresh_skill_view()
                 # `/<skill> args`: only the args get @mentions and pastes; the SKILL.md text goes around them
                 skill_run = parse_skill_command(user_text, self._skill_commands)
                 mentions = skill_mentions(user_text, self._skill_commands)  # what was typed, before anything expands
@@ -4384,6 +4499,8 @@ class DostuffTUI(App):
                 session_hook_context=self.session_hook_context,
                 # D1: the app's mid-turn queue, drained at the next tool boundary (main session only)
                 steering=self._steering,
+                # What the system prompt lists: a skill or agent type that differs is announced (mid-run refresh D2)
+                capabilities_baseline=self._capabilities_baseline,
             )
 
             agent_text = result or "(no response)"

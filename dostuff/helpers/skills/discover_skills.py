@@ -1,5 +1,6 @@
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -49,19 +50,53 @@ def _disabled(value: Any) -> bool:
     return not (isinstance(value, str) and value.strip().lower() in _NOT_DISABLED)
 
 
+def model_visible_skills(skills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The skills the model may be told about: every list it sees goes through here, so a manual-only skill
+    (`disable-model-invocation`) is left out in this one place (skills-and-multi-edit CON-005)."""
+    return [s for s in skills if not s.get("disable_model_invocation")]
+
+
+def _skill_folders() -> list[str]:
+    """SKILLS_DIRS that exist, each once: the same directory can be reached twice (e.g. cwd is home, so
+    .dostuff/skills is ~/.dostuff/skills)."""
+    folders: list[str] = []
+    seen_dirs: set[str] = set()
+    for skills_dir in SKILLS_DIRS:
+        if not os.path.isdir(skills_dir):
+            continue
+        real_dir = os.path.normcase(os.path.realpath(skills_dir))
+        if real_dir not in seen_dirs:
+            seen_dirs.add(real_dir)
+            folders.append(skills_dir)
+    return folders
+
+
+def skills_signature() -> tuple[tuple[str, int, int], ...]:
+    """(SKILL.md path, mtime_ns, size) for every candidate skill, in a stable order: a stat pass that opens and parses
+    nothing (a few ms per 100 skills, one stat each), so it can run before every model call. It only says *whether*
+    discovery would find something different. Paths are absolute, so a `cd` moves it too."""
+    sig: list[tuple[str, int, int]] = []
+    for skills_dir in _skill_folders():
+        try:
+            entries = sorted(os.listdir(skills_dir))
+        except OSError:
+            continue
+        base = os.path.abspath(skills_dir)
+        for entry in entries:
+            path = os.path.join(base, entry, "SKILL.md")
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                sig.append((path, st.st_mtime_ns, st.st_size))
+    return tuple(sig)
+
+
 def discover_skills() -> list[dict]:
     skills: list[dict[str, Any]] = []
     seen_names: set[str] = set()
-    seen_dirs: set[str] = set()
-    for SKILLS_DIR in SKILLS_DIRS:
-        if not os.path.isdir(SKILLS_DIR):
-            continue
-        # The same directory can be reached twice (e.g. cwd is home, so
-        # .dostuff/skills is ~/.dostuff/skills); scan it once.
-        real_dir = os.path.normcase(os.path.realpath(SKILLS_DIR))
-        if real_dir in seen_dirs:
-            continue
-        seen_dirs.add(real_dir)
+    for SKILLS_DIR in _skill_folders():
         for entry in sorted(os.listdir(SKILLS_DIR)):
             skill_md_path = os.path.join(SKILLS_DIR, entry, "SKILL.md")
             if not os.path.isfile(skill_md_path):

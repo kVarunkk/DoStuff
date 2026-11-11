@@ -15,7 +15,8 @@ COMMAND_DESCRIPTIONS = {
     "/tools": "List the agent's tools: when each asks, whether subagents get it, and the connected MCP servers' tools",
     "/hooks": "List the configured hooks, where each came from and whether it runs (/hooks r reloads config)",
     "/jobs": "List this session's background shell jobs; /jobs <id> shows its output, /jobs kill <id> stops it",
-    "/agents": "This session's subagents: read a transcript, stop one or answer its approval (/agents types lists the agent types, /agents types <name> shows one's system prompt, /agents reload re-reads their files)",
+    "/agents": "This session's subagents: read a transcript, stop one or answer its approval (/agents types lists the agent types, /agents types <name> shows one's system prompt, /agents reload re-reads their files and rebuilds the system prompt)",
+    "/skills": "List the skills, where each lives and which are manual only; /skills reload re-reads them and rebuilds the system prompt",
     "/queue": "Show the prompts waiting for the current turn: edit, run next or remove one (/queue clear drops them all)",
     "/rename": "Name this session (/rename <title>); shown by `dostuff sessions`",
     "/export": "Save this session as Markdown (/export [path])",
@@ -46,6 +47,7 @@ COMMAND_ARGS = {
     "/hooks": "[r]",
     "/jobs": "[id | kill <id>]",
     "/agents": "[types [name] | reload]",
+    "/skills": "[reload]",
     "/queue": "[clear]",
     "/rename": "<title>",
     "/btw": "<question>",
@@ -159,8 +161,9 @@ You can help with a wide range of tasks using the tools and skills available to 
 - New agent types: when the user asks for a new kind of agent (e.g. "make a code-reviewer agent"),
   or a role recurs, define it with `create_agent_type` (name, description, system prompt, optional
   tools/model). It writes an agent file in .dostuff/agents/ (or ~/.dostuff/agents/ with
-  scope="user"), and `agent(subagent_type=<name>)` can start it right away, though this list
-  won't show it until the next session. Don't create a type for a one-off task.
+  scope="user"), and `agent(subagent_type=<name>)` can start it right away. The type list above is
+  as of when this prompt was written: a type added or removed later is announced in a
+  `<turn-context>` note before your next step. Don't create a type for a one-off task.
 - For a subagent that writes files, pass `isolation="worktree"` (git repos only) so it works in its
   own checkout of HEAD; then review its changes and bring over what the user wants.
 
@@ -169,7 +172,8 @@ You can help with a wide range of tasks using the tools and skills available to 
 - If a tool call fails, say what went wrong; never claim a step succeeded when it did not.
 
 Available skills (before using one, read the SKILL.md in its dir; the files it refers to are relative to that dir. If a
-script it references is missing, list the dir once and tell the user rather than guessing names):
+script it references is missing, list the dir once and tell the user rather than guessing names. This list is as of
+when this prompt was written; a skill added, changed or removed later is announced in a `<turn-context>` note):
 {skills_summary}
 """
 
