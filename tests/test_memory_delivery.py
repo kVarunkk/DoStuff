@@ -4,6 +4,7 @@ The loop is driven with scripted model replies (`_interactive` from test_loop.py
 fake with the real store's `list_all` scope semantics, so no Chroma is needed.
 """
 import asyncio
+import inspect
 
 import litellm
 
@@ -184,7 +185,7 @@ def test_facts_step_after_the_turns_bundle(monkeypatch):
 def test_facts_read_off_the_event_loop(monkeypatch):
     """The store read is awaited, so a slow read doesn't block the TUI (the real store uses to_thread)."""
     store = FakeFacts().add("name", "Nemo")
-    assert asyncio.iscoroutinefunction(store.list_all)
+    assert inspect.iscoroutinefunction(store.list_all)
     _run(monkeypatch, store, [_msg(content="ok")])
     assert store.reads == 1
 

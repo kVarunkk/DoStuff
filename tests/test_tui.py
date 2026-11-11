@@ -6589,7 +6589,8 @@ def _context_steps(history):
 
 
 class _Recall:
-    """A memory store: every query recalls its own question, so a different prompt recalls a different fact."""
+    """An episode store: every query recalls its own question, so a different prompt recalls a different episode.
+    (Facts below the cap aren't recalled per prompt any more: they go in the facts step, memory recall D3.)"""
 
     def __init__(self, hits=True):
         self.hits = hits
@@ -6597,12 +6598,16 @@ class _Recall:
 
     async def query(self, *args, **kwargs):
         self.queries.append(kwargs["query_text"])
-        return [{"key": "recalled", "value": kwargs["query_text"]}] if self.hits else []
+        return [{"event_type": "EVENT", "anchor_event": kwargs["query_text"], "summary": "s",
+                 "created_at_iso": "2026-11-12"}] if self.hits else []
+
+    async def list_all(self, *args, **kwargs):  # as the fact store: nothing saved, so no facts step
+        return []
 
 
 def _use_recall(app):
-    app.memory_store, app.episodic_store = _Recall(), _Recall(hits=False)
-    return app.memory_store
+    app.memory_store, app.episodic_store = _Recall(hits=False), _Recall()
+    return app.episodic_store
 
 
 def test_run_turn_appends_context_then_prompt(turn_tui):
@@ -6700,7 +6705,7 @@ def test_system_instruction_stable_across_turns(tui, fake_model, monkeypatch):
     assert "new.txt" in second[-1]["content"] and "new.txt" not in first[-1]["content"]
 
 
-def test_model_still_sees_environment_and_facts(tui, fake_model, monkeypatch):
+def test_model_still_sees_environment_and_episodes(tui, fake_model, monkeypatch):
     _real_turns(tui, fake_model, monkeypatch, "one")
 
     async def scenario():
@@ -6719,7 +6724,7 @@ def test_model_still_sees_environment_and_facts(tui, fake_model, monkeypatch):
     bundle = messages[-1]  # the context step and the prompt, one message on the way out
     assert bundle["role"] == "user" and "meta" not in bundle
     assert "<environment>" in bundle["content"]
-    assert "- recalled: what is my name?" in bundle["content"]
+    assert "  • [EVENT] what is my name?" in bundle["content"]
     assert bundle["content"].endswith("</turn-context>\n\nwhat is my name?")
 
 
