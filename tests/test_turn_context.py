@@ -269,7 +269,8 @@ def test_facts_step_text_overflow_note():
     text = render_facts_step([_fact("name", "Nemo")], saved_user=51, saved_project=0, project="p")
     assert '<user_facts shown="1" saved="51">' in text
     assert text.endswith("This replaces any earlier list of saved facts.\n"
-                         "Other saved facts appear in the turn context when relevant; search_memory finds the rest.")
+                         "Not every saved fact is listed: before writing code or committing, call search_memory for "
+                         "the user's preferences and this project's conventions on that work.")
 
 
 def test_facts_step_text_when_everything_was_forgotten():

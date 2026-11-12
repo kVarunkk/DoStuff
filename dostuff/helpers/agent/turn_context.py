@@ -212,5 +212,6 @@ def render_facts_step(shown: list[dict], *, saved_user: int, saved_project: int,
         blocks.append(f'<{tag}{attrs} shown="{len(rows)}" saved="{saved}">\n{lines}</{tag}>')
     text = "\n".join(blocks) + "\n" + FACTS_REPLACE_NOTE
     if len(shown) < saved_user + saved_project:
-        text += "\nOther saved facts appear in the turn context when relevant; search_memory finds the rest."
+        text += ("\nNot every saved fact is listed: before writing code or committing, call search_memory for the "
+                 "user's preferences and this project's conventions on that work.")
     return text
