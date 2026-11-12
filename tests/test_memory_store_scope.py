@@ -328,3 +328,18 @@ def test_episode_query_excludes_before_top_k(episodes):
     found = _ids(asyncio.run(episodes.query(USER, "database is locked", top_k=3, working_dir=PROJ_A,
                                             exclude_ids=set(best[:10]))))
     assert len(found) == 3 and not set(found) & set(best[:10])
+
+
+def test_episode_query_reports_matching(episodes):
+    stats = {}
+    found = asyncio.run(episodes.query(USER, "database is locked", top_k=3, working_dir=PROJ_A, stats=stats))
+    # All 15 match, but only a pool of 10 candidates is fetched: "at least 10", never a number that understates
+    assert len(found) == 3 and stats == {"matching": "10+"}
+    asyncio.run(episodes.query(USER, "chocolate cake recipe", top_k=3, working_dir=PROJ_A, stats=stats))
+    assert stats == {"matching": "0"}
+
+
+def test_episode_count_per_project(episodes):
+    assert asyncio.run(episodes.count(USER, working_dir=PROJ_A)) == 15
+    assert asyncio.run(episodes.count(USER, working_dir=PROJ_B)) == 0
+    assert asyncio.run(episodes.count("someone-else")) == 0

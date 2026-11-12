@@ -63,12 +63,15 @@ class EpisodicMemoryStore(EpisodicStore):
         min_similarity: float = MIN_EPISODE_SIMILARITY,
         *,
         exclude_ids: Collection[str] = (),
+        stats: dict[str, Any] | None = None,
     ) -> list[dict]:
         """Episodes of this user from any past session (only from `working_dir` when given),
         at least `min_similarity` similar to `query_text`, re-ranked with an exponential recency decay.
 
         `exclude_ids` (the episodes this session already shows the model, memory recall D8) are dropped before the
         top_k cut, and the candidate pool grows by as many, so excluding never leaves fewer results than exist.
+        `stats`, when given, gets `matching`: how many candidates passed the floor before the cut, as text, with a
+        "+" when the whole pool matched (only a pool is fetched, so there may be more).
         """
         excluded = set(exclude_ids)
         candidate_k = max(top_k * 3, 10) + len(excluded)
@@ -125,6 +128,11 @@ class EpisodicMemoryStore(EpisodicStore):
                 "session_id": meta.get("session_id"),
             })
 
+        if stats is not None:
+            # A full pool whose farthest candidate still passed the floor: more beyond it may match too
+            pool_full = len(ids) >= candidate_k and bool(distances) and 1.0 - distances[-1] >= min_similarity
+            stats["matching"] = f"{len(scored_episodes)}{'+' if pool_full else ''}"
+
         # Sort by hybrid score descending and pick top_k
         scored_episodes.sort(key=lambda x: float(x["score"]), reverse=True)
         return scored_episodes[:top_k]
@@ -144,6 +152,14 @@ class EpisodicMemoryStore(EpisodicStore):
         if ids and dists and 1.0 - dists[0] >= min_similarity:
             return str(ids[0])
         return None
+
+    async def count(self, user_id: str, working_dir: str | None = None) -> int:
+        """How many episodes this user has saved (only from `working_dir` when given): `saved_in_project` (D8)."""
+        where: dict[str, Any] = {"user_id": user_id}
+        if working_dir:
+            where = {"$and": [{"user_id": user_id}, {"working_dir": working_dir}]}
+        found = await asyncio.to_thread(self._collection.get, where=where, include=[])
+        return len(found.get("ids") or [])
 
     async def list_all(self, user_id: str, working_dir: str | None = None) -> list[dict]:
         """Every saved episode for this user (only from `working_dir` when given), newest first (for /episodes)."""

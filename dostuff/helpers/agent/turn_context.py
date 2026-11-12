@@ -51,14 +51,40 @@ def _wrap(text: str) -> str:
     return f"<turn-context>\n{text}\n</turn-context>"
 
 
-def compose_turn_context(environment: str = "", facts: str = "", episodes: str = "", prompt_context: str = "") -> str:
+EPISODES_MORE_NOTE = "The closest to this prompt only; more are saved."
+
+
+class EpisodeCounts(NamedTuple):
+    """The labels on `<past_episodes>` (memory recall D8). None = the store couldn't say, so the label is left out."""
+    shown: int
+    matching: str | None = None  # above the floor before the top-k cut, not counting episodes already in view;
+    #                              "10+" when every candidate fetched matched (there may be more)
+    saved_in_project: int | None = None
+
+
+def _episodes_block(episodes: str, counts: EpisodeCounts | None) -> str:
+    if counts is None:
+        return f"<past_episodes>\n{episodes}\n</past_episodes>"
+    attrs = f' shown="{counts.shown}"'
+    if counts.matching is not None:
+        attrs += f' matching="{counts.matching}"'
+    if counts.saved_in_project is not None:
+        attrs += f' saved_in_project="{counts.saved_in_project}"'
+    # Only when it's true: the model shouldn't go looking for episodes that don't exist
+    more = (counts.saved_in_project is not None and counts.saved_in_project > counts.shown) or (
+        counts.matching is not None and (counts.matching.endswith("+") or int(counts.matching) > counts.shown))
+    return f"<past_episodes{attrs}>\n{episodes}" + (f"\n{EPISODES_MORE_NOTE}" if more else "") + "\n</past_episodes>"
+
+
+def compose_turn_context(environment: str = "", facts: str = "", episodes: str = "", prompt_context: str = "",
+                         episode_counts: EpisodeCounts | None = None) -> str:
     """The bundle: the sections that have text, in a fixed order; "" when none has (D4). Does no I/O.
 
     `facts` are the saved facts past the facts step's cap that match the prompt (memory recall D3)."""
     sections = [
         environment,
         f"<other_relevant_facts>\n{facts}\n</other_relevant_facts>" if facts else "",
-        f"<past_episodes>\n{episodes}\n</past_episodes>" if episodes else "",
+        _episodes_block(episodes, episode_counts) if episodes else "",
         f"{PROMPT_CONTEXT_HEADER}\n{prompt_context}" if prompt_context else "",
     ]
     body = "\n\n".join(s for s in sections if s)

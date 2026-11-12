@@ -411,3 +411,42 @@ def test_episode_recalled_again_after_compaction(monkeypatch, tmp_path):
     # e1-e3 left the model's view with the summary, so they can come back; e4/e5 are still in the kept bundle
     assert episodes.excluded[-1] == {"e4", "e5"}
     assert again.episode_ids == ("e1", "e2", "e3")
+
+
+class CountingEpisodes(RankedEpisodes):
+    """RankedEpisodes that also counts, as EpisodicMemoryStore does: matches before the cut, saved in the project."""
+
+    def __init__(self, n=7, saved=24):
+        super().__init__(n)
+        self.saved = saved
+        self.counted = []
+
+    async def query(self, user_id, query_text, top_k=3, working_dir=None, exclude_ids=(), stats=None, **kwargs):
+        found = await super().query(user_id, query_text, top_k, working_dir, exclude_ids)
+        if stats is not None:
+            stats["matching"] = str(len([e for e in self.ranked if e["id"] not in set(exclude_ids)]))
+        return found
+
+    async def count(self, user_id, working_dir=None):
+        self.counted.append(working_dir)
+        return self.saved
+
+
+def test_episode_block_counts(monkeypatch, tmp_path):
+    episodes = CountingEpisodes(n=7, saved=24)
+    first = _turn(episodes, monkeypatch, tmp_path)
+    assert '<past_episodes shown="3" matching="7" saved_in_project="24">' in first.text
+    assert "The closest to this prompt only; more are saved.\n</past_episodes>" in first.text
+    # The same project the query is scoped to (episodic_scope "project" by default)
+    assert episodes.counted == [str(tmp_path.resolve())]
+    # Already-shown episodes don't count as matching again
+    second = _turn(episodes, monkeypatch, tmp_path, _exchange(first))
+    assert '<past_episodes shown="3" matching="4" saved_in_project="24">' in second.text
+
+
+def test_episode_block_user_scope_has_no_project_count(monkeypatch, tmp_path):
+    from dostuff.config import get_config
+    monkeypatch.setattr(get_config(), "episodic_scope", "user")
+    episodes = CountingEpisodes(n=7, saved=24)
+    text = _turn(episodes, monkeypatch, tmp_path).text
+    assert '<past_episodes shown="3" matching="7">' in text and episodes.counted == []
