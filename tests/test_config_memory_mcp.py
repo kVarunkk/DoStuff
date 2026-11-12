@@ -253,6 +253,84 @@ def test_dedupe_model_error_saves(monkeypatch, tmp_path):
     assert result.startswith("Saved episode ") and len(added) == 1
 
 
+class _ProjectsCollection:
+    """Episode rows with a working_dir; get() honours the user/working_dir `where` save_episode's prune uses."""
+    def __init__(self, rows):
+        self.rows = rows  # {id: metadata}
+        self.deleted: list[str] = []
+
+    def get(self, ids=None, where=None, include=None):
+        terms = (where or {}).get("$and", [where] if where else [])
+        rows = {i: m for i, m in self.rows.items() if all(m.get(k) == v for t in terms for k, v in t.items())}
+        return {"ids": list(rows), "metadatas": list(rows.values())}
+
+    def delete(self, ids):
+        self.deleted.extend(ids)
+        for i in ids:
+            self.rows.pop(i)
+
+
+def _episode_rows(project, n, event_type, days_old, prefix):
+    now = 1_800_000_000
+    return {f"{prefix}{k}": {"user_id": "u", "working_dir": project, "event_type": event_type,
+                             "created_at_epoch": now - int(days_old * 86400) - k} for k in range(n)}
+
+
+def test_prune_above_cap_keeps_decisions(monkeypatch):
+    from dostuff.lib.memory import episodic_memory_store as ems
+    monkeypatch.setattr(ems.time, "time", lambda: 1_800_000_000)
+    assert ems.EPISODE_CAP_PER_PROJECT == 200
+    rows = {
+        **_episode_rows("/a", 150, "DECISION", 400, "old_decision"),   # oldest of all, never pruned
+        **_episode_rows("/a", 40, "PREFERENCE", 300, "pref"),          # no decay: score 1
+        **_episode_rows("/a", 10, "LEARNING", 30, "lesson"),           # e^-0.3 = 0.74
+        **_episode_rows("/a", 5, "EVENT", 2, "event"),                 # e^-0.1 = 0.90
+    }
+    store = _store(ems.EpisodicMemoryStore, [])
+    store._collection = _ProjectsCollection(rows)
+    deleted = asyncio.run(store.prune("u", "/a"))
+    # 205 → 200: the five lowest scores are lessons (oldest first among equals), not the newer events
+    assert sorted(deleted) == sorted(f"lesson{k}" for k in range(5, 10))
+    assert len(store._collection.rows) == 200
+    assert asyncio.run(store.prune("u", "/a")) == []  # at the cap: nothing to do
+
+    # Only decisions over the cap: none deleted
+    store._collection = _ProjectsCollection(_episode_rows("/a", 205, "DECISION", 400, "d"))
+    assert asyncio.run(store.prune("u", "/a")) == [] and len(store._collection.rows) == 205
+
+
+def test_prune_only_this_project(monkeypatch):
+    from dostuff.lib.memory import episodic_memory_store as ems
+    monkeypatch.setattr(ems.time, "time", lambda: 1_800_000_000)
+    rows = {**_episode_rows("/a", 201, "EVENT", 1, "a"), **_episode_rows("/b", 300, "EVENT", 900, "b"),
+            **{f"other{k}": {**m, "user_id": "v"} for k, m in _episode_rows("/a", 50, "EVENT", 900, "x").items()}}
+    store = _store(ems.EpisodicMemoryStore, [])
+    store._collection = _ProjectsCollection(rows)
+    # /b's far older events and another user's rows in /a are left alone; /a's oldest event goes
+    assert asyncio.run(store.prune("u", "/a")) == ["a200"]
+
+
+def test_save_episode_prunes_after_saving(monkeypatch, tmp_path):
+    from dostuff.tools.memory import save_episode as se
+    calls: list[tuple] = []
+
+    class FakeEpisodic:
+        async def nearest(self, user_id, vector_text, working_dir):
+            return None
+
+        async def add(self, episodes):
+            calls.append(("add",))
+
+        async def prune(self, user_id, working_dir):
+            calls.append(("prune", user_id, working_dir))
+            raise RuntimeError("index broken")  # a failed prune never fails the save
+    monkeypatch.setattr(se, "get_config", lambda: SimpleNamespace(get_user_id=lambda: "u"))
+    monkeypatch.setattr(se, "get_episodic_store", lambda: FakeEpisodic())
+    monkeypatch.chdir(tmp_path)
+    assert asyncio.run(se.save_episode("EVENT", "Ran the suite", "All green", session_id="s1")).startswith("Saved episode")
+    assert calls == [("add",), ("prune", "u", str(tmp_path.resolve()))]
+
+
 class FakeCollection:
     """Chroma collection stand-in: query returns the given rows with their cosine distances."""
     def __init__(self, rows):

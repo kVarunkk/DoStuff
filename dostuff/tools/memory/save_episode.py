@@ -76,5 +76,9 @@ async def save_episode(
         },
     }
     await store.add([episode])
+    try:
+        await store.prune(user_id, working_dir)
+    except Exception:
+        pass  # the episode is saved; an over-full project is tidied on the next save
     emit(f"Remembered episode [{event_type}]: {anchor_event}", msg_type="system")
     return f"Saved episode {episode_id}."

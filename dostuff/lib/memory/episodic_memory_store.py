@@ -20,6 +20,8 @@ DUPLICATE_EPISODE_SIMILARITY = 0.85
 # Between this and DUPLICATE_EPISODE_SIMILARITY a new episode may be the same moment reworded or a related one; the
 # model is asked which (memory recall D10)
 SIMILAR_EPISODE_SIMILARITY = 0.6
+# Most episodes kept per project; past it the lowest decayed score goes, never a DECISION (memory recall D10)
+EPISODE_CAP_PER_PROJECT = 200
 
 # Recency decay per day by event type (memory recall D9): a decision, preference or correction stays true until it is
 # replaced, a lesson stays useful for months (half-life ~70 days), an event is about now (half-life ~14 days). With
@@ -190,6 +192,33 @@ class EpisodicMemoryStore(EpisodicStore):
             "anchor_event": str(meta.get("anchor_event") or ""),
             "summary": str(meta.get("summary") or ""),
         }
+
+    async def prune(self, user_id: str, working_dir: str, cap: int = EPISODE_CAP_PER_PROJECT) -> list[str]:
+        """Delete this user's episodes from `working_dir` beyond `cap`, lowest decayed score first (with no prompt to
+        compare against, the score is the D9 recency factor alone; equal scores go oldest first). DECISIONs are never
+        deleted, so a project with more than `cap` decisions keeps them all. Returns the deleted ids."""
+        where = {"$and": [{"user_id": user_id}, {"working_dir": working_dir}]}
+        found = await asyncio.to_thread(self._collection.get, where=where, include=["metadatas"])
+        ids, metas = found.get("ids") or [], found.get("metadatas") or []
+        excess = len(ids) - cap
+        if excess <= 0:
+            return []
+        now_epoch = int(time.time())
+
+        def created(meta: dict) -> int:
+            raw = meta.get("created_at_epoch")
+            return int(raw) if isinstance(raw, (int, float)) else 0
+
+        candidates = [
+            (math.exp(-decay_rate(meta.get("event_type")) * max(0.0, (now_epoch - created(meta)) / 86400.0)),
+             created(meta), str(episode_id))
+            for episode_id, meta in zip(ids, metas)
+            if str((meta or {}).get("event_type") or "").upper() != "DECISION"
+        ]
+        doomed = [episode_id for _, _, episode_id in sorted(candidates)[:excess]]
+        if doomed:
+            await asyncio.to_thread(self._collection.delete, ids=doomed)
+        return doomed
 
     async def count(self, user_id: str, working_dir: str | None = None) -> int:
         """How many episodes this user has saved (only from `working_dir` when given): `saved_in_project` (D8)."""
