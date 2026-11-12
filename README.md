@@ -394,9 +394,24 @@ The top line is the tab strip: `▌` marks the question you are on (bold and ora
 answered, and both sit in the same slot so the tabs never shift as you answer. The submit row is dim until
 every question has an answer, then it brightens and the parenthetical hint goes away.
 
-- **Nothing submits on one key.** A pick records the answer and moves to the next question; `Submit answers` is
-  the only thing that sends, and it stays inert (`answer every question first`) until every question has one.
-  `←`/`Shift+Tab` goes back, so an earlier answer can be changed before submitting.
+- **Nothing submits on one key.** A pick records the answer and moves to the next question; `Submit answers`
+  stays inert (`answer every question first`) until every question has one. `←`/`Shift+Tab` goes back, so an
+  earlier answer can be changed before submitting.
+- **You review before it sends.** `Submit answers` opens a review of every question with your answer under it;
+  the review's own `Submit answers` row is what sends. From the review, `←`/`Shift+Tab` goes back to the
+  questions, and Enter on an answer (or its number, or a click) reopens that question to change it:
+
+  ```
+   ✓ DB · ✓ Auth · ▌ Review
+     Review your answers
+     1. Which database should I use?
+        → Postgres
+     2. Which auth methods?
+        → JWT, OAuth
+     ────────────────────────────────────────────────────────
+   ❯ Submit answers
+   ↑/↓ select · Enter on an answer changes it · Enter on Submit sends · ← back · Esc cancel
+  ```
 - **`2-4` options, one line each**, with the trade-off where it matters. A multi-select question toggles with
   `space` or its number, and the joined answer comes back in option order.
 - **`Other`** is always the last row, numbered after the options: pick it and the input takes a typed answer (a
