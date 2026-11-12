@@ -304,3 +304,41 @@ def test_select_returns_overflow():
     shown, overflow = select_injected_facts(facts)
     assert [f["key"] for f in shown] == ["b", "a"] and overflow == []
     assert select_injected_facts([]) == ([], [])
+
+
+# --- memory recall T2.1: episodes already delivered in this session (D8) -------------------------------------------
+
+def test_context_step_records_episode_ids():
+    step = make_context_step("<turn-context>b</turn-context>", ("e1", "e2"))
+    assert step["meta"] == {"hidden": TURN_CONTEXT_MARKER, "episode_ids": ["e1", "e2"]}
+    # A bundle with no episodes is the step it always was
+    assert make_context_step("<turn-context>b</turn-context>")["meta"] == {"hidden": TURN_CONTEXT_MARKER}
+
+
+def test_delivered_episode_ids_every_bundle_in_history():
+    from dostuff.helpers.agent.turn_context import delivered_episode_ids, make_facts_step
+    history = [make_context_step("a", ("e1",)), {"role": "user", "content": "hi"},
+               make_context_step("b", ("e2", "e3")), make_context_step("c"), make_facts_step("f", ()),
+               {"role": "user", "content": "x", "meta": {"episode_ids": ["not-a-bundle"]}}]
+    assert delivered_episode_ids(history) == {"e1", "e2", "e3"}
+    assert delivered_episode_ids([]) == set()
+
+
+# --- memory recall T2.2: the labelled episodes block (REQ-3.2, D8) -----------------------------------------------
+
+def test_past_episodes_block_counts():
+    from dostuff.helpers.agent.turn_context import EPISODES_MORE_NOTE, EpisodeCounts
+    text = compose_turn_context(ENV, "", "  • [LEARNING] a", episode_counts=EpisodeCounts(3, "7", 24))
+    assert '<past_episodes shown="3" matching="7" saved_in_project="24">\n  • [LEARNING] a\n' in text
+    assert EPISODES_MORE_NOTE == "The closest to this prompt only; more are saved."
+    assert f"{EPISODES_MORE_NOTE}\n</past_episodes>" in text
+
+
+def test_past_episodes_block_no_note_when_all_shown_and_unknown_counts_left_out():
+    from dostuff.helpers.agent.turn_context import EPISODES_MORE_NOTE, EpisodeCounts
+    text = compose_turn_context(ENV, "", "  • [LEARNING] a", episode_counts=EpisodeCounts(1, "1", 1))
+    assert '<past_episodes shown="1" matching="1" saved_in_project="1">' in text and EPISODES_MORE_NOTE not in text
+    # A store that can't count: only what is known
+    text = compose_turn_context(ENV, "", "  • [LEARNING] a", episode_counts=EpisodeCounts(1, None, None))
+    assert '<past_episodes shown="1">' in text and EPISODES_MORE_NOTE not in text
+    assert "<past_episodes>" in compose_turn_context(ENV, "", "  • x")  # no counts given: the old tag

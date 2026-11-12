@@ -8,6 +8,7 @@ whole cached prefix. The model reads them; a user never sees them. Every reader 
 Light on import: the TUI loads this before its first frame.
 """
 import hashlib
+import re
 from contextvars import ContextVar
 from typing import Any, NamedTuple
 
@@ -51,23 +52,79 @@ def _wrap(text: str) -> str:
     return f"<turn-context>\n{text}\n</turn-context>"
 
 
-def compose_turn_context(environment: str = "", facts: str = "", episodes: str = "", prompt_context: str = "") -> str:
+EPISODES_MORE_NOTE = "The closest to this prompt only; more are saved."
+
+
+class EpisodeCounts(NamedTuple):
+    """The labels on `<past_episodes>` (memory recall D8). None = the store couldn't say, so the label is left out."""
+    shown: int
+    matching: str | None = None  # above the floor before the top-k cut, not counting episodes already in view;
+    #                              "10+" when every candidate fetched matched (there may be more)
+    saved_in_project: int | None = None
+
+
+def _episodes_block(episodes: str, counts: EpisodeCounts | None) -> str:
+    if counts is None:
+        return f"<past_episodes>\n{episodes}\n</past_episodes>"
+    attrs = f' shown="{counts.shown}"'
+    if counts.matching is not None:
+        attrs += f' matching="{counts.matching}"'
+    if counts.saved_in_project is not None:
+        attrs += f' saved_in_project="{counts.saved_in_project}"'
+    # Only when it's true: the model shouldn't go looking for episodes that don't exist
+    more = (counts.saved_in_project is not None and counts.saved_in_project > counts.shown) or (
+        counts.matching is not None and (counts.matching.endswith("+") or int(counts.matching) > counts.shown))
+    return f"<past_episodes{attrs}>\n{episodes}" + (f"\n{EPISODES_MORE_NOTE}" if more else "") + "\n</past_episodes>"
+
+
+def compose_turn_context(environment: str = "", facts: str = "", episodes: str = "", prompt_context: str = "",
+                         episode_counts: EpisodeCounts | None = None) -> str:
     """The bundle: the sections that have text, in a fixed order; "" when none has (D4). Does no I/O.
 
     `facts` are the saved facts past the facts step's cap that match the prompt (memory recall D3)."""
     sections = [
         environment,
         f"<other_relevant_facts>\n{facts}\n</other_relevant_facts>" if facts else "",
-        f"<past_episodes>\n{episodes}\n</past_episodes>" if episodes else "",
+        _episodes_block(episodes, episode_counts) if episodes else "",
         f"{PROMPT_CONTEXT_HEADER}\n{prompt_context}" if prompt_context else "",
     ]
     body = "\n\n".join(s for s in sections if s)
     return _wrap(body) if body else ""
 
 
-def make_context_step(bundle: str) -> dict[str, Any]:
-    """The hidden step that carries a bundle."""
-    return {"role": "user", "content": bundle, "meta": {"hidden": TURN_CONTEXT_MARKER}}
+_MEMORY_SECTIONS = re.compile(r"<other_relevant_facts>.*?</other_relevant_facts>|<past_episodes\b.*?</past_episodes>",
+                              re.DOTALL)
+
+
+def memory_sections(step: dict) -> list[str]:
+    """The parts of a turn-context step that are long-term memory (memory recall D11): all of a facts step, or a
+    bundle's `<other_relevant_facts>` and `<past_episodes>` sections; [] for anything else."""
+    if not is_turn_context(step):
+        return []
+    text = step.get("content") if isinstance(step.get("content"), str) else ""
+    if "facts" in step["meta"]:
+        return [text] if text else []
+    return _MEMORY_SECTIONS.findall(text or "")
+
+
+class TurnContext(NamedTuple):
+    """A built bundle: its text ("" when there is nothing to send) and the ids of the episodes it carries."""
+    text: str
+    episode_ids: tuple[str, ...] = ()
+
+
+def make_context_step(bundle: str, episode_ids: tuple[str, ...] = ()) -> dict[str, Any]:
+    """The hidden step that carries a bundle; `episode_ids` records which episodes it delivered (memory recall D8)."""
+    meta: dict[str, Any] = {"hidden": TURN_CONTEXT_MARKER}
+    if episode_ids:
+        meta["episode_ids"] = list(episode_ids)
+    return {"role": "user", "content": bundle, "meta": meta}
+
+
+def delivered_episode_ids(history: list) -> set[str]:
+    """Every episode a bundle in `history` delivered: the model still sees them, so they aren't recalled again
+    (REQ-3.1). Compaction drops old bundles, which lets their episodes come back."""
+    return {str(i) for step in history if is_turn_context(step) for i in step["meta"].get("episode_ids") or ()}
 
 
 def make_plan_mode_step(plan_mode: bool, text: str) -> dict[str, Any]:

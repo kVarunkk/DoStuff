@@ -70,7 +70,9 @@ from dostuff.helpers.agent.side_question import (
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
-from dostuff.helpers.agent.turn_context import CONSOLIDATE_HINT_USER_FACTS, is_turn_context, make_context_step
+from dostuff.helpers.agent.turn_context import (
+    CONSOLIDATE_HINT_USER_FACTS, TurnContext, delivered_episode_ids, is_turn_context, make_context_step,
+)
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
 from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers
@@ -2282,6 +2284,7 @@ class DostuffTUI(App):
             else:
                 await self._ensure_embedding_model()
                 await self._warn_if_memory_index_damaged()
+                await self._hint_consolidate()
         except Exception as e:
             self._backend_error = str(e)
             self._append(f"Startup failed: {e}", msg_type="error")
@@ -2323,6 +2326,19 @@ class DostuffTUI(App):
                          "Memory recall is off until it succeeds (it retries on the next start).", msg_type="error")
             return
         self._append("Embedding model ready.", msg_type="system")
+
+    async def _hint_consolidate(self) -> None:
+        """Past 30 user facts, say once at startup that they can be merged (memory recall D10): every one of them
+        is sent with each session's first call. A failed count says nothing; /memories shows the same hint."""
+        assert self.memory_store is not None
+        try:
+            user_facts = len(await self.memory_store.list_all(self.user_id, scope="user"))
+        except Exception:
+            return
+        if user_facts > CONSOLIDATE_HINT_USER_FACTS:
+            self._append(f"You have {user_facts} user facts, and each session starts with them. "
+                         "/memories consolidate merges overlapping ones after showing you the change.",
+                         msg_type="system")
 
     async def _warn_if_memory_index_damaged(self) -> None:
         """Say the memory index needs a rebuild, instead of letting recall quietly return less.
@@ -3647,8 +3663,44 @@ class DostuffTUI(App):
         text += "\n\nForget one with /forget <key> (/forget user:<key> for a user fact when this project has the same key)."
         if len(user) > CONSOLIDATE_HINT_USER_FACTS:
             text += (f"\n\nYou have {len(user)} user facts. Merging overlapping ones keeps the list every session "
-                     "starts with short; /forget the ones you no longer need.")
+                     "starts with short: /memories consolidate shows the merge before writing it, and /forget "
+                     "removes the ones you no longer need.")
         self._append(text, msg_type="system")
+
+    async def _consolidate_memories(self) -> None:
+        """/memories consolidate: one model call merges overlapping facts (yours and this project's), the diff is
+        shown, and nothing is written until you say yes (memory recall D10). Auto mode never asks, so it refuses."""
+        if not await self._memory_ready():
+            return
+        assert self.memory_store is not None
+        if (self.permissions.mode or self.config.permission_mode) == "auto":
+            self._append("Merging facts needs your OK, and auto mode never stops to ask. Leave auto mode "
+                         "(shift+tab) or run `dostuff memory consolidate --yes` in a terminal.", msg_type="system")
+            return
+        from dostuff.helpers.memory.consolidate import ConsolidateError, apply, describe, propose, summary
+        here = Path.cwd().resolve()
+        self._append("Asking the model to merge overlapping facts…", msg_type="system")
+        try:
+            changes = await propose(self.memory_store, self.user_id, str(here))
+        except ConsolidateError as error:
+            self._append(f"Can't merge: {error}. Nothing was changed.", msg_type="error")
+            return
+        except Exception as error:
+            self._append(f"Could not load memories: {error}. Nothing was changed.", msg_type="error")
+            return
+        if not changes:
+            self._append("Nothing to merge: no saved facts overlap.", msg_type="system")
+            return
+        if not await self.adapter.confirm(describe(changes, here.name), "Merge these facts?",
+                                          f"Yes, merge ({summary(changes)})", "No, keep them as they are"):
+            self._append("Nothing was changed.", msg_type="system")
+            return
+        try:
+            await apply(self.memory_store, self.user_id, changes)
+        except Exception as error:
+            self._append(f"The merge stopped part-way: {error}. Check /memories.", msg_type="error")
+            return
+        self._append(f"Merged: {summary(changes)}.", msg_type="system")
 
     def _episodes_dir(self) -> str | None:
         """The directory episodes are recalled from (None = all), as `memory.episodic_scope` says."""
@@ -3758,6 +3810,9 @@ class DostuffTUI(App):
             return
         if cmd == "/memories":
             self._start_worker(self._show_memories(), name="memories")
+            return
+        if cmd.split() == ["/memories", "consolidate"]:
+            self._start_worker(self._consolidate_memories(), name="memories")
             return
         if cmd.startswith("/"):
             # Skills added or removed since the last look (a stat pass): a new one is a command, not a typo, and a
@@ -4231,9 +4286,9 @@ class DostuffTUI(App):
             return ForkContext(system_instruction=kept.system_instruction, compaction_notes=notes, history=history,
                                tool_names=list(kept.tool_names), session_hook_context=kept.session_hook_context)
         from dostuff.tools.definitions import default_tool_names  # pulls in the tools: after the first frame
-        bundle = await self._build_turn_context(question)
-        if bundle:  # this snapshot's copy only: a side question stores nothing
-            history.append(make_context_step(bundle))
+        bundle = await self._build_turn_context(question, history=history)
+        if bundle.text:  # this snapshot's copy only: a side question stores nothing
+            history.append(make_context_step(bundle.text, bundle.episode_ids))
         return ForkContext(system_instruction=self._build_instructions(), compaction_notes=notes,
                            history=history, tool_names=default_tool_names(),
                            session_hook_context=dict(self.session_hook_context))
@@ -4408,9 +4463,12 @@ class DostuffTUI(App):
     def _build_instructions(self) -> str:
         return build_system_instructions(self._system_instructions)
 
-    async def _build_turn_context(self, user_text: str, prompt_context: str = "") -> str:
+    async def _build_turn_context(self, user_text: str, prompt_context: str = "",
+                                  history: list | None = None) -> TurnContext:
+        """The bundle for this prompt; episodes already in `history` (the session's working history) are left out."""
         return await build_turn_context(user_text, memory_store=self.memory_store, episodic_store=self.episodic_store,
-                                        user_id=self.user_id, prompt_context=prompt_context)
+                                        user_id=self.user_id, prompt_context=prompt_context,
+                                        exclude_episode_ids=delivered_episode_ids(history or []))
 
     async def _run_turn(self, user_text: str, wake: bool = False) -> None:
         """One agent turn. `wake`: started by a background job ending (D15) — `user_text` is the pending
@@ -4498,10 +4556,10 @@ class DostuffTUI(App):
 
             # The turn's context rides ahead of the prompt as a hidden step, never in the system prompt (D5). A
             # wake turn has no prompt, but the environment moved and the notice text recalls like one
-            bundle = await self._build_turn_context(user_text, prompt_context)
-            if bundle:
+            bundle = await self._build_turn_context(user_text, prompt_context, working_history)
+            if bundle.text:
                 await append_step(
-                    make_context_step(bundle),
+                    make_context_step(bundle.text, bundle.episode_ids),
                     self.steps_history,
                     working_history,
                     self.current_session_history,

@@ -34,7 +34,7 @@ class SemanticMemoryStore(MemoryStore):
             await resolve_memory_operation(user_id, fact, self)
 
     async def upsert_fact(self, user_id: str, fact: dict, scope: FactScope = "user", working_dir: str | None = None) -> None:
-        """Low-level write — used by resolve_memory_operation, not called directly elsewhere.
+        """Low-level write — used by resolve_memory_operation and by consolidate (after the user confirms a merge).
 
         The document is the value alone (what a query is compared with); `created_at_epoch` survives an update.
         """

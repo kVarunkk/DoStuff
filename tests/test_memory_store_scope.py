@@ -290,3 +290,208 @@ def test_reembed_only_with_repair(legacy_home):
     from dostuff.cli import app
     result = CliRunner().invoke(app, ["memory", "check", "--reembed"])
     assert result.exit_code == 2 and "--reembed goes with 'repair'" in result.output
+
+
+# Episode store, memory recall T2.1 (REQ-3.1, D8) ----------------------------------------------------------------
+
+@pytest.fixture
+def episodes(tmp_path, monkeypatch):
+    from dostuff.lib.memory import chroma
+    from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+
+    monkeypatch.setattr(chroma, "_clients", {})
+    store = EpisodicMemoryStore(persist_path=str(tmp_path / "chroma"))
+    now = 1_800_000_000
+    monkeypatch.setattr("dostuff.lib.memory.episodic_memory_store.time.time", lambda: now)
+    # 15 episodes about the same lock, so every one of them matches the query
+    asyncio.run(store.add([{
+        "id": f"ep{i:02d}", "vector_text": f"tests hang with database is locked; fixed by busy timeout (note {i})",
+        "metadata": {"user_id": USER, "working_dir": PROJ_A, "event_type": "LEARNING", "created_at_epoch": now,
+                     "created_at_iso": "2027-01-15T08:00:00", "anchor_event": f"lock fix {i}", "summary": "s",
+                     "tags": "[]", "session_id": "s0"},
+    } for i in range(15)]))
+    return store
+
+
+def _ids(found):
+    return [e["id"] for e in found]
+
+
+def test_episode_query_returns_ids(episodes):
+    found = asyncio.run(episodes.query(USER, "database is locked", top_k=3, working_dir=PROJ_A))
+    assert len(found) == 3 and all(e["id"].startswith("ep") for e in found)
+
+
+def test_episode_query_excludes_before_top_k(episodes):
+    best = _ids(asyncio.run(episodes.query(USER, "database is locked", top_k=12, working_dir=PROJ_A)))
+    # Excluding the 10 best still fills top_k from the rest: exclusion happens before the cut, not after
+    found = _ids(asyncio.run(episodes.query(USER, "database is locked", top_k=3, working_dir=PROJ_A,
+                                            exclude_ids=set(best[:10]))))
+    assert len(found) == 3 and not set(found) & set(best[:10])
+
+
+def test_episode_query_reports_matching(episodes):
+    stats = {}
+    found = asyncio.run(episodes.query(USER, "database is locked", top_k=3, working_dir=PROJ_A, stats=stats))
+    # All 15 match, but only a pool of 10 candidates is fetched: "at least 10", never a number that understates
+    assert len(found) == 3 and stats == {"matching": "10+"}
+    asyncio.run(episodes.query(USER, "chocolate cake recipe", top_k=3, working_dir=PROJ_A, stats=stats))
+    assert stats == {"matching": "0"}
+
+
+def test_episode_count_per_project(episodes):
+    assert asyncio.run(episodes.count(USER, working_dir=PROJ_A)) == 15
+    assert asyncio.run(episodes.count(USER, working_dir=PROJ_B)) == 0
+    assert asyncio.run(episodes.count("someone-else")) == 0
+
+
+# Episode decay by type, memory recall T2.3 (REQ-3.3, D9) -------------------------------------------------------
+
+def test_decay_table():
+    from dostuff.lib.memory.episodic_memory_store import RECENCY_DECAY, decay_rate
+    assert RECENCY_DECAY == {"DECISION": 0.0, "PREFERENCE": 0.0, "CORRECTION": 0.0, "LEARNING": 0.01, "EVENT": 0.05}
+    assert decay_rate("EVENT") == 0.05 and decay_rate("DECISION") == 0.0
+    assert decay_rate("SOMETHING_NEW") == 0.05 and decay_rate(None) == 0.05  # unknown: the old flat rate
+
+
+def test_tie_within_002_broken_by_recency():
+    from dostuff.lib.memory.episodic_memory_store import rank_episodes
+    day = 86_400
+    eps = [{"id": "old", "score": 0.71, "created_at_epoch": 10 * day},
+           {"id": "new", "score": 0.70, "created_at_epoch": 50 * day},   # within 0.02 of "old": newer goes first
+           {"id": "far", "score": 0.60, "created_at_epoch": 90 * day},   # newest, but not a tie
+           {"id": "mid", "score": 0.695, "created_at_epoch": 30 * day}]  # in the top tie too
+    assert [e["id"] for e in rank_episodes(eps)] == ["new", "mid", "old", "far"]
+
+
+def test_old_decision_beats_newer_less_similar_event(tmp_path, monkeypatch):
+    from dostuff.lib.memory import chroma
+    from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+
+    monkeypatch.setattr(chroma, "_clients", {})
+    store = EpisodicMemoryStore(persist_path=str(tmp_path / "chroma"))
+    now = 1_800_000_000
+    monkeypatch.setattr("dostuff.lib.memory.episodic_memory_store.time.time", lambda: now)
+
+    def ep(i, text, kind, days):
+        return {"id": i, "vector_text": text, "metadata": {
+            "user_id": USER, "working_dir": PROJ_A, "event_type": kind, "created_at_epoch": now - days * 86_400,
+            "created_at_iso": "x", "anchor_event": text, "summary": "s", "tags": "[]", "session_id": "s0"}}
+    asyncio.run(store.add([
+        ep("decision", "Decided to enable WAL journal mode for the SQLite session database", "DECISION", 300),
+        ep("event", "The SQLite database file was copied to a backup folder", "EVENT", 1),
+    ]))
+    found = asyncio.run(store.query(USER, "why do we use WAL journal mode for the sqlite database?", top_k=2,
+                                    working_dir=PROJ_A))
+    assert [e["id"] for e in found][0] == "decision"
+
+
+# Consolidate, memory recall T2.7 (REQ-4.3, D10) ----------------------------------------------------------------
+
+@pytest.fixture
+def facts_home(tmp_path, monkeypatch):
+    """A fake ~ and project with overlapping user facts, one project fact, and a fake model for the merge."""
+    from pathlib import Path
+
+    from dostuff import config as config_module
+    from dostuff.lib.memory import chroma
+
+    home, proj = tmp_path / "home", tmp_path / "proj"
+    (home / ".dostuff").mkdir(parents=True)
+    proj.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(proj)
+    monkeypatch.setattr(chroma, "_clients", {})
+    config_module.reset_config()
+    user = config_module.get_config().get_user_id()
+    store = sms.SemanticMemoryStore(persist_path=str(home / ".dostuff" / "data" / "chroma"))
+    clock = {"t": 1_000}
+    monkeypatch.setattr(sms.time, "time", lambda: clock["t"])
+    here = str(proj.resolve())
+    for key, value, scope in (("editor", "Neovim", {}), ("editor_pref", "Uses Neovim for everything", {}),
+                              ("name", "Nemo", {}), ("lint", "ruff", {"scope": "project", "working_dir": here})):
+        asyncio.run(store.upsert_fact(user, {"key": key, "value": value, "source": "user_message"}, **scope))
+    clock["t"] = 2_000
+    calls: list[str] = []
+    answer = {"text": '{"user": [{"key": "editor", "value": "Neovim, for everything"}, {"key": "name", "value": "Nemo"}],'
+                      ' "project": [{"key": "lint", "value": "ruff"}]}'}
+
+    async def fake_acompletion(**kwargs):
+        from litellm import ModelResponse
+        calls.append(kwargs["messages"][-1]["content"])
+        return ModelResponse(choices=[{"message": {"role": "assistant", "content": answer["text"]}}])
+    from dostuff.helpers.memory import consolidate
+    monkeypatch.setattr(consolidate, "acompletion", fake_acompletion)
+    yield {"home": home, "store": store, "user": user, "here": here, "calls": calls, "answer": answer}
+    config_module.reset_config()
+
+
+def _saved(home):
+    facts = asyncio.run(home["store"].list_all(home["user"], working_dir=home["here"]))
+    return {(f["scope"], f["key"]): (f["value"], f["created_at_epoch"], f["updated_at_epoch"]) for f in facts}
+
+
+def _consolidate(*args, input=None):
+    from typer.testing import CliRunner
+
+    from dostuff.cli import app
+    return CliRunner().invoke(app, ["memory", "consolidate", *args], input=input)
+
+
+def test_consolidate_shows_diff_writes_on_confirm(facts_home):
+    result = _consolidate(input="y\n")
+    assert result.exit_code == 0, result.output
+    assert "- editor_pref: Uses Neovim for everything" in result.output
+    assert "~ editor: Neovim  →  Neovim, for everything" in result.output
+    assert "Nemo" not in result.output and "Merged: 1 removed, 1 changed." in result.output  # unchanged: not listed
+    assert len(facts_home["calls"]) == 1 and "Uses Neovim for everything" in facts_home["calls"][0]
+    saved = _saved(facts_home)
+    assert ("user", "editor_pref") not in saved
+    assert saved[("user", "editor")] == ("Neovim, for everything", 1_000, 2_000)  # created kept, updated bumped
+    assert saved[("user", "name")] == ("Nemo", 1_000, 1_000)  # untouched
+    assert saved[("project", "lint")] == ("ruff", 1_000, 1_000)
+
+
+def test_consolidate_declined_writes_nothing(facts_home):
+    before = _saved(facts_home)
+    result = _consolidate(input="n\n")
+    assert result.exit_code == 1 and "- editor_pref" in result.output
+    assert _saved(facts_home) == before
+
+
+def test_consolidate_auto_mode_refuses_without_waiting(facts_home):
+    (facts_home["home"] / ".dostuff" / "config.yaml").write_text("permissions:\n  mode: auto\n")
+    from dostuff import config as config_module
+    config_module.reset_config()
+    before = _saved(facts_home)
+    result = _consolidate()  # no input: a prompt would abort, not wait
+    assert result.exit_code == 1 and "auto mode" in result.output and "--yes" in result.output
+    assert "[y/N]" not in result.output and facts_home["calls"] == []
+    assert _saved(facts_home) == before
+    # --yes is the user's own go-ahead, so it writes without asking even in auto mode
+    accepted = _consolidate("--yes")
+    assert accepted.exit_code == 0, accepted.output
+    assert "[y/N]" not in accepted.output and ("user", "editor_pref") not in _saved(facts_home)
+
+
+@pytest.mark.parametrize("bad", [
+    "Sure! Here are your facts.",                                                 # not JSON
+    '{"user": [], "project": [{"key": "lint", "value": "ruff"}]}',                 # every user fact gone
+    '{"user": [{"key": "editor", "value": ""}], "project": []}',                  # empty value
+    '{"user": [{"key": "a", "value": "x"}, {"key": "a", "value": "y"}], "project": [{"key": "lint", "value": "ruff"}]}',
+    '{"user": [{"key": "name", "value": "Nemo"}], "team": [], "project": [{"key": "lint", "value": "ruff"}]}',
+])
+def test_consolidate_bad_model_output_writes_nothing(facts_home, bad):
+    facts_home["answer"]["text"] = bad
+    before = _saved(facts_home)
+    result = _consolidate("--yes")
+    assert result.exit_code == 1 and "nothing was changed" in result.output.lower()
+    assert _saved(facts_home) == before
+
+
+def test_consolidate_nothing_to_merge(facts_home):
+    facts_home["answer"]["text"] = ('{"user": [{"key": "editor", "value": "Neovim"}, {"key": "editor_pref", "value": '
+                                    '"Uses Neovim for everything"}, {"key": "name", "value": "Nemo"}], '
+                                    '"project": [{"key": "lint", "value": "ruff"}]}')
+    result = _consolidate()
+    assert result.exit_code == 0 and "nothing to merge" in result.output.lower() and "[y/N]" not in result.output

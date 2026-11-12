@@ -238,18 +238,19 @@ def config():
 
 @app.command()
 def memory(
-    action: str = typer.Argument("check", help="'check' to diagnose, 'repair' to rebuild the indexes."),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Repair without asking for confirmation."),
+    action: str = typer.Argument("check", help="'check' to diagnose, 'repair' to rebuild the indexes, "
+                                 "'consolidate' to merge overlapping saved facts."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Repair or merge without asking for confirmation."),
     reembed: bool = typer.Option(False, "--reembed", help="With 'repair': re-embed saved facts as their value alone "
                                  "(older facts were embedded as \"User's <key> is <value>\")."),
 ):
-    """Check long-term memory's vector index, or rebuild it after 'Error finding id' failures."""
+    """Check long-term memory's vector index, rebuild it after 'Error finding id' failures, or merge overlapping facts."""
     from dostuff.config import get_config
     from dostuff.lib.memory import chroma
     from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
 
-    if action not in ("check", "repair"):
-        typer.secho(f"Unknown action '{action}'; use 'check' or 'repair'.", fg=typer.colors.RED)
+    if action not in ("check", "repair", "consolidate"):
+        typer.secho(f"Unknown action '{action}'; use 'check', 'repair' or 'consolidate'.", fg=typer.colors.RED)
         raise typer.Exit(code=2)
     if reembed and action != "repair":
         typer.secho("--reembed goes with 'repair': dostuff memory repair --reembed", fg=typer.colors.RED)
@@ -257,6 +258,9 @@ def memory(
     if not chroma.chroma_available():
         typer.echo(f"Long-term memory is off: chromadb is not installed ({MEMORY_INSTALL_HINT}).")
         raise typer.Exit(code=1)
+    if action == "consolidate":
+        _consolidate_facts(yes)
+        return
 
     from dostuff.helpers.memory.repair_index import check_collection, rebuild_collection
 
@@ -334,6 +338,41 @@ def memory(
     if reembed:
         reembed_facts_now()
     typer.secho("Rebuilt. Restart any running dostuff sessions so they reopen the collections.", fg=typer.colors.GREEN)
+
+
+def _consolidate_facts(yes: bool) -> None:
+    """`dostuff memory consolidate`: one model call merges overlapping user facts and this project's, the diff is
+    shown, and nothing is written until the user says yes (memory recall D10). In auto mode it never asks: without
+    --yes it refuses before calling the model."""
+    import asyncio
+    from pathlib import Path
+
+    from dostuff.config import get_config
+    from dostuff.helpers.memory.consolidate import ConsolidateError, apply, describe, propose, summary
+    from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
+
+    cfg = get_config()
+    if cfg.permission_mode == "auto" and not yes:
+        typer.echo("Permission mode is auto mode, which never stops to ask, and merging facts needs your OK. "
+                   "Run `dostuff memory consolidate --yes` to merge without asking.")
+        raise typer.Exit(code=1)
+    store = SemanticMemoryStore(persist_path=str(cfg.get_data_dir() / "chroma"))
+    user_id, here = cfg.get_user_id(), Path.cwd().resolve()
+    typer.echo("Asking the model to merge overlapping facts…")
+    try:
+        changes = asyncio.run(propose(store, user_id, str(here)))
+    except ConsolidateError as error:
+        typer.secho(f"Can't merge: {error}. Nothing was changed.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    if not changes:
+        typer.echo("Nothing to merge: no saved facts overlap.")
+        return
+    typer.echo(describe(changes, here.name))
+    if not yes and not typer.confirm("\nMerge these facts?", default=False):
+        typer.echo("Nothing was changed.")
+        raise typer.Exit(code=1)
+    asyncio.run(apply(store, user_id, changes))
+    typer.secho(f"Merged: {summary(changes)}.", fg=typer.colors.GREEN)
 
 
 @app.command()

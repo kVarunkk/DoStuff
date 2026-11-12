@@ -149,7 +149,7 @@ def test_save_episode_tool_stores_episode(monkeypatch, tmp_path):
     added = []
 
     class FakeEpisodic:
-        async def find_duplicate(self, user_id, vector_text, working_dir):
+        async def nearest(self, user_id, vector_text, working_dir):
             return None
 
         async def add(self, episodes):
@@ -171,9 +171,9 @@ def test_save_episode_skips_a_duplicate(monkeypatch, tmp_path):
     added, asked = [], []
 
     class FakeEpisodic:
-        async def find_duplicate(self, user_id, vector_text, working_dir):
+        async def nearest(self, user_id, vector_text, working_dir):
             asked.append((user_id, working_dir))
-            return "ep_old_1234abcd" if "WAL" in vector_text else None
+            return {"id": "ep_old_1234abcd", "similarity": 0.9} if "WAL" in vector_text else None
 
         async def add(self, episodes):
             added.extend(episodes)
@@ -186,6 +186,149 @@ def test_save_episode_skips_a_duplicate(monkeypatch, tmp_path):
     assert asked == [("u", str(tmp_path.resolve()))]
     asyncio.run(se.save_episode("DECISION", "Use httpx", "Async support", session_id="s2"))
     assert len(added) == 1
+
+
+class _BandEpisodic:
+    """Episode store whose nearest saved episode is `similarity` similar to anything saved."""
+    def __init__(self, similarity):
+        self.similarity, self.added = similarity, []
+
+    async def nearest(self, user_id, vector_text, working_dir):
+        return {"id": "ep_old_1234abcd", "similarity": self.similarity, "event_type": "DECISION",
+                "anchor_event": "Switched the session DB to WAL mode", "summary": "Stops database is locked errors"}
+
+    async def add(self, episodes):
+        self.added.extend(episodes)
+
+
+def _band(monkeypatch, tmp_path, similarity, answer=None, error=False):
+    """save_episode against a nearest episode at `similarity`; the judge answers `answer` (or raises)."""
+    from litellm import ModelResponse
+    from dostuff.helpers.memory import same_episode
+    from dostuff.tools.memory import save_episode as se
+    asked: list[str] = []
+
+    async def fake_acompletion(**kwargs):
+        asked.append(kwargs["messages"][-1]["content"])
+        if error:
+            raise RuntimeError("provider down")
+        return ModelResponse(choices=[{"message": {"role": "assistant", "content": answer}}])
+    monkeypatch.setattr(same_episode, "acompletion", fake_acompletion)
+    store = _BandEpisodic(similarity)
+    monkeypatch.setattr(se, "get_config", lambda: SimpleNamespace(get_user_id=lambda: "u"))
+    monkeypatch.setattr(se, "get_episodic_store", lambda: store)
+    monkeypatch.chdir(tmp_path)
+    result = asyncio.run(se.save_episode("LEARNING", "WAL mode fixed the locks", "Locks gone after WAL", session_id="s2"))
+    return result, store.added, asked
+
+
+def test_dedupe_band_asks_model(monkeypatch, tmp_path):
+    result, added, asked = _band(monkeypatch, tmp_path, 0.7, answer="YES")
+    assert result == "Already recorded as ep_old_1234abcd; nothing saved." and added == []
+    # One call, shown both episodes
+    assert len(asked) == 1 and "Switched the session DB to WAL mode" in asked[0] and "WAL mode fixed the locks" in asked[0]
+
+    result, added, asked = _band(monkeypatch, tmp_path, 0.7, answer="No, a different moment.")
+    assert result.startswith("Saved episode ep_s2_") and len(added) == 1 and len(asked) == 1
+
+
+def test_above_085_no_model_call(monkeypatch, tmp_path):
+    from dostuff.lib.memory.episodic_memory_store import DUPLICATE_EPISODE_SIMILARITY
+    result, added, asked = _band(monkeypatch, tmp_path, DUPLICATE_EPISODE_SIMILARITY, answer="no")
+    assert result == "Already recorded as ep_old_1234abcd; nothing saved." and added == [] and asked == []
+
+
+def test_below_06_no_model_call(monkeypatch, tmp_path):
+    from dostuff.lib.memory.episodic_memory_store import SIMILAR_EPISODE_SIMILARITY
+    assert SIMILAR_EPISODE_SIMILARITY == 0.6
+    result, added, asked = _band(monkeypatch, tmp_path, 0.59, answer="yes")
+    assert result.startswith("Saved episode ") and len(added) == 1 and asked == []
+
+
+def test_dedupe_model_error_saves(monkeypatch, tmp_path):
+    result, added, asked = _band(monkeypatch, tmp_path, 0.7, error=True)
+    assert result.startswith("Saved episode ") and len(added) == 1 and len(asked) == 1
+    # An answer that is neither yes nor no is not a "same"
+    result, added, _ = _band(monkeypatch, tmp_path, 0.7, answer="")
+    assert result.startswith("Saved episode ") and len(added) == 1
+
+
+class _ProjectsCollection:
+    """Episode rows with a working_dir; get() honours the user/working_dir `where` save_episode's prune uses."""
+    def __init__(self, rows):
+        self.rows = rows  # {id: metadata}
+        self.deleted: list[str] = []
+
+    def get(self, ids=None, where=None, include=None):
+        terms = (where or {}).get("$and", [where] if where else [])
+        rows = {i: m for i, m in self.rows.items() if all(m.get(k) == v for t in terms for k, v in t.items())}
+        return {"ids": list(rows), "metadatas": list(rows.values())}
+
+    def delete(self, ids):
+        self.deleted.extend(ids)
+        for i in ids:
+            self.rows.pop(i)
+
+
+def _episode_rows(project, n, event_type, days_old, prefix):
+    now = 1_800_000_000
+    return {f"{prefix}{k}": {"user_id": "u", "working_dir": project, "event_type": event_type,
+                             "created_at_epoch": now - int(days_old * 86400) - k} for k in range(n)}
+
+
+def test_prune_above_cap_keeps_decisions(monkeypatch):
+    from dostuff.lib.memory import episodic_memory_store as ems
+    monkeypatch.setattr(ems.time, "time", lambda: 1_800_000_000)
+    assert ems.EPISODE_CAP_PER_PROJECT == 200
+    rows = {
+        **_episode_rows("/a", 150, "DECISION", 400, "old_decision"),   # oldest of all, never pruned
+        **_episode_rows("/a", 40, "PREFERENCE", 300, "pref"),          # no decay: score 1
+        **_episode_rows("/a", 10, "LEARNING", 30, "lesson"),           # e^-0.3 = 0.74
+        **_episode_rows("/a", 5, "EVENT", 2, "event"),                 # e^-0.1 = 0.90
+    }
+    store = _store(ems.EpisodicMemoryStore, [])
+    store._collection = _ProjectsCollection(rows)
+    deleted = asyncio.run(store.prune("u", "/a"))
+    # 205 → 200: the five lowest scores are lessons (oldest first among equals), not the newer events
+    assert sorted(deleted) == sorted(f"lesson{k}" for k in range(5, 10))
+    assert len(store._collection.rows) == 200
+    assert asyncio.run(store.prune("u", "/a")) == []  # at the cap: nothing to do
+
+    # Only decisions over the cap: none deleted
+    store._collection = _ProjectsCollection(_episode_rows("/a", 205, "DECISION", 400, "d"))
+    assert asyncio.run(store.prune("u", "/a")) == [] and len(store._collection.rows) == 205
+
+
+def test_prune_only_this_project(monkeypatch):
+    from dostuff.lib.memory import episodic_memory_store as ems
+    monkeypatch.setattr(ems.time, "time", lambda: 1_800_000_000)
+    rows = {**_episode_rows("/a", 201, "EVENT", 1, "a"), **_episode_rows("/b", 300, "EVENT", 900, "b"),
+            **{f"other{k}": {**m, "user_id": "v"} for k, m in _episode_rows("/a", 50, "EVENT", 900, "x").items()}}
+    store = _store(ems.EpisodicMemoryStore, [])
+    store._collection = _ProjectsCollection(rows)
+    # /b's far older events and another user's rows in /a are left alone; /a's oldest event goes
+    assert asyncio.run(store.prune("u", "/a")) == ["a200"]
+
+
+def test_save_episode_prunes_after_saving(monkeypatch, tmp_path):
+    from dostuff.tools.memory import save_episode as se
+    calls: list[tuple] = []
+
+    class FakeEpisodic:
+        async def nearest(self, user_id, vector_text, working_dir):
+            return None
+
+        async def add(self, episodes):
+            calls.append(("add",))
+
+        async def prune(self, user_id, working_dir):
+            calls.append(("prune", user_id, working_dir))
+            raise RuntimeError("index broken")  # a failed prune never fails the save
+    monkeypatch.setattr(se, "get_config", lambda: SimpleNamespace(get_user_id=lambda: "u"))
+    monkeypatch.setattr(se, "get_episodic_store", lambda: FakeEpisodic())
+    monkeypatch.chdir(tmp_path)
+    assert asyncio.run(se.save_episode("EVENT", "Ran the suite", "All green", session_id="s1")).startswith("Saved episode")
+    assert calls == [("add",), ("prune", "u", str(tmp_path.resolve()))]
 
 
 class FakeCollection:
@@ -232,14 +375,16 @@ def test_fact_recall_floor_and_dedup_floor():
     assert memory.min_similarity == rmo.DEDUP_MIN_SIMILARITY < MIN_FACT_SIMILARITY
 
 
-def test_episode_find_duplicate_list_and_delete():
-    from dostuff.lib.memory.episodic_memory_store import DUPLICATE_EPISODE_SIMILARITY, EpisodicMemoryStore
-    old = {"event_type": "DECISION", "anchor_event": "Use WAL", "created_at_iso": "2026-10-01T00:00:00Z", "created_at_epoch": 100}
+def test_episode_nearest_list_and_delete():
+    from dostuff.lib.memory.episodic_memory_store import SIMILAR_EPISODE_SIMILARITY, EpisodicMemoryStore
+    old = {"event_type": "DECISION", "anchor_event": "Use WAL", "summary": "Locks", "created_at_iso": "2026-10-01T00:00:00Z", "created_at_epoch": 100}
     new = {"event_type": "LEARNING", "anchor_event": "Retry 429s", "created_at_iso": "2026-10-20T00:00:00Z", "created_at_epoch": 200}
     store = _store(EpisodicMemoryStore, [("ep_s1_aaaa1111", old, 0.1), ("ep_s2_bbbb2222", new, 0.5)])
-    assert asyncio.run(store.find_duplicate("u", "Use WAL mode", "/proj")) == "ep_s1_aaaa1111"
-    store._collection.rows[0] = ("ep_s1_aaaa1111", old, 1.0 - DUPLICATE_EPISODE_SIMILARITY + 0.05)
-    assert asyncio.run(store.find_duplicate("u", "Use WAL mode", "/proj")) is None
+    nearest = asyncio.run(store.nearest("u", "Use WAL mode", "/proj"))
+    assert nearest == {"id": "ep_s1_aaaa1111", "similarity": pytest.approx(0.9), "event_type": "DECISION",
+                       "anchor_event": "Use WAL", "summary": "Locks"}
+    store._collection.rows[0] = ("ep_s1_aaaa1111", old, 1.0 - SIMILAR_EPISODE_SIMILARITY + 0.05)
+    assert asyncio.run(store.nearest("u", "Use WAL mode", "/proj")) is None
 
     assert [ep["id"] for ep in asyncio.run(store.list_all("u"))] == ["ep_s2_bbbb2222", "ep_s1_aaaa1111"]
     assert asyncio.run(store.delete("u", "ep_s1_aaaa1111")) is True
