@@ -17,6 +17,9 @@ MIN_EPISODE_SIMILARITY = 0.3
 # saved twice. Rewordings of one moment score ~0.75-0.9 (even under another event type); a related
 # but different moment ~0.6
 DUPLICATE_EPISODE_SIMILARITY = 0.85
+# Between this and DUPLICATE_EPISODE_SIMILARITY a new episode may be the same moment reworded or a related one; the
+# model is asked which (memory recall D10)
+SIMILAR_EPISODE_SIMILARITY = 0.6
 
 # Recency decay per day by event type (memory recall D9): a decision, preference or correction stays true until it is
 # replaced, a lesson stays useful for months (half-life ~70 days), an event is about now (half-life ~14 days). With
@@ -163,10 +166,11 @@ class EpisodicMemoryStore(EpisodicStore):
         # Best decayed score first, ties newest first (D9), then top_k
         return rank_episodes(scored_episodes)[:top_k]
 
-    async def find_duplicate(
-        self, user_id: str, vector_text: str, working_dir: str, min_similarity: float = DUPLICATE_EPISODE_SIMILARITY
-    ) -> str | None:
-        """Id of an episode from `working_dir` at least `min_similarity` similar to `vector_text`, if any."""
+    async def nearest(
+        self, user_id: str, vector_text: str, working_dir: str, min_similarity: float = SIMILAR_EPISODE_SIMILARITY
+    ) -> dict | None:
+        """The episode from `working_dir` most similar to `vector_text`, if at least `min_similarity`: its `id`,
+        `similarity`, `event_type`, `anchor_event` and `summary` (what save_episode checks a new episode against)."""
         where = {"$and": [{"user_id": user_id}, {"working_dir": working_dir}]}
 
         def _query() -> Any:
@@ -175,9 +179,17 @@ class EpisodicMemoryStore(EpisodicStore):
         results = await asyncio.to_thread(_query)
         ids = (results.get("ids") or [[]])[0] or []
         dists = (results.get("distances") or [[]])[0] or []
-        if ids and dists and 1.0 - dists[0] >= min_similarity:
-            return str(ids[0])
-        return None
+        metas = (results.get("metadatas") or [[]])[0] or []
+        if not ids or not dists or 1.0 - dists[0] < min_similarity:
+            return None
+        meta = (metas[0] if metas else None) or {}
+        return {
+            "id": str(ids[0]),
+            "similarity": 1.0 - dists[0],
+            "event_type": str(meta.get("event_type") or ""),
+            "anchor_event": str(meta.get("anchor_event") or ""),
+            "summary": str(meta.get("summary") or ""),
+        }
 
     async def count(self, user_id: str, working_dir: str | None = None) -> int:
         """How many episodes this user has saved (only from `working_dir` when given): `saved_in_project` (D8)."""

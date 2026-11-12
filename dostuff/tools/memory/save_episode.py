@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dostuff.config import get_config
+from dostuff.helpers.memory.same_episode import is_same_episode
 from dostuff.helpers.ui.emit import emit
 from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
+from dostuff.lib.memory.episodic_memory_store import DUPLICATE_EPISODE_SIMILARITY, SIMILAR_EPISODE_SIMILARITY
 from dostuff.lib.memory.stores import get_episodic_store
 from dostuff.lib.memory.types import EpisodeType
 
@@ -47,9 +49,15 @@ async def save_episode(
     user_id = get_config().get_user_id()
     working_dir = str(Path.cwd().resolve())
     vector_text = f"- EVENT TYPE: {event_type}\n  - ANCHOR EVENT: {anchor_event}\n  - SUMMARY: {summary}"
-    duplicate_id = await store.find_duplicate(user_id, vector_text, working_dir)
-    if duplicate_id:
-        return f"Already recorded as {duplicate_id}; nothing saved."
+    saved = await store.nearest(user_id, vector_text, working_dir)
+    # A near-copy is the same moment; in the band below that, a reworded moment and a related one look alike to the
+    # embedding, so the model decides (memory recall D10)
+    if saved and (
+        saved["similarity"] >= DUPLICATE_EPISODE_SIMILARITY
+        or saved["similarity"] >= SIMILAR_EPISODE_SIMILARITY
+        and await is_same_episode(saved, event_type, anchor_event, summary)
+    ):
+        return f"Already recorded as {saved['id']}; nothing saved."
     now_epoch = int(time.time())
     episode_id = f"ep_{session_id}_{uuid.uuid4().hex[:8]}"
     episode = {

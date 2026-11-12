@@ -149,7 +149,7 @@ def test_save_episode_tool_stores_episode(monkeypatch, tmp_path):
     added = []
 
     class FakeEpisodic:
-        async def find_duplicate(self, user_id, vector_text, working_dir):
+        async def nearest(self, user_id, vector_text, working_dir):
             return None
 
         async def add(self, episodes):
@@ -171,9 +171,9 @@ def test_save_episode_skips_a_duplicate(monkeypatch, tmp_path):
     added, asked = [], []
 
     class FakeEpisodic:
-        async def find_duplicate(self, user_id, vector_text, working_dir):
+        async def nearest(self, user_id, vector_text, working_dir):
             asked.append((user_id, working_dir))
-            return "ep_old_1234abcd" if "WAL" in vector_text else None
+            return {"id": "ep_old_1234abcd", "similarity": 0.9} if "WAL" in vector_text else None
 
         async def add(self, episodes):
             added.extend(episodes)
@@ -186,6 +186,71 @@ def test_save_episode_skips_a_duplicate(monkeypatch, tmp_path):
     assert asked == [("u", str(tmp_path.resolve()))]
     asyncio.run(se.save_episode("DECISION", "Use httpx", "Async support", session_id="s2"))
     assert len(added) == 1
+
+
+class _BandEpisodic:
+    """Episode store whose nearest saved episode is `similarity` similar to anything saved."""
+    def __init__(self, similarity):
+        self.similarity, self.added = similarity, []
+
+    async def nearest(self, user_id, vector_text, working_dir):
+        return {"id": "ep_old_1234abcd", "similarity": self.similarity, "event_type": "DECISION",
+                "anchor_event": "Switched the session DB to WAL mode", "summary": "Stops database is locked errors"}
+
+    async def add(self, episodes):
+        self.added.extend(episodes)
+
+
+def _band(monkeypatch, tmp_path, similarity, answer=None, error=False):
+    """save_episode against a nearest episode at `similarity`; the judge answers `answer` (or raises)."""
+    from litellm import ModelResponse
+    from dostuff.helpers.memory import same_episode
+    from dostuff.tools.memory import save_episode as se
+    asked: list[str] = []
+
+    async def fake_acompletion(**kwargs):
+        asked.append(kwargs["messages"][-1]["content"])
+        if error:
+            raise RuntimeError("provider down")
+        return ModelResponse(choices=[{"message": {"role": "assistant", "content": answer}}])
+    monkeypatch.setattr(same_episode, "acompletion", fake_acompletion)
+    store = _BandEpisodic(similarity)
+    monkeypatch.setattr(se, "get_config", lambda: SimpleNamespace(get_user_id=lambda: "u"))
+    monkeypatch.setattr(se, "get_episodic_store", lambda: store)
+    monkeypatch.chdir(tmp_path)
+    result = asyncio.run(se.save_episode("LEARNING", "WAL mode fixed the locks", "Locks gone after WAL", session_id="s2"))
+    return result, store.added, asked
+
+
+def test_dedupe_band_asks_model(monkeypatch, tmp_path):
+    result, added, asked = _band(monkeypatch, tmp_path, 0.7, answer="YES")
+    assert result == "Already recorded as ep_old_1234abcd; nothing saved." and added == []
+    # One call, shown both episodes
+    assert len(asked) == 1 and "Switched the session DB to WAL mode" in asked[0] and "WAL mode fixed the locks" in asked[0]
+
+    result, added, asked = _band(monkeypatch, tmp_path, 0.7, answer="No, a different moment.")
+    assert result.startswith("Saved episode ep_s2_") and len(added) == 1 and len(asked) == 1
+
+
+def test_above_085_no_model_call(monkeypatch, tmp_path):
+    from dostuff.lib.memory.episodic_memory_store import DUPLICATE_EPISODE_SIMILARITY
+    result, added, asked = _band(monkeypatch, tmp_path, DUPLICATE_EPISODE_SIMILARITY, answer="no")
+    assert result == "Already recorded as ep_old_1234abcd; nothing saved." and added == [] and asked == []
+
+
+def test_below_06_no_model_call(monkeypatch, tmp_path):
+    from dostuff.lib.memory.episodic_memory_store import SIMILAR_EPISODE_SIMILARITY
+    assert SIMILAR_EPISODE_SIMILARITY == 0.6
+    result, added, asked = _band(monkeypatch, tmp_path, 0.59, answer="yes")
+    assert result.startswith("Saved episode ") and len(added) == 1 and asked == []
+
+
+def test_dedupe_model_error_saves(monkeypatch, tmp_path):
+    result, added, asked = _band(monkeypatch, tmp_path, 0.7, error=True)
+    assert result.startswith("Saved episode ") and len(added) == 1 and len(asked) == 1
+    # An answer that is neither yes nor no is not a "same"
+    result, added, _ = _band(monkeypatch, tmp_path, 0.7, answer="")
+    assert result.startswith("Saved episode ") and len(added) == 1
 
 
 class FakeCollection:
@@ -232,14 +297,16 @@ def test_fact_recall_floor_and_dedup_floor():
     assert memory.min_similarity == rmo.DEDUP_MIN_SIMILARITY < MIN_FACT_SIMILARITY
 
 
-def test_episode_find_duplicate_list_and_delete():
-    from dostuff.lib.memory.episodic_memory_store import DUPLICATE_EPISODE_SIMILARITY, EpisodicMemoryStore
-    old = {"event_type": "DECISION", "anchor_event": "Use WAL", "created_at_iso": "2026-10-01T00:00:00Z", "created_at_epoch": 100}
+def test_episode_nearest_list_and_delete():
+    from dostuff.lib.memory.episodic_memory_store import SIMILAR_EPISODE_SIMILARITY, EpisodicMemoryStore
+    old = {"event_type": "DECISION", "anchor_event": "Use WAL", "summary": "Locks", "created_at_iso": "2026-10-01T00:00:00Z", "created_at_epoch": 100}
     new = {"event_type": "LEARNING", "anchor_event": "Retry 429s", "created_at_iso": "2026-10-20T00:00:00Z", "created_at_epoch": 200}
     store = _store(EpisodicMemoryStore, [("ep_s1_aaaa1111", old, 0.1), ("ep_s2_bbbb2222", new, 0.5)])
-    assert asyncio.run(store.find_duplicate("u", "Use WAL mode", "/proj")) == "ep_s1_aaaa1111"
-    store._collection.rows[0] = ("ep_s1_aaaa1111", old, 1.0 - DUPLICATE_EPISODE_SIMILARITY + 0.05)
-    assert asyncio.run(store.find_duplicate("u", "Use WAL mode", "/proj")) is None
+    nearest = asyncio.run(store.nearest("u", "Use WAL mode", "/proj"))
+    assert nearest == {"id": "ep_s1_aaaa1111", "similarity": pytest.approx(0.9), "event_type": "DECISION",
+                       "anchor_event": "Use WAL", "summary": "Locks"}
+    store._collection.rows[0] = ("ep_s1_aaaa1111", old, 1.0 - SIMILAR_EPISODE_SIMILARITY + 0.05)
+    assert asyncio.run(store.nearest("u", "Use WAL mode", "/proj")) is None
 
     assert [ep["id"] for ep in asyncio.run(store.list_all("u"))] == ["ep_s2_bbbb2222", "ep_s1_aaaa1111"]
     assert asyncio.run(store.delete("u", "ep_s1_aaaa1111")) is True

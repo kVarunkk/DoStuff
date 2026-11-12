@@ -118,8 +118,8 @@ def test_episode_lookup_survives_divergence():
     store = EpisodicMemoryStore.__new__(EpisodicMemoryStore)
     store._collection = BrokenCollection([("ep_1", "Editor decision: use WAL", meta)])
     assert asyncio.run(store.query("u", "editor", top_k=3))[0]["anchor_event"] == "Use WAL"
-    # find_duplicate is the first step of save_episode: it must not raise, or the save never happens
-    assert asyncio.run(store.find_duplicate("u", "editor", "/proj", min_similarity=0.0)) == "ep_1"
+    # nearest is the first step of save_episode: it must not raise, or the save never happens
+    assert asyncio.run(store.nearest("u", "editor", "/proj", min_similarity=0.0))["id"] == "ep_1"
 
 
 def test_fallback_drops_rows_with_no_metadata():
