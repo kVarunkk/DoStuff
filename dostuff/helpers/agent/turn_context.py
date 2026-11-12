@@ -8,6 +8,7 @@ whole cached prefix. The model reads them; a user never sees them. Every reader 
 Light on import: the TUI loads this before its first frame.
 """
 import hashlib
+import re
 from contextvars import ContextVar
 from typing import Any, NamedTuple
 
@@ -89,6 +90,21 @@ def compose_turn_context(environment: str = "", facts: str = "", episodes: str =
     ]
     body = "\n\n".join(s for s in sections if s)
     return _wrap(body) if body else ""
+
+
+_MEMORY_SECTIONS = re.compile(r"<other_relevant_facts>.*?</other_relevant_facts>|<past_episodes\b.*?</past_episodes>",
+                              re.DOTALL)
+
+
+def memory_sections(step: dict) -> list[str]:
+    """The parts of a turn-context step that are long-term memory (memory recall D11): all of a facts step, or a
+    bundle's `<other_relevant_facts>` and `<past_episodes>` sections; [] for anything else."""
+    if not is_turn_context(step):
+        return []
+    text = step.get("content") if isinstance(step.get("content"), str) else ""
+    if "facts" in step["meta"]:
+        return [text] if text else []
+    return _MEMORY_SECTIONS.findall(text or "")
 
 
 class TurnContext(NamedTuple):
