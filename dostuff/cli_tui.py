@@ -129,6 +129,8 @@ ASK_RESULT_PREFIX = "ask_user: "  # its result is a few short "question → answ
 ASK_SUBMIT_LABEL = "Submit answers"
 ASK_HINT = "↑/↓ select · Enter confirm · ←/→ change question · Esc cancel"
 ASK_INERT_HINT = "answer every question first"
+ASK_REVIEW_LABEL = "Review"  # the tab the review step adds to the strip
+ASK_REVIEW_HINT = "↑/↓ select · Enter on an answer changes it · Enter on Submit sends · ← back · Esc cancel"
 ASK_OTHER_LABEL = "Other (type your own)"
 ASK_EMPTY_INPUT_HINT = "type an answer (Esc cancels the questions)"
 # The current question's tab: bold orange, plus the solid bar `_tabs` puts in front of it. No background:
@@ -767,7 +769,9 @@ class AskUserPanel(Static, can_focus=True):
     it never talks to the adapter or to the tool (tasks.md open point 2).
 
     Nothing submits on a single keystroke: a pick only records the answer and moves on, and the call is
-    submitted from the `Submit answers` row, which is inert until every question has an answer.
+    submitted from the `Submit answers` row, which is inert until every question has an answer. That row
+    opens a review of every answer first; the call is sent only from the review's own `Submit answers` row,
+    and `←` (or picking an answer) goes back to change one.
     """
 
     class Submit(Message):
@@ -794,6 +798,8 @@ class AskUserPanel(Static, can_focus=True):
         self.cursor_question = 0
         self.cursor_row = 0  # an option row, or len(options) for the Other row
         self.submit_focused = False  # the cursor is on the submit row
+        self.reviewing = False  # the review of every answer is up, in place of the questions
+        self.review_row = 0  # in the review: a question's row, or len(questions) for its submit row
 
     # ── State ──────────────────────────────────────────────────────────────────
 
@@ -806,6 +812,8 @@ class AskUserPanel(Static, can_focus=True):
         self.cursor_question = 0
         self.cursor_row = 0
         self.submit_focused = False
+        self.reviewing = False
+        self.review_row = 0
         if self.is_mounted:
             self._render_panel()
 
@@ -889,7 +897,7 @@ class AskUserPanel(Static, can_focus=True):
         for i, question in enumerate(self.questions):
             if i:
                 text.append(" · ", style="dim")
-            here = i == self.cursor_question and not self.submit_focused
+            here = i == self.cursor_question and not self.submit_focused and not self.reviewing
             if here:
                 mark, mark_style = "▌ ", ASK_CURRENT_TAB
             elif self.answered(i):
@@ -899,6 +907,10 @@ class AskUserPanel(Static, can_focus=True):
             text.append(mark, style=mark_style)
             label = _one_line_answer(question.get("header") or f"Q{i + 1}")
             text.append(label, style=ASK_CURRENT_TAB if here else "")
+        if self.reviewing:
+            text.append(" · ", style="dim")
+            text.append("▌ ", style=ASK_CURRENT_TAB)
+            text.append(ASK_REVIEW_LABEL, style=ASK_CURRENT_TAB)
         return text
 
     def _submit_line(self) -> tuple[str, str]:
@@ -926,11 +938,36 @@ class AskUserPanel(Static, can_focus=True):
         rows.append(f"{'✓' if typed else ' '} {number}. {ASK_OTHER_LABEL}" + (f": {typed}" if typed else ""))
         return rows
 
+    def _render_review(self, width: int) -> None:
+        """The review step: every question with its answer under it, then the submit row that sends.
+
+        A question's rows carry `meta={"ask-review": i}`, so a click on the question or on its answer goes
+        back to that question; the answer is shown whole (it wraps) — the review is where it gets read."""
+        text = self._tabs()
+        text.append("\n   Review your answers", style="bold")
+        for i, question in enumerate(self.questions):
+            meta = Style(meta={"ask-review": i})
+            here = i == self.review_row
+            mark = " ❯ " if here else "   "  # the same column as the submit row's `❯`
+            label = _one_line_answer(question.get("question", "")) or f"Q{i + 1}"
+            text.append("\n" + f"{mark}{i + 1}. {label}",
+                        style=(Style(bold=True, color="#8ab4f8") if here else Style()) + meta)
+            text.append("\n" + "      → " + (self.answer(i) or ""), style=Style(color="#98c379") + meta)
+        text.append("\n   " + "─" * max(min(width - 3, 56), 10), style="dim")
+        here = self.review_row >= len(self.questions)
+        text.append("\n" + (" ❯ " if here else "   ") + ASK_SUBMIT_LABEL,
+                    style=Style(color="#8ab4f8", bold=True) + Style(meta={"ask-submit": True}))
+        text.append("\n " + ASK_REVIEW_HINT, style="dim")
+        self.update(text)
+
     def _render_panel(self) -> None:
         if not self.questions:
             self.update(Text(""))
             return
         width = max((self.content_size.width or self.app.size.width) - 4, 20)
+        if self.reviewing:
+            self._render_review(width)
+            return
         index = min(self.cursor_question, len(self.questions) - 1)
         text = self._tabs()
         text.append("\n   " + _one_line_answer(self.questions[index].get("question", "")), style="bold")
@@ -983,10 +1020,24 @@ class AskUserPanel(Static, can_focus=True):
         self._render_quietly()
 
     def _submit(self) -> None:
-        if self.all_answered():
+        """The questions' submit row opens the review; only the review's submit row sends the call."""
+        if not self.all_answered():
+            self.post_message(self.Inert())
+        elif self.reviewing:
             self.post_message(self.Submit([self.answer(i) or "" for i in range(len(self.questions))]))
         else:
-            self.post_message(self.Inert())
+            self.reviewing, self.review_row = True, len(self.questions)  # the cursor starts on Submit
+            self._render_quietly()
+
+    def _leave_review(self, index: int | None = None) -> None:
+        """Back from the review: onto question `index` to change it, or (None) onto the questions' submit
+        row, so Enter there opens the review again."""
+        self.reviewing = False
+        if index is None:
+            self.submit_focused = True
+            self._render_quietly()
+        else:
+            self._go_to_question(index)
 
     def _go_to_question(self, index: int) -> None:
         self._land_on(index % len(self.questions))
@@ -996,7 +1047,9 @@ class AskUserPanel(Static, can_focus=True):
         """Shift+Tab (the app's binding reaches here while the panel is up, D6)."""
         if not self.questions:
             return
-        if self.submit_focused:
+        if self.reviewing:
+            self._leave_review()
+        elif self.submit_focused:
             self._go_to_question(len(self.questions) - 1)
         else:
             self._go_to_question(self.cursor_question - 1)
@@ -1004,17 +1057,50 @@ class AskUserPanel(Static, can_focus=True):
     def on_click(self, event: Click) -> None:
         meta = event.style.meta
         if meta.get("ask-submit"):
-            self.submit_focused = True
+            if self.reviewing:
+                self.review_row = len(self.questions)
+            else:
+                self.submit_focused = True
             self._render_quietly()
             self._submit()
+            return
+        if self.reviewing:
+            index = meta.get("ask-review")
+            if isinstance(index, int) and 0 <= index < len(self.questions):
+                self._leave_review(index)
             return
         row = meta.get("option")  # the same meta key every selector's rows carry
         if isinstance(row, int) and 0 <= row < self._row_count(self.cursor_question):
             self.cursor_row, self.submit_focused = row, False
             self._record_row(row)
 
+    def _review_key(self, key: str) -> bool:
+        """A key in the review; False for one it leaves alone (Esc reaches the app's cancel)."""
+        rows = len(self.questions) + 1  # each answer, then Submit
+        if key in ("up", "k", "down", "j"):
+            step = -1 if key in ("up", "k") else 1
+            self.review_row = (self.review_row + step) % rows
+            self._render_quietly()
+        elif key == "enter":
+            if self.review_row >= len(self.questions):
+                self._submit()
+            else:
+                self._leave_review(self.review_row)
+        elif key in ("left", "shift+tab", "backtab", "backspace"):
+            self._leave_review()
+        elif key.isdigit() and 1 <= int(key) <= len(self.questions):
+            self._leave_review(int(key) - 1)  # the number shown beside a question changes that answer
+        elif key not in ("tab", "right", "space"):
+            return False  # tab/right/space are swallowed: nothing past Submit, and nothing to toggle
+        return True
+
     def on_key(self, event: Key) -> None:
         key = event.key
+        if self.reviewing:
+            if self._review_key(key):
+                event.stop()
+                event.prevent_default()
+            return
         if key in ("tab", "right"):
             if self.submit_focused:
                 return
