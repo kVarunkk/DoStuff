@@ -51,10 +51,12 @@ async def save_episode(
     vector_text = f"- EVENT TYPE: {event_type}\n  - ANCHOR EVENT: {anchor_event}\n  - SUMMARY: {summary}"
     saved = await store.nearest(user_id, vector_text, working_dir)
     # A near-copy is the same moment; in the band below that, a reworded moment and a related one look alike to the
-    # embedding, so the model decides (memory recall D10)
+    # embedding, so the model decides (memory recall D10). Only between episodes of one type: a LEARNING next to the
+    # EVENT it explains is the lesson the event lacked, and the judge took them for one moment (live eval S7)
     if saved and (
         saved["similarity"] >= DUPLICATE_EPISODE_SIMILARITY
         or saved["similarity"] >= SIMILAR_EPISODE_SIMILARITY
+        and str(saved.get("event_type") or "").upper() == str(event_type).upper()
         and await is_same_episode(saved, event_type, anchor_event, summary)
     ):
         return f"Already recorded as {saved['id']}; nothing saved."

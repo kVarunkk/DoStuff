@@ -436,7 +436,7 @@ def test_episode_block_counts(monkeypatch, tmp_path):
     episodes = CountingEpisodes(n=7, saved=24)
     first = _turn(episodes, monkeypatch, tmp_path)
     assert '<past_episodes shown="3" matching="7" saved_in_project="24">' in first.text
-    assert "The closest to this prompt only; more are saved.\n</past_episodes>" in first.text
+    assert "The closest to this prompt only; more are saved (search_memory finds them).\n</past_episodes>" in first.text
     # The same project the query is scoped to (episodic_scope "project" by default)
     assert episodes.counted == [str(tmp_path.resolve())]
     # Already-shown episodes don't count as matching again
@@ -450,3 +450,70 @@ def test_episode_block_user_scope_has_no_project_count(monkeypatch, tmp_path):
     episodes = CountingEpisodes(n=7, saved=24)
     text = _turn(episodes, monkeypatch, tmp_path).text
     assert '<past_episodes shown="3" matching="7">' in text and episodes.counted == []
+
+
+# --- Overflow facts are not repeated within a session (like episodes, D8) --------------------------------------
+
+def _overflow_store(tmp_path):
+    """55 user facts: k00-k04 are past the cap, and every query ranks k00, k01, k02, k03 first."""
+    store = QueryRecorder()
+    for i in range(55):
+        store.add(f"k{i:02d}", f"v{i}", updated=i)
+    by_key = {f["key"]: f for f in store.facts}
+    store.ranked = [by_key[k] for k in ("k00", "k01", "k02", "k03")]
+    return store
+
+
+def _fact_turn(store, monkeypatch, tmp_path, history=()):
+    from dostuff.agent import instructions
+    from dostuff.helpers.agent.turn_context import delivered_fact_ids, delivered_episode_ids
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(instructions, "build_environment_block", lambda: "")
+    return asyncio.run(instructions.build_turn_context(
+        "which linter?", memory_store=store, episodic_store=NoEpisodes(), user_id=USER,
+        exclude_episode_ids=delivered_episode_ids(list(history)), exclude_fact_ids=delivered_fact_ids(list(history))))
+
+
+def _fact_exchange(ctx):
+    return [make_context_step(ctx.text, ctx.episode_ids, ctx.fact_ids), {"role": "user", "content": "which linter?"},
+            {"role": "assistant", "content": "a long answer " * 50}]
+
+
+def test_overflow_fact_not_repeated_in_session(monkeypatch, tmp_path):
+    store = _overflow_store(tmp_path)
+    first = _fact_turn(store, monkeypatch, tmp_path)
+    assert "- k00: v0\n- k01: v1\n- k02: v2\n" in first.text and len(first.fact_ids) == 3
+    history = _fact_exchange(first)
+
+    second = _fact_turn(store, monkeypatch, tmp_path, history)
+    assert "k00" not in second.text and "k01" not in second.text and "- k03: v3" in second.text
+
+    # Everything that matches is already in view: no facts block at all
+    third = _fact_turn(store, monkeypatch, tmp_path, history + _fact_exchange(second))
+    assert "<other_relevant_facts>" not in third.text and third.fact_ids == ()
+
+
+def test_overflow_fact_sent_again_when_its_value_changes(monkeypatch, tmp_path):
+    store = _overflow_store(tmp_path)
+    history = _fact_exchange(_fact_turn(store, monkeypatch, tmp_path))
+    for f in store.facts:  # the same key, a new value, still past the cap
+        if f["key"] == "k00":
+            f["value"] = "v0-new"
+    again = _fact_turn(store, monkeypatch, tmp_path, history)
+    assert "- k00: v0-new" in again.text and "k01" not in again.text
+
+
+def test_overflow_fact_recalled_again_after_compaction(monkeypatch, tmp_path):
+    from dostuff.helpers.agent import manage_context
+
+    async def summarize(chunk, notes):
+        return "SUMMARY"
+    monkeypatch.setattr(manage_context, "_summarize", summarize)
+    store = _overflow_store(tmp_path)
+    first = _fact_turn(store, monkeypatch, tmp_path)
+    history = _fact_exchange(first)
+    history += _fact_exchange(_fact_turn(store, monkeypatch, tmp_path, history))
+    kept, _ = asyncio.run(manage_context.compact_context(history, keep_token_budget=400, context_window=100_000))
+    assert len(kept) == 3  # the first bundle went into the summary
+    again = _fact_turn(store, monkeypatch, tmp_path, kept)
+    assert "- k00: v0" in again.text and "k03" not in again.text

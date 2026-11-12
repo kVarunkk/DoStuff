@@ -71,7 +71,8 @@ from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
 from dostuff.helpers.agent.turn_context import (
-    CONSOLIDATE_HINT_USER_FACTS, TurnContext, delivered_episode_ids, is_turn_context, make_context_step,
+    CONSOLIDATE_HINT_USER_FACTS, TurnContext, delivered_episode_ids, delivered_fact_ids, is_turn_context,
+    make_context_step,
 )
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
@@ -4288,7 +4289,7 @@ class DostuffTUI(App):
         from dostuff.tools.definitions import default_tool_names  # pulls in the tools: after the first frame
         bundle = await self._build_turn_context(question, history=history)
         if bundle.text:  # this snapshot's copy only: a side question stores nothing
-            history.append(make_context_step(bundle.text, bundle.episode_ids))
+            history.append(make_context_step(bundle.text, bundle.episode_ids, bundle.fact_ids))
         return ForkContext(system_instruction=self._build_instructions(), compaction_notes=notes,
                            history=history, tool_names=default_tool_names(),
                            session_hook_context=dict(self.session_hook_context))
@@ -4468,7 +4469,8 @@ class DostuffTUI(App):
         """The bundle for this prompt; episodes already in `history` (the session's working history) are left out."""
         return await build_turn_context(user_text, memory_store=self.memory_store, episodic_store=self.episodic_store,
                                         user_id=self.user_id, prompt_context=prompt_context,
-                                        exclude_episode_ids=delivered_episode_ids(history or []))
+                                        exclude_episode_ids=delivered_episode_ids(history or []),
+                                        exclude_fact_ids=delivered_fact_ids(history or []))
 
     async def _run_turn(self, user_text: str, wake: bool = False) -> None:
         """One agent turn. `wake`: started by a background job ending (D15) — `user_text` is the pending
@@ -4559,7 +4561,7 @@ class DostuffTUI(App):
             bundle = await self._build_turn_context(user_text, prompt_context, working_history)
             if bundle.text:
                 await append_step(
-                    make_context_step(bundle.text, bundle.episode_ids),
+                    make_context_step(bundle.text, bundle.episode_ids, bundle.fact_ids),
                     self.steps_history,
                     working_history,
                     self.current_session_history,

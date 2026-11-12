@@ -493,8 +493,9 @@ OLD_SAVE_MEMORY = (
 
 
 def test_tool_schema_snapshot_only_agent_description_changed():
-    """Since 30d3629 only two schemas changed on purpose: `agent`'s subagent_type description and `save_memory`
-    (its `scope` parameter and description). Everything else must be 30d3629's, byte for byte."""
+    """Since 30d3629 only these schemas changed on purpose: `agent`'s subagent_type description, `save_memory`
+    (its `scope` parameter and description) and the new `search_memory` (memory recall D12). Everything else must be
+    30d3629's, byte for byte."""
     import hashlib
     import json
     snapshot = json.loads((Path(__file__).parent / "snapshots" / "tool_schemas.json").read_text(encoding="utf-8"))
@@ -504,4 +505,5 @@ def test_tool_schema_snapshot_only_agent_description_changed():
     save_memory = snapshot["save_memory"]["function"]
     assert save_memory["parameters"]["properties"].pop("scope")["enum"] == ["user", "project"]
     save_memory["description"] = OLD_SAVE_MEMORY
+    assert snapshot.pop("search_memory")["function"]["parameters"]["required"] == ["query"]
     assert hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == SCHEMAS_30D3629

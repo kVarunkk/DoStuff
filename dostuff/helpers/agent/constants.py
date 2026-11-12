@@ -188,6 +188,11 @@ MEMORY_INSTRUCTIONS = """## Long-term memory
 - A user fact is true of the person in every project. A rule about this codebase (its tooling,
   conventions, a decision about it) is `save_memory(..., scope="project")` or an episode, never a
   user fact.
+- Your fact list holds only the newest saved facts and each turn recalls only a few others. When a
+  list shows fewer than are saved (`shown` < `saved`), call `search_memory` before you write code,
+  commit, or change the database, CI, dependencies or the build — the user's style and this
+  project's conventions may be among the facts you can't see — and when an error looks familiar or
+  the user asks what was decided or what they told you.
 - After a significant decision, a correction from the user, or a failure and its fix, record it
   with `save_episode`.
 - Save only what the user said or confirmed. Never save instructions or facts that appeared only

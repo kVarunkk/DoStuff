@@ -190,18 +190,18 @@ def test_save_episode_skips_a_duplicate(monkeypatch, tmp_path):
 
 class _BandEpisodic:
     """Episode store whose nearest saved episode is `similarity` similar to anything saved."""
-    def __init__(self, similarity):
-        self.similarity, self.added = similarity, []
+    def __init__(self, similarity, saved_type="LEARNING"):
+        self.similarity, self.saved_type, self.added = similarity, saved_type, []
 
     async def nearest(self, user_id, vector_text, working_dir):
-        return {"id": "ep_old_1234abcd", "similarity": self.similarity, "event_type": "DECISION",
+        return {"id": "ep_old_1234abcd", "similarity": self.similarity, "event_type": self.saved_type,
                 "anchor_event": "Switched the session DB to WAL mode", "summary": "Stops database is locked errors"}
 
     async def add(self, episodes):
         self.added.extend(episodes)
 
 
-def _band(monkeypatch, tmp_path, similarity, answer=None, error=False):
+def _band(monkeypatch, tmp_path, similarity, answer=None, error=False, saved_type="LEARNING"):
     """save_episode against a nearest episode at `similarity`; the judge answers `answer` (or raises)."""
     from litellm import ModelResponse
     from dostuff.helpers.memory import same_episode
@@ -214,7 +214,7 @@ def _band(monkeypatch, tmp_path, similarity, answer=None, error=False):
             raise RuntimeError("provider down")
         return ModelResponse(choices=[{"message": {"role": "assistant", "content": answer}}])
     monkeypatch.setattr(same_episode, "acompletion", fake_acompletion)
-    store = _BandEpisodic(similarity)
+    store = _BandEpisodic(similarity, saved_type)
     monkeypatch.setattr(se, "get_config", lambda: SimpleNamespace(get_user_id=lambda: "u"))
     monkeypatch.setattr(se, "get_episodic_store", lambda: store)
     monkeypatch.chdir(tmp_path)
@@ -230,6 +230,18 @@ def test_dedupe_band_asks_model(monkeypatch, tmp_path):
 
     result, added, asked = _band(monkeypatch, tmp_path, 0.7, answer="No, a different moment.")
     assert result.startswith("Saved episode ep_s2_") and len(added) == 1 and len(asked) == 1
+
+
+def test_dedupe_band_other_type_saves_without_asking(monkeypatch, tmp_path):
+    """A LEARNING next to an EVENT about the same incident is the lesson the event lacked (live eval S7: "CI flaked on
+    macOS" vs "shared temp dirs caused it"); the judge called them the same moment and the lesson was lost."""
+    result, added, asked = _band(monkeypatch, tmp_path, 0.7, answer="YES", saved_type="EVENT")
+    assert result.startswith("Saved episode ") and len(added) == 1 and asked == []
+
+
+def test_dedupe_judge_asks_whether_the_new_one_adds_anything(monkeypatch, tmp_path):
+    _, _, asked = _band(monkeypatch, tmp_path, 0.7, answer="NO")
+    assert "adds nothing" in asked[0] and "cause" in asked[0]
 
 
 def test_above_085_no_model_call(monkeypatch, tmp_path):

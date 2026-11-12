@@ -269,7 +269,8 @@ def test_facts_step_text_overflow_note():
     text = render_facts_step([_fact("name", "Nemo")], saved_user=51, saved_project=0, project="p")
     assert '<user_facts shown="1" saved="51">' in text
     assert text.endswith("This replaces any earlier list of saved facts.\n"
-                         "Other saved facts appear in the turn context when relevant.")
+                         "Not every saved fact is listed: before writing code or committing, call search_memory for "
+                         "the user's preferences and this project's conventions on that work.")
 
 
 def test_facts_step_text_when_everything_was_forgotten():
@@ -330,7 +331,7 @@ def test_past_episodes_block_counts():
     from dostuff.helpers.agent.turn_context import EPISODES_MORE_NOTE, EpisodeCounts
     text = compose_turn_context(ENV, "", "  • [LEARNING] a", episode_counts=EpisodeCounts(3, "7", 24))
     assert '<past_episodes shown="3" matching="7" saved_in_project="24">\n  • [LEARNING] a\n' in text
-    assert EPISODES_MORE_NOTE == "The closest to this prompt only; more are saved."
+    assert EPISODES_MORE_NOTE == "The closest to this prompt only; more are saved (search_memory finds them)."
     assert f"{EPISODES_MORE_NOTE}\n</past_episodes>" in text
 
 
