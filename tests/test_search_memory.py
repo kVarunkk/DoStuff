@@ -1,0 +1,188 @@
+"""search_memory: the model's own lookup past the caps (memory recall spec D12, T3.1).
+
+The facts step lists 50 facts and a turn recalls at most 3 overflow facts and 3 episodes; a prompt that needs more
+(S10 in the live eval) can only get them by asking. Real Chroma in a temp dir; skipped without chromadb.
+"""
+import asyncio
+import time
+from types import SimpleNamespace
+
+import pytest
+
+pytest.importorskip("chromadb")
+
+from dostuff.lib.memory import episodic_memory_store as ems  # noqa: E402
+from dostuff.lib.memory import semantic_memory_store as sms  # noqa: E402
+from dostuff.tools.memory import search_memory as sm  # noqa: E402
+
+USER = "u1"
+DAY = 86400
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    """Both stores in a temp dir, cwd in project A, and the tool pointed at them."""
+    from dostuff.lib.memory import chroma
+
+    monkeypatch.setattr(chroma, "_clients", {})
+    facts = sms.SemanticMemoryStore(persist_path=str(tmp_path / "chroma"))
+    episodes = ems.EpisodicMemoryStore(persist_path=str(tmp_path / "chroma"))
+    proj_a, proj_b = tmp_path / "projA", tmp_path / "projB"
+    proj_a.mkdir()
+    proj_b.mkdir()
+    monkeypatch.chdir(proj_a)
+    cfg = SimpleNamespace(get_user_id=lambda: USER, episodic_scope="project")
+    monkeypatch.setattr(sm, "get_config", lambda: cfg)
+    monkeypatch.setattr(sm, "get_semantic_store", lambda: facts)
+    monkeypatch.setattr(sm, "get_episodic_store", lambda: episodes)
+    return SimpleNamespace(facts=facts, episodes=episodes, a=str(proj_a.resolve()), b=str(proj_b.resolve()), cfg=cfg)
+
+
+def _facts(store, rows):
+    """Bulk-write facts as upsert_fact would, with chosen ages: rows are (key, value, days_ago, scope, working_dir)."""
+    now = int(time.time())
+    ids, docs, metas = [], [], []
+    for key, value, days, scope, wd in rows:
+        ts = now - days * DAY
+        meta = {"user_id": USER, "key": key, "value": value, "scope": scope, "source": "user_message",
+                "created_at_epoch": ts, "updated_at_epoch": ts}
+        if scope == "project":
+            meta["working_dir"] = wd
+        ids.append(sms.fact_id(USER, key, scope, wd))
+        docs.append(value)
+        metas.append(meta)
+    store._collection.upsert(ids=ids, documents=docs, metadatas=metas)
+
+
+def _episodes(store, rows):
+    """rows are (id, event_type, anchor, summary, days_ago, working_dir)."""
+    now = int(time.time())
+    eps = []
+    for eid, etype, anchor, summary, days, wd in rows:
+        ts = now - days * DAY
+        eps.append({"id": eid, "vector_text": f"- EVENT TYPE: {etype}\n  - ANCHOR EVENT: {anchor}\n  - SUMMARY: {summary}",
+                    "metadata": {"user_id": USER, "session_id": "s", "working_dir": wd, "created_at_epoch": ts,
+                                 "created_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+                                 "event_type": etype, "anchor_event": anchor, "summary": summary, "tags": "[]"}})
+    asyncio.run(store.add(eps))
+
+
+def _search(query, **kw):
+    return asyncio.run(sm.search_memory(query, **kw))
+
+
+def _over_the_cap(env):
+    """52 newer user fillers (so the user facts below are past the 50) and 31 newer project fillers in A (so A's
+    oldest project fact is past the 30 project slots), plus the facts the tests look for."""
+    fill_u = [(f"hobby_{i:02d}", f"Keeps a collection of {i} houseplants", 1 + i % 40, "user", None) for i in range(52)]
+    fill_p = [(f"note_{i:02d}", f"In this project, note {i} is filed under docs/notes", 1 + i % 20, "project", env.a)
+              for i in range(31)]
+    _facts(env.facts, fill_u + fill_p + [
+        ("shell", "Uses PowerShell on Windows", 0, "user", None),                       # newest: in the facts step
+        ("db_dislike", "Dislikes working with MongoDB", 400, "user", None),             # past the 50
+        ("ticket", "Commit messages start with the ticket id TKV-<number>", 300, "project", env.a),  # past the 30
+        ("ticket", "Commit messages start with the ticket id ABC-<number>", 300, "project", env.b),  # other project
+    ])
+
+
+def test_search_memory_scopes(env):
+    _over_the_cap(env)
+    _episodes(env.episodes, [
+        ("ep_a", "LEARNING", "Tests that shared one tinykv.db file interfered", "Each test gets its own database.", 30,
+         env.a),
+        ("ep_b", "LEARNING", "Tests that shared one database file interfered in project B", "Fixed in B.", 30, env.b),
+    ])
+
+    facts = _search("Which databases do I dislike working with?", kind="facts")
+    assert "MongoDB" in facts
+
+    ticket = _search("commit message ticket id", kind="facts")
+    assert "TKV-" in ticket and "ABC-" not in ticket  # this project's fact only
+    assert "[project]" in ticket
+
+    # A fact the facts step already lists is not searched: it is in context already
+    assert "PowerShell" not in _search("Which shell do I use? PowerShell", kind="facts")
+
+    eps = _search("tests sharing a database file", kind="episodes")
+    assert "tinykv.db" in eps and "project B" not in eps
+
+    both = _search("tests sharing a database file")  # kind="all": both sections
+    assert "Episodes" in both and "Facts" in both
+
+
+def test_search_memory_below_the_cap_says_facts_are_listed(env):
+    _facts(env.facts, [("db_dislike", "Dislikes working with MongoDB", 400, "user", None),
+                       ("ticket", "Commit messages start with TKV-<number>", 300, "project", env.a)])
+    out = _search("Which databases do I dislike?", kind="facts")
+    assert "MongoDB" not in out
+    assert "All 2 saved facts are already listed" in out
+
+
+def test_search_memory_episodes_user_scope_searches_every_directory(env):
+    env.cfg.episodic_scope = "user"
+    _episodes(env.episodes, [("ep_b", "LEARNING", "Tests that shared one database file interfered in project B",
+                              "Fixed in B.", 30, env.b)])
+    assert "project B" in _search("tests sharing a database file", kind="episodes")
+
+
+def test_search_memory_floor_and_no_decay(env):
+    _episodes(env.episodes, [
+        # Old and closest: with the turn's decay a 400-day-old LEARNING keeps ~2% of its score; here it leads
+        ("ep_old", "LEARNING", "sqlite3 'database is locked' fixed with a busy timeout",
+         "Two writers raised database is locked; sqlite3.connect(path, timeout=5) fixed it.", 400, env.a),
+        ("ep_new", "EVENT", "Looked at SQLite settings", "Read through the SQLite connection options.", 1, env.a),
+        ("ep_far", "DECISION", "Chose the MIT licence", "We picked MIT over Apache-2.0 for simplicity.", 1, env.a),
+    ])
+    out = _search("sqlite database is locked error", kind="episodes")
+    assert "busy timeout" in out
+    assert out.index("busy timeout") < out.index("SQLite settings")  # relevance, not recency
+    assert "MIT" not in out  # under the 0.2 floor
+    # Each result carries its type and date, so the model weighs age itself
+    assert "LEARNING" in out and time.strftime("%Y-%m-%d", time.gmtime(time.time() - 400 * DAY)) in out
+
+
+def test_search_memory_limit_and_nothing_found(env):
+    _episodes(env.episodes, [(f"ep_{i}", "LEARNING", f"Test lesson {i}: tests sharing a database file broke",
+                              f"Lesson {i}.", 10 + i, env.a) for i in range(8)])
+    out = _search("tests sharing a database file", kind="episodes", limit=2)
+    assert out.count("Test lesson") == 2
+    assert "Nothing" in _search("the colour of the moon on Tuesdays", kind="episodes")
+    with pytest.raises(ValueError):
+        _search("   ")
+
+
+def test_search_memory_memory_off(monkeypatch):
+    monkeypatch.setattr(sm, "get_semantic_store", lambda: None)
+    monkeypatch.setattr(sm, "get_episodic_store", lambda: None)
+    with pytest.raises(RuntimeError, match="memory is off"):
+        _search("anything")
+
+
+# Registration ---------------------------------------------------------------------------------------------------
+
+def test_search_memory_is_a_memory_tool_offered_only_with_memory(monkeypatch):
+    from dostuff.lib.memory import chroma
+    from dostuff.tools.definitions import MEMORY_TOOLS, TOOL_MAP, default_tool_names
+    assert TOOL_MAP["search_memory"].kind == "read"
+    assert "search_memory" in MEMORY_TOOLS
+    monkeypatch.setattr(chroma, "chroma_available", lambda: False)
+    assert "search_memory" not in default_tool_names()
+
+
+def test_search_memory_plan_mode_allowed():
+    from dostuff.agent.permissions import PermissionConfig, check
+    for mode in ("ask", "allowlist", "auto", "plan"):
+        decision = check("search_memory", "read", {"query": "q"}, None, PermissionConfig(mode=mode))  # type: ignore[arg-type]
+        assert decision.action == "allow", mode
+
+
+def test_search_memory_not_for_subagents():
+    from dostuff.agent.subagents import RESTRICTED_SUBAGENT_TOOLS
+    assert "search_memory" in RESTRICTED_SUBAGENT_TOOLS
+
+
+def test_prompts_point_at_search_memory():
+    from dostuff.helpers.agent.constants import MEMORY_INSTRUCTIONS
+    from dostuff.helpers.agent.turn_context import EPISODES_MORE_NOTE
+    assert "search_memory" in MEMORY_INSTRUCTIONS
+    assert "search_memory" in EPISODES_MORE_NOTE

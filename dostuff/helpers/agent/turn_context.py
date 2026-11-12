@@ -52,7 +52,7 @@ def _wrap(text: str) -> str:
     return f"<turn-context>\n{text}\n</turn-context>"
 
 
-EPISODES_MORE_NOTE = "The closest to this prompt only; more are saved."
+EPISODES_MORE_NOTE = "The closest to this prompt only; more are saved (search_memory finds them)."
 
 
 class EpisodeCounts(NamedTuple):
@@ -212,5 +212,5 @@ def render_facts_step(shown: list[dict], *, saved_user: int, saved_project: int,
         blocks.append(f'<{tag}{attrs} shown="{len(rows)}" saved="{saved}">\n{lines}</{tag}>')
     text = "\n".join(blocks) + "\n" + FACTS_REPLACE_NOTE
     if len(shown) < saved_user + saved_project:
-        text += "\nOther saved facts appear in the turn context when relevant."
+        text += "\nOther saved facts appear in the turn context when relevant; search_memory finds the rest."
     return text

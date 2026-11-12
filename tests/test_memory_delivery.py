@@ -436,7 +436,7 @@ def test_episode_block_counts(monkeypatch, tmp_path):
     episodes = CountingEpisodes(n=7, saved=24)
     first = _turn(episodes, monkeypatch, tmp_path)
     assert '<past_episodes shown="3" matching="7" saved_in_project="24">' in first.text
-    assert "The closest to this prompt only; more are saved.\n</past_episodes>" in first.text
+    assert "The closest to this prompt only; more are saved (search_memory finds them).\n</past_episodes>" in first.text
     # The same project the query is scoped to (episodic_scope "project" by default)
     assert episodes.counted == [str(tmp_path.resolve())]
     # Already-shown episodes don't count as matching again

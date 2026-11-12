@@ -23,6 +23,7 @@ from dostuff.tools.mcp.get_mcp_tool_details import _impl_get_mcp_tool_details
 from dostuff.tools.mcp.search_mcp_tools import _impl_search_mcp_tools
 from dostuff.tools.memory.save_episode import save_episode
 from dostuff.tools.memory.save_memory import save_memory
+from dostuff.tools.memory.search_memory import search_memory
 from dostuff.tools.search.glob import glob
 from dostuff.tools.settings import edit_config, read_settings, remove_mcp_server, set_mcp_server
 from dostuff.tools.search.grep import grep
@@ -78,6 +79,8 @@ _TOOLS = [
     # Memory saves never ask; each one is shown in the TUI and listed by /memories.
     ToolSpec("save_memory", save_memory, "read"),
     ToolSpec("save_episode", save_episode, "read", frozenset({"session_id"})),
+    # Reads only, so it never asks and plan mode allows it (memory recall D12)
+    ToolSpec("search_memory", search_memory, "read"),
     ToolSpec("search_mcp_tools", _impl_search_mcp_tools, "read", frozenset({"mcp_client"})),
     ToolSpec("get_mcp_tool_details", _impl_get_mcp_tool_details, "read", frozenset({"mcp_client"})),
     ToolSpec("call_mcp_tool", _impl_call_mcp_tool, "mcp", frozenset({"mcp_client"})),
@@ -112,7 +115,7 @@ TOOL_MAP: dict[str, ToolSpec] = {spec.name: spec for spec in _TOOLS}
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {name: spec.schema for name, spec in TOOL_MAP.items()}
 
 # Need chromadb (the `memory` extra); not offered to the model without it
-MEMORY_TOOLS = frozenset({"save_memory", "save_episode"})
+MEMORY_TOOLS = frozenset({"save_memory", "save_episode", "search_memory"})
 
 # Offered exactly when bash_command is: they only work on jobs it started
 SHELL_JOB_TOOLS = ("bash_output", "kill_shell")

@@ -695,6 +695,38 @@
     },
     "type": "function"
   },
+  "search_memory": {
+    "function": {
+      "description": "Searches long-term memory for saved facts and past episodes that the context doesn't show.\n\nYour fact list holds only the newest saved facts, and each turn recalls at most a few more facts and\nepisodes. Search when the lists say more are saved and the task may depend on them: before changing\nsomething that may have history (the database, CI, dependencies, the build, code style or project\nconventions), when an error looks familiar, or when the user asks what was decided or what they told\nyou. One search per topic; don't search for facts already listed.",
+      "name": "search_memory",
+      "parameters": {
+        "properties": {
+          "kind": {
+            "description": "'facts', 'episodes' or 'all'.",
+            "enum": [
+              "all",
+              "facts",
+              "episodes"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "description": "Results per kind, 1-10.",
+            "type": "integer"
+          },
+          "query": {
+            "description": "What to look for, in plain words, e.g. 'code style preferences' or 'sqlite database is locked'.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
   "send_message": {
     "function": {
       "description": "Send a follow-up to an agent you started. It keeps everything from its earlier work, so ask for more\ninstead of starting a new agent on the same task.",
