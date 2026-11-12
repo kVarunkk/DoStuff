@@ -47,7 +47,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
 - **Retries with backoff** for rate limits, timeouts and 5xx errors (6 by default, exponential with jitter, honors `Retry-After`; `loop.max_retries` / `loop.retry_max_delay`); auth / bad-request errors fail fast
 - **Token and cost tracking** — per-turn and cumulative totals in `/status` and the line after each turn (`✻ Worked for 1m 5s · $0.01`); cost in USD from litellm's price table (hidden when the model has no known price). The table bundled with litellm is used, so startup doesn't wait on a download; set `LITELLM_LOCAL_MODEL_COST_MAP=False` to fetch the latest one from GitHub instead
-- **Long-term memory tools** — the agent saves facts (`save_memory`) and notable moments (`save_episode`) as they come up; both are recalled in later sessions
+- **Long-term memory tools** — the agent saves facts (`save_memory`, about you or about this project) and notable moments (`save_episode`) as they come up; every saved fact is shown to the agent in later sessions, and episodes related to the prompt are recalled
 - **Graceful exit** — `Ctrl+Q` or `/exit` saves the session, cleans up, and stops background workers
 - **Clean Cancellation** — `Escape` can cancel in-flight agent turns cleanly without corrupting the session
 - **2-state session split** — `session_steps` (full audit) / `working_history` (LLM payload); DB persists both plus `compaction_notes` + `last_input_tokens`
@@ -207,7 +207,7 @@ In the TUI:
 | `/model [<provider/model>] [--active]` | Pick a model: your saved ones (`models:` in config.yaml) first, then "More <provider> models…" for each provider's list (type to filter; Enter on no match uses what you typed). A model that isn't saved yet is added to `~/.dostuff/config.yaml`. A plain `/model` switch lasts only for this session; add `--active` (e.g. `/model --active`, or `/model anthropic/claude-sonnet-5-5 --active`) to make it the default that new sessions start with |
 | `/config [mcp] [project]` | Edit a settings file right in the TUI: pick `config.yaml` or the MCP servers, user (`~/.dostuff`) or project (`./.dostuff`), or name one (`/config mcp project`). `Ctrl+S` checks the file, saves it and applies it without a restart (an invalid file stays open with the error); `Esc` closes, twice if there are unsaved changes. A new file starts with every option commented out. `.env` files aren't offered |
 | `/status`     | Session, directory, model, permission mode, tokens, context use, MCP servers |
-| `/context`    | What fills the context window: system prompt, turn context (the environment, recalled memories and hook context sent with each prompt), tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
+| `/context`    | What fills the context window: system prompt, turn context (the environment, saved facts, recalled episodes and hook context sent with the prompts), tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
 | `/memory [project\|global]` | Edit `AGENTS.md` (this project's or `~/.dostuff/AGENTS.md`) in the same editor as `/config`; `Ctrl+S` saves and the agent follows it from the next message |
 | `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory, hooks), with a fix for each problem |
 | `/tools`      | Every tool the agent has: when it asks (in `ask` mode), whether subagents get it and what it does, then each connected MCP server's tools (reached through `call_mcp_tool`) |
@@ -221,9 +221,9 @@ In the TUI:
 | `/export [<path>]` | Save this session as Markdown (default `dostuff-session-<id>.md`) |
 | `/undo [force]` | Revert the agent's file changes from its last file-editing turn |
 | `/compact`    | Manually trigger context compaction; `/compact auto <1-100\|off>` sets the auto-compaction threshold for this session |
-| `/memories`   | List the facts saved about you (and where each came from) |
+| `/memories`   | List your saved facts and this project's, newest first, with the date each was saved |
 | `/episodes`   | List saved episodes (decisions, corrections, fixes) recalled here, newest first |
-| `/forget <key or id>` | Delete a saved fact (by key) or episode (by the id shown in `/episodes`) |
+| `/forget <key or id>` | Delete a saved fact (by key: this project's first, `user:<key>` for the user-wide one) or episode (by the id shown in `/episodes`) |
 | `Ctrl+Q`      | Graceful quit with save             |
 | `Escape`      | Cancel in-flight turn (also answers "no" to an open approval prompt) |
 | `/help`       | Show available in-TUI commands      |
@@ -585,6 +585,10 @@ and can stop one with `stop_agent`.
 A subagent can never start, message or stop agents, delete files, save memories, write the todo list or change
 settings, whatever its type asks for. At most `agents.max_concurrent` (4) run at once; more are queued.
 
+A typed subagent sees your saved facts (user facts and this project's, read-only) before its first step, the same
+list the main agent gets; `explore`, `plan` and any type with `omit_memory: true` don't. It never gets past episodes.
+A fork already has them in the conversation it inherits.
+
 ### Agent types
 
 | Type | Tools | For |
@@ -613,6 +617,7 @@ description: Reviews a diff for bugs and missing tests. Use after a change.
 tools: Read, Grep, Glob, Bash   # omit for every subagent tool
 model: fast                     # inherit (default), an alias from agents.models, or a litellm model string
 max_iterations: 30              # optional; default agents.max_iterations
+omit_memory: true               # optional; leave out your saved facts (default false)
 ---
 You are a code reviewer. Report findings as a list, most severe first.
 ```
@@ -633,7 +638,8 @@ Unknown and forbidden names are dropped with a warning naming the file; `/agents
 source, resolved model, tools and any warnings, and `/agents types <name>` shows one type's whole config: its
 system prompt, model, tools and max iterations (for `fork`, the task message it gets). `model:` aliases come from `agents.models`; Claude Code's `sonnet`,
 `opus` and `haiku` are looked up there too and fall back to the main model (with a warning in the report) when they
-aren't defined. The call's `model=` wins over the type's `model:`.
+aren't defined. The call's `model=` wins over the type's `model:`. Claude Code's `memory:` field (a per-agent memory
+folder) is ignored with a warning: DoStuff has no per-agent memory.
 
 ### Background agents
 
@@ -1170,10 +1176,12 @@ after adding a command.
 - **Memory stores:** `~/.dostuff/data/chroma/` (needs `pip install "dostuff[memory]"`; without it, saved memories are kept on disk but not used)
   - Semantic (key/value facts)
   - Episodic (events with summaries and timestamps)
-- **Saved when:** the agent decides — `save_memory` stores a key/value fact (an overlapping fact is updated, not duplicated) and `save_episode` stores a decision, correction or lesson (one that rewords an episode already saved in the directory is skipped). Each save is shown in the TUI; nothing is extracted at exit. Subagents can't save memories.
+- **Saved when:** the agent decides — `save_memory` stores a key/value fact (an overlapping fact of the same scope is updated, not duplicated) and `save_episode` stores a decision, correction or lesson (one that rewords an episode already saved in the directory is skipped). Each save is shown in the TUI; nothing is extracted at exit. Subagents can't save memories.
+- **Fact scopes** — a fact is about you (`scope="user"`, the default: your name, editor, how you like answers) or about one project (`scope="project"`: its tooling, conventions, decisions), keyed by the directory it was saved in. The same key can be saved once per scope and project. A project fact is only shown in its own directory.
 - **Two step tables** — `session_steps` (full audit, shown on resume) and `working_steps` (what the model sees; compaction flags old rows instead of rewriting them). Each step is one INSERT. DBs from 0.1.6 and earlier are migrated on first open (`PRAGMA user_version`).
-- **Memory recall** — episodic memories come from your past sessions in the same directory (`memory.episodic_scope: user` for all directories). The agent is told never to save facts that only appeared in tool output; only facts and episodes related to the prompt are recalled (an unrelated prompt like "hi" gets none). List them with `/memories` and `/episodes`, delete one with `/forget`.
-- **Index repair** — if Chroma's vector index gets out of sync with its stored rows (chroma-core/chroma#7032), recall and saving fall back to a slower scan instead of failing, and the TUI warns at startup. `dostuff memory repair` rebuilds the index; rows it can't rebuild are left out but kept in the backup, and a failed rebuild leaves the original as it was.
+- **Fact delivery** — every saved fact (yours plus this project's) is listed for the agent before its first model call, in a hidden step after your prompt, and sent again only when the list changes (a save, an update, `/forget`) or a compaction drops it, so the prompt cache holds. Up to 50 facts are listed, newest first, at most 30 of them project facts; past that, up to 3 of the rest that match the prompt are added to that turn's context. Typed subagents get the same list (see [Subagents](#subagents)).
+- **Episode recall** — episodic memories come from your past sessions in the same directory (`memory.episodic_scope: user` for all directories); only episodes related to the prompt are recalled (an unrelated prompt like "hi" gets none). The agent is told never to save facts that only appeared in tool output. List them with `/memories` and `/episodes`, delete one with `/forget`.
+- **Index repair** — if Chroma's vector index gets out of sync with its stored rows (chroma-core/chroma#7032), recall and saving fall back to a slower scan instead of failing, and the TUI warns at startup. `dostuff memory repair` rebuilds the index; rows it can't rebuild are left out but kept in the backup, and a failed rebuild leaves the original as it was. `dostuff memory repair --reembed` also re-embeds facts saved by older versions (as `"User's <key> is <value>"`) as their value alone, after a backup; they keep working without it.
 - **Token persistence** — `prompt_tokens` / `completion_tokens` / `total_tokens` / `last_input_tokens` saved to DB; resume restores percent from DB meta
 
 Long-term memory survives `pip install . --upgrade` because it lives in the user's home directory, not in the package.

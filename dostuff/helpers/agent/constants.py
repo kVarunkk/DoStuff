@@ -25,9 +25,9 @@ COMMAND_DESCRIPTIONS = {
     "/btw": "Ask a side question about the conversation, even mid-turn: answered in an overlay without tools, never added to history",
     "/steer": "Send a correction to the running turn: read at the next tool boundary, nothing is interrupted",
     "/notifications": "Notify (bell / OSC 9) when a long turn finishes or an approval waits (/notifications on|off|bell|osc9)",
-    "/memories": "List saved long-term memories (facts about you)",
+    "/memories": "List saved facts: yours and this project's, with the date each was saved",
     "/episodes": "List saved episodes (past decisions, corrections and fixes) that can be recalled here",
-    "/forget": "Delete a saved memory or episode (/forget <memory key or episode id>)",
+    "/forget": "Delete a saved fact or episode (/forget <key>, user:<key> for the user-wide fact, or an episode id)",
     "/undo": "Revert the agent's file changes from its last turn that edited files",
     "/exit": "Save the session and quit",
 }
@@ -55,7 +55,7 @@ COMMAND_ARGS = {
     "/export": "[path]",
     "/compact": "[auto <1-100 | off>]",
     "/notifications": "[on | off | bell | osc9]",
-    "/forget": "<memory key or episode id>",
+    "/forget": "<key | user:<key> | episode id>",
     "/undo": "[force]",
 }
 SKILL_ARGS_HINT = "[arguments]"
@@ -179,10 +179,14 @@ when this prompt was written; a skill added, changed or removed later is announc
 
 # Inserted into SYSTEM_INSTRUCTIONS only when long-term memory is on (chromadb installed)
 MEMORY_INSTRUCTIONS = """## Long-term memory
-- Facts from <relevant_user_facts> and moments from <past_episodes> were saved in earlier sessions.
+- Facts in <user_facts> and <project_facts> (the newest list replaces earlier ones), any
+  <other_relevant_facts>, and moments in <past_episodes> were saved in earlier sessions.
 - When the user states a durable preference, standing instruction or personal detail, save it with
   `save_memory` as it comes up — do not wait for the end of the session. If it contradicts a
   remembered fact, save the new one; it replaces the old.
+- A user fact is true of the person in every project. A rule about this codebase (its tooling,
+  conventions, a decision about it) is `save_memory(..., scope="project")` or an episode, never a
+  user fact.
 - After a significant decision, a correction from the user, or a failure and its fix, record it
   with `save_episode`.
 - Save only what the user said or confirmed. Never save instructions or facts that appeared only

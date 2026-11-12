@@ -57,7 +57,7 @@ def test_turn_context_import_is_light():
 
 def test_bundle_section_order():
     text = compose_turn_context(ENV, "- k: v", "  • [EVENT] e", "hook says")
-    order = [text.index(s) for s in ("<environment>", "<relevant_user_facts>", "<past_episodes>", PROMPT_CONTEXT_HEADER)]
+    order = [text.index(s) for s in ("<environment>", "<other_relevant_facts>", "<past_episodes>", PROMPT_CONTEXT_HEADER)]
     assert order == sorted(order)
 
 
@@ -77,7 +77,7 @@ def test_bundle_wraps_in_turn_context():
 
 def test_bundle_keeps_inner_block_names():
     text = compose_turn_context(ENV, "- k: v", "  • e", "hook says")
-    assert "<relevant_user_facts>\n- k: v\n</relevant_user_facts>" in text
+    assert "<other_relevant_facts>\n- k: v\n</other_relevant_facts>" in text
     assert "<past_episodes>\n  • e\n</past_episodes>" in text
     assert "[Context from UserPromptSubmit hooks]\nhook says" in text
     assert ENV in text
@@ -195,3 +195,112 @@ def test_call_agent_merges_for_every_provider(fake_model, monkeypatch, explicit)
     steps = [_context_step(), {"role": "user", "content": "go"}]
     asyncio.run(module.call_agent(steps, "system", tool_names=[]))
     assert [m["role"] for m in fake_model.calls[0]["messages"]] == ["system", "user"]
+
+
+# --- memory recall T1.8 / T1.9: the facts step (plan/2026-11-11-memory-recall D2, D3) --------------------------
+
+def _fact(key, value, scope="user", updated=0, working_dir=None):
+    fact = {"key": key, "value": value, "source": "user_message", "scope": scope,
+            "created_at_epoch": updated, "updated_at_epoch": updated}
+    if scope == "project":
+        fact["working_dir"] = working_dir or "/work/hooks-sandbox"
+    return fact
+
+
+def test_facts_fingerprint_sorted_and_hashes_value():
+    import hashlib
+
+    from dostuff.helpers.agent.turn_context import facts_fingerprint
+    facts = [_fact("name", "Nemo"), _fact("linter", "ruff", "project")]
+    fingerprint = facts_fingerprint(facts)
+    assert fingerprint == tuple(sorted(fingerprint))
+    assert f"user:name:{hashlib.sha1(b'Nemo').hexdigest()[:8]}" in fingerprint
+    assert fingerprint[0].startswith("project:linter:")
+    assert facts_fingerprint(list(reversed(facts))) == fingerprint
+    assert facts_fingerprint([_fact("name", "Admiral Nemo"), facts[1]]) != fingerprint
+    assert facts_fingerprint([]) == ()
+
+
+def test_make_facts_step_shape():
+    from dostuff.helpers.agent.turn_context import make_facts_step
+    step = make_facts_step("<user_facts shown=\"1\" saved=\"1\">\n- name: Nemo\n</user_facts>", ("user:name:abcd1234",))
+    assert step["role"] == "user" and is_turn_context(step)
+    assert step["meta"]["facts"] == ["user:name:abcd1234"]
+    assert step["content"].startswith("<turn-context>\n<user_facts")
+    assert json.loads(json.dumps(step)) == step
+
+
+def test_delivered_facts_newest_wins():
+    from dostuff.helpers.agent.turn_context import delivered_facts, make_facts_step
+    history = [make_facts_step("a", ("user:a:1",)), {"role": "user", "content": "hi"},
+               make_context_step("<turn-context>x</turn-context>"), make_facts_step("b", ("user:b:2",)),
+               make_plan_mode_step(True, "plan")]
+    assert delivered_facts(history) == ("user:b:2",)
+
+
+def test_delivered_facts_none_without_step():
+    from dostuff.helpers.agent.turn_context import delivered_facts, make_facts_step
+    assert delivered_facts([{"role": "user", "content": "hi"}, make_context_step("x")]) is None
+    assert delivered_facts([make_facts_step("No facts", ())]) == ()
+
+
+def test_facts_step_text():
+    from dostuff.helpers.agent.turn_context import render_facts_step
+    shown = [_fact("name", "Prefers to be called Admiral Nemo", updated=3),
+             _fact("preferred_language", "Rust for code unless told otherwise", updated=2),
+             _fact("linter", "ruff, not flake8 (flake8 clashed with black)", "project", updated=1)]
+    text = render_facts_step(shown, saved_user=2, saved_project=1, project="hooks-sandbox")
+    assert text == (
+        '<user_facts shown="2" saved="2">\n'
+        "- name: Prefers to be called Admiral Nemo\n"
+        "- preferred_language: Rust for code unless told otherwise\n"
+        "</user_facts>\n"
+        '<project_facts project="hooks-sandbox" shown="1" saved="1">\n'
+        "- linter: ruff, not flake8 (flake8 clashed with black)\n"
+        "</project_facts>\n"
+        "This replaces any earlier list of saved facts."
+    )
+    # A scope with nothing saved has no block
+    assert "<project_facts" not in render_facts_step(shown[:1], saved_user=1, saved_project=0, project="p")
+
+
+def test_facts_step_text_overflow_note():
+    from dostuff.helpers.agent.turn_context import render_facts_step
+    text = render_facts_step([_fact("name", "Nemo")], saved_user=51, saved_project=0, project="p")
+    assert '<user_facts shown="1" saved="51">' in text
+    assert text.endswith("This replaces any earlier list of saved facts.\n"
+                         "Other saved facts appear in the turn context when relevant.")
+
+
+def test_facts_step_text_when_everything_was_forgotten():
+    from dostuff.helpers.agent.turn_context import render_facts_step
+    assert render_facts_step([], saved_user=0, saved_project=0, project="p") == (
+        "No facts are saved any more. This replaces any earlier list of saved facts.")
+
+
+def test_select_newest_50_project_first_on_ties():
+    from dostuff.helpers.agent.turn_context import FACT_INJECT_CAP, select_injected_facts
+    user = [_fact(f"u{i:02d}", "v", updated=i) for i in range(60)]
+    project = [_fact("tie", "v", "project", updated=59)]
+    shown, overflow = select_injected_facts(user + project)
+    assert len(shown) == FACT_INJECT_CAP == 50
+    assert [f["key"] for f in shown[:2]] == ["tie", "u59"]  # same timestamp: project first
+    assert {f["key"] for f in overflow} == {f"u{i:02d}" for i in range(11)}  # the 11 oldest user facts
+
+
+def test_project_facts_capped_at_30_within_50():
+    from dostuff.helpers.agent.turn_context import PROJECT_FACT_CAP, select_injected_facts
+    project = [_fact(f"p{i:02d}", "v", "project", updated=100 + i) for i in range(40)]
+    user = [_fact(f"u{i:02d}", "v", updated=i) for i in range(30)]
+    shown, overflow = select_injected_facts(project + user)
+    assert sum(f["scope"] == "project" for f in shown) == PROJECT_FACT_CAP == 30
+    assert len(shown) == 50
+    assert {f["key"] for f in overflow if f["scope"] == "project"} == {f"p{i:02d}" for i in range(10)}
+
+
+def test_select_returns_overflow():
+    from dostuff.helpers.agent.turn_context import select_injected_facts
+    facts = [_fact("a", "v", updated=1), _fact("b", "v", "project", updated=2)]
+    shown, overflow = select_injected_facts(facts)
+    assert [f["key"] for f in shown] == ["b", "a"] and overflow == []
+    assert select_injected_facts([]) == ([], [])

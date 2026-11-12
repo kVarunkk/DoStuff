@@ -20,6 +20,7 @@ class AgentDef:
     max_iterations: int | None = None  # None: the configured subagent cap
     source: str = "built-in"  # a file path, or "built-in"
     read_only_shell: bool = False  # bash_command limited to permissions.is_read_only_shell (D3)
+    omit_memory: bool = False  # no saved facts in its context (memory recall D14)
 
 
 # explore / plan: look, don't touch. The shell is limited to read-only commands (read_only_shell).
@@ -47,6 +48,7 @@ BUILTIN_TYPES: dict[str, AgentDef] = {
         ),
         tools=READ_ONLY_TOOLS,
         read_only_shell=True,
+        omit_memory=True,  # kept cheap, like Claude Code's Explore and Plan skipping CLAUDE.md
     ),
     "plan": AgentDef(
         name="plan",
@@ -58,6 +60,7 @@ BUILTIN_TYPES: dict[str, AgentDef] = {
         ),
         tools=READ_ONLY_TOOLS,
         read_only_shell=True,
+        omit_memory=True,  # kept cheap, like Claude Code's Explore and Plan skipping CLAUDE.md
     ),
 }
 RESERVED_TYPES = frozenset({"fork"})  # built into the harness (D11); a file can't define it
@@ -168,9 +171,13 @@ def parse_agent_file(path: Path) -> tuple[AgentDef | None, list[str]]:
             max_iterations = max(int(front["max_iterations"]), 1)
         except (TypeError, ValueError):
             warnings.append(f"{path}: max_iterations '{front['max_iterations']}' is not a number; ignored")
+    if front.get("memory") not in (None, ""):
+        warnings.append(f"{path}: memory '{front['memory']}' ignored: dostuff has no per-agent memory "
+                        "(saved facts reach typed subagents unless omit_memory: true)")
     agent_def = AgentDef(
         name=name, description=description, prompt=match.group(2).strip(), tools=tools,
         model=str(front.get("model") or "inherit").strip(), max_iterations=max_iterations, source=str(path),
+        omit_memory=str(front.get("omit_memory")).strip().lower() == "true",
     )
     return agent_def, warnings
 

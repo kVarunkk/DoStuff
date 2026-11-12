@@ -51,6 +51,7 @@ async def build_subagent_prompt(agent_def: "AgentDef", worktree: Worktree | None
     """(base rules, the type's body, the worktree note, the environment, project instructions and skills; the
     capability set its skills list claims, which the run's loop announces later changes against).
 
-    No memory recall: a subagent has nothing of the user's conversation to recall against. Built once per run.
+    No episode recall: a subagent has nothing of the user's conversation to recall against. Saved facts arrive as a
+    facts step in its history instead (memory recall D14), unless its type sets omit_memory. Built once per run.
     """
     return await asyncio.to_thread(_sections, agent_def, worktree)

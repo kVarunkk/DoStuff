@@ -263,7 +263,7 @@ def test_subagent_prompt_has_project_rules(agents, fake_model, monkeypatch, tmp_
         positions = [text.find(p) for p in parts]
         assert -1 not in positions, (marker, [p for p, i in zip(parts, positions) if i == -1])
         assert positions == sorted(positions), marker
-        assert "<relevant_user_facts>" not in text and "<past_episodes>" not in text
+        assert "<other_relevant_facts>" not in text and "<past_episodes>" not in text
         assert skills_summary(discover_skills()) in text  # the same block as the main prompt, `dir:` included
         assert "  dir: " in text and "  location: " not in text
     assert "git worktree" not in system_of("[A]")
@@ -539,3 +539,14 @@ def test_subagent_run_passes_own_baseline(agents, fake_model, monkeypatch):
         return await run.done
     assert asyncio.run(go()) == "ok"
     assert seen == [(("skill:own:1",), ("skill",))]
+
+
+def test_claude_code_memory_field_warns(tmp_path):
+    """memory recall D14: Claude Code's `memory: user|project|local` is a per-agent folder dostuff doesn't have."""
+    from dostuff.agent.subagents.definitions import parse_agent_file
+    path = tmp_path / "reviewer.md"
+    path.write_text("---\nname: reviewer\ndescription: Reviews.\nmemory: project\n---\nReview.\n", encoding="utf-8")
+    agent_def, warnings = parse_agent_file(path)
+    assert agent_def is not None and not agent_def.omit_memory
+    assert warnings == [f"{path}: memory 'project' ignored: dostuff has no per-agent memory "
+                        "(saved facts reach typed subagents unless omit_memory: true)"]

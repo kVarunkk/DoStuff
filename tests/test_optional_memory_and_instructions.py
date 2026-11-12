@@ -33,7 +33,7 @@ def test_without_chromadb_memory_is_off(no_chroma):
     base, _, _ = build_base_instructions()
     assert "save_memory" not in base and "## Long-term memory" not in base
     turn = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="user"))
-    assert "<environment>" in turn and "<relevant_user_facts>" not in turn
+    assert "<environment>" in turn and "<other_relevant_facts>" not in turn
 
     from dostuff.tools.memory.save_memory import save_memory
     with pytest.raises(RuntimeError, match=r"dostuff\[memory\]"):
@@ -97,8 +97,14 @@ class _Store:
             raise self.error
         return self.rows
 
+    async def list_all(self, *args, **kwargs):
+        self.calls.append(("list_all", kwargs))
+        if self.error:
+            raise self.error
+        return self.rows
 
-FACT = {"key": "name", "value": "Ada"}
+
+FACT = {"key": "name", "value": "Ada", "scope": "user", "updated_at_epoch": 0}
 EPISODE = {"event_type": "EVENT", "anchor_event": "shipped", "summary": "it went out", "created_at_iso": "2026-11-05"}
 
 
@@ -113,14 +119,14 @@ def test_no_stale_importer():
     assert not [p for p in root.rglob("*.py") if "build_turn_instructions" in p.read_text(encoding="utf-8")]
 
 
-def test_turn_context_recalls_facts_and_episodes():
+def test_turn_context_recalls_episodes_not_facts_below_the_cap():
+    """Below the facts step's cap every fact is in the facts step already (memory recall D3): no fact query."""
     from dostuff.agent.instructions import build_turn_context
-    from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
     facts, episodes = _Store([FACT]), _Store([EPISODE])
     text = asyncio.run(build_turn_context("hi", memory_store=facts, episodic_store=episodes, user_id="u"))
-    assert "<relevant_user_facts>\n- name: Ada\n</relevant_user_facts>" in text
+    assert "facts>" not in text and "- name: Ada" not in text
     assert "  • [EVENT] shipped\n    Summary: it went out\n    Date: 2026-11-05" in text
-    assert facts.calls == [(("u",), {"query_text": "hi", "top_k": 5, "min_similarity": MIN_FACT_SIMILARITY})]
+    assert [c[0] for c in facts.calls] == ["list_all"]
     assert episodes.calls[0][1]["top_k"] == 3 and episodes.calls[0][1]["query_text"] == "hi"
 
 
@@ -139,7 +145,7 @@ def test_turn_context_without_memory_stores():
     text = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="u",
                                           prompt_context="from a hook"))
     assert "<environment>" in text and "from a hook" in text
-    assert "<relevant_user_facts>" not in text and "<past_episodes>" not in text
+    assert "<other_relevant_facts>" not in text and "<past_episodes>" not in text
 
 
 def test_hook_context_rides_the_bundle():

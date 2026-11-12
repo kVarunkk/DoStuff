@@ -186,3 +186,29 @@ def rebuild_collection(client: Any, name: str, backup_dir: Path | None = None,
         "backup": str(backup_path) if backup_path else None,
         "error": check_collection(rebuilt),
     }
+
+
+def facts_to_reembed(collection: Any) -> tuple[dict[str, Any], list[tuple[str, str, dict]], int]:
+    """(raw rows, [(id, value, metadata)] whose document isn't the value alone, facts with a value).
+
+    Facts written before memory recall D7 were embedded as "User's {key} is {value}"; the value alone is what
+    the dedupe query compares with now. `get()` only, so this works on a diverged index too."""
+    raw = collection.get(include=["documents", "metadatas"])
+    pending: list[tuple[str, str, dict]] = []
+    total = 0
+    for row_id, document, metadata in zip(raw.get("ids") or [], raw.get("documents") or [], raw.get("metadatas") or []):
+        value = metadata.get("value") if isinstance(metadata, dict) else None
+        if not isinstance(value, str) or not value:
+            continue
+        total += 1
+        if document != value:
+            pending.append((str(row_id), value, metadata))
+    return raw, pending, total
+
+
+def reembed_facts(collection: Any, raw: dict[str, Any], pending: list[tuple[str, str, dict]], backup_dir: Path) -> Path:
+    """Back up the whole collection, then rewrite each pending fact's document as its value, metadata unchanged."""
+    backup = write_backup(collection.name, raw, backup_dir)
+    collection.upsert(ids=[p[0] for p in pending], documents=[p[1] for p in pending],
+                      metadatas=[p[2] for p in pending])
+    return backup

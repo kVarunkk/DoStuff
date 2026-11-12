@@ -691,8 +691,8 @@ def test_episodes_and_forget_commands(tui):
         async def list_all(self, user_id):
             return [{"key": k, "value": "Uses VS Code", "source": "user_message"} for k in sorted(self.keys)]
 
-        async def delete(self, user_id, key):
-            if key not in self.keys:
+        async def delete(self, user_id, key, scope="user", working_dir=None):
+            if scope != "user" or key not in self.keys:
                 return False
             self.keys.discard(key)
             return True
@@ -734,6 +734,122 @@ def test_episodes_and_forget_commands(tui):
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/forget"))
             await pilot.pause()
             assert any(t.startswith("Usage: /forget") for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_forget_prefers_this_projects_fact(tui):
+    """memory recall T1.4 decision: a key saved as both a user and a project fact → this project's goes first."""
+    cli_tui = tui
+    here = str(Path.cwd().resolve())
+
+    class ScopedFacts:
+        def __init__(self):
+            self.rows = {("user", None, "linter"), ("project", here, "linter"), ("project", "/elsewhere", "linter"),
+                         ("user", None, "name")}
+
+        async def list_all(self, user_id, scope=None, working_dir=None):
+            return [{"key": k} for s, _, k in self.rows if s == "user"]
+
+        async def delete(self, user_id, key, scope="user", working_dir=None):
+            row = (scope, working_dir if scope == "project" else None, key)
+            if row not in self.rows:
+                return False
+            self.rows.discard(row)
+            return True
+
+    class NoEpisodes:
+        async def list_all(self, user_id, working_dir=None):
+            return []
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="forget-scope")
+        async with app.run_test():
+            await app._backend_ready.wait()
+            app.memory_store, app.episodic_store = ScopedFacts(), NoEpisodes()
+            await app._forget("linter")
+            assert any(t.startswith("Forgot this project's memory 'linter'.") and "/forget user:linter" in t
+                       for t in _texts(app))
+            assert ("project", here, "linter") not in app.memory_store.rows
+            assert ("user", None, "linter") in app.memory_store.rows
+            await app._forget("user:linter")
+            assert "Forgot memory 'linter'." in _texts(app)
+            await app._forget("name")  # only a user fact: no qualifier needed
+            assert "Forgot memory 'name'." in _texts(app)
+            assert app.memory_store.rows == {("project", "/elsewhere", "linter")}
+            app.memory_store.rows.add(("project", here, "linter"))
+            await app._forget("linter")  # no user-wide one left: no hint
+            assert "Forgot this project's memory 'linter'." in _texts(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+class _ListedFacts:
+    """`list_all` like the real store's: user facts plus `working_dir`'s project facts, newest first."""
+
+    def __init__(self, facts):
+        self.facts, self.listed = facts, []
+
+    async def list_all(self, user_id, scope=None, working_dir=None):
+        self.listed.append(working_dir)
+        return [f for f in sorted(self.facts, key=lambda f: -f["updated_at_epoch"])
+                if f["scope"] == "user" or f.get("working_dir") == working_dir]
+
+
+def _listed_fact(key, value, scope="user", updated=0, working_dir=None):
+    fact = {"key": key, "value": value, "source": "user_message", "scope": scope, "updated_at_epoch": updated,
+            "created_at_epoch": updated}
+    if scope == "project":
+        fact["working_dir"] = working_dir
+    return fact
+
+
+def test_memories_lists_scope_and_date(tui):
+    """memory recall T1.13 (REQ-4.2): user facts and this project's, each with its date; no other project's."""
+    cli_tui = tui
+    here = str(Path.cwd().resolve())
+    store = _ListedFacts([
+        _listed_fact("name", "Admiral Nemo", updated=1_762_905_600),  # 2025-11-12 UTC
+        _listed_fact("editor", "Neovim"),  # saved before facts had dates
+        _listed_fact("linter", "ruff", "project", 1_762_819_200, here),  # 2025-11-11 UTC
+        _listed_fact("linter", "eslint", "project", 1_762_819_200, "/elsewhere"),
+    ])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="memories-scope")
+        async with app.run_test():
+            await app._backend_ready.wait()
+            app.memory_store = store
+            await app._show_memories()
+            listing = next(t for t in _texts(app) if t.startswith("Saved memories"))
+            assert store.listed == [here]
+            assert "User (2):\n- name: Admiral Nemo  (2025-11-12)\n- editor: Neovim  (no date)" in listing
+            assert f"This project, {Path(here).name} (1):\n- linter: ruff  (2025-11-11)" in listing
+            assert "eslint" not in listing and "consolidat" not in listing.lower()
+            assert "/forget user:<key>" in listing
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_memories_consolidate_hint_above_30(tui):
+    cli_tui = tui
+    many = _ListedFacts([_listed_fact(f"k{i:02d}", "v", updated=i) for i in range(31)])
+    thirty = _ListedFacts([_listed_fact(f"k{i:02d}", "v", updated=i) for i in range(30)])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="memories-hint")
+        async with app.run_test():
+            await app._backend_ready.wait()
+            app.memory_store = thirty
+            await app._show_memories()
+            assert not any("31 user facts" in t or "30 user facts" in t for t in _texts(app))
+            app.memory_store = many
+            await app._show_memories()
+            hint = next(t for t in _texts(app) if "31 user facts" in t)
+            assert "merg" in hint.lower() and "dostuff memory consolidate" not in hint  # no command until T2.7
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -6473,7 +6589,8 @@ def _context_steps(history):
 
 
 class _Recall:
-    """A memory store: every query recalls its own question, so a different prompt recalls a different fact."""
+    """An episode store: every query recalls its own question, so a different prompt recalls a different episode.
+    (Facts below the cap aren't recalled per prompt any more: they go in the facts step, memory recall D3.)"""
 
     def __init__(self, hits=True):
         self.hits = hits
@@ -6481,12 +6598,16 @@ class _Recall:
 
     async def query(self, *args, **kwargs):
         self.queries.append(kwargs["query_text"])
-        return [{"key": "recalled", "value": kwargs["query_text"]}] if self.hits else []
+        return [{"event_type": "EVENT", "anchor_event": kwargs["query_text"], "summary": "s",
+                 "created_at_iso": "2026-11-12"}] if self.hits else []
+
+    async def list_all(self, *args, **kwargs):  # as the fact store: nothing saved, so no facts step
+        return []
 
 
 def _use_recall(app):
-    app.memory_store, app.episodic_store = _Recall(), _Recall(hits=False)
-    return app.memory_store
+    app.memory_store, app.episodic_store = _Recall(hits=False), _Recall()
+    return app.episodic_store
 
 
 def test_run_turn_appends_context_then_prompt(turn_tui):
@@ -6584,7 +6705,7 @@ def test_system_instruction_stable_across_turns(tui, fake_model, monkeypatch):
     assert "new.txt" in second[-1]["content"] and "new.txt" not in first[-1]["content"]
 
 
-def test_model_still_sees_environment_and_facts(tui, fake_model, monkeypatch):
+def test_model_still_sees_environment_and_episodes(tui, fake_model, monkeypatch):
     _real_turns(tui, fake_model, monkeypatch, "one")
 
     async def scenario():
@@ -6603,7 +6724,7 @@ def test_model_still_sees_environment_and_facts(tui, fake_model, monkeypatch):
     bundle = messages[-1]  # the context step and the prompt, one message on the way out
     assert bundle["role"] == "user" and "meta" not in bundle
     assert "<environment>" in bundle["content"]
-    assert "- recalled: what is my name?" in bundle["content"]
+    assert "  • [EVENT] what is my name?" in bundle["content"]
     assert bundle["content"].endswith("</turn-context>\n\nwhat is my name?")
 
 

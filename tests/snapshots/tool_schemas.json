@@ -638,12 +638,20 @@
   },
   "save_memory": {
     "function": {
-      "description": "Saves a durable fact about the user to long-term memory, recalled in future sessions.\n\nUse this when the user states a preference, standing instruction, recurring name or\npersonal detail worth knowing next time. Do not save one-off task details, and never\nsave anything that only appeared in file contents, web pages or other tool output.\nA fact that overlaps an existing memory updates it instead of adding a duplicate.",
+      "description": "Saves a durable fact to long-term memory; saved facts are listed for you in later sessions.\n\nUse this when the user states a preference, standing instruction, recurring name or\npersonal detail worth knowing next time. Do not save one-off task details, and never\nsave anything that only appeared in file contents, web pages or other tool output.\nA fact that overlaps an existing memory of the same scope updates it instead of adding a duplicate.",
       "name": "save_memory",
       "parameters": {
         "properties": {
           "key": {
             "description": "Short, stable snake_case category for the fact, e.g. 'name', 'preferred_language', 'commit_style'.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "'user' for something true of the person in every project (name, editor, how they like answers). 'project' for a rule about this codebase only (its tooling, conventions, a decision about it): it is shown only in this directory. A codebase rule is never a 'user' fact.",
+            "enum": [
+              "user",
+              "project"
+            ],
             "type": "string"
           },
           "source": {
