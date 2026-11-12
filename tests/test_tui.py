@@ -3594,7 +3594,7 @@ def test_ask_panel_reused_hides_and_shows(tui):
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             first = _ask_questions(app, [DB_QUESTION])
             await _until(pilot, lambda: panel.display and app.focused is panel)
-            await pilot.press("1", "tab", "enter")
+            await pilot.press("1", "tab", "enter", "enter")  # submit opens the review, its submit sends
             await _until(pilot, lambda: first.done())
             assert not panel.display and app.query_one("#input", cli_tui.EnterSubmits).display
             second = _ask_questions(app, [AUTH_QUESTION])
@@ -3667,7 +3667,7 @@ def test_submit_row_inert_until_answered(tui):
             await pilot.pause()
             assert panel.all_answered()
             assert "answer every question first" not in str(panel.content)
-            await pilot.press("tab", "enter")
+            await pilot.press("tab", "enter", "enter")
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "Postgres"), ("Which auth methods?", "JWT")]
             assert not panel.display
@@ -3696,7 +3696,7 @@ def test_change_an_answer_before_submitting(tui):
             await pilot.press("2")
             await pilot.pause()
             assert panel.answers() == ["SQLite"]  # replaced, not appended
-            await pilot.press("tab", "enter")
+            await pilot.press("tab", "enter", "enter")
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "SQLite")]
             await app._cleanup_and_save_session()
@@ -3725,10 +3725,70 @@ def test_single_question_still_needs_submit(tui):
             await pilot.pause()
             assert not captures and not task.done()  # 0 resolutions after the pick
             assert panel.submit_focused  # the only question is answered, so the cursor is on the submit row
+            await pilot.press("enter")  # the review, not the submission
+            await pilot.pause()
+            assert not captures and panel.reviewing
             await pilot.press("enter")
             await _until(pilot, lambda: bool(captures))
             assert len(captures) == 1  # 1 after the submit
             assert captures[0] == [("Which database should I use?", "Postgres")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_review_before_submitting(tui):
+    """Submit opens a review of every answer; ← goes back without sending, Enter on an answer changes it,
+    and only the review's own submit row resolves the call."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-review")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1", "1", "tab")  # Postgres, JWT, then the submit row
+            await pilot.pause()
+            assert panel.submit_focused and not panel.reviewing
+            await pilot.press("enter")
+            await pilot.pause()
+            content = str(panel.content)
+            assert panel.reviewing and not task.done() and app.adapter.has_pending_ask()
+            assert "Review your answers" in content and "▌ Review" in content
+            assert "Which database should I use?" in content and "→ Postgres" in content
+            assert "Which auth methods?" in content and "→ JWT" in content
+            assert panel.review_row == 2  # the cursor starts on Submit
+
+            # ← leaves the review on the questions' submit row, nothing sent
+            await pilot.press("left")
+            await pilot.pause()
+            assert not panel.reviewing and panel.submit_focused and not task.done()
+            assert "Review your answers" not in str(panel.content)
+
+            # back in, pick the first answer: it reopens that question to change it
+            await pilot.press("enter", "up", "up", "enter")
+            await pilot.pause()
+            assert not panel.reviewing and panel.cursor_question == 0 and not panel.submit_focused
+            await pilot.press("2")  # SQLite; every question answered, so the cursor is on submit again
+            await pilot.pause()
+            assert panel.submit_focused
+            await pilot.press("enter")
+            await pilot.pause()
+            assert panel.reviewing and "→ SQLite" in str(panel.content)
+            # the number beside an answer changes it too, and shift+tab backs out like ←
+            await pilot.press("2")
+            await pilot.pause()
+            assert not panel.reviewing and panel.cursor_question == 1
+            await pilot.press("tab", "enter", "shift+tab")
+            await pilot.pause()
+            assert not panel.reviewing and panel.submit_focused and not task.done()
+
+            await pilot.press("enter", "enter")
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Which database should I use?", "SQLite"), ("Which auth methods?", "JWT")]
+            assert not panel.display
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -3753,6 +3813,10 @@ def test_submit_row_click(tui):
             await pilot.press("1")  # auto-advance puts the cursor on the submit row
             await pilot.pause()
             await pilot.click("#ask-panel", offset=(6, 7))
+            await pilot.pause()
+            assert panel.reviewing and not task.done()  # the first submit opens the review
+            # the review's submit row: border, tabs, title, the question and its answer, separator
+            await pilot.click("#ask-panel", offset=(6, 6))
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "Postgres")]
             await app._cleanup_and_save_session()
@@ -3789,7 +3853,7 @@ def test_multi_select_toggles(tui):
             await pilot.press("space")
             await pilot.pause()
             assert panel.answers() == [None]
-            await pilot.press("2", "1", "tab", "enter")
+            await pilot.press("2", "1", "tab", "enter", "enter")
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which auth methods?", "JWT, OAuth")]
             await app._cleanup_and_save_session()
@@ -3820,7 +3884,7 @@ def test_multi_select_with_other(tui):
             assert panel.display and not inp.display and app.focused is panel
             assert panel.answers() == ["JWT, my own"]
             assert "✓ 3. Other (type your own)" in str(panel.content)
-            await pilot.press("3", "tab", "enter")  # Other off again
+            await pilot.press("3", "tab", "enter", "enter")  # Other off again
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which auth methods?", "JWT")]
 
@@ -3832,7 +3896,7 @@ def test_multi_select_with_other(tui):
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("saml"))
             await pilot.pause()
             assert panel.answers() == ["saml"]
-            await pilot.press("enter")  # the cursor is on the submit row
+            await pilot.press("enter", "enter")  # the cursor is on the submit row; then the review's
             await _until(pilot, lambda: panel_task.done())
             assert panel_task.result() == [("Which auth methods?", "saml")]
             await app._cleanup_and_save_session()
@@ -3873,7 +3937,7 @@ def test_other_takes_the_input(tui):
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(app._pastes.inline("JWT,\n  OAuth")))
             await pilot.pause()
             assert panel.answers()[1] == "JWT, OAuth"
-            await pilot.press("enter")  # the cursor is on the submit row
+            await pilot.press("enter", "enter")  # the cursor is on the submit row; then the review's
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "DuckDB"), ("Which auth methods?", "JWT, OAuth")]
             await app._cleanup_and_save_session()
@@ -3935,7 +3999,7 @@ def test_mixed_call_hands_the_input_over(tui):
             await pilot.pause()
             assert panel.display and not inp.display
             assert panel.answers() == ["Postgres", "Tiger"]
-            await pilot.press("enter")  # every question answered: the cursor is on the submit row
+            await pilot.press("enter", "enter")  # every question answered: submit, then the review's submit
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "Postgres"), ("Name the app?", "Tiger")]
             await app._cleanup_and_save_session()
