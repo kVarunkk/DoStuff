@@ -3649,8 +3649,44 @@ class DostuffTUI(App):
         text += "\n\nForget one with /forget <key> (/forget user:<key> for a user fact when this project has the same key)."
         if len(user) > CONSOLIDATE_HINT_USER_FACTS:
             text += (f"\n\nYou have {len(user)} user facts. Merging overlapping ones keeps the list every session "
-                     "starts with short; /forget the ones you no longer need.")
+                     "starts with short: /memories consolidate shows the merge before writing it, and /forget "
+                     "removes the ones you no longer need.")
         self._append(text, msg_type="system")
+
+    async def _consolidate_memories(self) -> None:
+        """/memories consolidate: one model call merges overlapping facts (yours and this project's), the diff is
+        shown, and nothing is written until you say yes (memory recall D10). Auto mode never asks, so it refuses."""
+        if not await self._memory_ready():
+            return
+        assert self.memory_store is not None
+        if (self.permissions.mode or self.config.permission_mode) == "auto":
+            self._append("Merging facts needs your OK, and auto mode never stops to ask. Leave auto mode "
+                         "(shift+tab) or run `dostuff memory consolidate --yes` in a terminal.", msg_type="system")
+            return
+        from dostuff.helpers.memory.consolidate import ConsolidateError, apply, describe, propose, summary
+        here = Path.cwd().resolve()
+        self._append("Asking the model to merge overlapping facts…", msg_type="system")
+        try:
+            changes = await propose(self.memory_store, self.user_id, str(here))
+        except ConsolidateError as error:
+            self._append(f"Can't merge: {error}. Nothing was changed.", msg_type="error")
+            return
+        except Exception as error:
+            self._append(f"Could not load memories: {error}. Nothing was changed.", msg_type="error")
+            return
+        if not changes:
+            self._append("Nothing to merge: no saved facts overlap.", msg_type="system")
+            return
+        if not await self.adapter.confirm(describe(changes, here.name), "Merge these facts?",
+                                          f"Yes, merge ({summary(changes)})", "No, keep them as they are"):
+            self._append("Nothing was changed.", msg_type="system")
+            return
+        try:
+            await apply(self.memory_store, self.user_id, changes)
+        except Exception as error:
+            self._append(f"The merge stopped part-way: {error}. Check /memories.", msg_type="error")
+            return
+        self._append(f"Merged: {summary(changes)}.", msg_type="system")
 
     def _episodes_dir(self) -> str | None:
         """The directory episodes are recalled from (None = all), as `memory.episodic_scope` says."""
@@ -3760,6 +3796,9 @@ class DostuffTUI(App):
             return
         if cmd == "/memories":
             self._start_worker(self._show_memories(), name="memories")
+            return
+        if cmd.split() == ["/memories", "consolidate"]:
+            self._start_worker(self._consolidate_memories(), name="memories")
             return
         if cmd.startswith("/"):
             # Skills added or removed since the last look (a stat pass): a new one is a command, not a typo, and a

@@ -25,7 +25,7 @@ COMMAND_DESCRIPTIONS = {
     "/btw": "Ask a side question about the conversation, even mid-turn: answered in an overlay without tools, never added to history",
     "/steer": "Send a correction to the running turn: read at the next tool boundary, nothing is interrupted",
     "/notifications": "Notify (bell / OSC 9) when a long turn finishes or an approval waits (/notifications on|off|bell|osc9)",
-    "/memories": "List saved facts: yours and this project's, with the date each was saved",
+    "/memories": "List saved facts: yours and this project's, with the date each was saved; /memories consolidate merges overlapping ones after showing you the change",
     "/episodes": "List saved episodes (past decisions, corrections and fixes) that can be recalled here",
     "/forget": "Delete a saved fact or episode (/forget <key>, user:<key> for the user-wide fact, or an episode id)",
     "/undo": "Revert the agent's file changes from its last turn that edited files",
@@ -55,6 +55,7 @@ COMMAND_ARGS = {
     "/export": "[path]",
     "/compact": "[auto <1-100 | off>]",
     "/notifications": "[on | off | bell | osc9]",
+    "/memories": "[consolidate]",
     "/forget": "<key | user:<key> | episode id>",
     "/undo": "[force]",
 }

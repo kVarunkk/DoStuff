@@ -795,7 +795,7 @@ class _ListedFacts:
     async def list_all(self, user_id, scope=None, working_dir=None):
         self.listed.append(working_dir)
         return [f for f in sorted(self.facts, key=lambda f: -f["updated_at_epoch"])
-                if f["scope"] == "user" or f.get("working_dir") == working_dir]
+                if (f["scope"] == "user" or f.get("working_dir") == working_dir) and scope in (None, f["scope"])]
 
 
 def _listed_fact(key, value, scope="user", updated=0, working_dir=None):
@@ -849,7 +849,93 @@ def test_memories_consolidate_hint_above_30(tui):
             app.memory_store = many
             await app._show_memories()
             hint = next(t for t in _texts(app) if "31 user facts" in t)
-            assert "merg" in hint.lower() and "dostuff memory consolidate" not in hint  # no command until T2.7
+            assert "merg" in hint.lower() and "/memories consolidate" in hint  # named once T2.7 shipped it
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+class _MergeFacts(_ListedFacts):
+    """_ListedFacts that records the merge's writes."""
+
+    def __init__(self, facts):
+        super().__init__(facts)
+        self.writes = []
+
+    async def upsert_fact(self, user_id, fact, scope="user", working_dir=None):
+        self.writes.append(("upsert", fact["key"], fact["value"], scope))
+
+    async def delete(self, user_id, key, scope="user", working_dir=None):
+        self.writes.append(("delete", key, scope))
+        return True
+
+
+def _merge_scenario(cli_tui, monkeypatch, *, mode=None, reply=True):
+    """Run /memories consolidate against two overlapping user facts; returns (store, model calls, confirms, texts)."""
+    from litellm import ModelResponse
+    from dostuff.helpers.memory import consolidate
+    calls, confirms = [], []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return ModelResponse(choices=[{"message": {"role": "assistant", "content":
+                                       '{"user": [{"key": "editor", "value": "Neovim, for everything"}], "project": []}'}}])
+    monkeypatch.setattr(consolidate, "acompletion", fake_acompletion)
+    store = _MergeFacts([_listed_fact("editor", "Neovim", updated=2), _listed_fact("editor_pref", "Uses Neovim", updated=1)])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="memories-merge")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            app.memory_store = store
+            if mode:
+                app.permissions.mode = mode
+
+            async def confirm(details, question, yes, no):
+                confirms.append(details)
+                return reply
+            app.adapter.confirm = confirm
+            before = len(_texts(app))
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/memories consolidate"))
+            await _until(pilot, lambda: any(w in t for t in _texts(app)[before:]
+                                            for w in ("Merged:", "Nothing was changed", "auto mode")))
+            texts = _texts(app)
+            await app._cleanup_and_save_session()
+            return texts
+
+    return store, calls, confirms, asyncio.run(scenario())
+
+
+def test_memories_consolidate_confirm_writes(tui, monkeypatch):
+    store, calls, confirms, texts = _merge_scenario(tui, monkeypatch)
+    assert len(calls) == 1 and len(confirms) == 1
+    assert "- editor_pref: Uses Neovim" in confirms[0] and "~ editor: Neovim  →  Neovim, for everything" in confirms[0]
+    assert store.writes == [("upsert", "editor", "Neovim, for everything", "user"), ("delete", "editor_pref", "user")]
+    assert any("Merged: 1 removed, 1 changed." in t for t in texts)
+
+
+def test_memories_consolidate_declined_writes_nothing(tui, monkeypatch):
+    store, calls, confirms, texts = _merge_scenario(tui, monkeypatch, reply=False)
+    assert len(confirms) == 1 and store.writes == [] and any("Nothing was changed" in t for t in texts)
+
+
+def test_memories_consolidate_auto_mode_refuses_without_waiting(tui, monkeypatch):
+    store, calls, confirms, texts = _merge_scenario(tui, monkeypatch, mode="auto")
+    assert confirms == [] and calls == [] and store.writes == []
+    assert any("auto mode" in t and "dostuff memory consolidate --yes" in t for t in texts)
+
+
+def test_memories_names_consolidate_above_30(tui):
+    cli_tui = tui
+    store = _ListedFacts([_listed_fact(f"k{i:02d}", "v", updated=i) for i in range(31)])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="memories-hint-cmd")
+        async with app.run_test():
+            await app._backend_ready.wait()
+            app.memory_store = store
+            await app._show_memories()
+            assert any("31 user facts" in t and "/memories consolidate" in t for t in _texts(app))
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

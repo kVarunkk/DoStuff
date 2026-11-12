@@ -384,3 +384,114 @@ def test_old_decision_beats_newer_less_similar_event(tmp_path, monkeypatch):
     found = asyncio.run(store.query(USER, "why do we use WAL journal mode for the sqlite database?", top_k=2,
                                     working_dir=PROJ_A))
     assert [e["id"] for e in found][0] == "decision"
+
+
+# Consolidate, memory recall T2.7 (REQ-4.3, D10) ----------------------------------------------------------------
+
+@pytest.fixture
+def facts_home(tmp_path, monkeypatch):
+    """A fake ~ and project with overlapping user facts, one project fact, and a fake model for the merge."""
+    from pathlib import Path
+
+    from dostuff import config as config_module
+    from dostuff.lib.memory import chroma
+
+    home, proj = tmp_path / "home", tmp_path / "proj"
+    (home / ".dostuff").mkdir(parents=True)
+    proj.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(proj)
+    monkeypatch.setattr(chroma, "_clients", {})
+    config_module.reset_config()
+    user = config_module.get_config().get_user_id()
+    store = sms.SemanticMemoryStore(persist_path=str(home / ".dostuff" / "data" / "chroma"))
+    clock = {"t": 1_000}
+    monkeypatch.setattr(sms.time, "time", lambda: clock["t"])
+    here = str(proj.resolve())
+    for key, value, scope in (("editor", "Neovim", {}), ("editor_pref", "Uses Neovim for everything", {}),
+                              ("name", "Nemo", {}), ("lint", "ruff", {"scope": "project", "working_dir": here})):
+        asyncio.run(store.upsert_fact(user, {"key": key, "value": value, "source": "user_message"}, **scope))
+    clock["t"] = 2_000
+    calls: list[str] = []
+    answer = {"text": '{"user": [{"key": "editor", "value": "Neovim, for everything"}, {"key": "name", "value": "Nemo"}],'
+                      ' "project": [{"key": "lint", "value": "ruff"}]}'}
+
+    async def fake_acompletion(**kwargs):
+        from litellm import ModelResponse
+        calls.append(kwargs["messages"][-1]["content"])
+        return ModelResponse(choices=[{"message": {"role": "assistant", "content": answer["text"]}}])
+    from dostuff.helpers.memory import consolidate
+    monkeypatch.setattr(consolidate, "acompletion", fake_acompletion)
+    yield {"home": home, "store": store, "user": user, "here": here, "calls": calls, "answer": answer}
+    config_module.reset_config()
+
+
+def _saved(home):
+    facts = asyncio.run(home["store"].list_all(home["user"], working_dir=home["here"]))
+    return {(f["scope"], f["key"]): (f["value"], f["created_at_epoch"], f["updated_at_epoch"]) for f in facts}
+
+
+def _consolidate(*args, input=None):
+    from typer.testing import CliRunner
+
+    from dostuff.cli import app
+    return CliRunner().invoke(app, ["memory", "consolidate", *args], input=input)
+
+
+def test_consolidate_shows_diff_writes_on_confirm(facts_home):
+    result = _consolidate(input="y\n")
+    assert result.exit_code == 0, result.output
+    assert "- editor_pref: Uses Neovim for everything" in result.output
+    assert "~ editor: Neovim  →  Neovim, for everything" in result.output
+    assert "Nemo" not in result.output and "Merged: 1 removed, 1 changed." in result.output  # unchanged: not listed
+    assert len(facts_home["calls"]) == 1 and "Uses Neovim for everything" in facts_home["calls"][0]
+    saved = _saved(facts_home)
+    assert ("user", "editor_pref") not in saved
+    assert saved[("user", "editor")] == ("Neovim, for everything", 1_000, 2_000)  # created kept, updated bumped
+    assert saved[("user", "name")] == ("Nemo", 1_000, 1_000)  # untouched
+    assert saved[("project", "lint")] == ("ruff", 1_000, 1_000)
+
+
+def test_consolidate_declined_writes_nothing(facts_home):
+    before = _saved(facts_home)
+    result = _consolidate(input="n\n")
+    assert result.exit_code == 1 and "- editor_pref" in result.output
+    assert _saved(facts_home) == before
+
+
+def test_consolidate_auto_mode_refuses_without_waiting(facts_home):
+    (facts_home["home"] / ".dostuff" / "config.yaml").write_text("permissions:\n  mode: auto\n")
+    from dostuff import config as config_module
+    config_module.reset_config()
+    before = _saved(facts_home)
+    result = _consolidate()  # no input: a prompt would abort, not wait
+    assert result.exit_code == 1 and "auto mode" in result.output and "--yes" in result.output
+    assert "[y/N]" not in result.output and facts_home["calls"] == []
+    assert _saved(facts_home) == before
+    # --yes is the user's own go-ahead, so it writes without asking even in auto mode
+    accepted = _consolidate("--yes")
+    assert accepted.exit_code == 0, accepted.output
+    assert "[y/N]" not in accepted.output and ("user", "editor_pref") not in _saved(facts_home)
+
+
+@pytest.mark.parametrize("bad", [
+    "Sure! Here are your facts.",                                                 # not JSON
+    '{"user": [], "project": [{"key": "lint", "value": "ruff"}]}',                 # every user fact gone
+    '{"user": [{"key": "editor", "value": ""}], "project": []}',                  # empty value
+    '{"user": [{"key": "a", "value": "x"}, {"key": "a", "value": "y"}], "project": [{"key": "lint", "value": "ruff"}]}',
+    '{"user": [{"key": "name", "value": "Nemo"}], "team": [], "project": [{"key": "lint", "value": "ruff"}]}',
+])
+def test_consolidate_bad_model_output_writes_nothing(facts_home, bad):
+    facts_home["answer"]["text"] = bad
+    before = _saved(facts_home)
+    result = _consolidate("--yes")
+    assert result.exit_code == 1 and "nothing was changed" in result.output.lower()
+    assert _saved(facts_home) == before
+
+
+def test_consolidate_nothing_to_merge(facts_home):
+    facts_home["answer"]["text"] = ('{"user": [{"key": "editor", "value": "Neovim"}, {"key": "editor_pref", "value": '
+                                    '"Uses Neovim for everything"}, {"key": "name", "value": "Nemo"}], '
+                                    '"project": [{"key": "lint", "value": "ruff"}]}')
+    result = _consolidate()
+    assert result.exit_code == 0 and "nothing to merge" in result.output.lower() and "[y/N]" not in result.output
