@@ -2284,6 +2284,7 @@ class DostuffTUI(App):
             else:
                 await self._ensure_embedding_model()
                 await self._warn_if_memory_index_damaged()
+                await self._hint_consolidate()
         except Exception as e:
             self._backend_error = str(e)
             self._append(f"Startup failed: {e}", msg_type="error")
@@ -2325,6 +2326,19 @@ class DostuffTUI(App):
                          "Memory recall is off until it succeeds (it retries on the next start).", msg_type="error")
             return
         self._append("Embedding model ready.", msg_type="system")
+
+    async def _hint_consolidate(self) -> None:
+        """Past 30 user facts, say once at startup that they can be merged (memory recall D10): every one of them
+        is sent with each session's first call. A failed count says nothing; /memories shows the same hint."""
+        assert self.memory_store is not None
+        try:
+            user_facts = len(await self.memory_store.list_all(self.user_id, scope="user"))
+        except Exception:
+            return
+        if user_facts > CONSOLIDATE_HINT_USER_FACTS:
+            self._append(f"You have {user_facts} user facts, and each session starts with them. "
+                         "/memories consolidate merges overlapping ones after showing you the change.",
+                         msg_type="system")
 
     async def _warn_if_memory_index_damaged(self) -> None:
         """Say the memory index needs a rebuild, instead of letting recall quietly return less.

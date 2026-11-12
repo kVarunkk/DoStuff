@@ -941,6 +941,27 @@ def test_memories_names_consolidate_above_30(tui):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("n, hinted", [(31, True), (30, False)])
+def test_startup_consolidate_hint_above_30(tui, monkeypatch, n, hinted):
+    """memory recall D10: startup says so once user facts pass 30 (project facts don't count)."""
+    cli_tui = tui
+    from dostuff.lib.memory import stores
+    facts = [_listed_fact(f"k{i:02d}", "v", updated=i) for i in range(n)]
+    facts += [_listed_fact(f"p{i}", "v", scope="project", working_dir=str(Path.cwd().resolve())) for i in range(5)]
+    monkeypatch.setattr(stores, "get_semantic_store", lambda: _ListedFacts(facts))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id=f"startup-hint-{n}")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            await pilot.pause()
+            shown = [t for t in _texts(app) if "user facts" in t and "/memories consolidate" in t]
+            assert bool(shown) is hinted and (not shown or f"{n} user facts" in shown[0])
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_embedding_model_download_reported(tui, monkeypatch):
     cli_tui = tui
     from dostuff.lib.memory import chroma
