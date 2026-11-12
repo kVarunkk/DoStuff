@@ -697,7 +697,7 @@
   },
   "search_memory": {
     "function": {
-      "description": "Searches long-term memory for saved facts and past episodes that the context doesn't show.\n\nYour fact list holds only the newest saved facts, and each turn recalls at most a few more facts and\nepisodes. Search when the lists say more are saved and the task may depend on them: before changing\nsomething that may have history (the database, CI, dependencies, the build, code style or project\nconventions), when an error looks familiar, or when the user asks what was decided or what they told\nyou. One search per topic; don't search for facts already listed.",
+      "description": "Searches long-term memory for saved facts and past episodes that the context doesn't show.\n\nYour fact list holds only the newest saved facts, and each turn recalls at most a few more facts and\nepisodes. Search when the lists say more are saved and the task may depend on them: before changing\nsomething that may have history (the database, CI, dependencies, the build, code style or project\nconventions), when an error looks familiar, or when the user asks what was decided or what they told\nyou. Don't search for facts already listed. A broad query can miss a fact that a narrower one finds: for\nseveral topics (say docstrings, exports and error handling), search each one.",
       "name": "search_memory",
       "parameters": {
         "properties": {
@@ -711,8 +711,15 @@
             "type": "string"
           },
           "limit": {
-            "description": "Results per kind, 1-10.",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Results per kind: facts 10 by default, up to 20; episodes 5, up to 10."
           },
           "query": {
             "description": "What to look for, in plain words, e.g. 'code style preferences' or 'sqlite database is locked'.",

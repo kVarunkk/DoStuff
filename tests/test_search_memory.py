@@ -186,3 +186,37 @@ def test_prompts_point_at_search_memory():
     from dostuff.helpers.agent.turn_context import EPISODES_MORE_NOTE
     assert "search_memory" in MEMORY_INSTRUCTIONS
     assert "search_memory" in EPISODES_MORE_NOTE
+
+
+def _many_overflow_facts(env, n):
+    """52 newer fillers fill the 50; then `n` older style facts, all past the cap and all matching 'code style'."""
+    fill = [(f"hobby_{i:02d}", f"Keeps a collection of {i} houseplants", 1 + i % 40, "user", None) for i in range(52)]
+    style = [(f"style_{i:02d}", f"Python code style rule {i}: format helper functions this way", 200 + i, "user", None)
+             for i in range(n)]
+    _facts(env.facts, fill + style)
+
+
+def test_search_memory_facts_default_ten_up_to_twenty(env):
+    _many_overflow_facts(env, 25)
+    assert _search("Python code style rules", kind="facts").count("code style rule") == 10
+    assert _search("Python code style rules", kind="facts", limit=20).count("code style rule") == 20
+    assert _search("Python code style rules", kind="facts", limit=99).count("code style rule") == 20
+
+
+def test_search_memory_episodes_default_five_up_to_ten(env):
+    _episodes(env.episodes, [(f"ep_{i}", "LEARNING", f"Test lesson {i}: tests sharing a database file broke",
+                              f"Lesson {i}.", 10 + i, env.a) for i in range(12)])
+    assert _search("tests sharing a database file", kind="episodes").count("Test lesson") == 5
+    assert _search("tests sharing a database file", kind="episodes", limit=99).count("Test lesson") == 10
+
+
+def test_search_memory_says_when_more_facts_match(env):
+    _many_overflow_facts(env, 25)
+    out = _search("Python code style rules", kind="facts", limit=20)  # 25 match, 20 shown
+    assert "More facts match" in out and "narrower" in out
+
+
+def test_search_memory_no_more_note_when_all_matches_shown(env):
+    _many_overflow_facts(env, 3)
+    out = _search("Python code style rules", kind="facts")
+    assert out.count("code style rule") == 3 and "More facts match" not in out
