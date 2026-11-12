@@ -4982,9 +4982,9 @@ def test_btw_cold_session(btw_tui, monkeypatch):
         app = cli_tui.DostuffTUI(session_id="btw-cold")
         original = app._build_turn_context
 
-        async def build(text, prompt_context=""):
+        async def build(text, prompt_context="", history=None):
             built.append(text)
-            return await original(text, prompt_context)
+            return await original(text, prompt_context, history)
         app._build_turn_context = build  # type: ignore[method-assign]
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -6608,6 +6608,44 @@ class _Recall:
 def _use_recall(app):
     app.memory_store, app.episodic_store = _Recall(hits=False), _Recall()
     return app.episodic_store
+
+
+class _RankedRecall:
+    """An episode store with five matches for every prompt, best first, honouring `exclude_ids` (memory recall D8)."""
+
+    def __init__(self):
+        self.excluded = []
+
+    async def query(self, *args, exclude_ids=(), **kwargs):
+        self.excluded.append(set(exclude_ids))
+        return [{"id": f"e{i}", "event_type": "LEARNING", "anchor_event": f"anchor {i}", "summary": "s",
+                 "created_at_iso": "2026-11-12"} for i in range(1, 6) if f"e{i}" not in set(exclude_ids)][:3]
+
+    async def list_all(self, *args, **kwargs):
+        return []
+
+
+def test_episode_not_repeated_across_turns(turn_tui):
+    """REQ-3.1: the second prompt's bundle leaves out what the first one's still shows."""
+    cli_tui, seen = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-episodes")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()  # the real stores load in the background; replace them after
+            app.memory_store, app.episodic_store = _Recall(hits=False), _RankedRecall()
+            _submit(app, cli_tui, "why is the db locked?")
+            await _until(pilot, lambda: not app._turn_in_progress and len(seen) == 1)
+            _submit(app, cli_tui, "and the tests?")
+            await _until(pilot, lambda: not app._turn_in_progress and len(seen) == 2)
+            first, second = seen[0]["history"][-2], seen[1]["history"][-2]
+            assert first["meta"]["episode_ids"] == ["e1", "e2", "e3"]
+            assert app.episodic_store.excluded[1] == {"e1", "e2", "e3"}
+            assert second["meta"]["episode_ids"] == ["e4", "e5"] and "anchor 1" not in second["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
 
 
 def test_run_turn_appends_context_then_prompt(turn_tui):

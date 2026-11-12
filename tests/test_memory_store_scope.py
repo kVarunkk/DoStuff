@@ -290,3 +290,41 @@ def test_reembed_only_with_repair(legacy_home):
     from dostuff.cli import app
     result = CliRunner().invoke(app, ["memory", "check", "--reembed"])
     assert result.exit_code == 2 and "--reembed goes with 'repair'" in result.output
+
+
+# Episode store, memory recall T2.1 (REQ-3.1, D8) ----------------------------------------------------------------
+
+@pytest.fixture
+def episodes(tmp_path, monkeypatch):
+    from dostuff.lib.memory import chroma
+    from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+
+    monkeypatch.setattr(chroma, "_clients", {})
+    store = EpisodicMemoryStore(persist_path=str(tmp_path / "chroma"))
+    now = 1_800_000_000
+    monkeypatch.setattr("dostuff.lib.memory.episodic_memory_store.time.time", lambda: now)
+    # 15 episodes about the same lock, so every one of them matches the query
+    asyncio.run(store.add([{
+        "id": f"ep{i:02d}", "vector_text": f"tests hang with database is locked; fixed by busy timeout (note {i})",
+        "metadata": {"user_id": USER, "working_dir": PROJ_A, "event_type": "LEARNING", "created_at_epoch": now,
+                     "created_at_iso": "2027-01-15T08:00:00", "anchor_event": f"lock fix {i}", "summary": "s",
+                     "tags": "[]", "session_id": "s0"},
+    } for i in range(15)]))
+    return store
+
+
+def _ids(found):
+    return [e["id"] for e in found]
+
+
+def test_episode_query_returns_ids(episodes):
+    found = asyncio.run(episodes.query(USER, "database is locked", top_k=3, working_dir=PROJ_A))
+    assert len(found) == 3 and all(e["id"].startswith("ep") for e in found)
+
+
+def test_episode_query_excludes_before_top_k(episodes):
+    best = _ids(asyncio.run(episodes.query(USER, "database is locked", top_k=12, working_dir=PROJ_A)))
+    # Excluding the 10 best still fills top_k from the rest: exclusion happens before the cut, not after
+    found = _ids(asyncio.run(episodes.query(USER, "database is locked", top_k=3, working_dir=PROJ_A,
+                                            exclude_ids=set(best[:10]))))
+    assert len(found) == 3 and not set(found) & set(best[:10])

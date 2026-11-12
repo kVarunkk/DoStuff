@@ -32,7 +32,7 @@ def test_without_chromadb_memory_is_off(no_chroma):
 
     base, _, _ = build_base_instructions()
     assert "save_memory" not in base and "## Long-term memory" not in base
-    turn = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="user"))
+    turn = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="user")).text
     assert "<environment>" in turn and "<other_relevant_facts>" not in turn
 
     from dostuff.tools.memory.save_memory import save_memory
@@ -123,7 +123,7 @@ def test_turn_context_recalls_episodes_not_facts_below_the_cap():
     """Below the facts step's cap every fact is in the facts step already (memory recall D3): no fact query."""
     from dostuff.agent.instructions import build_turn_context
     facts, episodes = _Store([FACT]), _Store([EPISODE])
-    text = asyncio.run(build_turn_context("hi", memory_store=facts, episodic_store=episodes, user_id="u"))
+    text = asyncio.run(build_turn_context("hi", memory_store=facts, episodic_store=episodes, user_id="u")).text
     assert "facts>" not in text and "- name: Ada" not in text
     assert "  • [EVENT] shipped\n    Summary: it went out\n    Date: 2026-11-05" in text
     assert [c[0] for c in facts.calls] == ["list_all"]
@@ -135,7 +135,7 @@ def test_turn_context_recall_failure_is_reported(monkeypatch):
     said = []
     monkeypatch.setattr(instructions, "emit", lambda text, kind: said.append((text, kind)))
     text = asyncio.run(instructions.build_turn_context(
-        "hi", memory_store=_Store(error=RuntimeError("no model")), episodic_store=_Store([EPISODE]), user_id="u"))
+        "hi", memory_store=_Store(error=RuntimeError("no model")), episodic_store=_Store([EPISODE]), user_id="u")).text
     assert said == [("Memory recall failed, continuing without it: no model", "error")]
     assert "<environment>" in text and "<past_episodes>" not in text
 
@@ -143,7 +143,7 @@ def test_turn_context_recall_failure_is_reported(monkeypatch):
 def test_turn_context_without_memory_stores():
     from dostuff.agent.instructions import build_turn_context
     text = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="u",
-                                          prompt_context="from a hook"))
+                                          prompt_context="from a hook")).text
     assert "<environment>" in text and "from a hook" in text
     assert "<other_relevant_facts>" not in text and "<past_episodes>" not in text
 
@@ -151,7 +151,7 @@ def test_turn_context_without_memory_stores():
 def test_hook_context_rides_the_bundle():
     from dostuff.agent.instructions import build_turn_context
     text = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="u",
-                                          prompt_context="from a hook"))
+                                          prompt_context="from a hook")).text
     assert text.startswith("<turn-context>\n") and text.endswith("[Context from UserPromptSubmit hooks]\nfrom a hook\n</turn-context>")
 
 

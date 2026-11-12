@@ -214,7 +214,7 @@ def _bundle(store, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(instructions, "build_environment_block", lambda: "")
     return asyncio.run(instructions.build_turn_context("which linter?", memory_store=store,
-                                                       episodic_store=NoEpisodes(), user_id=USER))
+                                                       episodic_store=NoEpisodes(), user_id=USER)).text
 
 
 def test_bundle_does_not_query_facts_below_cap(monkeypatch, tmp_path):
@@ -344,3 +344,70 @@ def test_fork_unchanged(agents, fake_model, agents_home):
     asyncio.run(go())
     texts = _user_texts(fake_model.calls_for("[F]")[0])
     assert texts.count("<user_facts") == 1 and "Neovim" not in texts
+
+
+# --- T2.1 episodes are not repeated within a session (REQ-3.1, D8) -------------------------------------------------
+
+class RankedEpisodes:
+    """EpisodicMemoryStore.query's contract: best first, at most top_k, never an id in `exclude_ids`."""
+
+    def __init__(self, n=5):
+        self.ranked = [{"id": f"e{i}", "score": 1 - i / 10, "event_type": "LEARNING", "anchor_event": f"anchor {i}",
+                        "summary": f"summary {i}", "tags": [], "created_at_iso": "2026-11-01T00:00:00",
+                        "session_id": "s0"} for i in range(1, n + 1)]
+        self.excluded = []
+
+    async def query(self, user_id, query_text, top_k=3, working_dir=None, exclude_ids=(), **kwargs):
+        self.excluded.append(set(exclude_ids))
+        return [e for e in self.ranked if e["id"] not in set(exclude_ids)][:top_k]
+
+
+def _turn(episodes, monkeypatch, tmp_path, history=()):
+    """The bundle for one prompt, given the session's working history so far."""
+    from dostuff.agent import instructions
+    from dostuff.helpers.agent.turn_context import delivered_episode_ids
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(instructions, "build_environment_block", lambda: "")
+    return asyncio.run(instructions.build_turn_context(
+        "why is the db locked?", memory_store=FakeFacts(), episodic_store=episodes, user_id=USER,
+        exclude_episode_ids=delivered_episode_ids(list(history))))
+
+
+def _exchange(ctx, prompt="why is the db locked?"):
+    return [make_context_step(ctx.text, ctx.episode_ids), {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "a long answer " * 50}]
+
+
+def test_episode_not_repeated_in_session(monkeypatch, tmp_path):
+    episodes = RankedEpisodes(5)
+    first = _turn(episodes, monkeypatch, tmp_path)
+    assert first.episode_ids == ("e1", "e2", "e3") and "anchor 1" in first.text
+    history = _exchange(first)
+
+    second = _turn(episodes, monkeypatch, tmp_path, history)
+    assert episodes.excluded[-1] == {"e1", "e2", "e3"}
+    assert second.episode_ids == ("e4", "e5")
+    assert "anchor 1" not in second.text and "anchor 4" in second.text
+
+    # Every match already in view: no episodes block at all
+    third = _turn(episodes, monkeypatch, tmp_path, history + _exchange(second))
+    assert third.episode_ids == () and "<past_episodes" not in third.text
+
+
+def test_episode_recalled_again_after_compaction(monkeypatch, tmp_path):
+    from dostuff.helpers.agent import manage_context
+
+    async def summarize(chunk, notes):
+        return "SUMMARY"
+    monkeypatch.setattr(manage_context, "_summarize", summarize)
+    episodes = RankedEpisodes(5)
+    first = _turn(episodes, monkeypatch, tmp_path)
+    history = _exchange(first) + _exchange(_turn(episodes, monkeypatch, tmp_path, _exchange(first)), "next")
+
+    # The real compaction: the first exchange (and its bundle) is summarised, the recent one is kept
+    kept, notes = asyncio.run(manage_context.compact_context(history, keep_token_budget=400, context_window=100_000))
+    assert notes == "SUMMARY" and len(kept) == 3
+    again = _turn(episodes, monkeypatch, tmp_path, kept)
+    # e1-e3 left the model's view with the summary, so they can come back; e4/e5 are still in the kept bundle
+    assert episodes.excluded[-1] == {"e4", "e5"}
+    assert again.episode_ids == ("e1", "e2", "e3")

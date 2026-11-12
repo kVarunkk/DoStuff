@@ -70,7 +70,9 @@ from dostuff.helpers.agent.side_question import (
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
-from dostuff.helpers.agent.turn_context import CONSOLIDATE_HINT_USER_FACTS, is_turn_context, make_context_step
+from dostuff.helpers.agent.turn_context import (
+    CONSOLIDATE_HINT_USER_FACTS, TurnContext, delivered_episode_ids, is_turn_context, make_context_step,
+)
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
 from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers
@@ -4231,9 +4233,9 @@ class DostuffTUI(App):
             return ForkContext(system_instruction=kept.system_instruction, compaction_notes=notes, history=history,
                                tool_names=list(kept.tool_names), session_hook_context=kept.session_hook_context)
         from dostuff.tools.definitions import default_tool_names  # pulls in the tools: after the first frame
-        bundle = await self._build_turn_context(question)
-        if bundle:  # this snapshot's copy only: a side question stores nothing
-            history.append(make_context_step(bundle))
+        bundle = await self._build_turn_context(question, history=history)
+        if bundle.text:  # this snapshot's copy only: a side question stores nothing
+            history.append(make_context_step(bundle.text, bundle.episode_ids))
         return ForkContext(system_instruction=self._build_instructions(), compaction_notes=notes,
                            history=history, tool_names=default_tool_names(),
                            session_hook_context=dict(self.session_hook_context))
@@ -4408,9 +4410,12 @@ class DostuffTUI(App):
     def _build_instructions(self) -> str:
         return build_system_instructions(self._system_instructions)
 
-    async def _build_turn_context(self, user_text: str, prompt_context: str = "") -> str:
+    async def _build_turn_context(self, user_text: str, prompt_context: str = "",
+                                  history: list | None = None) -> TurnContext:
+        """The bundle for this prompt; episodes already in `history` (the session's working history) are left out."""
         return await build_turn_context(user_text, memory_store=self.memory_store, episodic_store=self.episodic_store,
-                                        user_id=self.user_id, prompt_context=prompt_context)
+                                        user_id=self.user_id, prompt_context=prompt_context,
+                                        exclude_episode_ids=delivered_episode_ids(history or []))
 
     async def _run_turn(self, user_text: str, wake: bool = False) -> None:
         """One agent turn. `wake`: started by a background job ending (D15) — `user_text` is the pending
@@ -4498,10 +4503,10 @@ class DostuffTUI(App):
 
             # The turn's context rides ahead of the prompt as a hidden step, never in the system prompt (D5). A
             # wake turn has no prompt, but the environment moved and the notice text recalls like one
-            bundle = await self._build_turn_context(user_text, prompt_context)
-            if bundle:
+            bundle = await self._build_turn_context(user_text, prompt_context, working_history)
+            if bundle.text:
                 await append_step(
-                    make_context_step(bundle),
+                    make_context_step(bundle.text, bundle.episode_ids),
                     self.steps_history,
                     working_history,
                     self.current_session_history,

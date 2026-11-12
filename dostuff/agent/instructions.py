@@ -1,5 +1,6 @@
 """The system prompt and the per-turn context, shared by the TUI and `dostuff -p` (headless)."""
 import asyncio
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ from dostuff.helpers.agent.constants import (
 from dostuff.helpers.agent.environment_context import build_environment_block
 from dostuff.helpers.agent.load_identity import load_identity
 from dostuff.helpers.agent.load_project_instructions import load_project_instructions
-from dostuff.helpers.agent.turn_context import compose_turn_context, select_injected_facts
+from dostuff.helpers.agent.turn_context import TurnContext, compose_turn_context, select_injected_facts
 from dostuff.helpers.skills.discover_skills import model_visible_skills
 from dostuff.helpers.ui.emit import emit
 from dostuff.lib.memory import chroma
@@ -98,11 +99,13 @@ async def _overflow_facts(memory_store: Any, user_id: str, user_text: str, min_s
 
 
 async def build_turn_context(user_text: str, *, memory_store: Any, episodic_store: Any, user_id: str,
-                             prompt_context: str = "") -> str:
+                             prompt_context: str = "", exclude_episode_ids: Collection[str] = ()) -> TurnContext:
     """The turn's hidden context step: the environment block, saved facts past the facts step's cap and past
     episodes relevant to user_text, and UserPromptSubmit context.
 
-    The stores are None when long-term memory is off (chromadb not installed): no recall then.
+    `exclude_episode_ids` are the episodes this session's history already shows (`delivered_episode_ids`): they are
+    not recalled again (memory recall D8). The stores are None when long-term memory is off (chromadb not
+    installed): no recall then.
     """
     # Recall is extra context: if it fails (e.g. the embedding model could not be downloaded),
     # say so and run the turn without it
@@ -113,11 +116,14 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
         from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
         try:
             memories = await _overflow_facts(memory_store, user_id, user_text, MIN_FACT_SIMILARITY)
+            # Only when there is something to leave out: a first turn queries the store exactly as before
+            skip = {"exclude_ids": set(exclude_episode_ids)} if exclude_episode_ids else {}
             episodes = await episodic_store.query(
                 user_id=user_id,
                 query_text=user_text,
                 top_k=3,
                 working_dir=str(Path.cwd().resolve()) if get_config().episodic_scope == "project" else None,
+                **skip,
             )
         except Exception as e:
             emit(f"Memory recall failed, continuing without it: {e}", "error")
@@ -131,4 +137,5 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
     )
 
     environment = await asyncio.to_thread(build_environment_block)
-    return compose_turn_context(environment, memory_text, episodic_text, prompt_context)
+    return TurnContext(compose_turn_context(environment, memory_text, episodic_text, prompt_context),
+                       tuple(str(ep["id"]) for ep in episodes if ep.get("id")))

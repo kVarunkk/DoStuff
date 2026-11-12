@@ -118,6 +118,7 @@ class Seeded:
         os.chdir(self.projects[proj])
         try:
             text = await build_turn_context(prompt, memory_store=self.sem, episodic_store=self.epi, user_id=USER_ID)
+            text = getattr(text, "text", text)  # a TurnContext since memory recall T2.1, a str before (--worktree)
         finally:
             os.chdir(old)
         try:  # the facts step the loop sends before the call, when the commit under test has one

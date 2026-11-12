@@ -310,6 +310,29 @@ def headless(env, monkeypatch):
     return calls
 
 
+def test_headless_episode_not_repeated_in_session(env, headless, monkeypatch):
+    """REQ-3.1 in `dostuff -p --session`: a continued session doesn't recall what its history already shows."""
+    from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+    excluded = []
+
+    async def ranked(self, user_id, query_text, top_k=3, working_dir=None, exclude_ids=(), **kwargs):
+        excluded.append(set(exclude_ids))
+        return [{"id": f"e{i}", "event_type": "LEARNING", "anchor_event": f"anchor {i}", "summary": "s",
+                 "created_at_iso": "2026-11-12"} for i in range(1, 6) if f"e{i}" not in set(exclude_ids)][:top_k]
+    monkeypatch.setattr(EpisodicMemoryStore, "query", ranked)
+    first = runner.invoke(env["app"], ["-p", "why is the db locked?", "--json", "-q", "--permission-mode", "auto"])
+    assert first.exit_code == 0, first.output
+    bundle = [s for s in headless[-1]["history"] if (s.get("meta") or {}).get("episode_ids")]
+    assert [s["meta"]["episode_ids"] for s in bundle] == [["e1", "e2", "e3"]]
+
+    again = runner.invoke(env["app"], ["-p", "and the tests?", "-q", "--permission-mode", "auto",
+                                       "--session", json.loads(first.stdout)["session_id"]])
+    assert again.exit_code == 0, again.output
+    assert excluded[-1] == {"e1", "e2", "e3"}
+    bundles = [s for s in headless[-1]["history"] if (s.get("meta") or {}).get("episode_ids")]
+    assert bundles[-1]["meta"]["episode_ids"] == ["e4", "e5"] and "anchor 1" not in bundles[-1]["content"]
+
+
 def test_print_mode(env, headless):
     app = env["app"]
     result = runner.invoke(app, ["-p", "say hi"])

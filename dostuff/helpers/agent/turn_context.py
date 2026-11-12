@@ -65,9 +65,24 @@ def compose_turn_context(environment: str = "", facts: str = "", episodes: str =
     return _wrap(body) if body else ""
 
 
-def make_context_step(bundle: str) -> dict[str, Any]:
-    """The hidden step that carries a bundle."""
-    return {"role": "user", "content": bundle, "meta": {"hidden": TURN_CONTEXT_MARKER}}
+class TurnContext(NamedTuple):
+    """A built bundle: its text ("" when there is nothing to send) and the ids of the episodes it carries."""
+    text: str
+    episode_ids: tuple[str, ...] = ()
+
+
+def make_context_step(bundle: str, episode_ids: tuple[str, ...] = ()) -> dict[str, Any]:
+    """The hidden step that carries a bundle; `episode_ids` records which episodes it delivered (memory recall D8)."""
+    meta: dict[str, Any] = {"hidden": TURN_CONTEXT_MARKER}
+    if episode_ids:
+        meta["episode_ids"] = list(episode_ids)
+    return {"role": "user", "content": bundle, "meta": meta}
+
+
+def delivered_episode_ids(history: list) -> set[str]:
+    """Every episode a bundle in `history` delivered: the model still sees them, so they aren't recalled again
+    (REQ-3.1). Compaction drops old bundles, which lets their episodes come back."""
+    return {str(i) for step in history if is_turn_context(step) for i in step["meta"].get("episode_ids") or ()}
 
 
 def make_plan_mode_step(plan_mode: bool, text: str) -> dict[str, Any]:

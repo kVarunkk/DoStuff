@@ -304,3 +304,21 @@ def test_select_returns_overflow():
     shown, overflow = select_injected_facts(facts)
     assert [f["key"] for f in shown] == ["b", "a"] and overflow == []
     assert select_injected_facts([]) == ([], [])
+
+
+# --- memory recall T2.1: episodes already delivered in this session (D8) -------------------------------------------
+
+def test_context_step_records_episode_ids():
+    step = make_context_step("<turn-context>b</turn-context>", ("e1", "e2"))
+    assert step["meta"] == {"hidden": TURN_CONTEXT_MARKER, "episode_ids": ["e1", "e2"]}
+    # A bundle with no episodes is the step it always was
+    assert make_context_step("<turn-context>b</turn-context>")["meta"] == {"hidden": TURN_CONTEXT_MARKER}
+
+
+def test_delivered_episode_ids_every_bundle_in_history():
+    from dostuff.helpers.agent.turn_context import delivered_episode_ids, make_facts_step
+    history = [make_context_step("a", ("e1",)), {"role": "user", "content": "hi"},
+               make_context_step("b", ("e2", "e3")), make_context_step("c"), make_facts_step("f", ()),
+               {"role": "user", "content": "x", "meta": {"episode_ids": ["not-a-bundle"]}}]
+    assert delivered_episode_ids(history) == {"e1", "e2", "e3"}
+    assert delivered_episode_ids([]) == set()

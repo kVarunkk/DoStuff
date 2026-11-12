@@ -281,7 +281,7 @@ async def run_headless(
     from dostuff.config import get_config
     from dostuff.helpers.agent.append_step import append_step
     from dostuff.helpers.agent.file_mentions import expand_file_mentions
-    from dostuff.helpers.agent.turn_context import make_context_step
+    from dostuff.helpers.agent.turn_context import delivered_episode_ids, make_context_step
     from dostuff.helpers.mcp.load_mcp_config import load_mcp_config
     from dostuff.helpers.skills.custom_commands import discover_commands
     from dostuff.helpers.skills.skill_command import (
@@ -369,9 +369,10 @@ async def run_headless(
             raise _Refused(blocked_prompt_message(blocked))
         # The turn's context rides ahead of the prompt as a hidden step, never in the system prompt (D5)
         bundle = await build_turn_context(prompt, memory_store=get_semantic_store(), episodic_store=get_episodic_store(),
-                                          user_id=config.get_user_id(), prompt_context=prompt_context)
-        if bundle:
-            await append_step(make_context_step(bundle), steps_history, working_history,
+                                          user_id=config.get_user_id(), prompt_context=prompt_context,
+                                          exclude_episode_ids=delivered_episode_ids(working_history))
+        if bundle.text:
+            await append_step(make_context_step(bundle.text, bundle.episode_ids), steps_history, working_history,
                               current_session_history, session_id, store, "interactive_loop")
         await append_step({"role": "user", "content": content}, steps_history, working_history,
                           current_session_history, session_id, store, "interactive_loop")

@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 import json
 import math
 import time
+from collections.abc import Collection
 from typing import Any
 
 from dostuff.lib.memory.chroma import get_chroma_client
@@ -26,9 +27,10 @@ class EpisodicStore(ABC):
 
     @abstractmethod
     async def query(
-        self, user_id: str, query_text: str, top_k: int = 3, working_dir: str | None = None
+        self, user_id: str, query_text: str, top_k: int = 3, working_dir: str | None = None, *,
+        exclude_ids: Collection[str] = (),
     ) -> list[dict]:
-        """Retrieve relevant and recent episodic memories."""
+        """Retrieve relevant and recent episodic memories, each with its `id`, none of `exclude_ids`."""
         ...
 
 
@@ -59,11 +61,17 @@ class EpisodicMemoryStore(EpisodicStore):
         working_dir: str | None = None,
         recency_decay_rate: float = 0.05,
         min_similarity: float = MIN_EPISODE_SIMILARITY,
+        *,
+        exclude_ids: Collection[str] = (),
     ) -> list[dict]:
         """Episodes of this user from any past session (only from `working_dir` when given),
         at least `min_similarity` similar to `query_text`, re-ranked with an exponential recency decay.
+
+        `exclude_ids` (the episodes this session already shows the model, memory recall D8) are dropped before the
+        top_k cut, and the candidate pool grows by as many, so excluding never leaves fewer results than exist.
         """
-        candidate_k = max(top_k * 3, 10)
+        excluded = set(exclude_ids)
+        candidate_k = max(top_k * 3, 10) + len(excluded)
         where: dict[str, Any] = {"user_id": user_id}
         if working_dir:
             where = {"$and": [{"user_id": user_id}, {"working_dir": working_dir}]}
@@ -73,10 +81,12 @@ class EpisodicMemoryStore(EpisodicStore):
 
         results = await asyncio.to_thread(_query)
 
+        raw_ids = results.get("ids") or [[]]
         raw_docs = results.get("documents") or [[]]
         raw_metas = results.get("metadatas") or [[]]
         raw_dists = results.get("distances") or [[]]
 
+        ids = raw_ids[0] if raw_ids and raw_ids[0] is not None else []
         documents = raw_docs[0] if raw_docs and raw_docs[0] is not None else []
         metadatas = raw_metas[0] if raw_metas and raw_metas[0] is not None else []
         distances = raw_dists[0] if raw_dists and raw_dists[0] is not None else []
@@ -84,7 +94,9 @@ class EpisodicMemoryStore(EpisodicStore):
         now_epoch = int(time.time())
         scored_episodes: list[dict[str, Any]] = []
 
-        for doc, meta, dist in zip(documents, metadatas, distances):
+        for episode_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
+            if episode_id in excluded:
+                continue
             # 1. Convert cosine distance to vector similarity score [0, 1]
             similarity = 1.0 - dist
             if similarity < min_similarity:
@@ -103,6 +115,7 @@ class EpisodicMemoryStore(EpisodicStore):
             tags = json.loads(raw_tags) if isinstance(raw_tags, str) else []
 
             scored_episodes.append({
+                "id": str(episode_id),
                 "score": hybrid_score,
                 "event_type": meta.get("event_type"),
                 "anchor_event": meta.get("anchor_event"),
