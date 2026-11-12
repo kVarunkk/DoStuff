@@ -87,21 +87,21 @@ OVERFLOW_FACTS_RECALLED = 3
 
 
 async def _overflow_facts(memory_store: Any, user_id: str, user_text: str, min_similarity: float,
-                          exclude: Collection[str] = ()) -> list[dict]:
-    """The facts the facts step leaves out that are most relevant to `user_text`, none whose `fact_entry` is in
-    `exclude` (already in view); [] below the cap, with no query at all (every fact is in the facts step already).
-    Never another project's facts."""
+                          exclude: Collection[str] = ()) -> tuple[list[dict], int]:
+    """(recalled, hidden): the facts the facts step leaves out that are most relevant to `user_text`, none whose
+    `fact_entry` is in `exclude` (already in view), and how many it leaves out in all; ([], 0) below the cap, with no
+    query at all (every fact is in the facts step already). Never another project's facts."""
     here = str(Path.cwd().resolve())
     facts = await memory_store.list_all(user_id, working_dir=here)
     _, overflow = select_injected_facts(facts)
     if not overflow:
-        return []
+        return [], 0
     wanted = {(f["scope"], f["key"]) for f in overflow}
     ranked = await memory_store.query(user_id, query_text=user_text, top_k=len(facts),
                                       min_similarity=min_similarity, working_dir=here)
     skip = set(exclude)
     return [m for m in ranked
-            if (m.get("scope", "user"), m["key"]) in wanted and fact_entry(m) not in skip][:OVERFLOW_FACTS_RECALLED]
+            if (m.get("scope", "user"), m["key"]) in wanted and fact_entry(m) not in skip][:OVERFLOW_FACTS_RECALLED],         len(overflow)
 
 
 async def build_turn_context(user_text: str, *, memory_store: Any, episodic_store: Any, user_id: str,
@@ -118,6 +118,7 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
     # Recall is extra context: if it fails (e.g. the embedding model could not be downloaded),
     # say so and run the turn without it
     memories: list[dict] = []
+    hidden_facts = 0
     episodes: list[dict] = []
     stats: dict[str, Any] = {}
     counts: EpisodeCounts | None = None
@@ -126,7 +127,7 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
         from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
         working_dir = str(Path.cwd().resolve()) if get_config().episodic_scope == "project" else None
         try:
-            memories = await _overflow_facts(memory_store, user_id, user_text, MIN_FACT_SIMILARITY,
+            memories, hidden_facts = await _overflow_facts(memory_store, user_id, user_text, MIN_FACT_SIMILARITY,
                                              exclude=exclude_fact_ids)
             # Only when there is something to leave out: the store sees no exclusion on a first turn
             skip = {"exclude_ids": set(exclude_episode_ids)} if exclude_episode_ids else {}
@@ -140,7 +141,7 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
             )
         except Exception as e:
             emit(f"Memory recall failed, continuing without it: {e}", "error")
-            memories, episodes = [], []
+            memories, episodes, hidden_facts = [], [], 0
         if episodes:
             counts = EpisodeCounts(len(episodes), stats.get("matching"),
                                    await _saved_episodes(episodic_store, user_id, working_dir))
@@ -153,7 +154,8 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
     )
 
     environment = await asyncio.to_thread(build_environment_block)
-    return TurnContext(compose_turn_context(environment, memory_text, episodic_text, prompt_context, counts),
+    return TurnContext(compose_turn_context(environment, memory_text, episodic_text, prompt_context, counts,
+                                            hidden_facts),
                        tuple(str(ep["id"]) for ep in episodes if ep.get("id")),
                        tuple(fact_entry(m) for m in memories))
 

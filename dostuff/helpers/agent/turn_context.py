@@ -77,14 +77,22 @@ def _episodes_block(episodes: str, counts: EpisodeCounts | None) -> str:
     return f"<past_episodes{attrs}>\n{episodes}" + (f"\n{EPISODES_MORE_NOTE}" if more else "") + "\n</past_episodes>"
 
 
+# Repeated every turn while facts are hidden: the same advice in the facts step sits far back in a long session,
+# and weaker models stopped searching before code and commits (glm-5.3-flash S10: 2/7 searches)
+HIDDEN_FACTS_NOTE = ("Saved facts the facts step leaves out. Before writing code or committing, call search_memory "
+                     "for the user's preferences and this project's conventions on that work.")
+
+
 def compose_turn_context(environment: str = "", facts: str = "", episodes: str = "", prompt_context: str = "",
-                         episode_counts: EpisodeCounts | None = None) -> str:
+                         episode_counts: EpisodeCounts | None = None, hidden_facts: int = 0) -> str:
     """The bundle: the sections that have text, in a fixed order; "" when none has (D4). Does no I/O.
 
-    `facts` are the saved facts past the facts step's cap that match the prompt (memory recall D3)."""
+    `facts` are the saved facts past the facts step's cap that match the prompt (memory recall D3); `hidden_facts`
+    counts every fact past the cap, matching or not."""
     sections = [
         environment,
         f"<other_relevant_facts>\n{facts}\n</other_relevant_facts>" if facts else "",
+        f'<hidden_facts count="{hidden_facts}">{HIDDEN_FACTS_NOTE}</hidden_facts>' if hidden_facts > 0 else "",
         _episodes_block(episodes, episode_counts) if episodes else "",
         f"{PROMPT_CONTEXT_HEADER}\n{prompt_context}" if prompt_context else "",
     ]
@@ -92,13 +100,14 @@ def compose_turn_context(environment: str = "", facts: str = "", episodes: str =
     return _wrap(body) if body else ""
 
 
-_MEMORY_SECTIONS = re.compile(r"<other_relevant_facts>.*?</other_relevant_facts>|<past_episodes\b.*?</past_episodes>",
+_MEMORY_SECTIONS = re.compile(r"<other_relevant_facts>.*?</other_relevant_facts>|<hidden_facts\b.*?</hidden_facts>"
+                              r"|<past_episodes\b.*?</past_episodes>",
                               re.DOTALL)
 
 
 def memory_sections(step: dict) -> list[str]:
     """The parts of a turn-context step that are long-term memory (memory recall D11): all of a facts step, or a
-    bundle's `<other_relevant_facts>` and `<past_episodes>` sections; [] for anything else."""
+    bundle's `<other_relevant_facts>`, `<hidden_facts>` and `<past_episodes>` sections; [] for anything else."""
     if not is_turn_context(step):
         return []
     text = step.get("content") if isinstance(step.get("content"), str) else ""

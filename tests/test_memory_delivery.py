@@ -246,6 +246,26 @@ def test_over_cap_newest_50_and_overflow_in_bundle(monkeypatch, tmp_path):
     assert q["min_similarity"] == 0.25 and q["working_dir"] == here and q["scope"] is None
     assert "<other_relevant_facts>\n- k02: v2\n- linter: ruff\n- k00: v0\n</other_relevant_facts>" in bundle
     assert "k54" not in bundle and "<relevant_user_facts>" not in bundle
+    # Every turn, not just the facts step: 56 saved, 50 in the facts step
+    assert hidden_facts_note(6) in bundle
+
+
+def hidden_facts_note(n):
+    from dostuff.helpers.agent.turn_context import HIDDEN_FACTS_NOTE
+    return f'<hidden_facts count="{n}">{HIDDEN_FACTS_NOTE}</hidden_facts>'
+
+
+def test_hidden_facts_note_only_past_the_cap(monkeypatch, tmp_path):
+    from dostuff.helpers.agent.turn_context import HIDDEN_FACTS_NOTE
+    assert "search_memory" in HIDDEN_FACTS_NOTE and "code" in HIDDEN_FACTS_NOTE and "commit" in HIDDEN_FACTS_NOTE
+    store = QueryRecorder()
+    for i in range(50):
+        store.add(f"k{i:02d}", f"v{i}", updated=i)
+    assert "<hidden_facts" not in _bundle(store, monkeypatch, tmp_path)
+    store.add("k50", "v50", updated=50)
+    store.ranked = []  # nothing matches the prompt: the note still says facts are hidden
+    bundle = _bundle(store, monkeypatch, tmp_path)
+    assert hidden_facts_note(1) in bundle and "<other_relevant_facts>" not in bundle
 
 
 # T1.12 typed subagents get facts, read-only (D14) -----------------------------------------------------------
