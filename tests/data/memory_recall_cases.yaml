@@ -97,6 +97,24 @@ episodes:
     days_old: 55
     anchor: Keep tinykv single-file; no server mode
     summary: Scope decision.
+  # Recent everyday events about the same SQLite file (memory recall T2.3): they compete with the old WAL decision,
+  # so a flat decay pushes the decision out of the top 3 and D9's per-type decay keeps it
+  - type: EVENT
+    days_old: 1
+    anchor: Opened tinykv.db in DB Browser for SQLite to look at the rows
+    summary: Inspected the kv table by hand.
+  - type: EVENT
+    days_old: 2
+    anchor: Copied the tinykv.db SQLite file to a backup folder
+    summary: Backup before a refactor.
+  - type: EVENT
+    days_old: 4
+    anchor: The tinykv.db SQLite database grew to 40 MB in the load test
+    summary: Load test with a million keys.
+  - type: EVENT
+    days_old: 5
+    anchor: Ran VACUUM on the tinykv.db SQLite database
+    summary: Reclaimed space after the load test.
   B:
   - type: DECISION
     days_old: 40
@@ -528,5 +546,15 @@ cases:
 - project: A
   prompt: Why are line endings LF in this repo?
   must_recall: ['e:gitattributes']
+  must_not_recall: []
+  group: decay
+- project: A
+  prompt: Should the store keep using WAL journal mode for SQLite?
+  must_recall: ['e:WAL']
+  must_not_recall: []
+  group: decay
+- project: A
+  prompt: What did we decide about the SQLite database?
+  must_recall: ['e:WAL']
   must_not_recall: []
   group: decay

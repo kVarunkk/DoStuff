@@ -110,6 +110,16 @@ class Seeded:
                 })
             await self.epi.add(batch)
 
+    def raw_similarity(self, prompt: str, proj: str, anchor_part: str) -> float:
+        """Undecayed similarity of the project's episode whose anchor contains `anchor_part`: tells a miss in the
+        ranking (decay, top-k) from one the embedding never matched (below the floor whatever the ranking)."""
+        got = self.epi._collection.query(query_texts=[prompt], n_results=min(self.epi._collection.count(), 100),
+                                         where={"$and": [{"user_id": USER_ID},
+                                                         {"working_dir": str(self.projects[proj])}]})
+        sims = [1 - d for m, d in zip(got["metadatas"][0], got["distances"][0])
+                if anchor_part.lower() in str(m.get("anchor_event", "")).lower()]
+        return round(max(sims, default=0.0), 3)
+
     async def delivered(self, prompt: str, proj: str) -> tuple[set[str], list[str]]:
         """Fact keys and episode lines the model would see for `prompt` in project `proj`."""
         from dostuff.agent.instructions import build_turn_context
@@ -153,10 +163,12 @@ async def evaluate(seeded: Seeded) -> list[dict[str, Any]]:
         leaks = sorted({f"f:{f}" for f in facts if seeded.fact_owner.get(f, proj) != proj}
                        | {f"e:{a[:30]}" for a, owner in seeded.episode_owner.items()
                           if owner != proj and any(a in e for e in episodes)})
-        rows.append({**case,
-                     "miss": [m for m in case["must_recall"] if not hit(m, facts, episodes)],
+        miss = [m for m in case["must_recall"] if not hit(m, facts, episodes)]
+        rows.append({**case, "miss": miss,
                      "false": [m for m in case["must_not_recall"] if hit(m, facts, episodes)],
-                     "leaks": leaks})
+                     "leaks": leaks,
+                     "miss_similarity": {m: seeded.raw_similarity(case["prompt"], proj, m.partition(":")[2])
+                                         for m in miss if m.startswith("e:")}})
     return rows
 
 
@@ -223,9 +235,10 @@ def test_case_file_is_well_formed():
 
 
 # Raised by memory recall phase 1 (facts step): every fact below the cap is delivered and project facts stay in their
-# project (was 18 / 15 / 10 / 8 on package-structure before). Never lower one without a sweep table in the PR that
-# says why.
-FLOORS = {"fact recall": 34, "episode recall": 15}
+# project (was 18 / 15 / 10 / 8 on package-structure before). Episode recall 15 -> 17 with T2.3: two decay cases
+# (an old WAL decision among newer SQLite events) that the flat decay ranked out. Never lower one without a sweep
+# table in the PR that says why.
+FLOORS = {"fact recall": 34, "episode recall": 17}
 CEILINGS = {"false hits": 2, "leaky cases": 0}
 
 
@@ -239,6 +252,17 @@ def test_recall_at_least_baseline(results, measure):
 def test_misses_at_most_baseline(results, measure):
     got, total = summary(results)[measure]
     assert got <= CEILINGS[measure], f"{measure} {got}/{total} > {CEILINGS[measure]}\n\n{table(results)}"
+
+
+def test_decay_group_nothing_lost_in_ranking(results):
+    """Memory recall T2.3 (D9): an old DECISION or LEARNING that matches the prompt is recalled despite its age. A
+    miss is allowed only when the episode never cleared the similarity floor, which no decay rate can fix (the
+    embedding doesn't link the prompt to it, e.g. "line endings LF" vs ".gitattributes eol=lf", 0.18)."""
+    from dostuff.lib.memory.episodic_memory_store import MIN_EPISODE_SIMILARITY
+    lost = [(r["prompt"], m, s) for r in results if r["group"] == "decay"
+            for m, s in r["miss_similarity"].items() if s >= MIN_EPISODE_SIMILARITY]
+    assert not lost, f"recalled above the floor but ranked out: {lost}"
+    assert all(not r["false"] and not r["leaks"] for r in results if r["group"] == "decay")
 
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -343,3 +343,44 @@ def test_episode_count_per_project(episodes):
     assert asyncio.run(episodes.count(USER, working_dir=PROJ_A)) == 15
     assert asyncio.run(episodes.count(USER, working_dir=PROJ_B)) == 0
     assert asyncio.run(episodes.count("someone-else")) == 0
+
+
+# Episode decay by type, memory recall T2.3 (REQ-3.3, D9) -------------------------------------------------------
+
+def test_decay_table():
+    from dostuff.lib.memory.episodic_memory_store import RECENCY_DECAY, decay_rate
+    assert RECENCY_DECAY == {"DECISION": 0.0, "PREFERENCE": 0.0, "CORRECTION": 0.0, "LEARNING": 0.01, "EVENT": 0.05}
+    assert decay_rate("EVENT") == 0.05 and decay_rate("DECISION") == 0.0
+    assert decay_rate("SOMETHING_NEW") == 0.05 and decay_rate(None) == 0.05  # unknown: the old flat rate
+
+
+def test_tie_within_002_broken_by_recency():
+    from dostuff.lib.memory.episodic_memory_store import rank_episodes
+    day = 86_400
+    eps = [{"id": "old", "score": 0.71, "created_at_epoch": 10 * day},
+           {"id": "new", "score": 0.70, "created_at_epoch": 50 * day},   # within 0.02 of "old": newer goes first
+           {"id": "far", "score": 0.60, "created_at_epoch": 90 * day},   # newest, but not a tie
+           {"id": "mid", "score": 0.695, "created_at_epoch": 30 * day}]  # in the top tie too
+    assert [e["id"] for e in rank_episodes(eps)] == ["new", "mid", "old", "far"]
+
+
+def test_old_decision_beats_newer_less_similar_event(tmp_path, monkeypatch):
+    from dostuff.lib.memory import chroma
+    from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+
+    monkeypatch.setattr(chroma, "_clients", {})
+    store = EpisodicMemoryStore(persist_path=str(tmp_path / "chroma"))
+    now = 1_800_000_000
+    monkeypatch.setattr("dostuff.lib.memory.episodic_memory_store.time.time", lambda: now)
+
+    def ep(i, text, kind, days):
+        return {"id": i, "vector_text": text, "metadata": {
+            "user_id": USER, "working_dir": PROJ_A, "event_type": kind, "created_at_epoch": now - days * 86_400,
+            "created_at_iso": "x", "anchor_event": text, "summary": "s", "tags": "[]", "session_id": "s0"}}
+    asyncio.run(store.add([
+        ep("decision", "Decided to enable WAL journal mode for the SQLite session database", "DECISION", 300),
+        ep("event", "The SQLite database file was copied to a backup folder", "EVENT", 1),
+    ]))
+    found = asyncio.run(store.query(USER, "why do we use WAL journal mode for the sqlite database?", top_k=2,
+                                    working_dir=PROJ_A))
+    assert [e["id"] for e in found][0] == "decision"

@@ -18,6 +18,30 @@ MIN_EPISODE_SIMILARITY = 0.3
 # but different moment ~0.6
 DUPLICATE_EPISODE_SIMILARITY = 0.85
 
+# Recency decay per day by event type (memory recall D9): a decision, preference or correction stays true until it is
+# replaced, a lesson stays useful for months (half-life ~70 days), an event is about now (half-life ~14 days). With
+# one flat 0.05 a 150-day-old lesson kept 0.06% of its similarity and lost to anything newer.
+RECENCY_DECAY = {"DECISION": 0.0, "PREFERENCE": 0.0, "CORRECTION": 0.0, "LEARNING": 0.01, "EVENT": 0.05}
+UNKNOWN_TYPE_DECAY = 0.05
+# Scores this close are a tie, and the newer episode goes first
+TIE_SCORE = 0.02
+
+
+def decay_rate(event_type: Any) -> float:
+    return RECENCY_DECAY.get(str(event_type or "").upper(), UNKNOWN_TYPE_DECAY)
+
+
+def rank_episodes(episodes: list[dict]) -> list[dict]:
+    """Best score first; a run of episodes within TIE_SCORE of the run's best is ordered newest first."""
+    by_score = sorted(episodes, key=lambda e: float(e["score"]), reverse=True)
+    ranked: list[dict] = []
+    while by_score:
+        top = float(by_score[0]["score"])
+        tied = [e for e in by_score if top - float(e["score"]) <= TIE_SCORE]
+        by_score = by_score[len(tied):]
+        ranked += sorted(tied, key=lambda e: int(e.get("created_at_epoch") or 0), reverse=True)
+    return ranked
+
 
 class EpisodicStore(ABC):
     @abstractmethod
@@ -59,14 +83,15 @@ class EpisodicMemoryStore(EpisodicStore):
         query_text: str,
         top_k: int = 3,
         working_dir: str | None = None,
-        recency_decay_rate: float = 0.05,
+        recency_decay_rate: float | None = None,
         min_similarity: float = MIN_EPISODE_SIMILARITY,
         *,
         exclude_ids: Collection[str] = (),
         stats: dict[str, Any] | None = None,
     ) -> list[dict]:
         """Episodes of this user from any past session (only from `working_dir` when given),
-        at least `min_similarity` similar to `query_text`, re-ranked with an exponential recency decay.
+        at least `min_similarity` similar to `query_text`, re-ranked with an exponential recency decay
+        whose rate depends on the event type (`RECENCY_DECAY`; `recency_decay_rate` forces one rate for all).
 
         `exclude_ids` (the episodes this session already shows the model, memory recall D8) are dropped before the
         top_k cut, and the candidate pool grows by as many, so excluding never leaves fewer results than exist.
@@ -111,7 +136,8 @@ class EpisodicMemoryStore(EpisodicStore):
             days_old = max(0.0, (now_epoch - created_at_epoch) / 86400.0)
 
             # 3. Apply exponential time decay: Score = Similarity * e^(-decay * days)
-            time_factor = math.exp(-recency_decay_rate * days_old)
+            rate = decay_rate(meta.get("event_type")) if recency_decay_rate is None else recency_decay_rate
+            time_factor = math.exp(-rate * days_old)
             hybrid_score = similarity * time_factor
 
             raw_tags = meta.get("tags")
@@ -125,6 +151,7 @@ class EpisodicMemoryStore(EpisodicStore):
                 "summary": meta.get("summary"),
                 "tags": tags,
                 "created_at_iso": meta.get("created_at_iso"),
+                "created_at_epoch": created_at_epoch,
                 "session_id": meta.get("session_id"),
             })
 
@@ -133,9 +160,8 @@ class EpisodicMemoryStore(EpisodicStore):
             pool_full = len(ids) >= candidate_k and bool(distances) and 1.0 - distances[-1] >= min_similarity
             stats["matching"] = f"{len(scored_episodes)}{'+' if pool_full else ''}"
 
-        # Sort by hybrid score descending and pick top_k
-        scored_episodes.sort(key=lambda x: float(x["score"]), reverse=True)
-        return scored_episodes[:top_k]
+        # Best decayed score first, ties newest first (D9), then top_k
+        return rank_episodes(scored_episodes)[:top_k]
 
     async def find_duplicate(
         self, user_id: str, vector_text: str, working_dir: str, min_similarity: float = DUPLICATE_EPISODE_SIMILARITY
