@@ -156,7 +156,7 @@ In the TUI:
 | `dostuff setup`          | Pick a model, save its API key, write `~/.dostuff/config.yaml` (runs automatically on first launch) |
 | `dostuff config`         | Show resolved config paths and values           |
 | `dostuff doctor`         | Health check: config, API key, MCP, data dir; prints a fix for each problem |
-| `dostuff memory [check\|repair] [-y]` | Check that long-term memory's indexes can answer queries (`check`, the default), or rebuild a broken one after "Error finding id" errors (`repair`, which backs it up to `~/.dostuff/data/chroma-backups/` first). Stop dostuff before repairing |
+| `dostuff memory [check\|repair\|consolidate] [-y]` | Check that long-term memory's indexes can answer queries (`check`, the default), or rebuild a broken one after "Error finding id" errors (`repair`, which backs it up to `~/.dostuff/data/chroma-backups/` first). Stop dostuff before repairing. `consolidate` asks the model to merge your overlapping saved facts and this project's, shows the change, and writes it only when you say yes (`-y` skips the question; in auto mode it refuses without `-y`) |
 | `dostuff resume [<id>]`  | Resume the latest session started in the current directory (or the given one; a unique ID prefix is enough). `--fork` resumes a copy, `--worktree` moves it into a new worktree |
 | `dostuff sessions [--all] [-n N]` | List sessions in the current directory with their title or first prompt (`--all`: every directory) |
 | `dostuff sessions rename <id> <title>` | Name a session |
@@ -221,7 +221,7 @@ In the TUI:
 | `/export [<path>]` | Save this session as Markdown (default `dostuff-session-<id>.md`) |
 | `/undo [force]` | Revert the agent's file changes from its last file-editing turn |
 | `/compact`    | Manually trigger context compaction; `/compact auto <1-100\|off>` sets the auto-compaction threshold for this session |
-| `/memories`   | List your saved facts and this project's, newest first, with the date each was saved |
+| `/memories`   | List your saved facts and this project's, newest first, with the date each was saved; `/memories consolidate` merges overlapping facts after showing you the change (not in auto mode) |
 | `/episodes`   | List saved episodes (decisions, corrections, fixes) recalled here, newest first |
 | `/forget <key or id>` | Delete a saved fact (by key: this project's first, `user:<key>` for the user-wide one) or episode (by the id shown in `/episodes`) |
 | `Ctrl+Q`      | Graceful quit with save             |
