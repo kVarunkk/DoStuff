@@ -108,16 +108,20 @@ def memory_sections(step: dict) -> list[str]:
 
 
 class TurnContext(NamedTuple):
-    """A built bundle: its text ("" when there is nothing to send) and the ids of the episodes it carries."""
+    """A built bundle: its text ("" when there is nothing to send) and the episodes and overflow facts it carries."""
     text: str
     episode_ids: tuple[str, ...] = ()
+    fact_ids: tuple[str, ...] = ()  # `fact_entry` of each fact in `<other_relevant_facts>`
 
 
-def make_context_step(bundle: str, episode_ids: tuple[str, ...] = ()) -> dict[str, Any]:
-    """The hidden step that carries a bundle; `episode_ids` records which episodes it delivered (memory recall D8)."""
+def make_context_step(bundle: str, episode_ids: tuple[str, ...] = (), fact_ids: tuple[str, ...] = ()) -> dict[str, Any]:
+    """The hidden step that carries a bundle; `episode_ids` and `fact_ids` record which episodes and overflow facts
+    it delivered, so later turns don't send them again (memory recall D8)."""
     meta: dict[str, Any] = {"hidden": TURN_CONTEXT_MARKER}
     if episode_ids:
         meta["episode_ids"] = list(episode_ids)
+    if fact_ids:
+        meta["fact_ids"] = list(fact_ids)
     return {"role": "user", "content": bundle, "meta": meta}
 
 
@@ -125,6 +129,12 @@ def delivered_episode_ids(history: list) -> set[str]:
     """Every episode a bundle in `history` delivered: the model still sees them, so they aren't recalled again
     (REQ-3.1). Compaction drops old bundles, which lets their episodes come back."""
     return {str(i) for step in history if is_turn_context(step) for i in step["meta"].get("episode_ids") or ()}
+
+
+def delivered_fact_ids(history: list) -> set[str]:
+    """Every overflow fact a bundle in `history` delivered, as `fact_entry`: not recalled again while in view. A new
+    value is a new entry, so it is sent; compaction drops old bundles, which lets their facts come back."""
+    return {str(i) for step in history if is_turn_context(step) for i in step["meta"].get("fact_ids") or ()}
 
 
 def make_plan_mode_step(plan_mode: bool, text: str) -> dict[str, Any]:
@@ -156,11 +166,16 @@ def delivered_plan_mode(history: list) -> bool:
     return False
 
 
+def fact_entry(fact: dict) -> str:
+    """`scope:key:sha1(value)[:8]`: one fact as delivered, so a new value under the same key is a different entry.
+    8 hex digits: the hash only tells one value of a key from the next, not a secret from a guess."""
+    value_hash = hashlib.sha1(str(fact["value"]).encode("utf-8")).hexdigest()[:8]
+    return f"{fact.get('scope', 'user')}:{fact['key']}:{value_hash}"
+
+
 def facts_fingerprint(facts: list[dict]) -> tuple[str, ...]:
-    """What a facts step delivered: sorted `scope:key:sha1(value)[:8]`, so any save, update or forget changes it."""
-    return tuple(sorted(
-        f"{f.get('scope', 'user')}:{f['key']}:{hashlib.sha1(str(f['value']).encode('utf-8')).hexdigest()[:8]}"
-        for f in facts))
+    """What a facts step delivered: its facts' `fact_entry`, sorted, so any save, update or forget changes it."""
+    return tuple(sorted(fact_entry(f) for f in facts))
 
 
 def make_facts_step(text: str, fingerprint: tuple[str, ...]) -> dict[str, Any]:

@@ -13,7 +13,7 @@ from dostuff.helpers.agent.environment_context import build_environment_block
 from dostuff.helpers.agent.load_identity import load_identity
 from dostuff.helpers.agent.load_project_instructions import load_project_instructions
 from dostuff.helpers.agent.turn_context import (
-    EpisodeCounts, TurnContext, compose_turn_context, select_injected_facts,
+    EpisodeCounts, TurnContext, compose_turn_context, fact_entry, select_injected_facts,
 )
 from dostuff.helpers.skills.discover_skills import model_visible_skills
 from dostuff.helpers.ui.emit import emit
@@ -86,9 +86,11 @@ def build_system_instructions(base: str) -> str:
 OVERFLOW_FACTS_RECALLED = 3
 
 
-async def _overflow_facts(memory_store: Any, user_id: str, user_text: str, min_similarity: float) -> list[dict]:
-    """The facts the facts step leaves out that are most relevant to `user_text`; [] below the cap, with no
-    query at all (every fact is in the facts step already). Never another project's facts."""
+async def _overflow_facts(memory_store: Any, user_id: str, user_text: str, min_similarity: float,
+                          exclude: Collection[str] = ()) -> list[dict]:
+    """The facts the facts step leaves out that are most relevant to `user_text`, none whose `fact_entry` is in
+    `exclude` (already in view); [] below the cap, with no query at all (every fact is in the facts step already).
+    Never another project's facts."""
     here = str(Path.cwd().resolve())
     facts = await memory_store.list_all(user_id, working_dir=here)
     _, overflow = select_injected_facts(facts)
@@ -97,17 +99,21 @@ async def _overflow_facts(memory_store: Any, user_id: str, user_text: str, min_s
     wanted = {(f["scope"], f["key"]) for f in overflow}
     ranked = await memory_store.query(user_id, query_text=user_text, top_k=len(facts),
                                       min_similarity=min_similarity, working_dir=here)
-    return [m for m in ranked if (m.get("scope", "user"), m["key"]) in wanted][:OVERFLOW_FACTS_RECALLED]
+    skip = set(exclude)
+    return [m for m in ranked
+            if (m.get("scope", "user"), m["key"]) in wanted and fact_entry(m) not in skip][:OVERFLOW_FACTS_RECALLED]
 
 
 async def build_turn_context(user_text: str, *, memory_store: Any, episodic_store: Any, user_id: str,
-                             prompt_context: str = "", exclude_episode_ids: Collection[str] = ()) -> TurnContext:
+                             prompt_context: str = "", exclude_episode_ids: Collection[str] = (),
+                             exclude_fact_ids: Collection[str] = ()) -> TurnContext:
     """The turn's hidden context step: the environment block, saved facts past the facts step's cap and past
     episodes relevant to user_text, and UserPromptSubmit context.
 
     `exclude_episode_ids` are the episodes this session's history already shows (`delivered_episode_ids`): they are
-    not recalled again (memory recall D8). The stores are None when long-term memory is off (chromadb not
-    installed): no recall then.
+    not recalled again (memory recall D8), and nor are the overflow facts in `exclude_fact_ids`
+    (`delivered_fact_ids`). The stores are None when long-term memory is off (chromadb not installed): no recall
+    then.
     """
     # Recall is extra context: if it fails (e.g. the embedding model could not be downloaded),
     # say so and run the turn without it
@@ -120,7 +126,8 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
         from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
         working_dir = str(Path.cwd().resolve()) if get_config().episodic_scope == "project" else None
         try:
-            memories = await _overflow_facts(memory_store, user_id, user_text, MIN_FACT_SIMILARITY)
+            memories = await _overflow_facts(memory_store, user_id, user_text, MIN_FACT_SIMILARITY,
+                                             exclude=exclude_fact_ids)
             # Only when there is something to leave out: the store sees no exclusion on a first turn
             skip = {"exclude_ids": set(exclude_episode_ids)} if exclude_episode_ids else {}
             episodes = await episodic_store.query(
@@ -147,7 +154,8 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
 
     environment = await asyncio.to_thread(build_environment_block)
     return TurnContext(compose_turn_context(environment, memory_text, episodic_text, prompt_context, counts),
-                       tuple(str(ep["id"]) for ep in episodes if ep.get("id")))
+                       tuple(str(ep["id"]) for ep in episodes if ep.get("id")),
+                       tuple(fact_entry(m) for m in memories))
 
 
 async def _saved_episodes(episodic_store: Any, user_id: str, working_dir: str | None) -> int | None:
