@@ -93,6 +93,7 @@ class EpisodicMemoryStore(EpisodicStore):
         *,
         exclude_ids: Collection[str] = (),
         stats: dict[str, Any] | None = None,
+        event_type: str | None = None,
     ) -> list[dict]:
         """Episodes of this user from any past session (only from `working_dir` when given),
         at least `min_similarity` similar to `query_text`, re-ranked with an exponential recency decay
@@ -100,14 +101,18 @@ class EpisodicMemoryStore(EpisodicStore):
 
         `exclude_ids` (the episodes this session already shows the model, memory recall D8) are dropped before the
         top_k cut, and the candidate pool grows by as many, so excluding never leaves fewer results than exist.
+        `event_type`, when given, keeps only episodes of that type.
         `stats`, when given, gets `matching`: how many candidates passed the floor before the cut, as text, with a
         "+" when the whole pool matched (only a pool is fetched, so there may be more).
         """
         excluded = set(exclude_ids)
         candidate_k = max(top_k * 3, 10) + len(excluded)
-        where: dict[str, Any] = {"user_id": user_id}
+        conditions: list[dict[str, Any]] = [{"user_id": user_id}]
         if working_dir:
-            where = {"$and": [{"user_id": user_id}, {"working_dir": working_dir}]}
+            conditions.append({"working_dir": working_dir})
+        if event_type:
+            conditions.append({"event_type": event_type})
+        where: dict[str, Any] = conditions[0] if len(conditions) == 1 else {"$and": conditions}
 
         def _query() -> Any:
             return safe_query(self._collection, query_text, candidate_k, where)

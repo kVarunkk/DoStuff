@@ -220,3 +220,66 @@ def test_search_memory_no_more_note_when_all_matches_shown(env):
     _many_overflow_facts(env, 3)
     out = _search("Python code style rules", kind="facts")
     assert out.count("code style rule") == 3 and "More facts match" not in out
+
+
+# event_type filter ----------------------------------------------------------------------------------------------
+# "What did I correct you on?" names a kind of memory, not its words: a correction worded by what happened ("removed
+# an any from the cart reducer") scores under the 0.2 floor against it. With the type given, every episode of that
+# type is ranked without the floor; today's unfiltered results follow, so a wrong type never loses what the search
+# would have found without it (offline benchmark plan/2026-11-11-memory-recall/t2_search, 2026-11-13).
+
+def _corrections_and_others(env):
+    _episodes(env.episodes, [
+        ("c_any", "CORRECTION", "User removed an any I added to the cart reducer",
+         "Use a discriminated union for cart actions instead.", 20, env.a),
+        ("c_log", "CORRECTION", "User rewrote my f-string log lines as structlog key-values",
+         "log.info('loaded', rows=n), not log.info(f'loaded {n} rows').", 25, env.a),
+        ("c_other", "CORRECTION", "User changed my tab indentation to spaces in project B", "Spaces.", 25, env.b),
+        ("d_uv", "DECISION", "Switched the pipeline from Poetry to uv", "Lock resolution took minutes.", 10, env.a),
+        ("d_css", "DECISION", "Dropped Tailwind for CSS modules", "Class lists got unreadable.", 12, env.a),
+    ])
+
+
+def test_search_memory_event_type_ranks_that_type_without_the_floor(env):
+    _corrections_and_others(env)
+    query = "things the user corrected me on"
+    plain = _search(query, kind="episodes")
+    assert "cart reducer" not in plain  # under the floor without the filter: the case this exists for
+    out = _search(query, kind="episodes", event_type="CORRECTION")
+    assert "cart reducer" in out and "structlog" in out
+    assert "project B" not in out  # still this project's episodes only
+    typed = out.split("Other episodes")[0]
+    assert "Poetry" not in typed and "Tailwind" not in typed  # the typed section holds that type only
+
+
+def test_search_memory_wrong_event_type_keeps_the_unfiltered_results(env):
+    _episodes(env.episodes, [
+        ("l_lock", "LEARNING", "sqlite3 'database is locked' fixed with a busy timeout",
+         "Two writers raised database is locked; timeout=5 fixed it.", 40, env.a),
+        ("d_mit", "DECISION", "Chose the MIT licence", "We picked MIT over Apache-2.0.", 5, env.a),
+    ])
+    query = "sqlite database is locked error"
+    assert "busy timeout" in _search(query, kind="episodes")
+    out = _search(query, kind="episodes", event_type="DECISION")  # wrong type for this question
+    assert "busy timeout" in out and "Other episodes" in out
+    assert out.count("busy timeout") == 1  # shown once, not in both sections
+
+
+def test_search_memory_event_type_none_saved(env):
+    _corrections_and_others(env)
+    out = _search("what did we learn", kind="episodes", event_type="LEARNING")
+    assert "No LEARNING episodes" in out
+
+
+def test_search_memory_event_type_rejects_bad_input(env):
+    with pytest.raises(ValueError, match="event_type"):
+        _search("anything", kind="episodes", event_type="IDEA")
+    with pytest.raises(ValueError, match="episodes"):
+        _search("anything", kind="facts", event_type="DECISION")
+
+
+def test_episode_store_query_filters_by_event_type(env):
+    _corrections_and_others(env)
+    got = asyncio.run(env.episodes.query(USER, "cart reducer", top_k=10, working_dir=env.a, min_similarity=-1.0,
+                                         recency_decay_rate=0.0, event_type="DECISION"))
+    assert {e["event_type"] for e in got} == {"DECISION"} and len(got) == 2

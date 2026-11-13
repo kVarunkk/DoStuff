@@ -701,6 +701,24 @@
       "name": "search_memory",
       "parameters": {
         "properties": {
+          "event_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "DECISION",
+                  "PREFERENCE",
+                  "CORRECTION",
+                  "EVENT",
+                  "LEARNING"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Episodes of one type first: DECISION, LEARNING, CORRECTION, EVENT or PREFERENCE. Use it when the question asks for a kind of memory (what was decided, what we learned, what the user corrected), whose wording may share no words with the query. The other matches follow."
+          },
           "kind": {
             "description": "'facts', 'episodes' or 'all'.",
             "enum": [
