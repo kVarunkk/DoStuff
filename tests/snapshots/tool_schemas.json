@@ -697,7 +697,7 @@
   },
   "search_memory": {
     "function": {
-      "description": "Searches long-term memory for saved facts and past episodes that the context doesn't show.\n\nYour fact list holds only the newest saved facts, and each turn recalls at most a few more facts and\nepisodes. Search when the lists say more are saved and the task may depend on them: before changing\nsomething that may have history (the database, CI, dependencies, the build, code style or project\nconventions), when an error looks familiar, or when the user asks what was decided or what they told\nyou. Don't search for facts already listed. A broad query can miss a fact that a narrower one finds: for\nseveral topics (say docstrings, exports and error handling), search each one.",
+      "description": "Searches long-term memory for saved facts and past episodes that the context doesn't show.\n\nYour fact list holds only the newest saved facts, and each turn recalls at most a few more facts and\nepisodes. Search when the lists say more are saved and the task may depend on them: before changing\nsomething that may have history (the database, CI, dependencies, the build, code style or project\nconventions), when an error looks familiar, or when the user asks what was decided or what they told\nyou. Don't search for facts already listed. A broad query can miss a fact that a narrower one finds: for\nseveral topics (say docstrings, exports and error handling), search each one. Episodes (not facts) each have\na type: to find a kind of episode, such as what was decided, what was learned or what the user corrected,\npass event_type as well as the query.",
       "name": "search_memory",
       "parameters": {
         "properties": {

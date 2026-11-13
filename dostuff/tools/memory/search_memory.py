@@ -26,7 +26,9 @@ async def search_memory(query: str, kind: Literal["all", "facts", "episodes"] = 
     something that may have history (the database, CI, dependencies, the build, code style or project
     conventions), when an error looks familiar, or when the user asks what was decided or what they told
     you. Don't search for facts already listed. A broad query can miss a fact that a narrower one finds: for
-    several topics (say docstrings, exports and error handling), search each one.
+    several topics (say docstrings, exports and error handling), search each one. Episodes (not facts) each have
+    a type: to find a kind of episode, such as what was decided, what was learned or what the user corrected,
+    pass event_type as well as the query.
 
     Args:
         query: What to look for, in plain words, e.g. 'code style preferences' or
