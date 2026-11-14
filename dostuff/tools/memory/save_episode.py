@@ -52,7 +52,7 @@ async def save_episode(
     # Each store's own band: a keyword score runs lower than an embedding's for the same rewording
     duplicate = float(getattr(store, "DUPLICATE", DUPLICATE_EPISODE_SIMILARITY))
     similar = float(getattr(store, "SIMILAR", SIMILAR_EPISODE_SIMILARITY))
-    saved = await store.nearest(user_id, vector_text, working_dir, min_similarity=similar)
+    saved = await store.nearest(user_id, vector_text, working_dir)  # its own default floor is `similar`
     # A near-copy is the same moment; in the band below that, a reworded moment and a related one look alike to the
     # embedding, so the model decides (memory recall D10). Only between episodes of one type: a LEARNING next to the
     # EVENT it explains is the lesson the event lacked, and the judge took them for one moment (live eval S7)
