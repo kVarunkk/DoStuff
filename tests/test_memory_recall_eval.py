@@ -76,6 +76,14 @@ class Seeded:
         if backend == "sqlite":
             from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
             self.sem, self.epi = SQLiteFactStore(str(root / "memory.db")), SQLiteEpisodeStore(str(root / "memory.db"))
+        elif backend == "hybrid":
+            from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore, HybridFactStore
+            self.sem = HybridFactStore(str(root / "memory.db"), str(root / "memory-index"))
+            self.epi = HybridEpisodeStore(str(root / "memory.db"), str(root / "memory-index"))
+            self.embedding = CachedEmbedding(self.sem.embedding._collection._embedding_function)
+            for store in (self.sem.embedding, self.epi.embedding):
+                store._collection._embedding_function = self.embedding
+            self.embedding.warm([c["prompt"] for c in data["cases"]])
         else:
             from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
             from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
@@ -351,7 +359,7 @@ def _main() -> None:
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--sweep", action="store_true", help="also print the similarity-floor sweep")
-    ap.add_argument("--backend", choices=("chroma", "sqlite"), default="chroma", help="memory.backend to evaluate")
+    ap.add_argument("--backend", choices=("chroma", "sqlite", "hybrid"), default="chroma", help="memory.backend to evaluate")
     args = ap.parse_args()
     seeded = Seeded(Path(tempfile.mkdtemp(prefix="recall_eval_")), load_cases(), backend=args.backend)
 

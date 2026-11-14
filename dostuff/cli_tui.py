@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     from dostuff.lib.mcp.mcp_client import MCPClient
     from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
     from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
+    from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore, HybridFactStore
     from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
 
 MCP_CONNECT_TIMEOUT_S = 150.0  # covers the 120 s OAuth browser callback
@@ -2047,8 +2048,8 @@ class DostuffTUI(App):
         )
         # Memory stores and the MCP client need litellm / chromadb / mcp; _load_backend sets them
         # after the first frame, then sets _backend_ready
-        self.memory_store: "SemanticMemoryStore | SQLiteFactStore | None" = None
-        self.episodic_store: "EpisodicMemoryStore | SQLiteEpisodeStore | None" = None
+        self.memory_store: "SemanticMemoryStore | SQLiteFactStore | HybridFactStore | None" = None
+        self.episodic_store: "EpisodicMemoryStore | SQLiteEpisodeStore | HybridEpisodeStore | None" = None
         self.mcp_client: "MCPClient | None" = None
         self._backend_ready = asyncio.Event()
         self._backend_error = ""
@@ -2374,6 +2375,10 @@ class DostuffTUI(App):
                 if memory_backend() == "chroma":  # the sqlite store has no embedding model and no vector index
                     await self._ensure_embedding_model()
                     await self._warn_if_memory_index_damaged()
+                else:
+                    from dostuff.lib.memory.chroma import chroma_available
+                    if memory_backend() == "hybrid" and chroma_available():
+                        await self._ensure_embedding_model()  # no repair tool checks its index yet
                 await self._hint_consolidate()
         except Exception as e:
             self._backend_error = str(e)

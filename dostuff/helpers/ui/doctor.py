@@ -68,7 +68,7 @@ def doctor_checks() -> list[Check]:
                         else "MCP servers: none configured (optional; `dostuff mcp add`)", None))
     checks += [Check(warning, False) for warning in key_warnings(servers)]
     checks.append(Check(f"Data dir: {cfg.data_dir}" + ("" if cfg.data_dir.exists() else " (created on first run)"), None))
-    if memory_backend() == "sqlite":
+    if memory_backend() == "sqlite" or (memory_backend() == "hybrid" and not chroma_available()):
         checks.append(Check("Long-term memory: on (sqlite keyword search, memory.db)", None))
     elif not chroma_available():
         checks.append(Check(f"Long-term memory: off, chromadb not installed (optional; `{MEMORY_INSTALL_HINT}`)", None))

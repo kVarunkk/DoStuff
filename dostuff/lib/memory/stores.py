@@ -13,6 +13,7 @@ from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
 
 if TYPE_CHECKING:
     from dostuff.lib.mcp.mcp_tool_registry_store import MCPToolRegistryStore
+    from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore, HybridFactStore
     from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
 
 
@@ -42,21 +43,48 @@ def _sqlite_episodes(db_path: str) -> "SQLiteEpisodeStore":
     return SQLiteEpisodeStore(db_path)
 
 
+@lru_cache(maxsize=None)
+def _hybrid_facts(db_path: str, index_path: str) -> "HybridFactStore":
+    from dostuff.lib.memory.hybrid_memory_store import HybridFactStore
+    return HybridFactStore(db_path, index_path)
+
+
+@lru_cache(maxsize=None)
+def _hybrid_episodes(db_path: str, index_path: str) -> "HybridEpisodeStore":
+    from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore
+    return HybridEpisodeStore(db_path, index_path)
+
+
+def _index_path() -> str:
+    """The hybrid backend's embedding index: its own Chroma dir, so a chroma-backend store beside it is never mixed in."""
+    return str(get_config().get_data_dir() / "memory-index")
+
+
+def _keywords_only() -> bool:
+    """sqlite, or hybrid without chromadb (then it is sqlite: same memory.db, no embedding side)."""
+    backend = memory_backend()
+    return backend == "sqlite" or (backend == "hybrid" and not chroma.chroma_available())
+
+
 def _sqlite_path() -> str:
     data_dir = get_config().get_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     return str(data_dir / "memory.db")
 
 
-def get_semantic_store() -> "SemanticMemoryStore | SQLiteFactStore | None":
-    if memory_backend() == "sqlite":
+def get_semantic_store() -> "SemanticMemoryStore | SQLiteFactStore | HybridFactStore | None":
+    if _keywords_only():
         return _sqlite_facts(_sqlite_path())
+    if memory_backend() == "hybrid":
+        return _hybrid_facts(_sqlite_path(), _index_path())
     return _semantic(_persist_path()) if chroma.chroma_available() else None
 
 
-def get_episodic_store() -> "EpisodicMemoryStore | SQLiteEpisodeStore | None":
-    if memory_backend() == "sqlite":
+def get_episodic_store() -> "EpisodicMemoryStore | SQLiteEpisodeStore | HybridEpisodeStore | None":
+    if _keywords_only():
         return _sqlite_episodes(_sqlite_path())
+    if memory_backend() == "hybrid":
+        return _hybrid_episodes(_sqlite_path(), _index_path())
     return _episodic(_persist_path()) if chroma.chroma_available() else None
 
 

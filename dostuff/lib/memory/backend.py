@@ -4,11 +4,12 @@ from dostuff.lib.memory import chroma
 
 
 def memory_backend() -> str:
-    """`chroma` (embeddings, needs the `memory` extra) or `sqlite` (FTS5 keyword search, built in)."""
+    """`chroma` (embeddings, needs the `memory` extra), `sqlite` (FTS5 keyword search, built in) or `hybrid` (sqlite
+    plus an embedding index when the extra is installed)."""
     from dostuff.config import get_config
     return str(getattr(get_config(), "memory_backend", "chroma"))
 
 
 def memory_available() -> bool:
-    """True if long-term memory works: the sqlite backend always, the chroma one with chromadb installed."""
-    return memory_backend() == "sqlite" or chroma.chroma_available()
+    """True if long-term memory works: sqlite and hybrid always, chroma with chromadb installed."""
+    return memory_backend() in ("sqlite", "hybrid") or chroma.chroma_available()
