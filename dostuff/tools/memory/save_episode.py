@@ -45,17 +45,20 @@ async def save_episode(
         raise ValueError("Both anchor_event and summary must be non-empty.")
     store = get_episodic_store()
     if store is None:
-        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}).")
+        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}, or set memory.backend: sqlite).")
     user_id = get_config().get_user_id()
     working_dir = str(Path.cwd().resolve())
     vector_text = f"- EVENT TYPE: {event_type}\n  - ANCHOR EVENT: {anchor_event}\n  - SUMMARY: {summary}"
-    saved = await store.nearest(user_id, vector_text, working_dir)
+    # Each store's own band: a keyword score runs lower than an embedding's for the same rewording
+    duplicate = float(getattr(store, "DUPLICATE", DUPLICATE_EPISODE_SIMILARITY))
+    similar = float(getattr(store, "SIMILAR", SIMILAR_EPISODE_SIMILARITY))
+    saved = await store.nearest(user_id, vector_text, working_dir, min_similarity=similar)
     # A near-copy is the same moment; in the band below that, a reworded moment and a related one look alike to the
     # embedding, so the model decides (memory recall D10). Only between episodes of one type: a LEARNING next to the
     # EVENT it explains is the lesson the event lacked, and the judge took them for one moment (live eval S7)
     if saved and (
-        saved["similarity"] >= DUPLICATE_EPISODE_SIMILARITY
-        or saved["similarity"] >= SIMILAR_EPISODE_SIMILARITY
+        saved["similarity"] >= duplicate
+        or saved["similarity"] >= similar
         and str(saved.get("event_type") or "").upper() == str(event_type).upper()
         and await is_same_episode(saved, event_type, anchor_event, summary)
     ):

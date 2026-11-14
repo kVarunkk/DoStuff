@@ -54,7 +54,7 @@ async def search_memory(query: str, kind: Literal["all", "facts", "episodes"] = 
         raise ValueError("event_type filters episodes; use kind 'episodes' or 'all'.")
     fact_store, episode_store = get_semantic_store(), get_episodic_store()
     if fact_store is None or episode_store is None:
-        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}).")
+        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}, or set memory.backend: sqlite).")
     config = get_config()
     user_id = config.get_user_id()
     here = str(Path.cwd().resolve())
@@ -75,7 +75,7 @@ async def _facts(store: Any, user_id: str, here: str, query: str, limit: int) ->
     if not overflow:
         return f"Facts: All {len(facts)} saved facts are already listed in your fact list."
     wanted = {(f["scope"], f["key"]) for f in overflow}
-    ranked = await store.query(user_id, query_text=query, top_k=len(facts), min_similarity=SEARCH_MIN_SIMILARITY,
+    ranked = await store.query(user_id, query_text=query, top_k=len(facts), min_similarity=getattr(store, "SEARCH_FLOOR", SEARCH_MIN_SIMILARITY),
                                working_dir=here)
     matched = [f for f in ranked if (f.get("scope", "user"), f["key"]) in wanted]
     found = matched[:limit]
@@ -94,7 +94,8 @@ async def _episodes(store: Any, user_id: str, working_dir: str | None, query: st
                     event_type: str | None = None) -> str:
     # Relevance alone, no recency decay: each result shows its date and type, and the model weighs age (D12)
     found = await store.query(user_id=user_id, query_text=query, top_k=limit, working_dir=working_dir,
-                              recency_decay_rate=0.0, min_similarity=SEARCH_MIN_SIMILARITY)
+                              recency_decay_rate=0.0,
+                              min_similarity=getattr(store, "SEARCH_FLOOR", SEARCH_MIN_SIMILARITY))
     if event_type is None:
         if not found:
             return "Episodes: Nothing saved matches."

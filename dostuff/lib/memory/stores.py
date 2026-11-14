@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING
 
 from dostuff.config import get_config
 from dostuff.lib.memory import chroma
+from dostuff.lib.memory.backend import memory_backend
 from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
 from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
 
 if TYPE_CHECKING:
     from dostuff.lib.mcp.mcp_tool_registry_store import MCPToolRegistryStore
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
 
 
 def _persist_path() -> str:
@@ -28,11 +30,33 @@ def _episodic(persist_path: str) -> EpisodicMemoryStore:
     return EpisodicMemoryStore(persist_path=persist_path)
 
 
-def get_semantic_store() -> SemanticMemoryStore | None:
+@lru_cache(maxsize=None)
+def _sqlite_facts(db_path: str) -> "SQLiteFactStore":
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteFactStore
+    return SQLiteFactStore(db_path)
+
+
+@lru_cache(maxsize=None)
+def _sqlite_episodes(db_path: str) -> "SQLiteEpisodeStore":
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore
+    return SQLiteEpisodeStore(db_path)
+
+
+def _sqlite_path() -> str:
+    data_dir = get_config().get_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return str(data_dir / "memory.db")
+
+
+def get_semantic_store() -> "SemanticMemoryStore | SQLiteFactStore | None":
+    if memory_backend() == "sqlite":
+        return _sqlite_facts(_sqlite_path())
     return _semantic(_persist_path()) if chroma.chroma_available() else None
 
 
-def get_episodic_store() -> EpisodicMemoryStore | None:
+def get_episodic_store() -> "EpisodicMemoryStore | SQLiteEpisodeStore | None":
+    if memory_backend() == "sqlite":
+        return _sqlite_episodes(_sqlite_path())
     return _episodic(_persist_path()) if chroma.chroma_available() else None
 
 
@@ -50,7 +74,7 @@ def memory_collections() -> list[tuple[str, object, dict | None]]:
     The filter matters: an unfiltered query can succeed where the filtered one callers run fails.
     Returns [] without chromadb.
     """
-    if not chroma.chroma_available():
+    if not chroma.chroma_available() or memory_backend() != "chroma":
         return []
     client = chroma.get_chroma_client(_persist_path())
     existing = {collection.name for collection in client.list_collections()}

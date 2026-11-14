@@ -132,7 +132,7 @@ def with_shell_job_tools(names: list[str]) -> list[str]:
 
 def default_tool_names() -> list[str]:
     """Tools offered to the main agent: all of them, minus the memory tools when memory is off."""
-    from dostuff.lib.memory.chroma import chroma_available
-    if chroma_available():
+    from dostuff.lib.memory.backend import memory_available
+    if memory_available():
         return list(TOOL_SCHEMAS)
     return [name for name in TOOL_SCHEMAS if name not in MEMORY_TOOLS]

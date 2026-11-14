@@ -135,6 +135,9 @@ class Config:
         mem = _block(self.raw, "memory")
         scope = str(mem.get("episodic_scope") or "project").lower()
         self.episodic_scope = scope if scope in ("project", "user") else "project"
+        # Where facts and episodes live: chroma (embeddings, the `memory` extra) or sqlite (FTS5 keywords, built in)
+        backend = str(mem.get("backend") or "chroma").lower()
+        self.memory_backend = backend if backend in ("chroma", "sqlite") else "chroma"
         # Permission layer (dostuff/agent/permissions.py): mode ask | allowlist | auto | plan
         perms = _block(self.raw, "permissions")
         mode = str(perms.get("mode", "ask")).lower()

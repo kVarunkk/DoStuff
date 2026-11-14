@@ -17,7 +17,7 @@ from dostuff.helpers.agent.turn_context import (
 )
 from dostuff.helpers.skills.discover_skills import model_visible_skills
 from dostuff.helpers.ui.emit import emit
-from dostuff.lib.memory import chroma
+from dostuff.lib.memory.backend import memory_available
 
 
 def _background_wait(interactive: bool) -> str:
@@ -65,7 +65,7 @@ def build_base_instructions(interactive: bool = False) -> tuple[str, list[dict[s
     instructions = SYSTEM_INSTRUCTIONS.format(
         dostuff_identity=load_identity(),
         skills_summary=skills_summary(skills),
-        memory_section=MEMORY_INSTRUCTIONS if chroma.chroma_available() else "",
+        memory_section=MEMORY_INSTRUCTIONS if memory_available() else "",
         background_wait=_background_wait(interactive),
         agent_types=_agent_types_text(agent_types),
         agent_background=AGENT_BACKGROUND if interactive or get_config().agents_wake_on_end else "",
@@ -125,9 +125,10 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
     if memory_store is not None and episodic_store is not None:
         # Not at module level: the store module pulls in litellm, which the TUI loads after its first frame
         from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
+        floor = float(getattr(memory_store, "RECALL_FLOOR", MIN_FACT_SIMILARITY))
         working_dir = str(Path.cwd().resolve()) if get_config().episodic_scope == "project" else None
         try:
-            memories, hidden_facts = await _overflow_facts(memory_store, user_id, user_text, MIN_FACT_SIMILARITY,
+            memories, hidden_facts = await _overflow_facts(memory_store, user_id, user_text, floor,
                                              exclude=exclude_fact_ids)
             # Only when there is something to leave out: the store sees no exclusion on a first turn
             skip = {"exclude_ids": set(exclude_episode_ids)} if exclude_episode_ids else {}
