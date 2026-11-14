@@ -14,6 +14,7 @@ from dostuff.helpers.agent.tool_attachments import collecting, tool_attachment_s
 import asyncio
 import inspect
 import random
+from pathlib import Path
 from dataclasses import dataclass, field
 from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, PLAN_MODE_OFF_INSTRUCTION, SessionPermissions
 from dostuff.agent.run_tool import (
@@ -31,8 +32,9 @@ from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
 from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, frame_steered
 from dostuff.helpers.agent.turn_context import (
-    PROMPT_CONTEXT_HEADER, FactsSource, delivered_capabilities, delivered_facts, delivered_plan_mode, facts_source,
-    facts_step_content, make_capability_step, make_facts_step, make_plan_mode_step,
+    PROMPT_CONTEXT_HEADER, FactsSource, delivered_capabilities, delivered_episode_index, delivered_facts,
+    delivered_plan_mode, episode_index_content, facts_source, facts_step_content, make_capability_step,
+    make_episode_index_step, make_facts_step, make_plan_mode_step,
 )
 from dostuff.agent.capabilities import ALL_KINDS, delta_text, take_snapshot
 from dostuff.helpers.agent.side_question import (
@@ -200,7 +202,7 @@ def _job_events(owner: str, adapter: Any) -> Iterator[None]:
         registry.remove_listener(on_job)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None, capabilities_baseline: tuple[str, ...] | None = None, capability_kinds: tuple[str, ...] = ALL_KINDS, memory_store: Any = None, memory_user_id: str | None = None, facts_project: str | None = None) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None, capabilities_baseline: tuple[str, ...] | None = None, capability_kinds: tuple[str, ...] = ALL_KINDS, memory_store: Any = None, memory_user_id: str | None = None, facts_project: str | None = None, episodic_store: Any = None) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction).
 
     `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
@@ -223,6 +225,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     `facts_project` (the project root whose project facts apply) turn on the facts step (memory recall spec D2):
     every saved fact, re-sent whenever the list differs from the newest facts step in the history.
     `memory_user_id` defaults to the configured user.
+    `episodic_store` (main session only; subagents never get episodes) adds the episode index step: one line per
+    episode of this project, re-sent when that list changes.
     """
     current_session_id.set(session_id)
     owner = owner or session_id
@@ -308,6 +312,30 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             return
         await append_step(make_facts_step(text, fingerprint), steps_history, working_history,
                           current_session_history, session_id, store, turn_type)
+        publish_snapshot(session_id, fork_context())
+
+    episodes_error_reported = False
+
+    async def sync_episode_index() -> None:
+        """Send this project's episode index when it differs from the newest index step, like sync_facts. Episodes are
+        saved per directory, so the index reads the working directory, as episode recall does."""
+        nonlocal episodes_error_reported
+        if episodic_store is None or not facts_user:
+            return
+        working_dir = str(Path.cwd().resolve()) if config.episodic_scope == "project" else None
+        try:
+            episodes = await episodic_store.list_all(facts_user, working_dir=working_dir)
+        except Exception as e:
+            if not episodes_error_reported:
+                episodes_error_reported = True
+                await loop_emit("error", f"Could not load saved episodes, continuing without them: {e}", adapter=adapter)
+            return
+        text, fingerprint = episode_index_content(episodes, working_dir or facts_project or "")
+        belief = delivered_episode_index(working_history)
+        if belief == fingerprint or (belief is None and not fingerprint):
+            return
+        await append_step(make_episode_index_step(text or "No episodes are saved any more.", fingerprint),
+                          steps_history, working_history, current_session_history, session_id, store, turn_type)
         publish_snapshot(session_id, fork_context())
 
     async def sync_capabilities() -> None:
@@ -439,6 +467,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     await sync_plan_mode()  # here, so a retry after an overflow compaction is covered too
                     await sync_capabilities()  # after it: rarer, so the plan step keeps its place (D6)
                     await sync_facts()  # last: changes only on a save or forget (memory recall D2)
+                    await sync_episode_index()  # likewise, on an episode save, forget or prune
                     try:
                         interaction, model_span = await call_agent(
                             steps_history=working_history,

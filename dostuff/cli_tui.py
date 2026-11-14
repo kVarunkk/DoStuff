@@ -4706,6 +4706,8 @@ class DostuffTUI(App):
                 # Every saved fact in a facts step, re-sent only when the list changes (memory recall D2)
                 memory_store=self.memory_store, memory_user_id=self.user_id,
                 facts_project=str(Path.cwd().resolve()),
+                # One line per episode of this project, so a past decision is seen without matching the prompt
+                episodic_store=self.episodic_store,
             )
 
             agent_text = result or "(no response)"

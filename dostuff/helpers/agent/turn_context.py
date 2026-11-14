@@ -8,7 +8,9 @@ whole cached prefix. The model reads them; a user never sees them. Every reader 
 Light on import: the TUI loads this before its first frame.
 """
 import hashlib
+import math
 import re
+import time
 from contextvars import ContextVar
 from typing import Any, NamedTuple
 
@@ -108,12 +110,13 @@ _MEMORY_SECTIONS = re.compile(r"<other_relevant_facts>.*?</other_relevant_facts>
 
 
 def memory_sections(step: dict) -> list[str]:
-    """The parts of a turn-context step that are long-term memory (memory recall D11): all of a facts step, or a
+    """The parts of a turn-context step that are long-term memory (memory recall D11): all of a facts or episode index
+    step, or a
     bundle's `<other_relevant_facts>`, `<hidden_facts>` and `<past_episodes>` sections; [] for anything else."""
     if not is_turn_context(step):
         return []
     text = step.get("content") if isinstance(step.get("content"), str) else ""
-    if "facts" in step["meta"]:
+    if "facts" in step["meta"] or "episode_index" in step["meta"]:
         return [text] if text else []
     return _MEMORY_SECTIONS.findall(text or "")
 
@@ -260,3 +263,72 @@ def render_facts_step(shown: list[dict], *, saved_user: int, saved_project: int,
         text += ("\nNot every saved fact is listed: before writing code or committing, call search_memory for the "
                  "user's preferences and this project's conventions on that work.")
     return text
+
+
+# ---- episode index -----------------------------------------------------------------------------------------------
+# One line per saved episode of this project, in a hidden step like the facts step: the model sees that a decision or
+# lesson exists even when the prompt shares no word (or meaning, for an embedding) with it, and fetches the detail
+# with search_memory. Recall by similarity can only find what the prompt resembles; the index doesn't need to.
+EPISODE_INDEX_TOKEN_BUDGET = 1500
+# Kinds that stay true until replaced come first; then lessons and events by their decayed weight (newest first)
+_LASTING_TYPES = ("DECISION", "PREFERENCE", "CORRECTION")
+EPISODE_INDEX_NOTE = ("Past episodes saved in this project, one line each; this replaces any earlier list. The line is "
+                      "only the gist: before work one of them may bear on, call search_memory for its details.")
+
+
+def episode_line(episode: dict) -> str:
+    epoch = int(episode.get("created_at_epoch") or 0)
+    date = time.strftime("%Y-%m-%d", time.gmtime(epoch)) if epoch else "undated"
+    return f"- [{str(episode.get('event_type') or 'EVENT').upper()} {date}] {episode.get('anchor_event') or ''}\n"
+
+
+def select_episode_index(episodes: list[dict], now: float | None = None) -> list[dict]:
+    """The episodes the index lists, in order: decisions, preferences and corrections newest first, then lessons and
+    events by recency weight (their recall decay), each while its line fits in EPISODE_INDEX_TOKEN_BUDGET."""
+    from dostuff.lib.memory.episodic_memory_store import decay_rate
+    now = time.time() if now is None else now
+
+    def rank(ep: dict) -> tuple:
+        epoch = int(ep.get("created_at_epoch") or 0)
+        kind = str(ep.get("event_type") or "").upper()
+        if kind in _LASTING_TYPES:
+            return (0, -epoch)
+        return (1, -math.exp(-decay_rate(kind) * max(0.0, (now - epoch) / 86400.0)), -epoch)
+
+    budget, shown = EPISODE_INDEX_TOKEN_BUDGET, []
+    for ep in sorted(episodes, key=rank):
+        cost = (len(episode_line(ep)) + 3) // 4
+        if cost <= budget:
+            shown.append(ep)
+            budget -= cost
+    return shown
+
+
+def episode_index_content(episodes: list[dict], project: str, now: float | None = None) -> tuple[str, tuple[str, ...]]:
+    """(text, fingerprint) of the episode index step; ("", ()) when nothing is saved. The fingerprint is the listed
+    episodes' ids and anchors, so a save, a forget or a prune changes it."""
+    if not episodes:
+        return "", ()
+    shown = select_episode_index(episodes, now)
+    name = project.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or project
+    lines = "".join(episode_line(e) for e in shown)
+    text = (f'<episode_index project="{name}" shown="{len(shown)}" saved="{len(episodes)}">\n{lines}</episode_index>\n'
+            + EPISODE_INDEX_NOTE)
+    if len(shown) < len(episodes):
+        text += " Older ones are not listed; search_memory finds them too."
+    fingerprint = tuple(sorted(f"{e.get('id')}:{hashlib.sha1(str(e.get('anchor_event')).encode()).hexdigest()[:8]}"
+                               for e in shown))
+    return text, fingerprint
+
+
+def make_episode_index_step(text: str, fingerprint: tuple[str, ...]) -> dict[str, Any]:
+    return {"role": "user", "content": _wrap(text),
+            "meta": {"hidden": TURN_CONTEXT_MARKER, "episode_index": list(fingerprint)}}
+
+
+def delivered_episode_index(history: list) -> tuple[str, ...] | None:
+    """The fingerprint of the newest episode index step; None when the history has none."""
+    for step in reversed(history):
+        if is_turn_context(step) and "episode_index" in step["meta"]:
+            return tuple(step["meta"]["episode_index"])
+    return None
