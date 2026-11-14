@@ -35,7 +35,9 @@ async def save_episode(
         anchor_event: The core moment in 1-2 sentences, e.g. 'Switched session DB to WAL
             mode to stop "database is locked" errors'.
         summary: What happened, why, and the outcome.
-        tags: Key topics or technologies involved, e.g. ['sqlite', 'wal_mode'].
+        tags: Key topics and technologies involved, plus other words someone might use when asking
+            about this later (the component, the symptom, a plainer name), e.g. ['sqlite', 'wal_mode',
+            'locking', 'concurrency', 'store'].
 
     Returns:
         A confirmation with the episode id, or the id of the same moment already saved.

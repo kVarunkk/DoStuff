@@ -37,6 +37,19 @@ through to too under until up us very was we were what when where which while wh
 yours yourself hi hello hey thanks thank please ok okay yes yeah sure tell know get got
 """.split())
 
+# The words people use for each episode type, indexed with it: "what did we decide" stems to "decid", which the type
+# name DECISION ("decis") doesn't match. The type's own vocabulary, nothing about any one project.
+TYPE_WORDS = {
+    "DECISION": "decision decided decide chose choice settled agreed",
+    "PREFERENCE": "preference prefers prefer wants likes",
+    "CORRECTION": "correction corrected mistake wrong fixed",
+    "LEARNING": "learning learned lesson discovered found",
+    "EVENT": "event happened occurred",
+}
+_TYPE_WORDS_SQL = "CASE upper({col}) " + " ".join(
+    f"WHEN '{t}' THEN '{t.lower()} {w}'" for t, w in TYPE_WORDS.items()) + " ELSE {col} END"
+_NEW_TYPE, _OLD_TYPE = _TYPE_WORDS_SQL.format(col="new.event_type"), _TYPE_WORDS_SQL.format(col="old.event_type")
+
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS facts (
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, scope TEXT NOT NULL, working_dir TEXT,
@@ -59,15 +72,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_vocab USING fts5vocab(episodes_fts, 'row');
 CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
     INSERT INTO episodes_fts(rowid, event_type, anchor_event, summary, tags)
-    VALUES (new.rowid, new.event_type, new.anchor_event, new.summary, new.tags); END;
+    VALUES (new.rowid, {_NEW_TYPE}, new.anchor_event, new.summary, new.tags); END;
 CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
     INSERT INTO episodes_fts(episodes_fts, rowid, event_type, anchor_event, summary, tags)
-    VALUES ('delete', old.rowid, old.event_type, old.anchor_event, old.summary, old.tags); END;
+    VALUES ('delete', old.rowid, {_OLD_TYPE}, old.anchor_event, old.summary, old.tags); END;
 CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
     INSERT INTO episodes_fts(episodes_fts, rowid, event_type, anchor_event, summary, tags)
-    VALUES ('delete', old.rowid, old.event_type, old.anchor_event, old.summary, old.tags);
+    VALUES ('delete', old.rowid, {_OLD_TYPE}, old.anchor_event, old.summary, old.tags);
     INSERT INTO episodes_fts(rowid, event_type, anchor_event, summary, tags)
-    VALUES (new.rowid, new.event_type, new.anchor_event, new.summary, new.tags); END;
+    VALUES (new.rowid, {_NEW_TYPE}, new.anchor_event, new.summary, new.tags); END;
 """
 
 
@@ -260,7 +273,10 @@ class SQLiteFactStore:
 # ---- episodes --------------------------------------------------------------------------------------------------------
 
 def _episode_text(row: sqlite3.Row) -> str:
-    return f"{row['event_type']} {row['anchor_event']} {row['summary']} {row['tags']}"
+    """What the score compares a query with: the same text the FTS row indexes (type words included)."""
+    kind = str(row["event_type"] or "").upper()
+    words = f"{kind.lower()} {TYPE_WORDS[kind]}" if kind in TYPE_WORDS else kind
+    return f"{words} {row['anchor_event']} {row['summary']} {row['tags']}"
 
 
 def _epoch(row: sqlite3.Row) -> int:

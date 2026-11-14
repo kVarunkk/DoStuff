@@ -284,8 +284,8 @@ def sqlite_results(tmp_path_factory) -> list[dict[str, Any]]:
 
 
 # memory.backend: sqlite (FTS5 keywords, no embeddings) on the same set, floors from its sweep (2026-11-14): the
-# embedding store's recall with no episode false hits
-SQLITE_FLOORS = {"fact recall": 34, "episode recall": 17}
+# embedding store's recall with no episode false hits; 17 -> 18 with the episode type words ("decide" finds a DECISION)
+SQLITE_FLOORS = {"fact recall": 34, "episode recall": 18}
 SQLITE_CEILINGS = {"false hits": 0, "leaky cases": 0}
 
 

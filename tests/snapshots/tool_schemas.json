@@ -623,7 +623,7 @@
                 "type": "null"
               }
             ],
-            "description": "Key topics or technologies involved, e.g. ['sqlite', 'wal_mode']."
+            "description": "Key topics and technologies involved, plus other words someone might use when asking about this later (the component, the symptom, a plainer name), e.g. ['sqlite', 'wal_mode', 'locking', 'concurrency', 'store']."
           }
         },
         "required": [

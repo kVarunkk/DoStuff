@@ -491,10 +491,14 @@ OLD_SAVE_MEMORY = (
     "A fact that overlaps an existing memory updates it instead of adding a duplicate."
 )
 
+# save_episode's tags before the sqlite-fts work asked for the other words a later question may use
+OLD_SAVE_EPISODE_TAGS = "Key topics or technologies involved, e.g. ['sqlite', 'wal_mode']."
+
 
 def test_tool_schema_snapshot_only_agent_description_changed():
     """Since 30d3629 only these schemas changed on purpose: `agent`'s subagent_type description, `save_memory`
-    (its `scope` parameter and description) and the new `search_memory` (memory recall D12). Everything else must be
+    (its `scope` parameter and description), the new `search_memory` (memory recall D12) and save_episode's `tags`
+    description. Everything else must be
     30d3629's, byte for byte."""
     import hashlib
     import json
@@ -506,4 +510,7 @@ def test_tool_schema_snapshot_only_agent_description_changed():
     assert save_memory["parameters"]["properties"].pop("scope")["enum"] == ["user", "project"]
     save_memory["description"] = OLD_SAVE_MEMORY
     assert snapshot.pop("search_memory")["function"]["parameters"]["required"] == ["query"]
+    tags = snapshot["save_episode"]["function"]["parameters"]["properties"]["tags"]
+    assert tags["description"] != OLD_SAVE_EPISODE_TAGS
+    tags["description"] = OLD_SAVE_EPISODE_TAGS
     assert hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == SCHEMAS_30D3629
