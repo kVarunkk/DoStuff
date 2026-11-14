@@ -1,6 +1,6 @@
 """search_memory: the model's own lookup past the caps (memory recall spec D12, T3.1).
 
-The facts step lists 50 facts and a turn recalls at most 3 overflow facts and 3 episodes; a prompt that needs more
+The facts step lists facts up to a token budget and a turn recalls at most 3 overflow facts and 3 episodes; a prompt that needs more
 (S10 in the live eval) can only get them by asking. Real Chroma in a temp dir; skipped without chromadb.
 """
 import asyncio
@@ -35,6 +35,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(sm, "get_config", lambda: cfg)
     monkeypatch.setattr(sm, "get_semantic_store", lambda: facts)
     monkeypatch.setattr(sm, "get_episodic_store", lambda: episodes)
+    # Smaller than the fillers below cost (~12-16 tokens each), so the facts older than them are past the budget
+    from dostuff.helpers.agent import turn_context
+    monkeypatch.setattr(turn_context, "FACT_TOKEN_BUDGET", 400)
     return SimpleNamespace(facts=facts, episodes=episodes, a=str(proj_a.resolve()), b=str(proj_b.resolve()), cfg=cfg)
 
 
@@ -72,15 +75,15 @@ def _search(query, **kw):
 
 
 def _over_the_cap(env):
-    """52 newer user fillers (so the user facts below are past the 50) and 31 newer project fillers in A (so A's
-    oldest project fact is past the 30 project slots), plus the facts the tests look for."""
+    """52 newer user fillers and 31 newer project fillers in A, more than the budget holds, so the older facts below
+    are past it, plus the facts the tests look for."""
     fill_u = [(f"hobby_{i:02d}", f"Keeps a collection of {i} houseplants", 1 + i % 40, "user", None) for i in range(52)]
     fill_p = [(f"note_{i:02d}", f"In this project, note {i} is filed under docs/notes", 1 + i % 20, "project", env.a)
               for i in range(31)]
     _facts(env.facts, fill_u + fill_p + [
         ("shell", "Uses PowerShell on Windows", 0, "user", None),                       # newest: in the facts step
-        ("db_dislike", "Dislikes working with MongoDB", 400, "user", None),             # past the 50
-        ("ticket", "Commit messages start with the ticket id TKV-<number>", 300, "project", env.a),  # past the 30
+        ("db_dislike", "Dislikes working with MongoDB", 400, "user", None),             # past the budget
+        ("ticket", "Commit messages start with the ticket id TKV-<number>", 300, "project", env.a),  # past the budget
         ("ticket", "Commit messages start with the ticket id ABC-<number>", 300, "project", env.b),  # other project
     ])
 
@@ -189,7 +192,7 @@ def test_prompts_point_at_search_memory():
 
 
 def _many_overflow_facts(env, n):
-    """52 newer fillers fill the 50; then `n` older style facts, all past the cap and all matching 'code style'."""
+    """52 newer fillers fill the budget; then `n` older style facts, all past it and all matching 'code style'."""
     fill = [(f"hobby_{i:02d}", f"Keeps a collection of {i} houseplants", 1 + i % 40, "user", None) for i in range(52)]
     style = [(f"style_{i:02d}", f"Python code style rule {i}: format helper functions this way", 200 + i, "user", None)
              for i in range(n)]

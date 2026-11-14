@@ -279,23 +279,62 @@ def test_facts_step_text_when_everything_was_forgotten():
         "No facts are saved any more. This replaces any earlier list of saved facts.")
 
 
-def test_select_newest_50_project_first_on_ties():
-    from dostuff.helpers.agent.turn_context import FACT_INJECT_CAP, select_injected_facts
+def test_select_newest_first_until_the_budget_project_first_on_ties(monkeypatch):
+    from dostuff.helpers.agent import turn_context
+    from dostuff.helpers.agent.turn_context import fact_tokens, select_injected_facts
     user = [_fact(f"u{i:02d}", "v", updated=i) for i in range(60)]
     project = [_fact("tie", "v", "project", updated=59)]
+    assert {fact_tokens(f) for f in user + project} == {3}  # "- u00: v\n"
+    monkeypatch.setattr(turn_context, "FACT_TOKEN_BUDGET", 150)
     shown, overflow = select_injected_facts(user + project)
-    assert len(shown) == FACT_INJECT_CAP == 50
+    assert len(shown) == 50
     assert [f["key"] for f in shown[:2]] == ["tie", "u59"]  # same timestamp: project first
     assert {f["key"] for f in overflow} == {f"u{i:02d}" for i in range(11)}  # the 11 oldest user facts
 
 
-def test_project_facts_capped_at_30_within_50():
-    from dostuff.helpers.agent.turn_context import PROJECT_FACT_CAP, select_injected_facts
+def test_default_budget_lists_hundreds_of_typical_facts():
+    """The budget is sized for a few hundred facts of ~10 tokens, so a normal store is listed whole."""
+    from dostuff.helpers.agent.turn_context import FACT_TOKEN_BUDGET, fact_tokens, select_injected_facts
+    facts = [_fact(f"pref_{i:03d}", f"prefers option {i} for this", updated=i) for i in range(300)]
+    assert 7 <= fact_tokens(facts[0]) <= 11
+    shown, overflow = select_injected_facts(facts)
+    assert len(shown) == 300 and overflow == []
+    assert sum(fact_tokens(f) for f in shown) <= FACT_TOKEN_BUDGET
+
+
+def test_budget_counts_tokens_not_facts(monkeypatch):
+    """Long values use up the budget sooner: fewer of them fit than short ones."""
+    from dostuff.helpers.agent import turn_context
+    from dostuff.helpers.agent.turn_context import select_injected_facts
+    monkeypatch.setattr(turn_context, "FACT_TOKEN_BUDGET", 300)
+    short = [_fact(f"s{i:02d}", "v", updated=i) for i in range(100)]
+    long = [_fact(f"l{i:02d}", "x" * 200, updated=i) for i in range(100)]
+    assert len(select_injected_facts(short)[0]) == 100
+    assert len(select_injected_facts(long)[0]) == 5  # 52 tokens each
+
+
+def test_a_fact_too_long_for_what_is_left_is_skipped_not_the_end(monkeypatch):
+    from dostuff.helpers.agent import turn_context
+    from dostuff.helpers.agent.turn_context import select_injected_facts
+    monkeypatch.setattr(turn_context, "FACT_TOKEN_BUDGET", 100)
+    huge = _fact("huge", "x" * 2000, updated=100)  # newest, but bigger than the whole budget
+    older = [_fact(f"o{i:02d}", "v", updated=i) for i in range(10)]
+    shown, overflow = select_injected_facts([huge] + older)
+    assert [f["key"] for f in overflow] == ["huge"]
+    assert len(shown) == 10
+
+
+def test_project_facts_get_at_most_their_share_of_the_budget(monkeypatch):
+    from dostuff.helpers.agent import turn_context
+    from dostuff.helpers.agent.turn_context import PROJECT_FACT_TOKEN_SHARE, fact_tokens, select_injected_facts
+    monkeypatch.setattr(turn_context, "FACT_TOKEN_BUDGET", 150)
     project = [_fact(f"p{i:02d}", "v", "project", updated=100 + i) for i in range(40)]
     user = [_fact(f"u{i:02d}", "v", updated=i) for i in range(30)]
     shown, overflow = select_injected_facts(project + user)
-    assert sum(f["scope"] == "project" for f in shown) == PROJECT_FACT_CAP == 30
-    assert len(shown) == 50
+    shown_project = [f for f in shown if f["scope"] == "project"]
+    assert sum(fact_tokens(f) for f in shown_project) <= 150 * PROJECT_FACT_TOKEN_SHARE
+    assert len(shown_project) == 30  # 90 of 150 tokens, the newest 30
+    assert len(shown) == 50  # user facts fill the rest
     assert {f["key"] for f in overflow if f["scope"] == "project"} == {f"p{i:02d}" for i in range(10)}
 
 

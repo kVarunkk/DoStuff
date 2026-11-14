@@ -7,12 +7,21 @@ import asyncio
 import inspect
 
 import litellm
+import pytest
 
 from dostuff.agent import loop as loop_module
 from dostuff.agent.call_agent import provider_messages
 from dostuff.helpers.agent.turn_context import make_context_step
 from conftest import fake_response
 from tests.test_loop import _interactive, _msg, _tc, Adapter
+
+
+@pytest.fixture(autouse=True)
+def fifty_short_facts_budget(monkeypatch):
+    """The facts step's budget shrunk to 50 of this file's `kNN: vNN` facts (3 tokens each), so the overflow tests
+    stay small; the budget itself is tested in test_turn_context."""
+    from dostuff.helpers.agent import turn_context
+    monkeypatch.setattr(turn_context, "FACT_TOKEN_BUDGET", 150)
 
 USER = "u1"
 PROJ_A = "/work/proj-a"
@@ -475,7 +484,7 @@ def test_episode_block_user_scope_has_no_project_count(monkeypatch, tmp_path):
 # --- Overflow facts are not repeated within a session (like episodes, D8) --------------------------------------
 
 def _overflow_store(tmp_path):
-    """55 user facts: k00-k04 are past the cap, and every query ranks k00, k01, k02, k03 first."""
+    """55 user facts: k00-k04 are past the budget, and every query ranks k00, k01, k02, k03 first."""
     store = QueryRecorder()
     for i in range(55):
         store.add(f"k{i:02d}", f"v{i}", updated=i)

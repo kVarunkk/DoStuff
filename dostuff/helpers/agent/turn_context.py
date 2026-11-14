@@ -18,11 +18,13 @@ TURN_CONTEXT_MARKER = "turn_context"
 HIDDEN_LIKE_PATTERN = f'%"hidden": "{TURN_CONTEXT_MARKER}"%'
 PROMPT_CONTEXT_HEADER = "[Context from UserPromptSubmit hooks]"
 
-# Saved facts delivered whole in the facts step; the rest are recalled per turn by similarity
-# (plan/2026-11-11-memory-recall D3). Project facts are capped inside the total so one busy repo
-# can't push every user fact out.
-FACT_INJECT_CAP = 50
-PROJECT_FACT_CAP = 30
+# Saved facts delivered whole in the facts step, newest first, until their lines cost FACT_TOKEN_BUDGET; the rest are
+# recalled per turn by similarity and reachable through search_memory (plan/2026-11-11-memory-recall D3). A budget in
+# tokens, not a count: a fact costs ~7-11 tokens, so 4000 lists a few hundred typical facts (far past the consolidate
+# hint) for ~3% of a 128k window, paid once per change since the step is cached, while a few long values can't
+# blow it up. Project facts get at most PROJECT_FACT_TOKEN_SHARE of it so one busy repo can't push every user fact out.
+FACT_TOKEN_BUDGET = 4000
+PROJECT_FACT_TOKEN_SHARE = 0.6
 FACTS_REPLACE_NOTE = "This replaces any earlier list of saved facts."
 # Past this many user facts, /memories suggests merging (D10): the facts step grows with every one
 CONSOLIDATE_HINT_USER_FACTS = 30
@@ -87,8 +89,8 @@ def compose_turn_context(environment: str = "", facts: str = "", episodes: str =
                          episode_counts: EpisodeCounts | None = None, hidden_facts: int = 0) -> str:
     """The bundle: the sections that have text, in a fixed order; "" when none has (D4). Does no I/O.
 
-    `facts` are the saved facts past the facts step's cap that match the prompt (memory recall D3); `hidden_facts`
-    counts every fact past the cap, matching or not."""
+    `facts` are the saved facts past the facts step's budget that match the prompt (memory recall D3); `hidden_facts`
+    counts every fact past the budget, matching or not."""
     sections = [
         environment,
         f"<other_relevant_facts>\n{facts}\n</other_relevant_facts>" if facts else "",
@@ -200,16 +202,35 @@ def delivered_facts(history: list) -> tuple[str, ...] | None:
     return None
 
 
+def fact_line(fact: dict) -> str:
+    """One fact as the facts step lists it."""
+    return f"- {fact['key']}: {fact['value']}\n"
+
+
+def fact_tokens(fact: dict) -> int:
+    """Rough token cost of a fact's line: ~4 characters a token, like `estimate_tokens`. Deterministic and offline,
+    because the same selection decides the facts step, the per-turn overflow recall and search_memory."""
+    return (len(fact_line(fact)) + 3) // 4
+
+
 def select_injected_facts(facts: list[dict]) -> tuple[list[dict], list[dict]]:
-    """(shown, overflow): the newest FACT_INJECT_CAP facts, project first on equal timestamps and at most
-    PROJECT_FACT_CAP of them, newest first; overflow is everything else."""
+    """(shown, overflow): facts newest first (project first on equal timestamps), each shown while its line fits in
+    FACT_TOKEN_BUDGET, project facts in at most PROJECT_FACT_TOKEN_SHARE of it; one that doesn't fit is skipped, not
+    the end of the list, so a single long value can't hide every older fact. Overflow is everything else, in order."""
     ordered = sorted(facts, key=lambda f: (-int(f.get("updated_at_epoch") or 0), f.get("scope") != "project", f["key"]))
-    project_ids = [id(f) for f in ordered if f.get("scope") == "project"][:PROJECT_FACT_CAP]
-    allowed = set(project_ids)
-    candidates = [f for f in ordered if f.get("scope") != "project" or id(f) in allowed]
-    shown = candidates[:FACT_INJECT_CAP]
-    shown_ids = {id(f) for f in shown}
-    return shown, [f for f in ordered if id(f) not in shown_ids]
+    budget, project_budget = FACT_TOKEN_BUDGET, int(FACT_TOKEN_BUDGET * PROJECT_FACT_TOKEN_SHARE)
+    shown, overflow = [], []
+    for fact in ordered:
+        cost = fact_tokens(fact)
+        is_project = fact.get("scope") == "project"
+        if cost <= budget and (not is_project or cost <= project_budget):
+            shown.append(fact)
+            budget -= cost
+            if is_project:
+                project_budget -= cost
+        else:
+            overflow.append(fact)
+    return shown, overflow
 
 
 def facts_step_content(facts: list[dict], project: str) -> tuple[str, tuple[str, ...]]:
@@ -232,7 +253,7 @@ def render_facts_step(shown: list[dict], *, saved_user: int, saved_project: int,
         if not saved:
             continue
         rows = [f for f in shown if f.get("scope", "user") == scope]
-        lines = "".join(f"- {f['key']}: {f['value']}\n" for f in rows)
+        lines = "".join(fact_line(f) for f in rows)
         blocks.append(f'<{tag}{attrs} shown="{len(rows)}" saved="{saved}">\n{lines}</{tag}>')
     text = "\n".join(blocks) + "\n" + FACTS_REPLACE_NOTE
     if len(shown) < saved_user + saved_project:

@@ -82,7 +82,7 @@ def build_system_instructions(base: str) -> str:
     return base
 
 
-# Facts past the facts step's cap recalled per turn by similarity (memory recall spec D3)
+# Facts past the facts step's budget recalled per turn by similarity (memory recall spec D3)
 OVERFLOW_FACTS_RECALLED = 3
 
 
@@ -107,7 +107,7 @@ async def _overflow_facts(memory_store: Any, user_id: str, user_text: str, min_s
 async def build_turn_context(user_text: str, *, memory_store: Any, episodic_store: Any, user_id: str,
                              prompt_context: str = "", exclude_episode_ids: Collection[str] = (),
                              exclude_fact_ids: Collection[str] = ()) -> TurnContext:
-    """The turn's hidden context step: the environment block, saved facts past the facts step's cap and past
+    """The turn's hidden context step: the environment block, saved facts past the facts step's budget and past
     episodes relevant to user_text, and UserPromptSubmit context.
 
     `exclude_episode_ids` are the episodes this session's history already shows (`delivered_episode_ids`): they are
