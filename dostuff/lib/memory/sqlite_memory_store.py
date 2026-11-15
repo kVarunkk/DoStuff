@@ -85,7 +85,11 @@ CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
 CREATE TABLE IF NOT EXISTS index_outbox (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, row_id TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS index_outbox_row ON index_outbox(kind, row_id);
+
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
+# `meta`: one-off facts about this file, such as whether the memories of the old Chroma store were imported (migrate.py)
+FTS_TABLES = ("facts_fts", "episodes_fts")
 # `index_outbox`: rows whose copy in a secondary index (the hybrid backend's embeddings) is out of date. A store opened
 # with `outbox=True` adds an entry in the same transaction as the write, so a crash can't leave a change the index
 # never hears about. An entry names the row only: whoever drains it reads the row's current state (gone = delete).
@@ -157,6 +161,49 @@ class _Db:
             return out
 
         return await asyncio.to_thread(_rows) if ids else {}
+
+    async def all_rows(self, table: str) -> dict[str, sqlite3.Row]:
+        """Every row of `table` ("facts" or "episodes"), every user's, by id."""
+        def _rows() -> dict[str, sqlite3.Row]:
+            with self.connect() as conn:
+                return {r["id"]: r for r in conn.execute(f"SELECT * FROM {table}")}
+
+        return await asyncio.to_thread(_rows)
+
+    async def enqueue(self, kind: str, row_ids: Collection[str]) -> None:
+        """Queue these rows for the index (an index found out of date by a check, not by a write)."""
+        def _enqueue_now() -> None:
+            with self.connect() as conn:
+                _enqueue(conn, kind, row_ids)
+
+        if row_ids:
+            await asyncio.to_thread(_enqueue_now)
+
+    async def outbox_count(self, kind: str) -> int:
+        """How many rows still wait to reach the index."""
+        def _count() -> int:
+            with self.connect() as conn:
+                return int(conn.execute("SELECT count(DISTINCT row_id) FROM index_outbox WHERE kind = ?",
+                                        (kind,)).fetchone()[0])
+
+        return await asyncio.to_thread(_count)
+
+    def fts_problems(self) -> list[str]:
+        """The keyword indexes that fail FTS5's integrity check (they no longer match their table), by name."""
+        broken = []
+        with self.connect() as conn:
+            for table in FTS_TABLES:
+                try:
+                    conn.execute(f"INSERT INTO {table}({table}, rank) VALUES ('integrity-check', 1)")
+                except sqlite3.DatabaseError:
+                    broken.append(table)
+        return broken
+
+    def rebuild_fts(self) -> None:
+        """Rebuild both keyword indexes from their tables (the tables are the data; nothing is lost)."""
+        with self.connect() as conn:
+            for table in FTS_TABLES:
+                conn.execute(f"INSERT INTO {table}({table}) VALUES ('rebuild')")
 
 
 def _stems(conn: sqlite3.Connection, texts: list[str]) -> list[set[str]]:

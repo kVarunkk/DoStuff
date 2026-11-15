@@ -177,10 +177,14 @@ def test_store_error_reports_once_turn_runs(monkeypatch):
 def test_no_chromadb_no_step_no_tools(monkeypatch):
     from dostuff.lib.memory import chroma
     from dostuff.tools.definitions import MEMORY_TOOLS, default_tool_names
+    from dostuff.config import get_config
     _, working, _ = _interactive(monkeypatch, [_msg(content="ok")])  # no store passed: memory is off
     assert _facts_steps(working) == []
     monkeypatch.setattr(chroma, "chroma_available", lambda: False)
+    monkeypatch.setattr(get_config(), "memory_backend", "chroma")  # the only backend that needs chromadb
     assert not MEMORY_TOOLS & set(default_tool_names())
+    monkeypatch.setattr(get_config(), "memory_backend", "hybrid")  # the default works without it
+    assert MEMORY_TOOLS <= set(default_tool_names())
 
 
 def test_facts_step_after_the_turns_bundle(monkeypatch):

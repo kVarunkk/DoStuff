@@ -1,6 +1,8 @@
 """One semantic and one episodic store per data dir, shared by the TUI (recall) and the memory tools (save).
 
-Each getter returns None when chromadb isn't installed: long-term memory is then off.
+The backend is `memory.backend`: hybrid (the default) and sqlite keep memories in `<data>/memory.db` and always work;
+hybrid adds an embedding index when chromadb is installed. On those two, the first getter call copies the chroma
+backend's memories into memory.db (migrate.py). On `chroma`, each getter returns None without chromadb (memory off).
 """
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -14,6 +16,7 @@ from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
 if TYPE_CHECKING:
     from dostuff.lib.mcp.mcp_tool_registry_store import MCPToolRegistryStore
     from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore, HybridFactStore
+    from dostuff.lib.memory.migrate import ImportResult
     from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
 
 
@@ -72,7 +75,26 @@ def _sqlite_path() -> str:
     return str(data_dir / "memory.db")
 
 
+@lru_cache(maxsize=None)
+def _imported(db_path: str, chroma_path: str, queue_for_index: bool) -> "ImportResult":
+    """Memories of the chroma backend copied into memory.db, once per process (and once ever: migrate.py)."""
+    from dostuff.lib.memory.migrate import import_from_chroma
+    # The store's tables first: the import writes into them
+    from dostuff.lib.memory.sqlite_memory_store import _Db
+    _Db(db_path)
+    return import_from_chroma(db_path, chroma_path, queue_for_index=queue_for_index)
+
+
+def chroma_import_result() -> "ImportResult | None":
+    """What bringing in the chroma backend's memories did this run, or None on the chroma backend."""
+    if memory_backend() == "chroma":
+        return None
+    return _imported(_sqlite_path(), _persist_path(), not _keywords_only())
+
+
 def get_semantic_store() -> "SemanticMemoryStore | SQLiteFactStore | HybridFactStore | None":
+    if memory_backend() != "chroma":
+        chroma_import_result()
     if _keywords_only():
         return _sqlite_facts(_sqlite_path())
     if memory_backend() == "hybrid":
@@ -81,6 +103,8 @@ def get_semantic_store() -> "SemanticMemoryStore | SQLiteFactStore | HybridFactS
 
 
 def get_episodic_store() -> "EpisodicMemoryStore | SQLiteEpisodeStore | HybridEpisodeStore | None":
+    if memory_backend() != "chroma":
+        chroma_import_result()
     if _keywords_only():
         return _sqlite_episodes(_sqlite_path())
     if memory_backend() == "hybrid":

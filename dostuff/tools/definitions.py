@@ -114,7 +114,7 @@ TOOL_MAP: dict[str, ToolSpec] = {spec.name: spec for spec in _TOOLS}
 
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {name: spec.schema for name, spec in TOOL_MAP.items()}
 
-# Need chromadb (the `memory` extra); not offered to the model without it
+# Need a memory store; not offered to the model when memory is off (memory.backend: chroma without chromadb)
 MEMORY_TOOLS = frozenset({"save_memory", "save_episode", "search_memory"})
 
 # Offered exactly when bash_command is: they only work on jobs it started

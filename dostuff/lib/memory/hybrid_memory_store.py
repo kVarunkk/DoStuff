@@ -21,6 +21,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Collection
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from dostuff.helpers.memory.resolve_memory_operation import DEDUP_MIN_SIMILARITY, resolve_memory_operation
@@ -106,8 +107,104 @@ def _merge(sides: list[tuple[list[dict], float, str]], key: Callable[[dict], Any
     return sorted(best.values(), key=lambda b: -b[0])
 
 
-class HybridFactStore:
+@dataclass
+class IndexReport:
+    """How one embedding index compares with memory.db (`dostuff memory check`)."""
+    kind: str  # "facts" or "episodes"
+    rows: int  # in memory.db
+    indexed: int  # in the index
+    missing: int = 0  # in memory.db, not in the index (e.g. saved under the sqlite backend, or imported)
+    stale: int = 0  # in both, but the index holds an older text
+    extra: int = 0  # in the index only (forgotten in memory.db)
+    pending: int = 0  # queued writes not yet in the index
+    broken: str | None = None  # the index can't answer queries (Chroma "Error finding id")
+
+    @property
+    def ok(self) -> bool:
+        return not (self.missing or self.stale or self.extra or self.pending or self.broken)
+
+    def describe(self) -> str:
+        if self.broken:
+            return f"{self.kind}: index BROKEN ({self.broken})"
+        if self.ok:
+            return f"{self.kind}: ok ({self.rows} saved, all indexed)"
+        parts = [f"{n} {label}" for n, label in ((self.missing, "not indexed"), (self.stale, "out of date"),
+                                                   (self.extra, "forgotten but still indexed"),
+                                                   (self.pending, "queued")) if n]
+        return f"{self.kind}: {self.rows} saved, {', '.join(parts)}"
+
+
+class IndexSync:
+    """Check and repair of one hybrid store's embedding index against memory.db, which is the data: the index can
+    always be rebuilt from it. Subclasses name their table and what of a row the index must hold."""
+
+    keyword: SQLiteFactStore | SQLiteEpisodeStore
+    embedding: SemanticMemoryStore | EpisodicMemoryStore
+    outbox: _Outbox
+    _table: str
+    _collection_name: str
+
+    @staticmethod
+    def _row_state(row: sqlite3.Row) -> tuple:
+        raise NotImplementedError
+
+    @staticmethod
+    def _index_state(meta: dict) -> tuple:
+        raise NotImplementedError
+
+    def _diff(self, rows: dict[str, sqlite3.Row]) -> tuple[list[str], list[str], list[str], int]:
+        """(missing, stale, extra) ids and how many rows the index holds; reads metadata only, so a broken vector
+        graph doesn't stop it."""
+        found = self.embedding._collection.get(include=["metadatas"])
+        index = {str(i): (m or {}) for i, m in zip(found.get("ids") or [], found.get("metadatas") or [])}
+        missing = [i for i in rows if i not in index]
+        stale = [i for i in rows if i in index and self._row_state(rows[i]) != self._index_state(index[i])]
+        extra = [i for i in index if i not in rows]
+        return missing, stale, extra, len(index)
+
+    async def check_index(self) -> IndexReport:
+        from dostuff.helpers.memory.repair_index import check_collection
+        rows = await self.keyword._db.all_rows(self._table)
+        missing, stale, extra, indexed = await asyncio.to_thread(self._diff, rows)
+        return IndexReport(self._table, len(rows), indexed, len(missing), len(stale), len(extra),
+                           await self.keyword._db.outbox_count(self.keyword.OUTBOX_KIND),
+                           await asyncio.to_thread(check_collection, self.embedding._collection))
+
+    async def repair_index(self) -> IndexReport:
+        """Bring the index in line with memory.db: a broken one is dropped and rebuilt, otherwise only the rows that
+        differ are queued and written. Returns the state after. Raises if the index can't be written."""
+        from dostuff.helpers.memory.repair_index import check_collection
+        if await asyncio.to_thread(check_collection, self.embedding._collection):
+            await asyncio.to_thread(self._recreate_collection)
+        rows = await self.keyword._db.all_rows(self._table)
+        missing, stale, extra, _ = await asyncio.to_thread(self._diff, rows)
+        await self.keyword._db.enqueue(self.keyword.OUTBOX_KIND, [*missing, *stale, *extra])
+        if not await self.outbox.drain():
+            raise RuntimeError(f"the {self._table} embedding index could not be written (see the log)")
+        return await self.check_index()
+
+    def _recreate_collection(self) -> None:
+        client = self.embedding._client
+        client.delete_collection(self._collection_name)
+        self.embedding._collection = client.get_or_create_collection(name=self._collection_name,
+                                                                     metadata={"hnsw:space": "cosine"})
+
+
+class HybridFactStore(IndexSync):
     """Facts (`SemanticMemoryStore`'s API): SQLite of record plus an embedding index."""
+
+    keyword: SQLiteFactStore
+    embedding: SemanticMemoryStore
+    _table = "facts"
+    _collection_name = "semantic_memory"
+
+    @staticmethod
+    def _row_state(row: sqlite3.Row) -> tuple:
+        return (row["value"],)
+
+    @staticmethod
+    def _index_state(meta: dict) -> tuple:
+        return (meta.get("value"),)
 
     # Named floors, one per kind of search; callers read them by name (getattr), so each maps to both sides' floor
     RECALL_FLOOR = 0.3
@@ -182,8 +279,24 @@ def _episode_doc(row: sqlite3.Row) -> dict:
     return {"id": row["id"], "vector_text": vector_text, "metadata": meta}
 
 
-class HybridEpisodeStore:
+_EPISODE_TEXT = ("event_type", "anchor_event", "summary", "tags")
+
+
+class HybridEpisodeStore(IndexSync):
     """Episodes (`EpisodicMemoryStore`'s API): SQLite of record plus an embedding index."""
+
+    keyword: SQLiteEpisodeStore
+    embedding: EpisodicMemoryStore
+    _table = "episodes"
+    _collection_name = "episodic_memory"
+
+    @staticmethod
+    def _row_state(row: sqlite3.Row) -> tuple:
+        return tuple(row[k] for k in _EPISODE_TEXT)
+
+    @staticmethod
+    def _index_state(meta: dict) -> tuple:
+        return tuple(meta.get(k) for k in _EPISODE_TEXT)
 
     RECALL_FLOOR = 0.3
     SEARCH_FLOOR = 0.2

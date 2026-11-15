@@ -68,11 +68,18 @@ def doctor_checks() -> list[Check]:
                         else "MCP servers: none configured (optional; `dostuff mcp add`)", None))
     checks += [Check(warning, False) for warning in key_warnings(servers)]
     checks.append(Check(f"Data dir: {cfg.data_dir}" + ("" if cfg.data_dir.exists() else " (created on first run)"), None))
-    if memory_backend() == "sqlite" or (memory_backend() == "hybrid" and not chroma_available()):
-        checks.append(Check("Long-term memory: on (sqlite keyword search, memory.db)", None))
+    backend = memory_backend()
+    if backend == "sqlite":
+        checks.append(Check("Long-term memory: on (sqlite keyword search, memory.db; `dostuff memory check`)", None))
+    elif backend == "hybrid" and not chroma_available():
+        checks.append(Check("Long-term memory: on, keyword search only (memory.db); add search by meaning with "
+                            f"`{MEMORY_INSTALL_HINT}`", None))
     elif not chroma_available():
         checks.append(Check(f"Long-term memory: off, chromadb not installed (optional; `{MEMORY_INSTALL_HINT}`)", None))
     else:
+        if backend == "hybrid":
+            checks.append(Check("Long-term memory: on (memory.db, searched by keywords and meaning; "
+                                "`dostuff memory check`)", None))
         checks.append(Check("Memory embedding model: " + ("not downloaded yet (~80 MB; the TUI fetches it on first start)"
                                                           if embedding_model_missing() else "downloaded"), None))
     checks.append(Check(f"Permission mode: {cfg.permission_mode}", None))

@@ -178,7 +178,7 @@ when this prompt was written; a skill added, changed or removed later is announc
 {skills_summary}
 """
 
-# Inserted into SYSTEM_INSTRUCTIONS only when long-term memory is on (chromadb installed)
+# Inserted into SYSTEM_INSTRUCTIONS only when long-term memory is on (memory_available())
 MEMORY_INSTRUCTIONS = """## Long-term memory
 - Facts in <user_facts> and <project_facts> (the newest list replaces earlier ones), any
   <other_relevant_facts>, and moments in <past_episodes> were saved in earlier sessions.

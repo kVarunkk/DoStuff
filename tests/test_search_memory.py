@@ -168,8 +168,12 @@ def test_search_memory_is_a_memory_tool_offered_only_with_memory(monkeypatch):
     from dostuff.tools.definitions import MEMORY_TOOLS, TOOL_MAP, default_tool_names
     assert TOOL_MAP["search_memory"].kind == "read"
     assert "search_memory" in MEMORY_TOOLS
+    from dostuff.config import get_config
     monkeypatch.setattr(chroma, "chroma_available", lambda: False)
+    monkeypatch.setattr(get_config(), "memory_backend", "chroma")  # memory is off only here
     assert "search_memory" not in default_tool_names()
+    monkeypatch.setattr(get_config(), "memory_backend", "hybrid")
+    assert "search_memory" in default_tool_names()
 
 
 def test_search_memory_plan_mode_allowed():

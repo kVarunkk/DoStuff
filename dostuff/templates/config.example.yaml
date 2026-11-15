@@ -33,7 +33,7 @@ loop:
 
 memory:
   episodic_scope: project   # project: recall past episodes from this directory only | user: from anywhere
-  backend: chroma           # chroma: semantic search (needs dostuff[memory]) | sqlite: keyword search, no extra (experimental)
+  backend: hybrid           # hybrid: keywords + meaning (meaning needs dostuff[memory]) | sqlite: keywords only | chroma: the old embeddings-only store
 
 ui:
   # Status bar items, shown in this order. Default: [cwd, model, mode, context].

@@ -47,7 +47,7 @@ async def save_episode(
         raise ValueError("Both anchor_event and summary must be non-empty.")
     store = get_episodic_store()
     if store is None:
-        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}, or set memory.backend: sqlite).")
+        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}, or remove memory.backend: chroma to use the built-in store).")
     user_id = get_config().get_user_id()
     working_dir = str(Path.cwd().resolve())
     vector_text = f"- EVENT TYPE: {event_type}\n  - ANCHOR EVENT: {anchor_event}\n  - SUMMARY: {summary}"

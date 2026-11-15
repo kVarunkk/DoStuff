@@ -3,11 +3,14 @@ system prompt and the tool list ask before the stores are loaded."""
 from dostuff.lib.memory import chroma
 
 
+DEFAULT_BACKEND = "hybrid"
+
+
 def memory_backend() -> str:
-    """`chroma` (embeddings, needs the `memory` extra), `sqlite` (FTS5 keyword search, built in) or `hybrid` (sqlite
-    plus an embedding index when the extra is installed)."""
+    """`hybrid` (the default: sqlite plus an embedding index when the `memory` extra is installed), `sqlite` (FTS5
+    keyword search, built in) or `chroma` (embeddings only, needs the extra; the default before hybrid)."""
     from dostuff.config import get_config
-    return str(getattr(get_config(), "memory_backend", "chroma"))
+    return str(getattr(get_config(), "memory_backend", DEFAULT_BACKEND))
 
 
 def memory_available() -> bool:

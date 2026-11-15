@@ -112,7 +112,7 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
 
     `exclude_episode_ids` are the episodes this session's history already shows (`delivered_episode_ids`): they are
     not recalled again (memory recall D8), and nor are the overflow facts in `exclude_fact_ids`
-    (`delivered_fact_ids`). The stores are None when long-term memory is off (chromadb not installed): no recall
+    (`delivered_fact_ids`). The stores are None when long-term memory is off (chroma backend without chromadb): no recall
     then.
     """
     # Recall is extra context: if it fails (e.g. the embedding model could not be downloaded),

@@ -255,12 +255,20 @@ def memory(
     if reembed and action != "repair":
         typer.secho("--reembed goes with 'repair': dostuff memory repair --reembed", fg=typer.colors.RED)
         raise typer.Exit(code=2)
-    if not chroma.chroma_available():
-        typer.echo(f"Long-term memory is off: chromadb is not installed ({MEMORY_INSTALL_HINT}).")
-        raise typer.Exit(code=1)
+    from dostuff.lib.memory.backend import memory_backend
     if action == "consolidate":
         _consolidate_facts(yes)
         return
+    if memory_backend() != "chroma":
+        if reembed:
+            typer.secho("--reembed is for the chroma backend; memory.db's index needs no re-embedding.",
+                        fg=typer.colors.RED)
+            raise typer.Exit(code=2)
+        _check_memory_db(repair=action == "repair", yes=yes)
+        return
+    if not chroma.chroma_available():
+        typer.echo(f"Long-term memory is off: chromadb is not installed ({MEMORY_INSTALL_HINT}).")
+        raise typer.Exit(code=1)
 
     from dostuff.helpers.memory.repair_index import check_collection, rebuild_collection
 
@@ -340,6 +348,70 @@ def memory(
     typer.secho("Rebuilt. Restart any running dostuff sessions so they reopen the collections.", fg=typer.colors.GREEN)
 
 
+def _check_memory_db(repair: bool, yes: bool) -> None:
+    """`dostuff memory check|repair` on the sqlite and hybrid backends: memory.db's keyword index, the import of the
+    old chroma store's memories, and (hybrid with chromadb) the embedding index. memory.db is the data; both indexes
+    are rebuilt from it, so a repair never loses a memory."""
+    import asyncio
+
+    from dostuff.lib.memory.backend import memory_backend
+    from dostuff.lib.memory.hybrid_memory_store import IndexReport, IndexSync
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteFactStore
+    from dostuff.lib.memory.stores import chroma_import_result, get_episodic_store, get_semantic_store
+
+    facts, episodes = get_semantic_store(), get_episodic_store()
+    imported = chroma_import_result()
+    keyword = facts.keyword if isinstance(facts, IndexSync) else facts
+    # sqlite and hybrid always have stores, and both keep them in memory.db
+    assert isinstance(keyword, SQLiteFactStore) and episodes is not None and imported is not None
+    db = keyword._db
+    typer.echo(f"Backend: {memory_backend()} ({db.db_path})")
+    problems = 0
+
+    if imported.status == "imported":
+        typer.secho(f"  old chroma store: brought in now ({imported.facts} facts, {imported.episodes} episodes)",
+                    fg=typer.colors.GREEN)
+    elif imported.status in ("needs-chromadb", "failed"):
+        problems += 1
+        typer.secho(f"  old chroma store: {imported.message()}", fg=typer.colors.RED)
+
+    broken_fts = db.fts_problems()
+    if broken_fts and repair:
+        db.rebuild_fts()
+        broken_fts = db.fts_problems()
+        typer.secho("  keyword index: rebuilt" if not broken_fts else f"  keyword index: still BROKEN ({broken_fts})",
+                    fg=typer.colors.RED if broken_fts else typer.colors.GREEN)
+    elif broken_fts:
+        typer.secho(f"  keyword index: BROKEN ({', '.join(broken_fts)})", fg=typer.colors.RED)
+    else:
+        typer.secho("  keyword index: ok", fg=typer.colors.GREEN)
+    problems += bool(broken_fts)
+
+    hybrid = [s for s in (facts, episodes) if isinstance(s, IndexSync)]
+    if memory_backend() == "hybrid" and not hybrid:
+        typer.echo("  embedding index: off (chromadb is not installed; recall uses keywords only)")
+    for store in hybrid:
+        report: IndexReport = asyncio.run(store.check_index())
+        if not report.ok and repair:
+            if report.broken and not yes and not typer.confirm(
+                    f"Rebuild the {report.kind} embedding index from memory.db? Nothing saved is lost."):
+                raise typer.Exit(code=1)
+            try:
+                report = asyncio.run(store.repair_index())
+            except Exception as error:
+                typer.secho(f"  {report.kind}: repair failed: {error}", fg=typer.colors.RED)
+                problems += 1
+                continue
+        typer.secho(f"  {report.describe()}", fg=typer.colors.GREEN if report.ok else typer.colors.RED)
+        problems += not report.ok
+
+    if problems:
+        if not repair:
+            typer.echo("\nRun `dostuff memory repair` to fix it (memory.db is kept as it is).")
+        raise typer.Exit(code=1)
+    typer.echo("\nMemory is healthy." if not repair else "\nNothing left to repair.")
+
+
 def _consolidate_facts(yes: bool) -> None:
     """`dostuff memory consolidate`: one model call merges overlapping user facts and this project's, the diff is
     shown, and nothing is written until the user says yes (memory recall D10). In auto mode it never asks: without
@@ -349,14 +421,18 @@ def _consolidate_facts(yes: bool) -> None:
 
     from dostuff.config import get_config
     from dostuff.helpers.memory.consolidate import ConsolidateError, apply, describe, propose, summary
-    from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
+    from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
+    from dostuff.lib.memory.stores import get_semantic_store
 
     cfg = get_config()
     if cfg.permission_mode == "auto" and not yes:
         typer.echo("Permission mode is auto mode, which never stops to ask, and merging facts needs your OK. "
                    "Run `dostuff memory consolidate --yes` to merge without asking.")
         raise typer.Exit(code=1)
-    store = SemanticMemoryStore(persist_path=str(cfg.get_data_dir() / "chroma"))
+    store = get_semantic_store()  # the configured backend's store, the one the TUI and the memory tools use
+    if store is None:
+        typer.echo(f"Long-term memory is off: chromadb is not installed ({MEMORY_INSTALL_HINT}).")
+        raise typer.Exit(code=1)
     user_id, here = cfg.get_user_id(), Path.cwd().resolve()
     typer.echo("Asking the model to merge overlapping facts…")
     try:

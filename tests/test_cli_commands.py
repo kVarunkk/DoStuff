@@ -312,7 +312,10 @@ def headless(env, monkeypatch):
 
 def test_headless_episode_not_repeated_in_session(env, headless, monkeypatch):
     """REQ-3.1 in `dostuff -p --session`: a continued session doesn't recall what its history already shows."""
+    from dostuff import config as config_module
     from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+    (env["home"] / ".dostuff" / "config.yaml").write_text("memory:\n  backend: chroma\n")  # the store stubbed below
+    config_module.reset_config()
     excluded = []
 
     async def ranked(self, user_id, query_text, top_k=3, working_dir=None, exclude_ids=(), **kwargs):

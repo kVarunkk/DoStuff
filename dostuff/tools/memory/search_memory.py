@@ -54,7 +54,7 @@ async def search_memory(query: str, kind: Literal["all", "facts", "episodes"] = 
         raise ValueError("event_type filters episodes; use kind 'episodes' or 'all'.")
     fact_store, episode_store = get_semantic_store(), get_episodic_store()
     if fact_store is None or episode_store is None:
-        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}, or set memory.backend: sqlite).")
+        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}, or remove memory.backend: chroma to use the built-in store).")
     config = get_config()
     user_id = config.get_user_id()
     here = str(Path.cwd().resolve())

@@ -38,7 +38,7 @@ def tools_listing(mcp_tools: dict[str, dict[str, Any]] | None = None) -> str:
                      f"{_summary(spec.schema['function'].get('description'))}")
     off = [n for n in TOOL_MAP if n not in offered and n in MEMORY_TOOLS]
     if off:
-        lines.append(f"  Off: {', '.join(off)} (need the memory extra: pip install \"dostuff[memory]\")")
+        lines.append(f"  Off: {', '.join(off)} (memory.backend: chroma needs the memory extra: pip install \"dostuff[memory]\"; the default backend doesn't)")
 
     servers: dict[str, list[dict[str, Any]]] = {}
     for info in (mcp_tools or {}).values():
