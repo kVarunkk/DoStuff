@@ -7,12 +7,21 @@ import asyncio
 import inspect
 
 import litellm
+import pytest
 
 from dostuff.agent import loop as loop_module
 from dostuff.agent.call_agent import provider_messages
 from dostuff.helpers.agent.turn_context import make_context_step
 from conftest import fake_response
 from tests.test_loop import _interactive, _msg, _tc, Adapter
+
+
+@pytest.fixture(autouse=True)
+def fifty_short_facts_budget(monkeypatch):
+    """The facts step's budget shrunk to 50 of this file's `kNN: vNN` facts (3 tokens each), so the overflow tests
+    stay small; the budget itself is tested in test_turn_context."""
+    from dostuff.helpers.agent import turn_context
+    monkeypatch.setattr(turn_context, "FACT_TOKEN_BUDGET", 150)
 
 USER = "u1"
 PROJ_A = "/work/proj-a"
@@ -168,10 +177,14 @@ def test_store_error_reports_once_turn_runs(monkeypatch):
 def test_no_chromadb_no_step_no_tools(monkeypatch):
     from dostuff.lib.memory import chroma
     from dostuff.tools.definitions import MEMORY_TOOLS, default_tool_names
+    from dostuff.config import get_config
     _, working, _ = _interactive(monkeypatch, [_msg(content="ok")])  # no store passed: memory is off
     assert _facts_steps(working) == []
     monkeypatch.setattr(chroma, "chroma_available", lambda: False)
+    monkeypatch.setattr(get_config(), "memory_backend", "chroma")  # the only backend that needs chromadb
     assert not MEMORY_TOOLS & set(default_tool_names())
+    monkeypatch.setattr(get_config(), "memory_backend", "hybrid")  # the default works without it
+    assert MEMORY_TOOLS <= set(default_tool_names())
 
 
 def test_facts_step_after_the_turns_bundle(monkeypatch):
@@ -246,6 +259,26 @@ def test_over_cap_newest_50_and_overflow_in_bundle(monkeypatch, tmp_path):
     assert q["min_similarity"] == 0.25 and q["working_dir"] == here and q["scope"] is None
     assert "<other_relevant_facts>\n- k02: v2\n- linter: ruff\n- k00: v0\n</other_relevant_facts>" in bundle
     assert "k54" not in bundle and "<relevant_user_facts>" not in bundle
+    # Every turn, not just the facts step: 56 saved, 50 in the facts step
+    assert hidden_facts_note(6) in bundle
+
+
+def hidden_facts_note(n):
+    from dostuff.helpers.agent.turn_context import HIDDEN_FACTS_NOTE
+    return f'<hidden_facts count="{n}">{HIDDEN_FACTS_NOTE}</hidden_facts>'
+
+
+def test_hidden_facts_note_only_past_the_cap(monkeypatch, tmp_path):
+    from dostuff.helpers.agent.turn_context import HIDDEN_FACTS_NOTE
+    assert "search_memory" in HIDDEN_FACTS_NOTE and "code" in HIDDEN_FACTS_NOTE and "commit" in HIDDEN_FACTS_NOTE
+    store = QueryRecorder()
+    for i in range(50):
+        store.add(f"k{i:02d}", f"v{i}", updated=i)
+    assert "<hidden_facts" not in _bundle(store, monkeypatch, tmp_path)
+    store.add("k50", "v50", updated=50)
+    store.ranked = []  # nothing matches the prompt: the note still says facts are hidden
+    bundle = _bundle(store, monkeypatch, tmp_path)
+    assert hidden_facts_note(1) in bundle and "<other_relevant_facts>" not in bundle
 
 
 # T1.12 typed subagents get facts, read-only (D14) -----------------------------------------------------------
@@ -455,7 +488,7 @@ def test_episode_block_user_scope_has_no_project_count(monkeypatch, tmp_path):
 # --- Overflow facts are not repeated within a session (like episodes, D8) --------------------------------------
 
 def _overflow_store(tmp_path):
-    """55 user facts: k00-k04 are past the cap, and every query ranks k00, k01, k02, k03 first."""
+    """55 user facts: k00-k04 are past the budget, and every query ranks k00, k01, k02, k03 first."""
     store = QueryRecorder()
     for i in range(55):
         store.add(f"k{i:02d}", f"v{i}", updated=i)

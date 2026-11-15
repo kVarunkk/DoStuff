@@ -1,6 +1,6 @@
 """search_memory: the model's own lookup past the caps (memory recall spec D12, T3.1).
 
-The facts step lists 50 facts and a turn recalls at most 3 overflow facts and 3 episodes; a prompt that needs more
+The facts step lists facts up to a token budget and a turn recalls at most 3 overflow facts and 3 episodes; a prompt that needs more
 (S10 in the live eval) can only get them by asking. Real Chroma in a temp dir; skipped without chromadb.
 """
 import asyncio
@@ -35,6 +35,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(sm, "get_config", lambda: cfg)
     monkeypatch.setattr(sm, "get_semantic_store", lambda: facts)
     monkeypatch.setattr(sm, "get_episodic_store", lambda: episodes)
+    # Smaller than the fillers below cost (~12-16 tokens each), so the facts older than them are past the budget
+    from dostuff.helpers.agent import turn_context
+    monkeypatch.setattr(turn_context, "FACT_TOKEN_BUDGET", 400)
     return SimpleNamespace(facts=facts, episodes=episodes, a=str(proj_a.resolve()), b=str(proj_b.resolve()), cfg=cfg)
 
 
@@ -72,15 +75,15 @@ def _search(query, **kw):
 
 
 def _over_the_cap(env):
-    """52 newer user fillers (so the user facts below are past the 50) and 31 newer project fillers in A (so A's
-    oldest project fact is past the 30 project slots), plus the facts the tests look for."""
+    """52 newer user fillers and 31 newer project fillers in A, more than the budget holds, so the older facts below
+    are past it, plus the facts the tests look for."""
     fill_u = [(f"hobby_{i:02d}", f"Keeps a collection of {i} houseplants", 1 + i % 40, "user", None) for i in range(52)]
     fill_p = [(f"note_{i:02d}", f"In this project, note {i} is filed under docs/notes", 1 + i % 20, "project", env.a)
               for i in range(31)]
     _facts(env.facts, fill_u + fill_p + [
         ("shell", "Uses PowerShell on Windows", 0, "user", None),                       # newest: in the facts step
-        ("db_dislike", "Dislikes working with MongoDB", 400, "user", None),             # past the 50
-        ("ticket", "Commit messages start with the ticket id TKV-<number>", 300, "project", env.a),  # past the 30
+        ("db_dislike", "Dislikes working with MongoDB", 400, "user", None),             # past the budget
+        ("ticket", "Commit messages start with the ticket id TKV-<number>", 300, "project", env.a),  # past the budget
         ("ticket", "Commit messages start with the ticket id ABC-<number>", 300, "project", env.b),  # other project
     ])
 
@@ -165,8 +168,12 @@ def test_search_memory_is_a_memory_tool_offered_only_with_memory(monkeypatch):
     from dostuff.tools.definitions import MEMORY_TOOLS, TOOL_MAP, default_tool_names
     assert TOOL_MAP["search_memory"].kind == "read"
     assert "search_memory" in MEMORY_TOOLS
+    from dostuff.config import get_config
     monkeypatch.setattr(chroma, "chroma_available", lambda: False)
+    monkeypatch.setattr(get_config(), "memory_backend", "chroma")  # memory is off only here
     assert "search_memory" not in default_tool_names()
+    monkeypatch.setattr(get_config(), "memory_backend", "hybrid")
+    assert "search_memory" in default_tool_names()
 
 
 def test_search_memory_plan_mode_allowed():
@@ -189,7 +196,7 @@ def test_prompts_point_at_search_memory():
 
 
 def _many_overflow_facts(env, n):
-    """52 newer fillers fill the 50; then `n` older style facts, all past the cap and all matching 'code style'."""
+    """52 newer fillers fill the budget; then `n` older style facts, all past it and all matching 'code style'."""
     fill = [(f"hobby_{i:02d}", f"Keeps a collection of {i} houseplants", 1 + i % 40, "user", None) for i in range(52)]
     style = [(f"style_{i:02d}", f"Python code style rule {i}: format helper functions this way", 200 + i, "user", None)
              for i in range(n)]
@@ -220,3 +227,66 @@ def test_search_memory_no_more_note_when_all_matches_shown(env):
     _many_overflow_facts(env, 3)
     out = _search("Python code style rules", kind="facts")
     assert out.count("code style rule") == 3 and "More facts match" not in out
+
+
+# event_type filter ----------------------------------------------------------------------------------------------
+# "What did I correct you on?" names a kind of memory, not its words: a correction worded by what happened ("removed
+# an any from the cart reducer") scores under the 0.2 floor against it. With the type given, every episode of that
+# type is ranked without the floor; today's unfiltered results follow, so a wrong type never loses what the search
+# would have found without it (offline benchmark plan/2026-11-11-memory-recall/t2_search, 2026-11-13).
+
+def _corrections_and_others(env):
+    _episodes(env.episodes, [
+        ("c_any", "CORRECTION", "User removed an any I added to the cart reducer",
+         "Use a discriminated union for cart actions instead.", 20, env.a),
+        ("c_log", "CORRECTION", "User rewrote my f-string log lines as structlog key-values",
+         "log.info('loaded', rows=n), not log.info(f'loaded {n} rows').", 25, env.a),
+        ("c_other", "CORRECTION", "User changed my tab indentation to spaces in project B", "Spaces.", 25, env.b),
+        ("d_uv", "DECISION", "Switched the pipeline from Poetry to uv", "Lock resolution took minutes.", 10, env.a),
+        ("d_css", "DECISION", "Dropped Tailwind for CSS modules", "Class lists got unreadable.", 12, env.a),
+    ])
+
+
+def test_search_memory_event_type_ranks_that_type_without_the_floor(env):
+    _corrections_and_others(env)
+    query = "things the user corrected me on"
+    plain = _search(query, kind="episodes")
+    assert "cart reducer" not in plain  # under the floor without the filter: the case this exists for
+    out = _search(query, kind="episodes", event_type="CORRECTION")
+    assert "cart reducer" in out and "structlog" in out
+    assert "project B" not in out  # still this project's episodes only
+    typed = out.split("Other episodes")[0]
+    assert "Poetry" not in typed and "Tailwind" not in typed  # the typed section holds that type only
+
+
+def test_search_memory_wrong_event_type_keeps_the_unfiltered_results(env):
+    _episodes(env.episodes, [
+        ("l_lock", "LEARNING", "sqlite3 'database is locked' fixed with a busy timeout",
+         "Two writers raised database is locked; timeout=5 fixed it.", 40, env.a),
+        ("d_mit", "DECISION", "Chose the MIT licence", "We picked MIT over Apache-2.0.", 5, env.a),
+    ])
+    query = "sqlite database is locked error"
+    assert "busy timeout" in _search(query, kind="episodes")
+    out = _search(query, kind="episodes", event_type="DECISION")  # wrong type for this question
+    assert "busy timeout" in out and "Other episodes" in out
+    assert out.count("busy timeout") == 1  # shown once, not in both sections
+
+
+def test_search_memory_event_type_none_saved(env):
+    _corrections_and_others(env)
+    out = _search("what did we learn", kind="episodes", event_type="LEARNING")
+    assert "No LEARNING episodes" in out
+
+
+def test_search_memory_event_type_rejects_bad_input(env):
+    with pytest.raises(ValueError, match="event_type"):
+        _search("anything", kind="episodes", event_type="IDEA")
+    with pytest.raises(ValueError, match="episodes"):
+        _search("anything", kind="facts", event_type="DECISION")
+
+
+def test_episode_store_query_filters_by_event_type(env):
+    _corrections_and_others(env)
+    got = asyncio.run(env.episodes.query(USER, "cart reducer", top_k=10, working_dir=env.a, min_similarity=-1.0,
+                                         recency_decay_rate=0.0, event_type="DECISION"))
+    assert {e["event_type"] for e in got} == {"DECISION"} and len(got) == 2

@@ -37,7 +37,7 @@ async def save_memory(key: str, value: str, source: MemorySource = "user_message
         raise ValueError("Both key and value must be non-empty.")
     store = get_semantic_store()
     if store is None:
-        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}).")
+        raise RuntimeError(f"Long-term memory is off (chromadb is not installed: {MEMORY_INSTALL_HINT}, or remove memory.backend: chroma to use the built-in store).")
     if scope not in ("user", "project"):
         raise ValueError("scope must be 'user' or 'project'.")
     fact = {"key": key, "value": value, "source": source}

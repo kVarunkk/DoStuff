@@ -8,7 +8,9 @@ whole cached prefix. The model reads them; a user never sees them. Every reader 
 Light on import: the TUI loads this before its first frame.
 """
 import hashlib
+import math
 import re
+import time
 from contextvars import ContextVar
 from typing import Any, NamedTuple
 
@@ -18,11 +20,13 @@ TURN_CONTEXT_MARKER = "turn_context"
 HIDDEN_LIKE_PATTERN = f'%"hidden": "{TURN_CONTEXT_MARKER}"%'
 PROMPT_CONTEXT_HEADER = "[Context from UserPromptSubmit hooks]"
 
-# Saved facts delivered whole in the facts step; the rest are recalled per turn by similarity
-# (plan/2026-11-11-memory-recall D3). Project facts are capped inside the total so one busy repo
-# can't push every user fact out.
-FACT_INJECT_CAP = 50
-PROJECT_FACT_CAP = 30
+# Saved facts delivered whole in the facts step, newest first, until their lines cost FACT_TOKEN_BUDGET; the rest are
+# recalled per turn by similarity and reachable through search_memory (plan/2026-11-11-memory-recall D3). A budget in
+# tokens, not a count: a fact costs ~7-11 tokens, so 4000 lists a few hundred typical facts (far past the consolidate
+# hint) for ~3% of a 128k window, paid once per change since the step is cached, while a few long values can't
+# blow it up. Project facts get at most PROJECT_FACT_TOKEN_SHARE of it so one busy repo can't push every user fact out.
+FACT_TOKEN_BUDGET = 4000
+PROJECT_FACT_TOKEN_SHARE = 0.6
 FACTS_REPLACE_NOTE = "This replaces any earlier list of saved facts."
 # Past this many user facts, /memories suggests merging (D10): the facts step grows with every one
 CONSOLIDATE_HINT_USER_FACTS = 30
@@ -77,14 +81,22 @@ def _episodes_block(episodes: str, counts: EpisodeCounts | None) -> str:
     return f"<past_episodes{attrs}>\n{episodes}" + (f"\n{EPISODES_MORE_NOTE}" if more else "") + "\n</past_episodes>"
 
 
+# Repeated every turn while facts are hidden: the same advice in the facts step sits far back in a long session,
+# and weaker models stopped searching before code and commits (glm-5.3-flash S10: 2/7 searches)
+HIDDEN_FACTS_NOTE = ("Saved facts the facts step leaves out. Before writing code or committing, call search_memory "
+                     "for the user's preferences and this project's conventions on that work.")
+
+
 def compose_turn_context(environment: str = "", facts: str = "", episodes: str = "", prompt_context: str = "",
-                         episode_counts: EpisodeCounts | None = None) -> str:
+                         episode_counts: EpisodeCounts | None = None, hidden_facts: int = 0) -> str:
     """The bundle: the sections that have text, in a fixed order; "" when none has (D4). Does no I/O.
 
-    `facts` are the saved facts past the facts step's cap that match the prompt (memory recall D3)."""
+    `facts` are the saved facts past the facts step's budget that match the prompt (memory recall D3); `hidden_facts`
+    counts every fact past the budget, matching or not."""
     sections = [
         environment,
         f"<other_relevant_facts>\n{facts}\n</other_relevant_facts>" if facts else "",
+        f'<hidden_facts count="{hidden_facts}">{HIDDEN_FACTS_NOTE}</hidden_facts>' if hidden_facts > 0 else "",
         _episodes_block(episodes, episode_counts) if episodes else "",
         f"{PROMPT_CONTEXT_HEADER}\n{prompt_context}" if prompt_context else "",
     ]
@@ -92,17 +104,19 @@ def compose_turn_context(environment: str = "", facts: str = "", episodes: str =
     return _wrap(body) if body else ""
 
 
-_MEMORY_SECTIONS = re.compile(r"<other_relevant_facts>.*?</other_relevant_facts>|<past_episodes\b.*?</past_episodes>",
+_MEMORY_SECTIONS = re.compile(r"<other_relevant_facts>.*?</other_relevant_facts>|<hidden_facts\b.*?</hidden_facts>"
+                              r"|<past_episodes\b.*?</past_episodes>",
                               re.DOTALL)
 
 
 def memory_sections(step: dict) -> list[str]:
-    """The parts of a turn-context step that are long-term memory (memory recall D11): all of a facts step, or a
-    bundle's `<other_relevant_facts>` and `<past_episodes>` sections; [] for anything else."""
+    """The parts of a turn-context step that are long-term memory (memory recall D11): all of a facts or episode index
+    step, or a
+    bundle's `<other_relevant_facts>`, `<hidden_facts>` and `<past_episodes>` sections; [] for anything else."""
     if not is_turn_context(step):
         return []
     text = step.get("content") if isinstance(step.get("content"), str) else ""
-    if "facts" in step["meta"]:
+    if "facts" in step["meta"] or "episode_index" in step["meta"]:
         return [text] if text else []
     return _MEMORY_SECTIONS.findall(text or "")
 
@@ -191,16 +205,35 @@ def delivered_facts(history: list) -> tuple[str, ...] | None:
     return None
 
 
+def fact_line(fact: dict) -> str:
+    """One fact as the facts step lists it."""
+    return f"- {fact['key']}: {fact['value']}\n"
+
+
+def fact_tokens(fact: dict) -> int:
+    """Rough token cost of a fact's line: ~4 characters a token, like `estimate_tokens`. Deterministic and offline,
+    because the same selection decides the facts step, the per-turn overflow recall and search_memory."""
+    return (len(fact_line(fact)) + 3) // 4
+
+
 def select_injected_facts(facts: list[dict]) -> tuple[list[dict], list[dict]]:
-    """(shown, overflow): the newest FACT_INJECT_CAP facts, project first on equal timestamps and at most
-    PROJECT_FACT_CAP of them, newest first; overflow is everything else."""
+    """(shown, overflow): facts newest first (project first on equal timestamps), each shown while its line fits in
+    FACT_TOKEN_BUDGET, project facts in at most PROJECT_FACT_TOKEN_SHARE of it; one that doesn't fit is skipped, not
+    the end of the list, so a single long value can't hide every older fact. Overflow is everything else, in order."""
     ordered = sorted(facts, key=lambda f: (-int(f.get("updated_at_epoch") or 0), f.get("scope") != "project", f["key"]))
-    project_ids = [id(f) for f in ordered if f.get("scope") == "project"][:PROJECT_FACT_CAP]
-    allowed = set(project_ids)
-    candidates = [f for f in ordered if f.get("scope") != "project" or id(f) in allowed]
-    shown = candidates[:FACT_INJECT_CAP]
-    shown_ids = {id(f) for f in shown}
-    return shown, [f for f in ordered if id(f) not in shown_ids]
+    budget, project_budget = FACT_TOKEN_BUDGET, int(FACT_TOKEN_BUDGET * PROJECT_FACT_TOKEN_SHARE)
+    shown, overflow = [], []
+    for fact in ordered:
+        cost = fact_tokens(fact)
+        is_project = fact.get("scope") == "project"
+        if cost <= budget and (not is_project or cost <= project_budget):
+            shown.append(fact)
+            budget -= cost
+            if is_project:
+                project_budget -= cost
+        else:
+            overflow.append(fact)
+    return shown, overflow
 
 
 def facts_step_content(facts: list[dict], project: str) -> tuple[str, tuple[str, ...]]:
@@ -223,10 +256,79 @@ def render_facts_step(shown: list[dict], *, saved_user: int, saved_project: int,
         if not saved:
             continue
         rows = [f for f in shown if f.get("scope", "user") == scope]
-        lines = "".join(f"- {f['key']}: {f['value']}\n" for f in rows)
+        lines = "".join(fact_line(f) for f in rows)
         blocks.append(f'<{tag}{attrs} shown="{len(rows)}" saved="{saved}">\n{lines}</{tag}>')
     text = "\n".join(blocks) + "\n" + FACTS_REPLACE_NOTE
     if len(shown) < saved_user + saved_project:
         text += ("\nNot every saved fact is listed: before writing code or committing, call search_memory for the "
                  "user's preferences and this project's conventions on that work.")
     return text
+
+
+# ---- episode index -----------------------------------------------------------------------------------------------
+# One line per saved episode of this project, in a hidden step like the facts step: the model sees that a decision or
+# lesson exists even when the prompt shares no word (or meaning, for an embedding) with it, and fetches the detail
+# with search_memory. Recall by similarity can only find what the prompt resembles; the index doesn't need to.
+EPISODE_INDEX_TOKEN_BUDGET = 1500
+# Kinds that stay true until replaced come first; then lessons and events by their decayed weight (newest first)
+_LASTING_TYPES = ("DECISION", "PREFERENCE", "CORRECTION")
+EPISODE_INDEX_NOTE = ("Past episodes saved in this project, one line each; this replaces any earlier list. The line is "
+                      "only the gist: before work one of them may bear on, call search_memory for its details.")
+
+
+def episode_line(episode: dict) -> str:
+    epoch = int(episode.get("created_at_epoch") or 0)
+    date = time.strftime("%Y-%m-%d", time.gmtime(epoch)) if epoch else "undated"
+    return f"- [{str(episode.get('event_type') or 'EVENT').upper()} {date}] {episode.get('anchor_event') or ''}\n"
+
+
+def select_episode_index(episodes: list[dict], now: float | None = None) -> list[dict]:
+    """The episodes the index lists, in order: decisions, preferences and corrections newest first, then lessons and
+    events by recency weight (their recall decay), each while its line fits in EPISODE_INDEX_TOKEN_BUDGET."""
+    from dostuff.lib.memory.episodic_memory_store import decay_rate
+    now = time.time() if now is None else now
+
+    def rank(ep: dict) -> tuple:
+        epoch = int(ep.get("created_at_epoch") or 0)
+        kind = str(ep.get("event_type") or "").upper()
+        if kind in _LASTING_TYPES:
+            return (0, -epoch)
+        return (1, -math.exp(-decay_rate(kind) * max(0.0, (now - epoch) / 86400.0)), -epoch)
+
+    budget, shown = EPISODE_INDEX_TOKEN_BUDGET, []
+    for ep in sorted(episodes, key=rank):
+        cost = (len(episode_line(ep)) + 3) // 4
+        if cost <= budget:
+            shown.append(ep)
+            budget -= cost
+    return shown
+
+
+def episode_index_content(episodes: list[dict], project: str, now: float | None = None) -> tuple[str, tuple[str, ...]]:
+    """(text, fingerprint) of the episode index step; ("", ()) when nothing is saved. The fingerprint is the listed
+    episodes' ids and anchors, so a save, a forget or a prune changes it."""
+    if not episodes:
+        return "", ()
+    shown = select_episode_index(episodes, now)
+    name = project.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or project
+    lines = "".join(episode_line(e) for e in shown)
+    text = (f'<episode_index project="{name}" shown="{len(shown)}" saved="{len(episodes)}">\n{lines}</episode_index>\n'
+            + EPISODE_INDEX_NOTE)
+    if len(shown) < len(episodes):
+        text += " Older ones are not listed; search_memory finds them too."
+    fingerprint = tuple(sorted(f"{e.get('id')}:{hashlib.sha1(str(e.get('anchor_event')).encode()).hexdigest()[:8]}"
+                               for e in shown))
+    return text, fingerprint
+
+
+def make_episode_index_step(text: str, fingerprint: tuple[str, ...]) -> dict[str, Any]:
+    return {"role": "user", "content": _wrap(text),
+            "meta": {"hidden": TURN_CONTEXT_MARKER, "episode_index": list(fingerprint)}}
+
+
+def delivered_episode_index(history: list) -> tuple[str, ...] | None:
+    """The fingerprint of the newest episode index step; None when the history has none."""
+    for step in reversed(history):
+        if is_turn_context(step) and "episode_index" in step["meta"]:
+            return tuple(step["meta"]["episode_index"])
+    return None

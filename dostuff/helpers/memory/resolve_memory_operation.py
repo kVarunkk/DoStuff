@@ -28,7 +28,8 @@ async def resolve_memory_operation(
     Returns the operation applied and the key it touched (the existing key for UPDATE / NOOP).
     """
     in_scope = {"scope": scope, "working_dir": working_dir}
-    similar = await memory_store.query(user_id, new_fact["value"], top_k=3, min_similarity=DEDUP_MIN_SIMILARITY, **in_scope)
+    similar = await memory_store.query(user_id, new_fact["value"], top_k=3,
+                                        min_similarity=getattr(memory_store, "DEDUPE_FLOOR", DEDUP_MIN_SIMILARITY), **in_scope)
 
     if not similar:
         await memory_store.upsert_fact(user_id, new_fact, **in_scope)

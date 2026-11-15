@@ -17,7 +17,7 @@ from dostuff.helpers.agent.turn_context import (
 )
 from dostuff.helpers.skills.discover_skills import model_visible_skills
 from dostuff.helpers.ui.emit import emit
-from dostuff.lib.memory import chroma
+from dostuff.lib.memory.backend import memory_available
 
 
 def _background_wait(interactive: bool) -> str:
@@ -65,7 +65,7 @@ def build_base_instructions(interactive: bool = False) -> tuple[str, list[dict[s
     instructions = SYSTEM_INSTRUCTIONS.format(
         dostuff_identity=load_identity(),
         skills_summary=skills_summary(skills),
-        memory_section=MEMORY_INSTRUCTIONS if chroma.chroma_available() else "",
+        memory_section=MEMORY_INSTRUCTIONS if memory_available() else "",
         background_wait=_background_wait(interactive),
         agent_types=_agent_types_text(agent_types),
         agent_background=AGENT_BACKGROUND if interactive or get_config().agents_wake_on_end else "",
@@ -82,51 +82,53 @@ def build_system_instructions(base: str) -> str:
     return base
 
 
-# Facts past the facts step's cap recalled per turn by similarity (memory recall spec D3)
+# Facts past the facts step's budget recalled per turn by similarity (memory recall spec D3)
 OVERFLOW_FACTS_RECALLED = 3
 
 
 async def _overflow_facts(memory_store: Any, user_id: str, user_text: str, min_similarity: float,
-                          exclude: Collection[str] = ()) -> list[dict]:
-    """The facts the facts step leaves out that are most relevant to `user_text`, none whose `fact_entry` is in
-    `exclude` (already in view); [] below the cap, with no query at all (every fact is in the facts step already).
-    Never another project's facts."""
+                          exclude: Collection[str] = ()) -> tuple[list[dict], int]:
+    """(recalled, hidden): the facts the facts step leaves out that are most relevant to `user_text`, none whose
+    `fact_entry` is in `exclude` (already in view), and how many it leaves out in all; ([], 0) below the cap, with no
+    query at all (every fact is in the facts step already). Never another project's facts."""
     here = str(Path.cwd().resolve())
     facts = await memory_store.list_all(user_id, working_dir=here)
     _, overflow = select_injected_facts(facts)
     if not overflow:
-        return []
+        return [], 0
     wanted = {(f["scope"], f["key"]) for f in overflow}
     ranked = await memory_store.query(user_id, query_text=user_text, top_k=len(facts),
                                       min_similarity=min_similarity, working_dir=here)
     skip = set(exclude)
     return [m for m in ranked
-            if (m.get("scope", "user"), m["key"]) in wanted and fact_entry(m) not in skip][:OVERFLOW_FACTS_RECALLED]
+            if (m.get("scope", "user"), m["key"]) in wanted and fact_entry(m) not in skip][:OVERFLOW_FACTS_RECALLED],         len(overflow)
 
 
 async def build_turn_context(user_text: str, *, memory_store: Any, episodic_store: Any, user_id: str,
                              prompt_context: str = "", exclude_episode_ids: Collection[str] = (),
                              exclude_fact_ids: Collection[str] = ()) -> TurnContext:
-    """The turn's hidden context step: the environment block, saved facts past the facts step's cap and past
+    """The turn's hidden context step: the environment block, saved facts past the facts step's budget and past
     episodes relevant to user_text, and UserPromptSubmit context.
 
     `exclude_episode_ids` are the episodes this session's history already shows (`delivered_episode_ids`): they are
     not recalled again (memory recall D8), and nor are the overflow facts in `exclude_fact_ids`
-    (`delivered_fact_ids`). The stores are None when long-term memory is off (chromadb not installed): no recall
+    (`delivered_fact_ids`). The stores are None when long-term memory is off (chroma backend without chromadb): no recall
     then.
     """
     # Recall is extra context: if it fails (e.g. the embedding model could not be downloaded),
     # say so and run the turn without it
     memories: list[dict] = []
+    hidden_facts = 0
     episodes: list[dict] = []
     stats: dict[str, Any] = {}
     counts: EpisodeCounts | None = None
     if memory_store is not None and episodic_store is not None:
         # Not at module level: the store module pulls in litellm, which the TUI loads after its first frame
         from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
+        floor = float(getattr(memory_store, "RECALL_FLOOR", MIN_FACT_SIMILARITY))
         working_dir = str(Path.cwd().resolve()) if get_config().episodic_scope == "project" else None
         try:
-            memories = await _overflow_facts(memory_store, user_id, user_text, MIN_FACT_SIMILARITY,
+            memories, hidden_facts = await _overflow_facts(memory_store, user_id, user_text, floor,
                                              exclude=exclude_fact_ids)
             # Only when there is something to leave out: the store sees no exclusion on a first turn
             skip = {"exclude_ids": set(exclude_episode_ids)} if exclude_episode_ids else {}
@@ -140,7 +142,7 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
             )
         except Exception as e:
             emit(f"Memory recall failed, continuing without it: {e}", "error")
-            memories, episodes = [], []
+            memories, episodes, hidden_facts = [], [], 0
         if episodes:
             counts = EpisodeCounts(len(episodes), stats.get("matching"),
                                    await _saved_episodes(episodic_store, user_id, working_dir))
@@ -153,7 +155,8 @@ async def build_turn_context(user_text: str, *, memory_store: Any, episodic_stor
     )
 
     environment = await asyncio.to_thread(build_environment_block)
-    return TurnContext(compose_turn_context(environment, memory_text, episodic_text, prompt_context, counts),
+    return TurnContext(compose_turn_context(environment, memory_text, episodic_text, prompt_context, counts,
+                                            hidden_facts),
                        tuple(str(ep["id"]) for ep in episodes if ep.get("id")),
                        tuple(fact_entry(m) for m in memories))
 

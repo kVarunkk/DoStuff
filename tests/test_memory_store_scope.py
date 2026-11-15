@@ -223,6 +223,9 @@ def test_memory_instructions_name_new_blocks():
 
 # T1.14 `dostuff memory repair --reembed` ------------------------------------------------------------------------
 
+CHROMA_BACKEND = "memory:\n  backend: chroma\n"
+
+
 @pytest.fixture
 def legacy_home(tmp_path, monkeypatch):
     """A fake ~ whose fact store holds two rows written before this spec ("User's …" documents, no scope)."""
@@ -233,6 +236,7 @@ def legacy_home(tmp_path, monkeypatch):
 
     home = tmp_path / "home"
     (home / ".dostuff").mkdir(parents=True)
+    (home / ".dostuff" / "config.yaml").write_text(CHROMA_BACKEND)  # --reembed is the chroma backend's
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(chroma, "_clients", {})
     config_module.reset_config()
@@ -398,6 +402,7 @@ def facts_home(tmp_path, monkeypatch):
 
     home, proj = tmp_path / "home", tmp_path / "proj"
     (home / ".dostuff").mkdir(parents=True)
+    (home / ".dostuff" / "config.yaml").write_text(CHROMA_BACKEND)  # the store seeded below is the chroma one
     proj.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.chdir(proj)
@@ -460,7 +465,7 @@ def test_consolidate_declined_writes_nothing(facts_home):
 
 
 def test_consolidate_auto_mode_refuses_without_waiting(facts_home):
-    (facts_home["home"] / ".dostuff" / "config.yaml").write_text("permissions:\n  mode: auto\n")
+    (facts_home["home"] / ".dostuff" / "config.yaml").write_text(CHROMA_BACKEND + "permissions:\n  mode: auto\n")
     from dostuff import config as config_module
     config_module.reset_config()
     before = _saved(facts_home)

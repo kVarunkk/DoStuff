@@ -623,7 +623,7 @@
                 "type": "null"
               }
             ],
-            "description": "Key topics or technologies involved, e.g. ['sqlite', 'wal_mode']."
+            "description": "Key topics and technologies involved, plus other words someone might use when asking about this later (the component, the symptom, a plainer name), e.g. ['sqlite', 'wal_mode', 'locking', 'concurrency', 'store']."
           }
         },
         "required": [
@@ -697,10 +697,28 @@
   },
   "search_memory": {
     "function": {
-      "description": "Searches long-term memory for saved facts and past episodes that the context doesn't show.\n\nYour fact list holds only the newest saved facts, and each turn recalls at most a few more facts and\nepisodes. Search when the lists say more are saved and the task may depend on them: before changing\nsomething that may have history (the database, CI, dependencies, the build, code style or project\nconventions), when an error looks familiar, or when the user asks what was decided or what they told\nyou. Don't search for facts already listed. A broad query can miss a fact that a narrower one finds: for\nseveral topics (say docstrings, exports and error handling), search each one.",
+      "description": "Searches long-term memory for saved facts and past episodes that the context doesn't show.\n\nYour fact list holds only the newest saved facts, and each turn recalls at most a few more facts and\nepisodes. Search when the lists say more are saved and the task may depend on them: before changing\nsomething that may have history (the database, CI, dependencies, the build, code style or project\nconventions), when an error looks familiar, or when the user asks what was decided or what they told\nyou. Don't search for facts already listed. A broad query can miss a fact that a narrower one finds: for\nseveral topics (say docstrings, exports and error handling), search each one. Episodes (not facts) each have\na type: to find a kind of episode, such as what was decided, what was learned or what the user corrected,\npass event_type as well as the query.",
       "name": "search_memory",
       "parameters": {
         "properties": {
+          "event_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "DECISION",
+                  "PREFERENCE",
+                  "CORRECTION",
+                  "EVENT",
+                  "LEARNING"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Episodes of one type first: DECISION, LEARNING, CORRECTION, EVENT or PREFERENCE. Use it when the question asks for a kind of memory (what was decided, what we learned, what the user corrected), whose wording may share no words with the query. The other matches follow."
+          },
           "kind": {
             "description": "'facts', 'episodes' or 'all'.",
             "enum": [

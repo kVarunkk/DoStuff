@@ -102,6 +102,8 @@ if TYPE_CHECKING:
     from dostuff.lib.mcp.mcp_client import MCPClient
     from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
     from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
+    from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore, HybridFactStore
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
 
 MCP_CONNECT_TIMEOUT_S = 150.0  # covers the 120 s OAuth browser callback
 SHELL_TIMEOUT_S = 110.0  # `!command` typed by the user
@@ -2046,8 +2048,8 @@ class DostuffTUI(App):
         )
         # Memory stores and the MCP client need litellm / chromadb / mcp; _load_backend sets them
         # after the first frame, then sets _backend_ready
-        self.memory_store: "SemanticMemoryStore | None" = None
-        self.episodic_store: "EpisodicMemoryStore | None" = None
+        self.memory_store: "SemanticMemoryStore | SQLiteFactStore | HybridFactStore | None" = None
+        self.episodic_store: "EpisodicMemoryStore | SQLiteEpisodeStore | HybridEpisodeStore | None" = None
         self.mcp_client: "MCPClient | None" = None
         self._backend_ready = asyncio.Event()
         self._backend_error = ""
@@ -2359,7 +2361,7 @@ class DostuffTUI(App):
             from dostuff.lib.memory.stores import get_episodic_store, get_semantic_store, make_tool_registry_store
 
             data_dir = self.config.get_data_dir()
-            # Same instances the save_memory / save_episode tools write to (None without chromadb)
+            # Same instances the save_memory / save_episode tools write to (None only on the chroma backend without chromadb)
             self.memory_store, self.episodic_store, tool_store = await asyncio.to_thread(
                 lambda: (get_semantic_store(), get_episodic_store(), make_tool_registry_store()))
             self.mcp_client = MCPClient(
@@ -2369,8 +2371,19 @@ class DostuffTUI(App):
             if self.memory_store is None:
                 self._note_memory_off()
             else:
-                await self._ensure_embedding_model()
-                await self._warn_if_memory_index_damaged()
+                from dostuff.lib.memory.backend import memory_backend
+                if memory_backend() == "chroma":  # the sqlite store has no embedding model and no vector index
+                    await self._ensure_embedding_model()
+                    await self._warn_if_memory_index_damaged()
+                else:
+                    from dostuff.lib.memory.stores import chroma_import_result
+                    imported = await asyncio.to_thread(chroma_import_result)
+                    if imported is not None and imported.message():
+                        self._append(imported.message(), msg_type="error" if imported.status == "failed" else "system")
+                    from dostuff.lib.memory.hybrid_memory_store import IndexSync
+                    if isinstance(self.memory_store, IndexSync):  # hybrid with chromadb
+                        await self._ensure_embedding_model()
+                        self._start_worker(self._sync_memory_index(), name="memory_index_sync")
                 await self._hint_consolidate()
         except Exception as e:
             self._backend_error = str(e)
@@ -2393,11 +2406,11 @@ class DostuffTUI(App):
             self._append("Running with local tools only.", msg_type="system")
 
     def _note_memory_off(self) -> None:
-        """Without chromadb, say so once if memories were saved before (e.g. an upgrade from 0.1)."""
+        """memory.backend: chroma without chromadb: say so once if memories were saved before."""
         if (self.config.get_data_dir() / "chroma").exists():
             from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
-            self._append(f"Long-term memory is off: chromadb isn't installed. Your saved memories are kept; "
-                         f"run `{MEMORY_INSTALL_HINT}` to turn it back on.", msg_type="system")
+            self._append(f"Long-term memory is off: memory.backend is chroma and chromadb isn't installed. Your saved "
+                         f"memories are kept; run `{MEMORY_INSTALL_HINT}` to turn it back on.", msg_type="system")
 
     async def _ensure_embedding_model(self) -> None:
         """First run: download Chroma's embedding model with a message, before the first turn
@@ -2426,6 +2439,26 @@ class DostuffTUI(App):
             self._append(f"You have {user_facts} user facts, and each session starts with them. "
                          "/memories consolidate merges overlapping ones after showing you the change.",
                          msg_type="system")
+
+    async def _sync_memory_index(self) -> None:
+        """Hybrid backend: index the memories the embedding index doesn't have yet (imported from the old store, saved
+        under the sqlite backend, or missed by a crash). Recall works meanwhile, by keywords for those rows. Says
+        something only when there was work or it failed."""
+        from dostuff.lib.memory.hybrid_memory_store import IndexSync
+        stores = [s for s in (self.memory_store, self.episodic_store) if isinstance(s, IndexSync)]
+        try:
+            reports = [await s.check_index() for s in stores]
+            todo = sum(r.missing + r.stale + r.extra + r.pending for r in reports)
+            if not todo and not any(r.broken for r in reports):
+                return
+            self._append(f"Indexing {todo} memories for search by meaning...", msg_type="system")
+            for store in stores:
+                await store.repair_index()
+        except Exception as e:
+            self._append(f"Couldn't update the memory embedding index: {e}\nRecall still works by keywords; "
+                         "`dostuff memory repair` retries.", msg_type="error")
+            return
+        self._append("Memory index up to date.", msg_type="system")
 
     async def _warn_if_memory_index_damaged(self) -> None:
         """Say the memory index needs a rebuild, instead of letting recall quietly return less.
@@ -3716,7 +3749,9 @@ class DostuffTUI(App):
             return False
         if self.memory_store is None or self.episodic_store is None:
             from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
-            self._append(f"Long-term memory is off (chromadb isn't installed). Turn it on with `{MEMORY_INSTALL_HINT}`.", msg_type="system")
+            self._append(f"Long-term memory is off: memory.backend is chroma and chromadb isn't installed. Turn it on with "
+                         f"`{MEMORY_INSTALL_HINT}`, or remove memory.backend from your config to use the built-in store.",
+                         msg_type="system")
             return False
         return True
 
@@ -4703,6 +4738,8 @@ class DostuffTUI(App):
                 # Every saved fact in a facts step, re-sent only when the list changes (memory recall D2)
                 memory_store=self.memory_store, memory_user_id=self.user_id,
                 facts_project=str(Path.cwd().resolve()),
+                # One line per episode of this project, so a past decision is seen without matching the prompt
+                episodic_store=self.episodic_store,
             )
 
             agent_text = result or "(no response)"

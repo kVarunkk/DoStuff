@@ -10,7 +10,10 @@ from dostuff.helpers.agent.load_project_instructions import instruction_files, l
 
 @pytest.fixture
 def no_chroma(monkeypatch, tmp_path):
+    """memory.backend: chroma without chromadb installed: the one setup where long-term memory is off."""
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    (tmp_path / "home" / ".dostuff").mkdir(parents=True)
+    (tmp_path / "home" / ".dostuff" / "config.yaml").write_text("memory:\n  backend: chroma\n")
     monkeypatch.chdir(tmp_path)
     from dostuff import config as config_module
     from dostuff.lib.memory import chroma
@@ -49,6 +52,21 @@ def test_without_chromadb_mcp_search_matches_keywords(no_chroma):
     client.mcp_tools["gh__create_issue"] = {"server_name": "gh", "tool_name": "create_issue",
                                             "schema": {"description": "Create a GitHub issue"}}
     assert "gh__create_issue" in asyncio.run(_impl_search_mcp_tools("open an issue", client))
+
+
+def test_default_backend_without_chromadb_keeps_memory_on(no_chroma, tmp_path):
+    from dostuff import config as config_module
+    from dostuff.lib.memory import stores
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
+    from dostuff.tools.definitions import MEMORY_TOOLS, default_tool_names
+    (tmp_path / "home" / ".dostuff" / "config.yaml").write_text("")  # the default backend: hybrid
+    config_module.reset_config()
+    assert isinstance(stores.get_semantic_store(), SQLiteFactStore)  # hybrid without chromadb = keywords only
+    assert isinstance(stores.get_episodic_store(), SQLiteEpisodeStore)
+    assert MEMORY_TOOLS <= set(default_tool_names())
+    from dostuff.cli import app
+    result = CliRunner().invoke(app, ["doctor"])
+    assert "Long-term memory: on, keyword search only" in result.output
 
 
 def test_doctor_reports_memory_off(no_chroma):

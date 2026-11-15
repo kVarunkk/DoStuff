@@ -114,7 +114,7 @@ TOOL_MAP: dict[str, ToolSpec] = {spec.name: spec for spec in _TOOLS}
 
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {name: spec.schema for name, spec in TOOL_MAP.items()}
 
-# Need chromadb (the `memory` extra); not offered to the model without it
+# Need a memory store; not offered to the model when memory is off (memory.backend: chroma without chromadb)
 MEMORY_TOOLS = frozenset({"save_memory", "save_episode", "search_memory"})
 
 # Offered exactly when bash_command is: they only work on jobs it started
@@ -132,7 +132,7 @@ def with_shell_job_tools(names: list[str]) -> list[str]:
 
 def default_tool_names() -> list[str]:
     """Tools offered to the main agent: all of them, minus the memory tools when memory is off."""
-    from dostuff.lib.memory.chroma import chroma_available
-    if chroma_available():
+    from dostuff.lib.memory.backend import memory_available
+    if memory_available():
         return list(TOOL_SCHEMAS)
     return [name for name in TOOL_SCHEMAS if name not in MEMORY_TOOLS]

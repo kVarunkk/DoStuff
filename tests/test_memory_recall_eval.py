@@ -64,22 +64,36 @@ class CachedEmbedding:
 class Seeded:
     """A scratch semantic + episodic store holding the labelled set's memory, one directory per project."""
 
-    def __init__(self, root: Path, data: dict[str, Any]):
-        from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
-        from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
-
+    def __init__(self, root: Path, data: dict[str, Any], backend: str = "chroma"):
         self.data = data
+        self.backend = backend
         self.projects = {}
         for name in "ABC":
             (root / f"proj{name}").mkdir(parents=True, exist_ok=True)
             self.projects[name] = (root / f"proj{name}").resolve()
-        persist = str(root / "chroma")
-        self.sem = SemanticMemoryStore(persist_path=persist)
-        self.epi = EpisodicMemoryStore(persist_path=persist)
-        self.embedding = CachedEmbedding(self.sem._collection._embedding_function)
-        for store in (self.sem, self.epi):
-            store._collection._embedding_function = self.embedding
-        self.embedding.warm([c["prompt"] for c in data["cases"]])
+        self.sem: Any
+        self.epi: Any
+        if backend == "sqlite":
+            from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
+            self.sem, self.epi = SQLiteFactStore(str(root / "memory.db")), SQLiteEpisodeStore(str(root / "memory.db"))
+        elif backend == "hybrid":
+            from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore, HybridFactStore
+            self.sem = HybridFactStore(str(root / "memory.db"), str(root / "memory-index"))
+            self.epi = HybridEpisodeStore(str(root / "memory.db"), str(root / "memory-index"))
+            self.embedding = CachedEmbedding(self.sem.embedding._collection._embedding_function)
+            for store in (self.sem.embedding, self.epi.embedding):
+                store._collection._embedding_function = self.embedding
+            self.embedding.warm([c["prompt"] for c in data["cases"]])
+        else:
+            from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+            from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
+            persist = str(root / "chroma")
+            self.sem = SemanticMemoryStore(persist_path=persist)
+            self.epi = EpisodicMemoryStore(persist_path=persist)
+            self.embedding = CachedEmbedding(self.sem._collection._embedding_function)
+            for store in (self.sem, self.epi):
+                store._collection._embedding_function = self.embedding
+            self.embedding.warm([c["prompt"] for c in data["cases"]])
         self.fact_owner = {f["key"]: p for p, rows in data["project_facts"].items() for f in rows}
         self.episode_owner = {e["anchor"]: p for p, rows in data["episodes"].items() for e in rows}
 
@@ -110,14 +124,12 @@ class Seeded:
                 })
             await self.epi.add(batch)
 
-    def raw_similarity(self, prompt: str, proj: str, anchor_part: str) -> float:
+    async def raw_similarity(self, prompt: str, proj: str, anchor_part: str) -> float:
         """Undecayed similarity of the project's episode whose anchor contains `anchor_part`: tells a miss in the
-        ranking (decay, top-k) from one the embedding never matched (below the floor whatever the ranking)."""
-        got = self.epi._collection.query(query_texts=[prompt], n_results=min(self.epi._collection.count(), 100),
-                                         where={"$and": [{"user_id": USER_ID},
-                                                         {"working_dir": str(self.projects[proj])}]})
-        sims = [1 - d for m, d in zip(got["metadatas"][0], got["distances"][0])
-                if anchor_part.lower() in str(m.get("anchor_event", "")).lower()]
+        ranking (decay, top-k) from one the store never matched (below the floor whatever the ranking)."""
+        got = (await self.epi.query(USER_ID, prompt, top_k=100, working_dir=str(self.projects[proj]),
+                                         recency_decay_rate=0.0, min_similarity=-1.0))
+        sims = [float(e["score"]) for e in got if anchor_part.lower() in str(e.get("anchor_event") or "").lower()]
         return round(max(sims, default=0.0), 3)
 
     async def delivered(self, prompt: str, proj: str) -> tuple[set[str], list[str]]:
@@ -167,7 +179,7 @@ async def evaluate(seeded: Seeded) -> list[dict[str, Any]]:
         rows.append({**case, "miss": miss,
                      "false": [m for m in case["must_not_recall"] if hit(m, facts, episodes)],
                      "leaks": leaks,
-                     "miss_similarity": {m: seeded.raw_similarity(case["prompt"], proj, m.partition(":")[2])
+                     "miss_similarity": {m: await seeded.raw_similarity(case["prompt"], proj, m.partition(":")[2])
                                          for m in miss if m.startswith("e:")}})
     return rows
 
@@ -265,27 +277,58 @@ def test_decay_group_nothing_lost_in_ranking(results):
     assert all(not r["false"] and not r["leaks"] for r in results if r["group"] == "decay")
 
 
+@pytest.fixture(scope="module")
+def sqlite_results(tmp_path_factory) -> list[dict[str, Any]]:
+    from dostuff.lib.memory.sqlite_memory_store import fts5_available
+    if not fts5_available():
+        pytest.skip("sqlite3 built without FTS5")
+    seeded = Seeded(tmp_path_factory.mktemp("recall_eval_sqlite"), load_cases(), backend="sqlite")
+
+    async def run() -> list[dict[str, Any]]:
+        await seeded.seed()
+        return await evaluate(seeded)
+
+    return asyncio.run(run())
+
+
+# memory.backend: sqlite (FTS5 keywords, no embeddings) on the same set, floors from its sweep (2026-11-14): the
+# embedding store's recall with no episode false hits; 17 -> 18 with the episode type words ("decide" finds a DECISION)
+SQLITE_FLOORS = {"fact recall": 34, "episode recall": 18}
+SQLITE_CEILINGS = {"false hits": 0, "leaky cases": 0}
+
+
+@pytest.mark.parametrize("measure", list(SQLITE_FLOORS))
+def test_sqlite_recall_at_least_baseline(sqlite_results, measure):
+    got, total = summary(sqlite_results)[measure]
+    assert got >= SQLITE_FLOORS[measure], f"{measure} {got}/{total}\n\n{table(sqlite_results)}"
+
+
+@pytest.mark.parametrize("measure", list(SQLITE_CEILINGS))
+def test_sqlite_misses_at_most_baseline(sqlite_results, measure):
+    got, total = summary(sqlite_results)[measure]
+    assert got <= SQLITE_CEILINGS[measure], f"{measure} {got}/{total}\n\n{table(sqlite_results)}"
+
+
 # ---------------------------------------------------------------------------------------------------------------
-# Floor sweep: python -m tests.test_memory_recall_eval --sweep
+# Floor sweep: python -m tests.test_memory_recall_eval --sweep [--backend sqlite]
 
 SWEEP_FLOORS = (0.15, 0.18, 0.20, 0.225, 0.25, 0.275, 0.30, 0.325, 0.35, 0.40)
 
 
 async def sweep(seeded: Seeded) -> str:
-    """Recall and episode false hits by raw similarity floor, with the shipped top-k (facts 5, episodes 3)."""
-    sem, epi = seeded.sem._collection, seeded.epi._collection
+    """Recall and episode false hits by raw similarity floor, with top-k facts 5, episodes 3 (the per-turn
+    overflow and episode recall). Through the store API, so it sweeps either backend's own score."""
     sims = []
+    n_facts = len(await seeded.sem.list_all(USER_ID))
     for case in seeded.data["cases"]:
         proj = case["project"]
-        fr = sem.query(query_texts=[case["prompt"]], n_results=sem.count(), where={"user_id": USER_ID},
-                       include=["metadatas", "distances"])
-        f_s = [(m["key"], 1 - d) for m, d in zip(fr["metadatas"][0], fr["distances"][0])]
+        fr = await seeded.sem.query(USER_ID, case["prompt"], top_k=n_facts, min_similarity=-1.0)
+        f_s = [(f["key"], float(f.get("similarity", 0.0))) for f in fr]
         e_s: list[tuple[str, float]] = []
         if proj in seeded.data["episodes"]:
-            er = epi.query(query_texts=[case["prompt"]], n_results=min(epi.count(), 50),
-                           where={"$and": [{"user_id": USER_ID}, {"working_dir": str(seeded.projects[proj])}]},
-                           include=["metadatas", "distances"])
-            e_s = [(m["anchor_event"], 1 - d) for m, d in zip(er["metadatas"][0], er["distances"][0])]
+            er = await seeded.epi.query(USER_ID, case["prompt"], top_k=50, working_dir=str(seeded.projects[proj]),
+                                        recency_decay_rate=0.0, min_similarity=-1.0)
+            e_s = [(str(e["anchor_event"]), float(e["score"])) for e in er]
         sims.append((case, f_s, e_s))
     lines = ["| floor | fact recall | episode recall | episode false hits (off-topic + unrelated + leak) |",
              "|---|---|---|---|"]
@@ -316,8 +359,9 @@ def _main() -> None:
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--sweep", action="store_true", help="also print the similarity-floor sweep")
+    ap.add_argument("--backend", choices=("chroma", "sqlite", "hybrid"), default="chroma", help="memory.backend to evaluate")
     args = ap.parse_args()
-    seeded = Seeded(Path(tempfile.mkdtemp(prefix="recall_eval_")), load_cases())
+    seeded = Seeded(Path(tempfile.mkdtemp(prefix="recall_eval_")), load_cases(), backend=args.backend)
 
     async def run() -> None:
         await seeded.seed()

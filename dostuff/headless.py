@@ -399,6 +399,7 @@ async def run_headless(
                 # Every saved fact in a facts step, re-sent only when the list changes (memory recall D2)
                 memory_store=get_semantic_store(), memory_user_id=config.get_user_id(),
                 facts_project=str(Path.cwd().resolve()),
+                episodic_store=get_episodic_store(),
             )
         result = await turn(prompt, turn_instructions, meta)
         # Background agents are waited for: each batch of their notices gets a turn, like the TUI's wake-up

@@ -61,7 +61,7 @@ class SemanticMemoryStore(MemoryStore):
 
     async def query(self, user_id: str, query_text: str, top_k: int = 3, min_similarity: float = 0.0,
                     scope: FactScope | None = None, working_dir: str | None = None) -> list[dict]:
-        """Memories at least `min_similarity` similar to `query_text`, as fact dicts (see `_as_fact`).
+        """Memories at least `min_similarity` similar to `query_text`, as fact dicts (see `_as_fact`) with their `similarity`.
 
         `scope` and `working_dir` select facts as in `list_all`.
         """
@@ -73,7 +73,8 @@ class SemanticMemoryStore(MemoryStore):
         raw_dists = results.get("distances") or [[]]
         metadatas = raw_metas[0] if raw_metas and raw_metas[0] is not None else []
         distances = raw_dists[0] if raw_dists and raw_dists[0] is not None else []
-        return [_as_fact(meta) for meta, dist in zip(metadatas, distances) if meta and 1.0 - dist >= min_similarity]
+        return [{**_as_fact(meta), "similarity": 1.0 - dist} for meta, dist in zip(metadatas, distances)
+                if meta and 1.0 - dist >= min_similarity]
 
     async def list_all(self, user_id: str, scope: FactScope | None = None, working_dir: str | None = None) -> list[dict]:
         """Saved facts, newest first (rows written before timestamps existed last).
@@ -93,6 +94,11 @@ class SemanticMemoryStore(MemoryStore):
             return False
         await asyncio.to_thread(self._collection.delete, ids=[row_id])
         return True
+
+    async def delete_ids(self, row_ids: list[str]) -> None:
+        """Drop these rows by id (`fact_id`); ids not present are ignored."""
+        if row_ids:
+            await asyncio.to_thread(self._collection.delete, ids=list(row_ids))
 
 
 def _require_dir(working_dir: str | None) -> str:
