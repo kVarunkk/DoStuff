@@ -81,7 +81,18 @@ CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
     VALUES ('delete', old.rowid, {_OLD_TYPE}, old.anchor_event, old.summary, old.tags);
     INSERT INTO episodes_fts(rowid, event_type, anchor_event, summary, tags)
     VALUES (new.rowid, {_NEW_TYPE}, new.anchor_event, new.summary, new.tags); END;
+
+CREATE TABLE IF NOT EXISTS index_outbox (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, row_id TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS index_outbox_row ON index_outbox(kind, row_id);
 """
+# `index_outbox`: rows whose copy in a secondary index (the hybrid backend's embeddings) is out of date. A store opened
+# with `outbox=True` adds an entry in the same transaction as the write, so a crash can't leave a change the index
+# never hears about. An entry names the row only: whoever drains it reads the row's current state (gone = delete).
+
+
+def _enqueue(conn: sqlite3.Connection, kind: str, row_ids: Iterable[str]) -> None:
+    conn.executemany("INSERT INTO index_outbox (kind, row_id) VALUES (?, ?)", [(kind, i) for i in row_ids])
 
 
 def fts5_available() -> bool:
@@ -112,6 +123,40 @@ class _Db:
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         return conn
+
+    async def outbox_pending(self, kind: str, limit: int) -> list[tuple[str, int]]:
+        """(row_id, newest seq) of up to `limit` rows with outbox entries, oldest first."""
+        def _pending() -> list[tuple[str, int]]:
+            with self.connect() as conn:
+                return [(str(r[0]), int(r[1])) for r in conn.execute(
+                    "SELECT row_id, max(seq) FROM index_outbox WHERE kind = ? GROUP BY row_id ORDER BY min(seq) LIMIT ?",
+                    (kind, limit))]
+
+        return await asyncio.to_thread(_pending)
+
+    async def outbox_done(self, kind: str, done: list[tuple[str, int]]) -> None:
+        """Drop the entries a drain applied: up to the seq it read, so a write made meanwhile is still pending."""
+        def _done() -> None:
+            with self.connect() as conn:
+                conn.executemany("DELETE FROM index_outbox WHERE kind = ? AND row_id = ? AND seq <= ?",
+                                 [(kind, row_id, seq) for row_id, seq in done])
+
+        await asyncio.to_thread(_done)
+
+    async def rows_by_id(self, table: str, row_ids: Collection[str]) -> dict[str, sqlite3.Row]:
+        """The current rows of `table` ("facts" or "episodes") among `row_ids`; a missing id is not in the dict."""
+        ids = list(dict.fromkeys(row_ids))
+
+        def _rows() -> dict[str, sqlite3.Row]:
+            out: dict[str, sqlite3.Row] = {}
+            with self.connect() as conn:
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    marks = ",".join("?" * len(chunk))
+                    out.update({r["id"]: r for r in conn.execute(f"SELECT * FROM {table} WHERE id IN ({marks})", chunk)})
+            return out
+
+        return await asyncio.to_thread(_rows) if ids else {}
 
 
 def _stems(conn: sqlite3.Connection, texts: list[str]) -> list[set[str]]:
@@ -190,7 +235,7 @@ def _fact_where(user_id: str, scope: FactScope | None, working_dir: str | None) 
     return "b.user_id = ?", [user_id]
 
 
-def _fact(row: sqlite3.Row) -> dict:
+def fact_fields(row: sqlite3.Row) -> dict:
     fact = {"key": row["key"], "value": row["value"], "source": row["source"] or "unknown", "scope": row["scope"],
             "created_at_epoch": int(row["created_at_epoch"] or 0), "updated_at_epoch": int(row["updated_at_epoch"] or 0)}
     if row["scope"] == "project":
@@ -207,9 +252,12 @@ class SQLiteFactStore:
     SEARCH_FLOOR = 0.1
     DEDUPE_FLOOR = 0.1
 
-    def __init__(self, db_path: str):
+    OUTBOX_KIND = "fact"
+
+    def __init__(self, db_path: str, outbox: bool = False):
         self._db = _Db(db_path)
         self.db_path = db_path
+        self._outbox = outbox
 
     async def add(self, user_id: str, facts: list[dict]) -> None:
         for fact in facts or []:
@@ -230,6 +278,8 @@ class SQLiteFactStore:
                     "updated_at_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
                     "value = excluded.value, source = excluded.source, updated_at_epoch = excluded.updated_at_epoch",
                     (row_id, user_id, scope, working_dir if scope == "project" else None, key, value, source, now, now))
+                if self._outbox:
+                    _enqueue(conn, self.OUTBOX_KIND, [row_id])
 
         await asyncio.to_thread(_write)
 
@@ -241,10 +291,10 @@ class SQLiteFactStore:
             with self._db.connect() as conn:
                 scored, _ = _ranked(conn, "facts", lambda r: f"{r['key']} {r['value']}", query_text, where, params,
                                     pool=max(_POOL, top_k))
-                found = [{**_fact(r), "similarity": s} for s, r in scored if s >= min_similarity][:top_k]
+                found = [{**fact_fields(r), "similarity": s} for s, r in scored if s >= min_similarity][:top_k]
                 if min_similarity <= 0 and len(found) < top_k:
                     seen = {r["id"] for _, r in scored}
-                    found += [{**_fact(r), "similarity": 0.0} for r in _others(conn, "facts b", where, params, seen, top_k - len(found),
+                    found += [{**fact_fields(r), "similarity": 0.0} for r in _others(conn, "facts b", where, params, seen, top_k - len(found),
                                                         "b.updated_at_epoch DESC")]
                 return found
 
@@ -255,7 +305,7 @@ class SQLiteFactStore:
 
         def _list() -> list[dict]:
             with self._db.connect() as conn:
-                return [_fact(r) for r in conn.execute(f"SELECT * FROM facts b WHERE {where}", params)]
+                return [fact_fields(r) for r in conn.execute(f"SELECT * FROM facts b WHERE {where}", params)]
 
         facts = await asyncio.to_thread(_list)
         return sorted(facts, key=lambda f: (-f["updated_at_epoch"], f["scope"] != "project", f["key"]))
@@ -265,6 +315,8 @@ class SQLiteFactStore:
 
         def _delete() -> bool:
             with self._db.connect() as conn:
+                if self._outbox:  # even when the row is already gone: its index copy may not be
+                    _enqueue(conn, self.OUTBOX_KIND, [row_id])
                 return conn.execute("DELETE FROM facts WHERE id = ?", (row_id,)).rowcount > 0
 
         return await asyncio.to_thread(_delete)
@@ -284,6 +336,14 @@ def _epoch(row: sqlite3.Row) -> int:
     return int(raw) if isinstance(raw, (int, float)) else 0
 
 
+def episode_fields(row: sqlite3.Row) -> dict:
+    """An episode row as a query returns it, without its score."""
+    raw_tags = row["tags"]
+    return {"id": row["id"], "event_type": row["event_type"], "anchor_event": row["anchor_event"],
+            "summary": row["summary"], "tags": json.loads(raw_tags) if isinstance(raw_tags, str) and raw_tags else [],
+            "created_at_iso": row["created_at_iso"], "created_at_epoch": _epoch(row), "session_id": row["session_id"]}
+
+
 class SQLiteEpisodeStore:
     """Episodes (`EpisodicMemoryStore`'s API) in SQLite, searched with FTS5."""
 
@@ -296,9 +356,12 @@ class SQLiteEpisodeStore:
     SIMILAR = 0.3
     DUPLICATE = 0.85
 
-    def __init__(self, db_path: str):
+    OUTBOX_KIND = "episode"
+
+    def __init__(self, db_path: str, outbox: bool = False):
         self._db = _Db(db_path)
         self.db_path = db_path
+        self._outbox = outbox
 
     async def add(self, episodes: list[dict]) -> None:
         if not episodes:
@@ -316,6 +379,8 @@ class SQLiteEpisodeStore:
                         (ep["id"], m.get("user_id"), m.get("session_id"), m.get("working_dir"), m.get("event_type"),
                          m.get("anchor_event"), m.get("summary"), m.get("tags") or "[]", m.get("created_at_epoch"),
                          m.get("created_at_iso")))
+                if self._outbox:
+                    _enqueue(conn, self.OUTBOX_KIND, [ep["id"] for ep in episodes])
 
         await asyncio.to_thread(_write)
 
@@ -338,14 +403,9 @@ class SQLiteEpisodeStore:
         now = int(time.time())
 
         def scored(similarity: float, row: sqlite3.Row) -> dict:
-            created = _epoch(row)
             rate = decay_rate(row["event_type"]) if recency_decay_rate is None else recency_decay_rate
-            raw_tags = row["tags"]
-            return {"id": row["id"], "score": similarity * math.exp(-rate * max(0.0, (now - created) / 86400.0)),
-                    "event_type": row["event_type"], "anchor_event": row["anchor_event"], "summary": row["summary"],
-                    "tags": json.loads(raw_tags) if isinstance(raw_tags, str) and raw_tags else [],
-                    "created_at_iso": row["created_at_iso"], "created_at_epoch": created,
-                    "session_id": row["session_id"]}
+            return {"score": similarity * math.exp(-rate * max(0.0, (now - _epoch(row)) / 86400.0)),
+                    **episode_fields(row)}
 
         def _query() -> list[dict]:
             with self._db.connect() as conn:
@@ -392,6 +452,8 @@ class SQLiteEpisodeStore:
                     for r in rows if str(r["event_type"] or "").upper() != "DECISION")
                 doomed = [episode_id for _, _, episode_id in candidates[:excess]]
                 conn.executemany("DELETE FROM episodes WHERE id = ?", [(i,) for i in doomed])
+                if self._outbox:
+                    _enqueue(conn, self.OUTBOX_KIND, doomed)
                 return doomed
 
         return await asyncio.to_thread(_prune)
@@ -419,7 +481,13 @@ class SQLiteEpisodeStore:
     async def delete(self, user_id: str, episode_id: str) -> bool:
         def _delete() -> bool:
             with self._db.connect() as conn:
-                return conn.execute("DELETE FROM episodes WHERE id = ? AND user_id = ?",
-                                    (episode_id, user_id)).rowcount > 0
+                deleted = conn.execute("DELETE FROM episodes WHERE id = ? AND user_id = ?",
+                                       (episode_id, user_id)).rowcount > 0
+                # Queued when the row is gone now, even if it was already (its index copy may not be); never for
+                # another user's episode, which stays
+                if self._outbox and (deleted or not conn.execute(
+                        "SELECT 1 FROM episodes WHERE id = ?", (episode_id,)).fetchone()):
+                    _enqueue(conn, self.OUTBOX_KIND, [episode_id])
+                return deleted
 
         return await asyncio.to_thread(_delete)

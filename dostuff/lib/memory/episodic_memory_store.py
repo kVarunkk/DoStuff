@@ -259,3 +259,8 @@ class EpisodicMemoryStore(EpisodicStore):
             return False
         await asyncio.to_thread(self._collection.delete, ids=[episode_id])
         return True
+
+    async def delete_ids(self, episode_ids: list[str]) -> None:
+        """Drop these episodes by id; ids not present are ignored."""
+        if episode_ids:
+            await asyncio.to_thread(self._collection.delete, ids=list(episode_ids))

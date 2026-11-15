@@ -95,6 +95,11 @@ class SemanticMemoryStore(MemoryStore):
         await asyncio.to_thread(self._collection.delete, ids=[row_id])
         return True
 
+    async def delete_ids(self, row_ids: list[str]) -> None:
+        """Drop these rows by id (`fact_id`); ids not present are ignored."""
+        if row_ids:
+            await asyncio.to_thread(self._collection.delete, ids=list(row_ids))
+
 
 def _require_dir(working_dir: str | None) -> str:
     if not working_dir:

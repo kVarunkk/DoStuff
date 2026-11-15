@@ -1,6 +1,7 @@
 """The hybrid memory backend (memory.backend: hybrid): SQLite of record, searched by keywords and embeddings."""
 import asyncio
 import json
+import sqlite3
 import time
 
 import pytest
@@ -93,6 +94,122 @@ def test_episode_union_and_reworded_duplicate(episodes):
     assert same and same["id"] == "e1" and same["similarity"] >= episodes.DUPLICATE
     assert run(episodes.nearest("u", "Bought a new desk lamp", "/p")) is None
     assert run(episodes.count("u", "/p")) == 2 and run(episodes.delete("u", "e2")) and run(episodes.count("u", "/p")) == 1
+
+
+# ---- outbox: SQLite and the index can't share a transaction --------------------------------------------------------
+
+def _pending(store) -> list[tuple[str, str]]:
+    with sqlite3.connect(store.db_path) as conn:
+        return [tuple(r) for r in conn.execute("SELECT kind, row_id FROM index_outbox ORDER BY seq")]
+
+
+def _index_keys(facts) -> set[str]:
+    return {f["key"] for f in run(facts.embedding.list_all("u"))}
+
+
+async def _boom(*a, **k):
+    raise RuntimeError("index down")
+
+
+def test_write_queues_and_drains_the_index(facts):
+    run(facts.upsert_fact("u", {"key": "shell", "value": "Uses fish as the login shell"}))
+    assert _index_keys(facts) == {"shell"} and _pending(facts) == []
+
+
+def test_index_down_on_save_keeps_the_change_queued_until_it_lands(facts, monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(facts.embedding, "upsert_fact", _boom)
+        run(facts.upsert_fact("u", {"key": "shell", "value": "Uses fish as the login shell"}))
+    assert [f["key"] for f in run(facts.list_all("u"))] == ["shell"]  # saved: SQLite committed
+    assert _pending(facts) == [("fact", "u:shell")] and _index_keys(facts) == set()
+    run(facts.upsert_fact("u", {"key": "editor", "value": "Uses Helix"}))  # the next write drains the backlog
+    assert _index_keys(facts) == {"shell", "editor"} and _pending(facts) == []
+
+
+def test_forgotten_fact_left_in_the_index_is_never_recalled_and_is_removed_later(facts, monkeypatch):
+    _seed(facts)
+    prompt = "what exception do I throw on illegal values?"  # found by the embedding side only
+    with monkeypatch.context() as m:
+        m.setattr(facts.embedding, "delete_ids", _boom)
+        assert run(facts.delete("u", "py_errors"))
+    assert "py_errors" in _index_keys(facts)  # the orphan
+    assert "py_errors" not in [f["key"] for f in run(facts.query("u", prompt, top_k=3, min_similarity=0.0))]
+    assert _pending(facts) == [("fact", "u:py_errors")]
+    assert run(facts.outbox.drain())
+    assert "py_errors" not in _index_keys(facts) and _pending(facts) == []
+
+
+def test_update_the_index_missed_reads_the_current_value(facts, monkeypatch):
+    _seed(facts)
+    with monkeypatch.context() as m:
+        m.setattr(facts.embedding, "upsert_fact", _boom)
+        run(facts.upsert_fact("u", {"key": "editor", "value": "Uses Neovim with the LazyVim distribution, in tmux"}))
+    stale = {f["key"]: f["value"] for f in run(facts.embedding.list_all("u"))}["editor"]
+    assert "tmux" not in stale
+    found = {f["key"]: f["value"] for f in run(facts.query("u", "LazyVim", top_k=3, min_similarity=0.0))}
+    assert found["editor"].endswith("in tmux")
+
+
+def test_crash_between_commit_and_drain_is_caught_up_by_the_next_session(tmp_path):
+    db, index = str(tmp_path / "memory.db"), str(tmp_path / "memory-index")
+    first = HybridFactStore(db, index)
+    run(first.keyword.upsert_fact("u", {"key": "shell", "value": "Uses fish as the login shell"}))  # no drain: "crash"
+    second = HybridFactStore(db, index)
+    assert _pending(second) == [("fact", "u:shell")]
+    assert [f["key"] for f in run(second.query("u", "which login shell", top_k=3, min_similarity=0.0))] == ["shell"]
+    assert _pending(second) == [] and _index_keys(second) == {"shell"}
+
+
+def test_failed_drain_is_not_retried_by_every_search(facts, monkeypatch):
+    calls = []
+
+    async def counting_boom(*a, **k):
+        calls.append(1)
+        raise RuntimeError("index down")
+
+    monkeypatch.setattr(facts.embedding, "upsert_fact", counting_boom)
+    run(facts.upsert_fact("u", {"key": "shell", "value": "Uses fish as the login shell"}))
+    run(facts.query("u", "fish", top_k=3, min_similarity=0.0))
+    run(facts.query("u", "fish", top_k=3, min_similarity=0.0))
+    assert len(calls) == 1  # the searches waited out _RETRY_AFTER
+    run(facts.upsert_fact("u", {"key": "editor", "value": "Uses Helix"}))  # a write tries again
+    assert len(calls) == 2
+
+
+def test_entry_written_during_a_drain_stays_queued(facts):
+    run(facts.keyword.upsert_fact("u", {"key": "shell", "value": "Uses fish"}))
+    pending = run(facts.keyword._db.outbox_pending("fact", 10))
+    run(facts.keyword.upsert_fact("u", {"key": "shell", "value": "Uses zsh"}))  # lands after the drain read
+    run(facts.keyword._db.outbox_done("fact", pending))
+    assert _pending(facts) == [("fact", "u:shell")]
+
+
+def test_deleted_episode_left_in_the_index_does_not_block_saving_it_again(episodes, monkeypatch):
+    run(episodes.add([_ep(1, "Enabled WAL mode on the SQLite store", "Concurrent writers hit 'database is locked'")]))
+    text = ("- EVENT TYPE: DECISION\n  - ANCHOR EVENT: Enabled WAL mode on the SQLite store\n"
+            "  - SUMMARY: Concurrent writers hit 'database is locked'")
+    with monkeypatch.context() as m:
+        m.setattr(episodes.embedding, "delete_ids", _boom)
+        # the keyword side would find the row too, so it's taken out of the index as well as SQLite
+        assert run(episodes.delete("u", "e1"))
+    assert run(episodes.embedding.nearest("u", text, "/p")) is not None  # the orphan
+    assert run(episodes.nearest("u", text, "/p")) is None
+    assert run(episodes.query("u", "WAL mode database is locked", top_k=3, working_dir="/p")) == []
+
+
+def test_pruned_episodes_leave_the_index(episodes):
+    run(episodes.add([_ep(i, f"Event number {i}", f"summary {i}", event_type="EVENT") for i in range(3)]))
+    doomed = run(episodes.prune("u", "/p", cap=1))
+    assert len(doomed) == 2 and _pending(episodes) == []
+    left = run(episodes.embedding.query("u", "Event number", top_k=5, working_dir="/p", min_similarity=0.0))
+    assert {e["id"] for e in left} == {"e0", "e1", "e2"} - set(doomed)
+
+
+def test_sqlite_backend_alone_writes_no_outbox(tmp_path):
+    store = SQLiteFactStore(str(tmp_path / "memory.db"))
+    run(store.upsert_fact("u", {"key": "shell", "value": "Uses fish"}))
+    run(store.delete("u", "shell"))
+    assert _pending(store) == []
 
 
 def test_backend_setting_selects_hybrid_and_keywords_without_chromadb(tmp_path, monkeypatch):
