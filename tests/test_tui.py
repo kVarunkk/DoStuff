@@ -307,17 +307,13 @@ def test_esc_denies_pending_prompt(tui):
     async def scenario():
         app = cli_tui.DostuffTUI(session_id="esc")
         async with app.run_test() as pilot:
+            # A turn waits for startup; on a slow runner the fixed 2.5 s wait ended first and ESC hit no prompt
+            await app._backend_ready.wait()
             await pilot.pause()
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("do it"))
-            for _ in range(50):
-                await pilot.pause(0.05)
-                if app.adapter.has_pending_confirm():
-                    break
+            await _until(pilot, app.adapter.has_pending_confirm, tries=200)
             await pilot.press("escape")
-            for _ in range(50):
-                await pilot.pause(0.05)
-                if not app._turn_in_progress:
-                    break
+            await _until(pilot, lambda: not app._turn_in_progress, tries=200)
             assert app.steps_history[-1]["content"].endswith("(no)")
             await app._cleanup_and_save_session()
 
