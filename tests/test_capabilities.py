@@ -491,15 +491,24 @@ OLD_SAVE_MEMORY = (
     "A fact that overlaps an existing memory updates it instead of adding a duplicate."
 )
 
+# save_episode before decisions-as-episodes (9932d0d): no pointer to save_memory
+OLD_SAVE_EPISODE = (
+    "Records a significant moment from this session as an episodic memory, recalled in\n"
+    "future sessions in this project when relevant.\n"
+    "\n"
+    "Use this right after something worth remembering next time: a technical decision, a\n"
+    "correction from the user, or a failure and how it was resolved. Skip routine steps,\n"
+    "greetings, plain Q&A and bare requests (\"user asked for X\"): save the outcome or lesson,\n"
+    "not the fact that a task was asked for."
+)
 # save_episode's tags before the sqlite-fts work asked for the other words a later question may use
 OLD_SAVE_EPISODE_TAGS = "Key topics or technologies involved, e.g. ['sqlite', 'wal_mode']."
 
 
 def test_tool_schema_snapshot_only_agent_description_changed():
     """Since 30d3629 only these schemas changed on purpose: `agent`'s subagent_type description, `save_memory`
-    (its `scope` parameter and description), the new `search_memory` (memory recall D12) and save_episode's `tags`
-    description. Everything else must be
-    30d3629's, byte for byte."""
+    (its `scope` parameter and description), the new `search_memory` (memory recall D12) and save_episode's description
+    and `tags` description. Everything else must be 30d3629's, byte for byte."""
     import hashlib
     import json
     snapshot = json.loads((Path(__file__).parent / "snapshots" / "tool_schemas.json").read_text(encoding="utf-8"))
@@ -513,4 +522,7 @@ def test_tool_schema_snapshot_only_agent_description_changed():
     tags = snapshot["save_episode"]["function"]["parameters"]["properties"]["tags"]
     assert tags["description"] != OLD_SAVE_EPISODE_TAGS
     tags["description"] = OLD_SAVE_EPISODE_TAGS
+    save_episode = snapshot["save_episode"]["function"]
+    assert save_episode["description"] != OLD_SAVE_EPISODE
+    save_episode["description"] = OLD_SAVE_EPISODE
     assert hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == SCHEMAS_30D3629
