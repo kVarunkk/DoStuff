@@ -985,6 +985,29 @@ def test_embedding_model_download_reported(tui, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_startup_without_fts5_says_memory_is_off_and_does_not_fail(tui, monkeypatch):
+    """A Python whose sqlite3 lacks FTS5 can't run memory.db: the TUI used to show "Startup failed: no such module:
+    fts5" and skip MCP; now memory is off with a reason and the rest of startup runs."""
+    cli_tui = tui
+    from dostuff.lib.memory import backend, chroma
+    monkeypatch.setattr(backend, "fts5_available", lambda: False)
+    monkeypatch.setattr(chroma, "chroma_available", lambda: False)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="nofts5")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            await pilot.pause()
+            texts = _texts(app)
+            assert not app._backend_error and not any("Startup failed" in t for t in texts)
+            assert app.memory_store is None and app.episodic_store is None
+            assert any("Long-term memory is off" in t and "FTS5" in t for t in texts)
+            assert not any("memory.backend is chroma and chromadb" in t for t in texts)  # not the chroma-only note
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_file_mention_completion_and_attachment(tui, monkeypatch):
     cli_tui = tui
     from dostuff.helpers.agent import file_mentions
@@ -3548,6 +3571,8 @@ def test_pin_transcript_without_ask_user(tui):
     async def scenario() -> list[str]:
         app = cli_tui.DostuffTUI(session_id="pin-transcript")
         async with app.run_test(size=(120, 40)) as pilot:
+            # Startup ends with "Running with local tools only."; on a slow start that landed inside the transcript
+            await app._backend_ready.wait()
             await pilot.pause()
             for step in snapshot:
                 await app.store.append("old", step)
