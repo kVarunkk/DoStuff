@@ -24,9 +24,10 @@ async def save_episode(
     future sessions in this project when relevant.
 
     Use this right after something worth remembering next time: a technical decision, a
-    correction from the user, or a failure and how it was resolved. Skip routine steps,
-    greetings, plain Q&A and bare requests ("user asked for X"): save the outcome or lesson,
-    not the fact that a task was asked for.
+    correction from the user, or a failure and how it was resolved, also when you save the rule
+    it sets with save_memory (the fact holds the rule, the episode what happened and why).
+    Skip routine steps, greetings, plain Q&A and bare requests ("user asked for X"): save the
+    outcome or lesson, not the fact that a task was asked for.
 
     Args:
         event_type: DECISION (a choice made), PREFERENCE (how the user wants things done),

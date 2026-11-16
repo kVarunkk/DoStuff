@@ -103,8 +103,11 @@ def test_search_memory_scopes(env):
     assert "TKV-" in ticket and "ABC-" not in ticket  # this project's fact only
     assert "[project]" in ticket
 
-    # A fact the facts step already lists is not searched: it is in context already
-    assert "PowerShell" not in _search("Which shell do I use? PowerShell", kind="facts")
+    # A fact the facts step already lists is not returned again: it is in context already. It is named by key,
+    # so the model answers from its list instead of concluding nothing matched
+    listed = _search("Which shell do I use? PowerShell", kind="facts")
+    assert "PowerShell" not in listed
+    assert "In your fact list and matching the query" in listed and "[user] shell" in listed
 
     eps = _search("tests sharing a database file", kind="episodes")
     assert "tinykv.db" in eps and "project B" not in eps
@@ -119,6 +122,22 @@ def test_search_memory_below_the_cap_says_facts_are_listed(env):
     out = _search("Which databases do I dislike?", kind="facts")
     assert "MongoDB" not in out
     assert "All 2 saved facts are already listed" in out
+    assert "[user] db_dislike" in out  # the listed fact that answers it, by key
+    assert "[project] ticket" not in out  # a listed fact that doesn't match isn't named
+
+
+def test_search_memory_decision_saved_only_as_a_fact_is_pointed_at(env):
+    """The live failure (hooks-sandbox, 2026-11-16): a storage decision saved only as a project fact, asked about as
+    a decision. No DECISION episode exists; the answer must not read as 'nothing was decided'."""
+    _facts(env.facts, [("data_storage", "Data is kept in one hand-editable JSON file, never SQLite", 1, "project",
+                        env.a)])
+    out = _search("where the data is stored, json or sqlite", event_type="DECISION")
+    assert "No DECISION episodes are saved" in out and "check your fact list" in out
+    assert "[project] data_storage" in out
+
+
+def test_search_memory_no_listed_pointer_without_facts(env):
+    assert _search("anything at all", kind="facts") == "Facts: All 0 saved facts are already listed in your fact list."
 
 
 def test_search_memory_episodes_user_scope_searches_every_directory(env):
@@ -193,6 +212,17 @@ def test_prompts_point_at_search_memory():
     from dostuff.helpers.agent.turn_context import EPISODES_MORE_NOTE
     assert "search_memory" in MEMORY_INSTRUCTIONS
     assert "search_memory" in EPISODES_MORE_NOTE
+
+
+def test_decisions_and_corrections_are_episodes_even_when_saved_as_facts():
+    """A decision saved only as a fact can't be found as a DECISION later; every prompt that says how to save one
+    asks for the episode too."""
+    from dostuff.helpers.agent.constants import MEMORY_INSTRUCTIONS
+    from dostuff.tools.definitions import TOOL_SCHEMAS
+    assert "or an episode" not in MEMORY_INSTRUCTIONS  # the old either/or the model resolved to a fact alone
+    assert "even when you also save the rule it sets" in MEMORY_INSTRUCTIONS
+    assert "call save_episode for it" in TOOL_SCHEMAS["save_memory"]["function"]["parameters"]["properties"]["scope"]["description"]
+    assert "also when you save the rule" in " ".join(TOOL_SCHEMAS["save_episode"]["function"]["description"].split())
 
 
 def _many_overflow_facts(env, n):

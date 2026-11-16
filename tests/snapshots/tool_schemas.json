@@ -588,7 +588,7 @@
   },
   "save_episode": {
     "function": {
-      "description": "Records a significant moment from this session as an episodic memory, recalled in\nfuture sessions in this project when relevant.\n\nUse this right after something worth remembering next time: a technical decision, a\ncorrection from the user, or a failure and how it was resolved. Skip routine steps,\ngreetings, plain Q&A and bare requests (\"user asked for X\"): save the outcome or lesson,\nnot the fact that a task was asked for.",
+      "description": "Records a significant moment from this session as an episodic memory, recalled in\nfuture sessions in this project when relevant.\n\nUse this right after something worth remembering next time: a technical decision, a\ncorrection from the user, or a failure and how it was resolved, also when you save the rule\nit sets with save_memory (the fact holds the rule, the episode what happened and why).\nSkip routine steps, greetings, plain Q&A and bare requests (\"user asked for X\"): save the\noutcome or lesson, not the fact that a task was asked for.",
       "name": "save_episode",
       "parameters": {
         "properties": {
@@ -647,7 +647,7 @@
             "type": "string"
           },
           "scope": {
-            "description": "'user' for something true of the person in every project (name, editor, how they like answers). 'project' for a rule about this codebase only (its tooling, conventions, a decision about it): it is shown only in this directory. A codebase rule is never a 'user' fact.",
+            "description": "'user' for something true of the person in every project (name, editor, how they like answers). 'project' for a rule about this codebase only (its tooling, conventions, a decision about it): it is shown only in this directory. A codebase rule is never a 'user' fact. A decision or a correction is also an episode: call save_episode for it too, with the reason.",
             "enum": [
               "user",
               "project"
