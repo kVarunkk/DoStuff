@@ -9,6 +9,16 @@ import pytest
 
 _hook_ids = itertools.count()
 
+# After the last test the process should exit at once. CI jobs instead sat in "Tests" for hours with every
+# test done (the last, partial line of dots never printed): something left running kept the interpreter alive.
+# If it hasn't exited this long after the session, dump every thread's stack and exit 1, so the log says what.
+EXIT_WATCHDOG_S = 120
+
+
+def pytest_unconfigure(config):
+    import faulthandler
+    faulthandler.dump_traceback_later(EXIT_WATCHDOG_S, exit=True)
+
 
 # --- optional extras (plan/2026-11-08-multimodal-input, CON-010) -------------------------------
 

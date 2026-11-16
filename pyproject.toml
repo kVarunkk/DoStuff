@@ -81,6 +81,10 @@ dev = [
     "mypy>=1.10",
 ]
 
+[tool.pytest.ini_options]
+# A test stuck this long dumps every thread's stack to the log (CI showed only dots, then a 6-hour timeout)
+faulthandler_timeout = 300
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dostuff*"]
