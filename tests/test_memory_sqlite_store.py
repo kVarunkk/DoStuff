@@ -1,6 +1,7 @@
 """The sqlite memory backend (memory.backend: sqlite): FTS5 keyword search behind the Chroma stores' API."""
 import asyncio
 import json
+import sqlite3
 import time
 
 import pytest
@@ -109,6 +110,44 @@ def test_episode_nearest_copy_scores_one(episodes):
     near = run(episodes.nearest("u", "LEARNING Per-test tmp_path fixed the macOS CI flake", "/p"))
     assert near["id"] == "e1" and near["similarity"] > episodes.DUPLICATE
     assert run(episodes.nearest("u", "Chose the MIT licence", "/p")) is None
+
+
+def _decided(episodes) -> list[str]:
+    """The episodes found by "what did we decide", which shares no word with the type name DECISION: it is found only
+    through the type words the keyword index holds for it."""
+    return [e["id"] for e in run(episodes.query("u", "what did we decide", top_k=3, working_dir="/p",
+                                                min_similarity=0.01, recency_decay_rate=0.0))]
+
+
+def test_episode_type_words_pass_the_integrity_check_and_survive_a_rebuild(episodes):
+    """The keyword index holds each type with its everyday words; the integrity check and a rebuild must read the same
+    text, or every saved episode reads as a broken index and `memory repair` strips the type words."""
+    run(episodes.add([_ep(1, "Leftover cents go to the payer", "DECISION"), _ep(2, "Bumped requests", "EVENT")]))
+    assert episodes._db.fts_problems() == []
+    assert _decided(episodes) == ["e1"]
+    episodes._db.rebuild_fts()
+    assert episodes._db.fts_problems() == []
+    assert _decided(episodes) == ["e1"]
+    run(episodes.delete("u", "e1"))
+    assert episodes._db.fts_problems() == [] and _decided(episodes) == []
+
+
+def test_episode_index_from_before_the_type_words_view_is_rebuilt_on_open(tmp_path):
+    """A memory.db whose episode index reads the episodes table directly (before the fix), already rebuilt by
+    `memory repair` so its type words are gone: opening it recreates the index with them."""
+    db = str(tmp_path / "memory.db")
+    run(SQLiteEpisodeStore(db).add([_ep(1, "Leftover cents go to the payer", "DECISION")]))
+    with sqlite3.connect(db) as conn:
+        conn.executescript("""
+            DROP TABLE episodes_vocab; DROP TABLE episodes_fts;
+            CREATE VIRTUAL TABLE episodes_fts USING fts5(
+                event_type, anchor_event, summary, tags, content='episodes', tokenize='porter unicode61');
+            CREATE VIRTUAL TABLE episodes_vocab USING fts5vocab(episodes_fts, 'row');
+            INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild');""")
+    reopened = SQLiteEpisodeStore(db)
+    assert reopened._db.fts_problems() == []
+    assert _decided(reopened) == ["e1"]
+    assert run(reopened.query("u", "payer", top_k=3, working_dir="/p", min_similarity=0.01))[0]["id"] == "e1"
 
 
 def test_episode_prune_count_list_delete(episodes):

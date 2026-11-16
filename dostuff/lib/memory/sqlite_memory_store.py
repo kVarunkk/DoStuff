@@ -49,6 +49,29 @@ TYPE_WORDS = {
 _TYPE_WORDS_SQL = "CASE upper({col}) " + " ".join(
     f"WHEN '{t}' THEN '{t.lower()} {w}'" for t, w in TYPE_WORDS.items()) + " ELSE {col} END"
 _NEW_TYPE, _OLD_TYPE = _TYPE_WORDS_SQL.format(col="new.event_type"), _TYPE_WORDS_SQL.format(col="old.event_type")
+# The episode index reads its text through this view, which spells each type out as the triggers do. With the episodes
+# table itself as content, FTS5's integrity check and 'rebuild' read the bare type name: every saved episode looked
+# like a broken index, and `memory repair` rebuilt it without the type words
+_EPISODES_FTS_VIEW = ("CREATE VIEW IF NOT EXISTS episodes_fts_src AS SELECT rowid AS rid, "
+                      f"{_TYPE_WORDS_SQL.format(col='event_type')} AS event_type, anchor_event, summary, tags "
+                      "FROM episodes")
+_EPISODE_INDEX_SQL = f"""{_EPISODES_FTS_VIEW};
+CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
+    event_type, anchor_event, summary, tags, content='episodes_fts_src', content_rowid='rid',
+    tokenize='{_TOKENIZE}');
+CREATE VIRTUAL TABLE IF NOT EXISTS episodes_vocab USING fts5vocab(episodes_fts, 'row');
+CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
+    INSERT INTO episodes_fts(rowid, event_type, anchor_event, summary, tags)
+    VALUES (new.rowid, {_NEW_TYPE}, new.anchor_event, new.summary, new.tags); END;
+CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
+    INSERT INTO episodes_fts(episodes_fts, rowid, event_type, anchor_event, summary, tags)
+    VALUES ('delete', old.rowid, {_OLD_TYPE}, old.anchor_event, old.summary, old.tags); END;
+CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
+    INSERT INTO episodes_fts(episodes_fts, rowid, event_type, anchor_event, summary, tags)
+    VALUES ('delete', old.rowid, {_OLD_TYPE}, old.anchor_event, old.summary, old.tags);
+    INSERT INTO episodes_fts(rowid, event_type, anchor_event, summary, tags)
+    VALUES (new.rowid, {_NEW_TYPE}, new.anchor_event, new.summary, new.tags); END;
+"""
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS facts (
@@ -67,20 +90,7 @@ CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
 CREATE TABLE IF NOT EXISTS episodes (
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT, working_dir TEXT, event_type TEXT,
     anchor_event TEXT, summary TEXT, tags TEXT, created_at_epoch INTEGER, created_at_iso TEXT);
-CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
-    event_type, anchor_event, summary, tags, content='episodes', tokenize='{_TOKENIZE}');
-CREATE VIRTUAL TABLE IF NOT EXISTS episodes_vocab USING fts5vocab(episodes_fts, 'row');
-CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
-    INSERT INTO episodes_fts(rowid, event_type, anchor_event, summary, tags)
-    VALUES (new.rowid, {_NEW_TYPE}, new.anchor_event, new.summary, new.tags); END;
-CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
-    INSERT INTO episodes_fts(episodes_fts, rowid, event_type, anchor_event, summary, tags)
-    VALUES ('delete', old.rowid, {_OLD_TYPE}, old.anchor_event, old.summary, old.tags); END;
-CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
-    INSERT INTO episodes_fts(episodes_fts, rowid, event_type, anchor_event, summary, tags)
-    VALUES ('delete', old.rowid, {_OLD_TYPE}, old.anchor_event, old.summary, old.tags);
-    INSERT INTO episodes_fts(rowid, event_type, anchor_event, summary, tags)
-    VALUES (new.rowid, {_NEW_TYPE}, new.anchor_event, new.summary, new.tags); END;
+{_EPISODE_INDEX_SQL}
 
 CREATE TABLE IF NOT EXISTS index_outbox (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, row_id TEXT NOT NULL);
@@ -93,6 +103,25 @@ FTS_TABLES = ("facts_fts", "episodes_fts")
 # `index_outbox`: rows whose copy in a secondary index (the hybrid backend's embeddings) is out of date. A store opened
 # with `outbox=True` adds an entry in the same transaction as the write, so a crash can't leave a change the index
 # never hears about. An entry names the row only: whoever drains it reads the row's current state (gone = delete).
+
+
+def _renew_episode_index(conn: sqlite3.Connection) -> None:
+    """Recreate the episode index when another version made it: before the type-words view, or with other
+    TYPE_WORDS. The view and the triggers go with it, so all of them spell the types the same way again, and the index
+    is rebuilt from the episodes table (nothing is lost; the table is the data). One script, one transaction."""
+    sql = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE name IN ('episodes_fts', 'episodes_fts_src')"))
+    if "episodes_fts" not in sql:
+        return  # a new file: _SCHEMA makes it
+    if ("content='episodes_fts_src'" in sql["episodes_fts"]
+            and sql.get("episodes_fts_src") == _EPISODES_FTS_VIEW.replace(" IF NOT EXISTS", "")):
+        return
+    conn.executescript(
+        "BEGIN IMMEDIATE;\n"
+        "DROP TRIGGER IF EXISTS episodes_ai; DROP TRIGGER IF EXISTS episodes_ad; DROP TRIGGER IF EXISTS episodes_au;\n"
+        "DROP TABLE IF EXISTS episodes_vocab; DROP TABLE IF EXISTS episodes_fts; DROP VIEW IF EXISTS episodes_fts_src;\n"
+        f"{_EPISODE_INDEX_SQL}\n"
+        "INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild');\n"
+        "COMMIT;")
 
 
 def _enqueue(conn: sqlite3.Connection, kind: str, row_ids: Iterable[str]) -> None:
@@ -121,6 +150,7 @@ class _Db:
         self.db_path = db_path
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            _renew_episode_index(conn)
             conn.executescript(_SCHEMA)
 
     def connect(self) -> sqlite3.Connection:
