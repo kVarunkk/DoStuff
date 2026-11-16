@@ -20,12 +20,13 @@ from collections.abc import Collection, Iterable
 from typing import Any
 
 from dostuff.helpers.memory.resolve_memory_operation import resolve_memory_operation
+from dostuff.lib.memory.backend import FTS5_TOKENIZE, fts5_available  # noqa: F401 - fts5_available re-exported
 from dostuff.lib.memory.episodic_memory_store import EPISODE_CAP_PER_PROJECT, decay_rate, rank_episodes
 from dostuff.lib.memory.semantic_memory_store import FactScope, fact_id
 
 # Candidates BM25 keeps before the cosine re-rank; a store holds hundreds of rows, so this is nearly all matches
 _POOL = 200
-_TOKENIZE = "porter unicode61"
+_TOKENIZE = FTS5_TOKENIZE
 _WORD = re.compile(r"[^\W_]+")
 # Words that say nothing about which memory is meant. Their absence is what makes "hi" match nothing
 STOPWORDS = frozenset("""
@@ -126,15 +127,6 @@ def _renew_episode_index(conn: sqlite3.Connection) -> None:
 
 def _enqueue(conn: sqlite3.Connection, kind: str, row_ids: Iterable[str]) -> None:
     conn.executemany("INSERT INTO index_outbox (kind, row_id) VALUES (?, ?)", [(kind, i) for i in row_ids])
-
-
-def fts5_available() -> bool:
-    """True if this Python's sqlite3 was built with FTS5 (almost every build; the store needs it)."""
-    try:
-        sqlite3.connect(":memory:").execute(f"CREATE VIRTUAL TABLE t USING fts5(a, tokenize='{_TOKENIZE}')")
-        return True
-    except sqlite3.Error:
-        return False
 
 
 def content_words(text: str) -> list[str]:

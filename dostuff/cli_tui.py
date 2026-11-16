@@ -2368,10 +2368,15 @@ class DostuffTUI(App):
                 registration_store=MCPClientRegistrationStore(path=str(data_dir / "mcp_client_registrations.json")),
                 tool_registry_store=tool_store,
             )
+            from dostuff.lib.memory.backend import fallback_notice, memory_backend
+            # hybrid or sqlite on a Python without FTS5 runs as chroma: say why, instead of the chroma-only notes
+            fallback = await asyncio.to_thread(fallback_notice)
+            if fallback:
+                self._append(fallback, msg_type="system")
             if self.memory_store is None:
-                self._note_memory_off()
+                if not fallback:
+                    self._note_memory_off()
             else:
-                from dostuff.lib.memory.backend import memory_backend
                 if memory_backend() == "chroma":  # the sqlite store has no embedding model and no vector index
                     await self._ensure_embedding_model()
                     await self._warn_if_memory_index_damaged()

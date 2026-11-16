@@ -32,6 +32,15 @@ def _err(text: str) -> None:
     print(text, file=sys.stderr, flush=True)
 
 
+def _memory_notices() -> list[str]:
+    """What the TUI says about memory at startup, for stderr: the backend falling back for want of FTS5, and the
+    one-time copy of the old chroma store's memories (how many, or why it didn't happen)."""
+    from dostuff.lib.memory.backend import fallback_notice
+    from dostuff.lib.memory.stores import chroma_import_result
+    imported = chroma_import_result()
+    return [n for n in (fallback_notice(), imported.message() if imported else "") if n]
+
+
 def _parse_ask_line(answer: str, options: list[dict]) -> str:
     """One line of stdin as the answer to one question (D13): `2` / `1,3` pick options in option order,
     anything else is the answer as typed, and an empty line is `(no answer)`."""
@@ -328,6 +337,8 @@ async def run_headless(
         if warning:
             _err(warning)
             untrusted_notice_given(session_id)
+        for notice in await asyncio.to_thread(_memory_notices):
+            _err(notice)
         if output_format == "stream-json":
             from dostuff.lib.model import get_model
             stream({"type": "init", "session_id": session_id, "model": get_model(), "cwd": str(Path.cwd()),

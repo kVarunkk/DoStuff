@@ -40,7 +40,7 @@ def doctor_checks() -> list[Check]:
     from dostuff.config import get_config
     from dostuff.helpers.mcp.load_mcp_config import mcp_config_sources, read_mcp_file
     from dostuff.helpers.mcp.server_config import key_warnings
-    from dostuff.lib.memory.backend import memory_backend
+    from dostuff.lib.memory.backend import fallback_notice, memory_backend
     from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT, chroma_available, embedding_model_missing
     from dostuff.setup_wizard import missing_api_keys
 
@@ -69,13 +69,17 @@ def doctor_checks() -> list[Check]:
     checks += [Check(warning, False) for warning in key_warnings(servers)]
     checks.append(Check(f"Data dir: {cfg.data_dir}" + ("" if cfg.data_dir.exists() else " (created on first run)"), None))
     backend = memory_backend()
+    fallback = fallback_notice()  # hybrid/sqlite configured, but this Python's sqlite3 has no FTS5
+    if fallback:
+        checks.append(Check(fallback, None if chroma_available() else False, "use a Python whose sqlite3 has FTS5"))
     if backend == "sqlite":
         checks.append(Check("Long-term memory: on (sqlite keyword search, memory.db; `dostuff memory check`)", None))
     elif backend == "hybrid" and not chroma_available():
         checks.append(Check("Long-term memory: on, keyword search only (memory.db); add search by meaning with "
                             f"`{MEMORY_INSTALL_HINT}`", None))
     elif not chroma_available():
-        checks.append(Check(f"Long-term memory: off, chromadb not installed (optional; `{MEMORY_INSTALL_HINT}`)", None))
+        if not fallback:
+            checks.append(Check(f"Long-term memory: off, chromadb not installed (optional; `{MEMORY_INSTALL_HINT}`)", None))
     else:
         if backend == "hybrid":
             checks.append(Check("Long-term memory: on (memory.db, searched by keywords and meaning; "

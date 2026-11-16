@@ -255,7 +255,10 @@ def memory(
     if reembed and action != "repair":
         typer.secho("--reembed goes with 'repair': dostuff memory repair --reembed", fg=typer.colors.RED)
         raise typer.Exit(code=2)
-    from dostuff.lib.memory.backend import memory_backend
+    from dostuff.lib.memory.backend import fallback_notice, memory_backend
+    notice = fallback_notice()
+    if notice:
+        typer.secho(notice, fg=typer.colors.YELLOW)
     if action == "consolidate":
         _consolidate_facts(yes)
         return
