@@ -43,6 +43,18 @@ def _stop_chroma_clients():
         SharedSystemClient._identifier_to_refcount.pop(identifier, None)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_global_registries():
+    """Each test starts with no process-wide agent or jobs registry. A TUI test attaches its session store and its
+    listeners to them; once its event loop closed, the next test's subagent queued a store write behind a write
+    into that dead store and waited forever (test_subagent.py hung CI on Ubuntu and macOS)."""
+    yield
+    from dostuff.agent.subagents import registry as agents_module
+    from dostuff.tools.bash import jobs as jobs_module
+    agents_module._agent_registry = None
+    jobs_module._registry = None
+
+
 # --- optional extras (plan/2026-11-08-multimodal-input, CON-010) -------------------------------
 
 EXTRA_MODULES = {
