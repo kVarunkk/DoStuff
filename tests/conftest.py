@@ -20,6 +20,29 @@ def pytest_unconfigure(config):
     faulthandler.dump_traceback_later(EXIT_WATCHDOG_S, exit=True)
 
 
+@pytest.fixture(autouse=True)
+def _stop_chroma_clients():
+    """Stop every Chroma client a test opened. Each test has its own data dir, so each app start opens new ones,
+    and chroma's and our caches kept all of them (500+ by the end of test_tui.py, each with its own runtime and
+    SQLite pool). Late in the suite a new PersistentClient then never returned on macOS CI, hanging the job."""
+    yield
+    if "chromadb" not in sys.modules:
+        return
+    from chromadb.api.shared_system_client import SharedSystemClient
+    from dostuff.lib.memory import chroma, stores
+    for cached in (stores._semantic, stores._episodic, stores._hybrid_facts, stores._hybrid_episodes,
+                   stores._sqlite_facts, stores._sqlite_episodes, stores._imported):
+        cached.cache_clear()
+    chroma._clients.clear()
+    systems = SharedSystemClient._identifier_to_system
+    for identifier in list(systems):
+        try:
+            systems.pop(identifier).stop()
+        except Exception:
+            pass
+        SharedSystemClient._identifier_to_refcount.pop(identifier, None)
+
+
 # --- optional extras (plan/2026-11-08-multimodal-input, CON-010) -------------------------------
 
 EXTRA_MODULES = {
