@@ -3578,6 +3578,8 @@ def test_pin_transcript_without_ask_user(tui):
                 await app.store.append("old", step)
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume old"))
             await _until(pilot, lambda: app.session_id == "old", tries=200)
+            # The transcript renders after the switch; a fixed pause was too short on a slow runner
+            await _until(pilot, lambda: any("Where is auth handled?" in t for t in _message_lines(app)), tries=200)
             await pilot.pause(0.3)
             lines = _message_lines(app)
             idx = max(i for i, t in enumerate(lines) if "Where is auth handled?" in t)
