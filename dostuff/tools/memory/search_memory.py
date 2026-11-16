@@ -15,6 +15,8 @@ SEARCH_MIN_SIMILARITY = 0.2
 # wanted one 11th or lower in the live eval (S10); an episode is a few lines
 FACT_RESULTS, MAX_FACT_RESULTS = 10, 20
 EPISODE_RESULTS, MAX_EPISODE_RESULTS = 5, 10
+# Listed facts that match are named by key only (their text is in context already); a few are enough to point at
+LISTED_POINTERS = 5
 
 
 async def search_memory(query: str, kind: Literal["all", "facts", "episodes"] = "all",
@@ -69,25 +71,32 @@ async def search_memory(query: str, kind: Literal["all", "facts", "episodes"] = 
 
 
 async def _facts(store: Any, user_id: str, here: str, query: str, limit: int) -> str:
-    """Only the facts the facts step leaves out: the listed ones are in context already (D12)."""
+    """Only the facts the facts step leaves out are returned in full: the listed ones are in context already (D12).
+    Listed facts that match are named by key, so an answer that is already in context isn't taken for one that
+    doesn't exist (a decision saved as a fact, searched for as a DECISION episode)."""
     facts = await store.list_all(user_id, working_dir=here)
-    _, overflow = select_injected_facts(facts)
+    listed, overflow = select_injected_facts(facts)
+    ranked = (await store.query(user_id, query_text=query, top_k=len(facts),
+                                min_similarity=getattr(store, "SEARCH_FLOOR", SEARCH_MIN_SIMILARITY), working_dir=here)
+              if facts else [])
+    listed_keys = {(f.get("scope", "user"), f["key"]) for f in listed}
+    in_list = [f for f in ranked if (f.get("scope", "user"), f["key"]) in listed_keys][:LISTED_POINTERS]
+    pointer = ("\nIn your fact list and matching the query (answer from them): "
+               + ", ".join(f"[{f.get('scope', 'user')}] {f['key']}" for f in in_list)) if in_list else ""
     if not overflow:
-        return f"Facts: All {len(facts)} saved facts are already listed in your fact list."
+        return f"Facts: All {len(facts)} saved facts are already listed in your fact list." + pointer
     wanted = {(f["scope"], f["key"]) for f in overflow}
-    ranked = await store.query(user_id, query_text=query, top_k=len(facts), min_similarity=getattr(store, "SEARCH_FLOOR", SEARCH_MIN_SIMILARITY),
-                               working_dir=here)
     matched = [f for f in ranked if (f.get("scope", "user"), f["key"]) in wanted]
     found = matched[:limit]
     if not found:
-        return f"Facts: nothing among the {len(overflow)} not in your fact list matches."
+        return f"Facts: nothing among the {len(overflow)} not in your fact list matches." + pointer
     lines = [f"- [{f['scope']}] {f['key']}: {f['value']} (saved {_date(f.get('updated_at_epoch'))})" for f in found]
     text = f"Facts not in your fact list ({len(found)} of {len(overflow)}, most relevant first):\n" + "\n".join(lines)
     if len(matched) > len(found):
         # Only when true: the cut is where a wanted fact goes missing under a broad query (S10)
         text += (f"\nMore facts match ({len(matched) - len(found)} not shown): search again with narrower words, "
                  "one topic at a time.")
-    return text
+    return text + pointer
 
 
 async def _episodes(store: Any, user_id: str, working_dir: str | None, query: str, limit: int,
@@ -111,7 +120,9 @@ async def _episodes(store: Any, user_id: str, working_dir: str | None, query: st
         text = (f"{event_type} episodes ({len(typed)}, most relevant first; every {event_type} is ranked, so the "
                 f"last may be unrelated):\n" + _episode_lines(typed))
     else:
-        text = f"No {event_type} episodes are saved."
+        # Before episodes were saved for every decision and correction, many lived only as facts
+        text = (f"No {event_type} episodes are saved. It may be saved as a fact instead: check your fact list "
+                "before saying there is none.")
     if others:
         text += f"\n\nOther episodes matching the query ({len(others)}):\n" + _episode_lines(others)
     return text

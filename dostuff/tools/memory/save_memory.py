@@ -27,7 +27,8 @@ async def save_memory(key: str, value: str, source: MemorySource = "user_message
         scope: 'user' for something true of the person in every project (name, editor, how they
             like answers). 'project' for a rule about this codebase only (its tooling, conventions,
             a decision about it): it is shown only in this directory. A codebase rule is never a
-            'user' fact.
+            'user' fact. A decision or a correction is also an episode: call save_episode for it
+            too, with the reason.
 
     Returns:
         What was stored: added, updated (with the key replaced) or already known.
