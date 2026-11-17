@@ -10,6 +10,7 @@ import contextlib
 import os
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import uuid
@@ -924,7 +925,8 @@ class AskUserPanel(Static, can_focus=True):
         return ((" ❯ " if self.submit_focused else "   ") + label), style
 
     def _row_texts(self, index: int, width: int) -> list[str]:
-        """`✓ 1. label   description` per row, the description cut to one row (D6: the `detail` idea)."""
+        """`✓ 1. label   description` per row; a long one wraps under its number rather than being cut, so the
+        whole description can be read."""
         rows: list[str] = []
         for i, option in enumerate(self._options(index)):
             picked = i in self._toggles[index] if self._multi(index) else self._single[index] == _one_line_answer(option.get("label", ""))
@@ -932,13 +934,35 @@ class AskUserPanel(Static, can_focus=True):
             line = f"{'✓' if picked else ' '} {i + 1}. {label}"
             description = _one_line_answer(option.get("description", ""))
             if description:
-                room = max(width - len(line) - 3, 8)
-                line += "   " + (description if len(description) <= room else description[:room - 1] + "…")
-            rows.append(line)
+                line += "   " + description
+            rows.append(self._wrap_row(line, f"  {i + 1}. ", width))
         typed = self._other[index]
         number = len(self._options(index)) + 1
-        rows.append(f"{'✓' if typed else ' '} {number}. {ASK_OTHER_LABEL}" + (f": {typed}" if typed else ""))
+        rows.append(self._wrap_row(f"{'✓' if typed else ' '} {number}. {ASK_OTHER_LABEL}" + (f": {typed}" if typed else ""),
+                                   f"  {number}. ", width))
         return rows
+
+    @staticmethod
+    def _wrap_row(line: str, number: str, width: int) -> str:
+        """`line` wrapped to `width` (less the 2-cell cursor mark), continuation lines under the label."""
+        return textwrap.fill(line, width=max(width - 2, 10), subsequent_indent=" " * len(number),
+                             break_long_words=True, break_on_hyphens=False)
+
+    def _fit_window(self, rows: list[str], cursor: int, start: int, end: int, room: int) -> tuple[int, int]:
+        """Narrow the option window `start:end` until its lines (and the `↑/↓ N more` markers) fit in `room`
+        lines, dropping rows from the side away from the cursor. A short terminal otherwise pushes the
+        options, the submit row and the hint off the bottom of the screen. At least one row stays."""
+        def lines(a: int, b: int) -> int:
+            return sum(row.count("\n") + 1 for row in rows[a:b]) + (a > 0) + (b < len(rows))
+
+        while end - start > 1 and lines(start, end) > room:
+            if start < cursor and (cursor - start >= end - 1 - cursor or end - 1 <= cursor):
+                start += 1
+            elif end - 1 > cursor:
+                end -= 1
+            else:
+                start += 1
+        return start, end
 
     def _render_review(self, width: int) -> None:
         """The review step: every question with its answer under it, then the submit row that sends.
@@ -974,7 +998,14 @@ class AskUserPanel(Static, can_focus=True):
         text = self._tabs()
         text.append("\n   " + _one_line_answer(self.questions[index].get("question", "")), style="bold")
         rows = self._row_texts(index, width)
-        start, end = _option_window(len(rows), min(self.cursor_row, len(rows) - 1))
+        cursor = min(self.cursor_row, len(rows) - 1)
+        start, end = _option_window(len(rows), cursor)
+        # lines the panel needs besides the options: tabs, question, rule, submit row, hint; and the screen's own
+        # (border, status row, margins) that it must leave
+        fixed = (len(textwrap.wrap(self._tabs().plain, width + 4) or [""])
+                 + len(textwrap.wrap(_one_line_answer(self.questions[index].get("question", "")), width + 1) or [""])
+                 + 3 + 6)
+        start, end = self._fit_window(rows, cursor, start, end, self.app.size.height - fixed)
         _append_option_rows(text, rows, self.cursor_row if not self.submit_focused else -1, start, end)
         text.append("\n   " + "─" * max(min(width - 3, 56), 10), style="dim")
         line, style = self._submit_line()
@@ -1934,7 +1965,7 @@ class DostuffTUI(App):
         height: auto; margin-top: 1; padding: 0 1; background: transparent; border: round #8ab4f8;
     }
     #ask-panel {
-        height: auto; margin-top: 1; padding: 0 1; background: transparent; border: round #8ab4f8;
+        height: auto; max-height: 100%; overflow-y: auto; margin-top: 1; padding: 0 1; background: transparent; border: round #8ab4f8;
     }
     .msg-error { color: #e06c75; }
     .msg-system { color: #8a8a8a; }
@@ -3515,7 +3546,7 @@ class DostuffTUI(App):
         registry = get_registry()
         words = arg.split()
         if not words:
-            jobs = self._session_jobs()
+            jobs = sorted(self._session_jobs(), key=lambda j: j.started, reverse=True)
             if not jobs:
                 self._append("No background jobs.", msg_type="system")
                 return
@@ -3578,10 +3609,8 @@ class DostuffTUI(App):
         self._append(detail, msg_type="system")
 
     def _session_agents(self) -> list["AgentRun"]:
-        """This session's agents: the ones that haven't ended first, then by start time."""
-        from dostuff.agent.subagents.registry import ENDED_STATUSES
-        return sorted(_agent_registry().runs(self.session_id),
-                      key=lambda r: (r.status in ENDED_STATUSES, r.started or float("inf")))
+        """This session's agents, the most recently started first (one still queued has no start yet, so it leads)."""
+        return sorted(_agent_registry().runs(self.session_id), key=lambda r: r.started or float("inf"), reverse=True)
 
     def _show_agents_list(self) -> None:
         """/agents (or a click on the agents item): pick one of this session's agents."""
@@ -5807,10 +5836,10 @@ class DostuffTUI(App):
             self.action_show_jobs()
 
     def action_show_jobs(self) -> None:
-        """The jobs line was clicked (or ↓ in an empty input): pick a job, running ones first."""
+        """The jobs line was clicked (or ↓ in an empty input): pick a job, the most recently started first."""
         if self._picker_open() or self._settings_open() or self.query("#permission-prompt"):
             return
-        jobs = sorted(self._session_jobs(), key=lambda j: (j.ended is not None, j.started))
+        jobs = sorted(self._session_jobs(), key=lambda j: j.started, reverse=True)
         if not jobs:
             return
         registry = get_registry()

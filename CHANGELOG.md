@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The jobs and agents lists show the newest first, and `ask_user` questions no longer get cut off.
+
+### Changed
+- The background jobs list (click the shells item, or `/jobs`) and the `/agents` list now put the most recently started first, instead of running ones first.
+
+### Fixed
+- **`ask_user`** option descriptions wrap in full instead of ending in `…`, and the options shown shrink to fit a short terminal, so a long question no longer pushes the options, the submit row and the hint off the bottom of the screen.
+
 ## [0.2.15] - 2026-11-17
 
 A skill or agent type you add while a session is running reaches the agent on your next message, with no restart, and one the agent creates itself mid-turn reaches it before its next step.
