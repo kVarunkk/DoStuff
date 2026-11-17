@@ -626,9 +626,66 @@ def prune_logs(days: float = 7) -> list[Path]:
     return removed
 
 
+_START_SLACK = 10.0  # seconds a process's creation may differ from the job's recorded `started`
+
+
+def _process_start(pid: int) -> tuple[bool, float | None]:
+    """`(alive, creation time as epoch seconds or None when the OS won't say)` for `pid`, stdlib only."""
+    if pid <= 0:
+        return False, None
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ctypes.get_last_error() == 5, None  # access denied = alive; anything else = no such pid
+            try:
+                code = wintypes.DWORD()
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:  # STILL_ACTIVE
+                    return False, None
+                created, ignored = (wintypes.FILETIME() for _ in range(2))
+                exited, kernel, user = (wintypes.FILETIME() for _ in range(3))
+                if not k32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                           ctypes.byref(kernel), ctypes.byref(user)):
+                    return True, None
+                ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                return True, (ticks - 116444736000000000) / 1e7
+            finally:
+                k32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False, None
+        except PermissionError:
+            pass
+        try:  # Linux: start time in clock ticks since boot, from /proc
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            boot = next(float(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+                        if line.startswith("btime"))
+            return True, boot + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError, IndexError, StopIteration):
+            return True, None
+    except Exception:
+        return True, None  # can't tell: keep the warning rather than hide a live job
+
+
+def _maybe_running(pid: int, started: object) -> bool:
+    """False only when `pid` is gone, or now belongs to a process created long after the job started."""
+    alive, created = _process_start(pid)
+    if not alive:
+        return False
+    if created is None or not isinstance(started, (int, float)):
+        return True
+    return abs(created - started) <= _START_SLACK
+
+
 def find_orphans(session_id: str) -> list[tuple[str, int]]:
-    """`(command, pid)` of jobs other sessions' `jobs.json` never marked ended (a hard crash).
-    Reported only — without psutil a live job can't be told from a reused pid."""
+    """`(command, pid)` of jobs other sessions' `jobs.json` never marked ended (a hard crash) whose process
+    still looks alive: a dead pid, or one reused by a process created after the job started, is dropped.
+    Reported only — the pid is not killed."""
     root = jobs_root()
     own = _job_dir(session_id)
     found: list[tuple[str, int]] = []
@@ -641,7 +698,8 @@ def find_orphans(session_id: str) -> list[tuple[str, int]]:
             continue
         try:
             entries = json.loads(path.read_text(encoding="utf-8"))
-            found += [(str(e["command"]), int(e["pid"])) for e in entries if e.get("ended") is None]
+            found += [(str(e["command"]), int(e["pid"])) for e in entries
+                      if e.get("ended") is None and _maybe_running(int(e["pid"]), e.get("started"))]
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             continue
     return found

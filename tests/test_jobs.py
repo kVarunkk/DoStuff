@@ -484,7 +484,9 @@ def test_prune_old_logs(jobs_home):
     assert not old.exists() and new.exists()
 
 
-def test_orphan_detection(jobs_home):
+def test_orphan_detection(jobs_home, monkeypatch):
+    monkeypatch.setattr("dostuff.tools.bash.jobs._process_start", lambda pid: (True, None))
+
     def index(session, entries):
         d = jobs_home / session
         d.mkdir(parents=True)
@@ -500,6 +502,21 @@ def test_orphan_detection(jobs_home):
     (jobs_home / "corrupt" / "jobs.json").write_text("{not json", encoding="utf-8")
     assert find_orphans("current") == [("npm run dev", 4812)]
     assert set(find_orphans("nothing-here-yet")) == {("npm run dev", 4812), ("mine", 7)}
+
+
+def test_orphan_detection_drops_dead_and_reused_pids(jobs_home, monkeypatch):
+    """A recorded pid that is gone, or now belongs to a process created after the job started, isn't reported."""
+    d = jobs_home / "earlier"
+    d.mkdir(parents=True)
+    (d / "jobs.json").write_text(json.dumps([
+        {"id": "dead", "pid": 1, "command": "dead", "started": 1000.0, "ended": None},
+        {"id": "reused", "pid": 2, "command": "reused", "started": 1000.0, "ended": None},
+        {"id": "live", "pid": 3, "command": "live", "started": 1000.0, "ended": None},
+        {"id": "unknown", "pid": 4, "command": "unknown", "started": 1000.0, "ended": None},
+    ]), encoding="utf-8")
+    states = {1: (False, None), 2: (True, 5000.0), 3: (True, 1001.0), 4: (True, None)}
+    monkeypatch.setattr("dostuff.tools.bash.jobs._process_start", lambda pid: states[pid])
+    assert find_orphans("current") == [("live", 3), ("unknown", 4)]
 
 
 # --- Phase 5: loop and lifecycle ---------------------------------------------------------------
