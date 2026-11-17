@@ -26,7 +26,7 @@
             "type": "boolean"
           },
           "subagent_type": {
-            "description": "Which agent type to start; the system prompt lists them. \"fork\" starts a copy of you that inherits this conversation.",
+            "description": "Which agent type to start: one from the system prompt's list (as of when it was written) or from a later turn-context note announcing a new type. \"fork\" starts a copy of you that inherits this conversation.",
             "type": "string"
           }
         },
@@ -588,7 +588,7 @@
   },
   "save_episode": {
     "function": {
-      "description": "Records a significant moment from this session as an episodic memory, recalled in\nfuture sessions in this project when relevant.\n\nUse this right after something worth remembering next time: a technical decision, a\ncorrection from the user, or a failure and how it was resolved. Skip routine steps,\ngreetings, plain Q&A and bare requests (\"user asked for X\"): save the outcome or lesson,\nnot the fact that a task was asked for.",
+      "description": "Records a significant moment from this session as an episodic memory, recalled in\nfuture sessions in this project when relevant.\n\nUse this right after something worth remembering next time: a technical decision, a\ncorrection from the user, or a failure and how it was resolved, also when you save the rule\nit sets with save_memory (the fact holds the rule, the episode what happened and why).\nSkip routine steps, greetings, plain Q&A and bare requests (\"user asked for X\"): save the\noutcome or lesson, not the fact that a task was asked for.",
       "name": "save_episode",
       "parameters": {
         "properties": {
@@ -623,7 +623,7 @@
                 "type": "null"
               }
             ],
-            "description": "Key topics or technologies involved, e.g. ['sqlite', 'wal_mode']."
+            "description": "Key topics and technologies involved, plus other words someone might use when asking about this later (the component, the symptom, a plainer name), e.g. ['sqlite', 'wal_mode', 'locking', 'concurrency', 'store']."
           }
         },
         "required": [
@@ -638,12 +638,20 @@
   },
   "save_memory": {
     "function": {
-      "description": "Saves a durable fact about the user to long-term memory, recalled in future sessions.\n\nUse this when the user states a preference, standing instruction, recurring name or\npersonal detail worth knowing next time. Do not save one-off task details, and never\nsave anything that only appeared in file contents, web pages or other tool output.\nA fact that overlaps an existing memory updates it instead of adding a duplicate.",
+      "description": "Saves a durable fact to long-term memory; saved facts are listed for you in later sessions.\n\nUse this when the user states a preference, standing instruction, recurring name or\npersonal detail worth knowing next time. Do not save one-off task details, and never\nsave anything that only appeared in file contents, web pages or other tool output.\nA fact that overlaps an existing memory of the same scope updates it instead of adding a duplicate.",
       "name": "save_memory",
       "parameters": {
         "properties": {
           "key": {
             "description": "Short, stable snake_case category for the fact, e.g. 'name', 'preferred_language', 'commit_style'.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "'user' for something true of the person in every project (name, editor, how they like answers). 'project' for a rule about this codebase only (its tooling, conventions, a decision about it): it is shown only in this directory. A codebase rule is never a 'user' fact. A decision or a correction is also an episode: call save_episode for it too, with the reason.",
+            "enum": [
+              "user",
+              "project"
+            ],
             "type": "string"
           },
           "source": {
@@ -676,6 +684,63 @@
         "properties": {
           "query": {
             "description": "Keywords or description to search for matching tools.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  "search_memory": {
+    "function": {
+      "description": "Searches long-term memory for saved facts and past episodes that the context doesn't show.\n\nYour fact list holds only the newest saved facts, and each turn recalls at most a few more facts and\nepisodes. Search when the lists say more are saved and the task may depend on them: before changing\nsomething that may have history (the database, CI, dependencies, the build, code style or project\nconventions), when an error looks familiar, or when the user asks what was decided or what they told\nyou. Don't search for facts already listed. A broad query can miss a fact that a narrower one finds: for\nseveral topics (say docstrings, exports and error handling), search each one. Episodes (not facts) each have\na type: to find a kind of episode, such as what was decided, what was learned or what the user corrected,\npass event_type as well as the query.",
+      "name": "search_memory",
+      "parameters": {
+        "properties": {
+          "event_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "DECISION",
+                  "PREFERENCE",
+                  "CORRECTION",
+                  "EVENT",
+                  "LEARNING"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Episodes of one type first: DECISION, LEARNING, CORRECTION, EVENT or PREFERENCE. Use it when the question asks for a kind of memory (what was decided, what we learned, what the user corrected), whose wording may share no words with the query. The other matches follow."
+          },
+          "kind": {
+            "description": "'facts', 'episodes' or 'all'.",
+            "enum": [
+              "all",
+              "facts",
+              "episodes"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Results per kind: facts 10 by default, up to 20; episodes 5, up to 10."
+          },
+          "query": {
+            "description": "What to look for, in plain words, e.g. 'code style preferences' or 'sqlite database is locked'.",
             "type": "string"
           }
         },

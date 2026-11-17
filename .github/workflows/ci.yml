@@ -8,6 +8,8 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    # A full run takes 5-15 min; a hung one used to sit until GitHub's 6-hour limit
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:

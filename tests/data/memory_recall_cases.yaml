@@ -1,0 +1,560 @@
+# Labelled recall set for tests/test_memory_recall_eval.py (spec: plan/2026-11-11-memory-recall, evals.md T1).
+#
+# Seeded memory, then prompts with what must / must not reach the model.
+# Labels: "f:<key>" is a fact by key; "e:<text>" an episode whose anchor contains <text> ("e:" = any episode).
+# Projects A and B have facts and episodes, C has none. A delivered label owned by another project is a leak.
+user_facts:
+- key: name
+  value: Prefers to be called Admiral Nemo
+- key: preferred_language
+  value: Writes new standalone programs and snippets in Rust
+- key: test_framework
+  value: Uses pytest, never unittest
+- key: commit_style
+  value: Conventional commits, all lowercase
+- key: shell
+  value: On Windows; wants PowerShell for shell commands
+- key: editor
+  value: Uses Neovim
+- key: explanation_style
+  value: Keep explanations to three sentences unless asked for more
+- key: timezone
+  value: Lives in IST (UTC+5:30)
+project_facts:
+  A:
+  - key: linter
+    value: Use ruff instead of flake8 in this project; flake8 clashed with black
+  - key: docs_package_manager
+    value: The docs site uses pnpm, not npm
+  B:
+  - key: linter_b
+    value: This project lints with flake8 only; CI rejects ruff
+  - key: db
+    value: Staging uses PostgreSQL 16
+episodes:
+  A:
+  - type: DECISION
+    days_old: 120
+    anchor: Enabled WAL journal mode for the tinykv Store's SQLite database
+    summary: Readers were blocked by writers; chose PRAGMA journal_mode=WAL; every connection must keep it.
+  - type: LEARNING
+    days_old: 45
+    anchor: '''database is locked'' in tests fixed with a busy timeout'
+    summary: 'Two Store objects writing at once raised sqlite3.OperationalError: database is locked; timeout=5 fixed it.'
+  - type: EVENT
+    days_old: 3
+    anchor: CI flaked on macOS runners
+    summary: Two macOS jobs failed and passed on re-run.
+  - type: DECISION
+    days_old: 200
+    anchor: Switched the docs theme to furo
+    summary: Switched the docs theme to furo.
+  - type: EVENT
+    days_old: 30
+    anchor: Bumped requests to 2.32
+    summary: Bumped requests to 2.32.
+  - type: LEARNING
+    days_old: 60
+    anchor: Paths with spaces broke the release script on Windows; quoted them
+    summary: Quoted all paths.
+  - type: DECISION
+    days_old: 90
+    anchor: Use hatchling as the build backend
+    summary: Use hatchling as the build backend.
+  - type: CORRECTION
+    days_old: 15
+    anchor: User wants f-strings, not str.format
+    summary: User corrected str.format to f-strings.
+  - type: LEARNING
+    days_old: 25
+    anchor: argparse subparsers need dest= to know which command ran
+    summary: Set dest='cmd'.
+  - type: DECISION
+    days_old: 70
+    anchor: Log with the stdlib logging module, no third-party logger
+    summary: No loguru.
+  - type: LEARNING
+    days_old: 100
+    anchor: json.dump needs ensure_ascii=False for non-ASCII titles
+    summary: Titles were escaped.
+  - type: DECISION
+    days_old: 140
+    anchor: Support Python 3.11 and newer only
+    summary: Dropped 3.10.
+  - type: LEARNING
+    days_old: 33
+    anchor: Store timestamps in UTC and convert only for display
+    summary: Mixed zones broke sorting.
+  - type: DECISION
+    days_old: 80
+    anchor: CLI output is plain text, no colours
+    summary: Colours broke piping.
+  - type: LEARNING
+    days_old: 150
+    anchor: A .gitattributes eol=lf stopped CRLF churn in diffs
+    summary: Windows checkouts churned.
+  - type: DECISION
+    days_old: 55
+    anchor: Keep tinykv single-file; no server mode
+    summary: Scope decision.
+  # Recent everyday events about the same SQLite file (memory recall T2.3): they compete with the old WAL decision,
+  # so a flat decay pushes the decision out of the top 3 and D9's per-type decay keeps it
+  - type: EVENT
+    days_old: 1
+    anchor: Opened tinykv.db in DB Browser for SQLite to look at the rows
+    summary: Inspected the kv table by hand.
+  - type: EVENT
+    days_old: 2
+    anchor: Copied the tinykv.db SQLite file to a backup folder
+    summary: Backup before a refactor.
+  - type: EVENT
+    days_old: 4
+    anchor: The tinykv.db SQLite database grew to 40 MB in the load test
+    summary: Load test with a million keys.
+  - type: EVENT
+    days_old: 5
+    anchor: Ran VACUUM on the tinykv.db SQLite database
+    summary: Reclaimed space after the load test.
+  B:
+  - type: DECISION
+    days_old: 40
+    anchor: Pinned flake8 to 7.0 because plugins broke on 7.1
+    summary: flake8-bugbear failed on 7.1.
+  - type: LEARNING
+    days_old: 20
+    anchor: Docker build cache was busted by an early COPY .; moved it after installing deps
+    summary: Builds went from 6 min to 40 s.
+  - type: CORRECTION
+    days_old: 10
+    anchor: Never auto-format generated files under gen/
+    summary: User reverted a formatted gen/ file.
+  - type: DECISION
+    days_old: 75
+    anchor: Moved CI from Jenkins to GitHub Actions
+    summary: Jenkins upkeep was too high.
+cases:
+- project: A
+  prompt: What should you call me?
+  must_recall: ['f:name']
+  must_not_recall: []
+  group: direct
+- project: A
+  prompt: What's my name?
+  must_recall: ['f:name']
+  must_not_recall: []
+  group: direct
+- project: C
+  prompt: Do you remember what I like to be called?
+  must_recall: ['f:name']
+  must_not_recall: []
+  group: direct
+- project: A
+  prompt: Which language do I prefer for new code?
+  must_recall: ['f:preferred_language']
+  must_not_recall: []
+  group: direct
+- project: B
+  prompt: What editor do I use?
+  must_recall: ['f:editor']
+  must_not_recall: []
+  group: direct
+- project: A
+  prompt: What timezone am I in?
+  must_recall: ['f:timezone']
+  must_not_recall: []
+  group: direct
+- project: C
+  prompt: How should my commit messages look?
+  must_recall: ['f:commit_style']
+  must_not_recall: []
+  group: direct
+- project: A
+  prompt: Which test framework do I use?
+  must_recall: ['f:test_framework']
+  must_not_recall: []
+  group: direct
+- project: A
+  prompt: What should you call me, and which language do I prefer for code?
+  must_recall: ['f:name', 'f:preferred_language']
+  must_not_recall: []
+  group: compound
+- project: B
+  prompt: Remind me of my name and my editor.
+  must_recall: ['f:name', 'f:editor']
+  must_not_recall: []
+  group: compound
+- project: C
+  prompt: What shell do I use and how long should your explanations be?
+  must_recall: ['f:shell', 'f:explanation_style']
+  must_not_recall: []
+  group: compound
+- project: A
+  prompt: Tell me my name, my timezone and my test framework.
+  must_recall: ['f:name', 'f:timezone', 'f:test_framework']
+  must_not_recall: []
+  group: compound
+- project: A
+  prompt: Give me a one-line hello world program.
+  must_recall: ['f:preferred_language']
+  must_not_recall: []
+  group: implicit
+- project: C
+  prompt: Write a small program that prints the first 20 Fibonacci numbers.
+  must_recall: ['f:preferred_language']
+  must_not_recall: []
+  group: implicit
+- project: A
+  prompt: Add a test for parse_duration.
+  must_recall: ['f:test_framework']
+  must_not_recall: []
+  group: implicit
+- project: B
+  prompt: Write the commit message for these changes.
+  must_recall: ['f:commit_style']
+  must_not_recall: []
+  group: implicit
+- project: C
+  prompt: How do I list the environment variables?
+  must_recall: ['f:shell']
+  must_not_recall: []
+  group: implicit
+- project: A
+  prompt: How do I find which process uses port 8080?
+  must_recall: ['f:shell']
+  must_not_recall: []
+  group: implicit
+- project: B
+  prompt: Explain how Python's GIL works.
+  must_recall: ['f:explanation_style']
+  must_not_recall: []
+  group: implicit
+- project: C
+  prompt: Schedule the job for 9am my time.
+  must_recall: ['f:timezone']
+  must_not_recall: []
+  group: implicit
+- project: A
+  prompt: ok do it
+  must_recall: ['f:name', 'f:preferred_language']
+  must_not_recall: []
+  group: continuation
+- project: B
+  prompt: continue
+  must_recall: ['f:shell']
+  must_not_recall: []
+  group: continuation
+- project: C
+  prompt: same for the other file
+  must_recall: ['f:test_framework']
+  must_not_recall: []
+  group: continuation
+- project: A
+  prompt: 'yes'
+  must_recall: ['f:commit_style']
+  must_not_recall: []
+  group: continuation
+- project: A
+  prompt: hi
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: B
+  prompt: thanks!
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: C
+  prompt: Explain what a mutex is in one sentence.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: A
+  prompt: What's 17 * 23?
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: B
+  prompt: Tell me a joke about compilers.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: A
+  prompt: good morning
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: B
+  prompt: how are you doing today?
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: A
+  prompt: What's the capital of Australia?
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: B
+  prompt: Recommend a good science fiction book.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: A
+  prompt: Convert 72 Fahrenheit to Celsius.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: B
+  prompt: What does HTTP status 418 mean?
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: A
+  prompt: Summarise the plot of Hamlet in two lines.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: B
+  prompt: What's the difference between a list and a tuple?
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: A
+  prompt: Translate 'thank you' into Japanese.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: B
+  prompt: ok thanks, that's all for now
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: A
+  prompt: Explain big-O notation briefly.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: B
+  prompt: Who won the 2018 football World Cup?
+  must_recall: []
+  must_not_recall: ['e:']
+  group: offtopic
+- project: A
+  prompt: Rename the variable tmp to buffer in app/utils.py.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: A
+  prompt: Add a docstring to the slugify function.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: A
+  prompt: Write a regex that matches US zip codes.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: A
+  prompt: Sort this list of dicts by the 'age' key.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: A
+  prompt: Add type hints to app/cli.py.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: A
+  prompt: Write a function that reverses a linked list.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: B
+  prompt: Add an installation section to the README.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: B
+  prompt: Implement a binary search helper.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: B
+  prompt: Make the error message for a missing input file friendlier.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: B
+  prompt: Add a --verbose flag to the CLI.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: B
+  prompt: Write a unit test for the add function.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: B
+  prompt: Count the words in README.md.
+  must_recall: []
+  must_not_recall: ['e:']
+  group: unrelated
+- project: A
+  prompt: Which linter should I set up here?
+  must_recall: ['f:linter']
+  must_not_recall: ['f:linter_b']
+  group: project
+- project: A
+  prompt: Which package manager does the docs site use?
+  must_recall: ['f:docs_package_manager']
+  must_not_recall: []
+  group: project
+- project: B
+  prompt: Which linter do we use in this repo?
+  must_recall: ['f:linter_b']
+  must_not_recall: ['f:linter']
+  group: project
+- project: B
+  prompt: What database version is staging on?
+  must_recall: ['f:db']
+  must_not_recall: []
+  group: project
+- project: C
+  prompt: Which linter did we pick for this project?
+  must_recall: []
+  must_not_recall: ['f:linter', 'f:linter_b']
+  group: leak
+- project: C
+  prompt: Set up linting for this repo.
+  must_recall: []
+  must_not_recall: ['f:linter', 'f:linter_b']
+  group: leak
+- project: B
+  prompt: Which package manager for the docs?
+  must_recall: []
+  must_not_recall: ['f:docs_package_manager']
+  group: leak
+- project: C
+  prompt: Why did we enable WAL mode?
+  must_recall: []
+  must_not_recall: ['e:WAL']
+  group: leak
+- project: B
+  prompt: The tests fail with database is locked.
+  must_recall: []
+  must_not_recall: ['e:database is locked']
+  group: leak
+- project: A
+  prompt: Why did we move CI off Jenkins?
+  must_recall: []
+  must_not_recall: ['e:Jenkins']
+  group: leak
+- project: C
+  prompt: Should we pin flake8?
+  must_recall: []
+  must_not_recall: ['e:flake8', 'f:linter_b']
+  group: leak
+- project: A
+  prompt: Why did we enable WAL mode on the store?
+  must_recall: ['e:WAL']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: 'Two writers now fail with sqlite3.OperationalError: database is locked. Fix it.'
+  must_recall: ['e:database is locked']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: Refactor app/store.py so the connection opens lazily.
+  must_recall: ['e:WAL']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: The release script fails on a path with spaces.
+  must_recall: ['e:Paths with spaces']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: Which build backend do we use?
+  must_recall: ['e:hatchling']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: Should I add loguru for logging?
+  must_recall: ['e:stdlib logging']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: Add colours to the CLI output.
+  must_recall: ['e:no colours']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: Non-ASCII todo titles come out escaped in the JSON file.
+  must_recall: ['e:ensure_ascii']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: Can we drop support for Python 3.11?
+  must_recall: ['e:Python 3.11']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: Diffs show every line changed after a Windows checkout.
+  must_recall: ['e:gitattributes']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: Add a server mode to tinykv.
+  must_recall: ['e:single-file']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: Use str.format for this message.
+  must_recall: ['e:f-strings']
+  must_not_recall: []
+  group: episode
+- project: B
+  prompt: The Docker build takes 6 minutes again.
+  must_recall: ['e:Docker build cache']
+  must_not_recall: []
+  group: episode
+- project: B
+  prompt: Run black over the whole repo including gen/.
+  must_recall: ['e:generated files']
+  must_not_recall: []
+  group: episode
+- project: B
+  prompt: Upgrade flake8 to the latest version.
+  must_recall: ['e:Pinned flake8']
+  must_not_recall: []
+  group: episode
+- project: A
+  prompt: What did we decide about the store's journal mode?
+  must_recall: ['e:WAL']
+  must_not_recall: []
+  group: decay
+- project: A
+  prompt: Which Python versions do we support?
+  must_recall: ['e:Python 3.11']
+  must_not_recall: []
+  group: decay
+- project: A
+  prompt: What theme do the docs use?
+  must_recall: ['e:furo']
+  must_not_recall: []
+  group: decay
+- project: A
+  prompt: Why are line endings LF in this repo?
+  must_recall: ['e:gitattributes']
+  must_not_recall: []
+  group: decay
+- project: A
+  prompt: Should the store keep using WAL journal mode for SQLite?
+  must_recall: ['e:WAL']
+  must_not_recall: []
+  group: decay
+- project: A
+  prompt: What did we decide about the SQLite database?
+  must_recall: ['e:WAL']
+  must_not_recall: []
+  group: decay

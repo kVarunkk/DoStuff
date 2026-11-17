@@ -22,6 +22,8 @@ RESTRICTED_SUBAGENT_TOOLS = frozenset({
     # Subagents never see the user conversation, so they have nothing to remember
     "save_memory",
     "save_episode",
+    # A typed subagent gets the facts list read-only (memory recall D14); searching past it is the main agent's
+    "search_memory",
     # The todo list belongs to the parent; a subagent would overwrite it
     "todo_write",
     # The question channel is the main agent's: it holds the conversation with the user (ask-user D11)

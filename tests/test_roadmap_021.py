@@ -65,6 +65,27 @@ def test_context_breakdown():
     assert text.startswith("Context: ~") and "Free" in text and "123 input tokens" in text
     bar = text.splitlines()[1]
     assert len(bar) == 40
+    assert "Memory" not in parts  # no memory delivered: no row
+
+
+def test_context_breakdown_memory_row():
+    """memory recall T2.8 (REQ-5.1, D11): facts steps + the facts/episodes sections of bundles, out of Turn context."""
+    from dostuff.helpers.agent.turn_context import compose_turn_context, make_context_step, make_facts_step
+    count = len
+    facts_step = make_facts_step("<user_facts>\n- name: Nemo\n</user_facts>", ("name:abc",))
+    bundle = compose_turn_context(environment="<env>cwd=/p</env>", facts="- lint: ruff", episodes="- [DECISION] WAL",
+                                  prompt_context="hook says hi")
+    messages = [facts_step, {"role": "user", "content": "hello"}, make_context_step(bundle, ("ep1",))]
+    parts = context_parts("SYSTEM", "", {}, messages, "", count)
+    names = [name for name, _ in parts]
+    assert names.index("Memory") == names.index("Turn context") + 1
+    memory = dict(parts)["Memory"]
+    expected = (len(facts_step["content"]) + len("<other_relevant_facts>\n- lint: ruff\n</other_relevant_facts>")
+                + len("<past_episodes>\n- [DECISION] WAL\n</past_episodes>"))
+    assert memory == expected
+    # Every token counted once: Turn context keeps the rest (environment, hook context)
+    assert dict(parts)["Turn context"] + memory == len(facts_step["content"]) + len(bundle)
+    assert dict(parts)["Messages"] == len("hello")
 
 
 def test_allowed_tools_patterns():

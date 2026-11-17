@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from bisect import bisect_right
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
 from textual.app import App, ComposeResult
@@ -69,7 +70,10 @@ from dostuff.helpers.agent.side_question import (
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.quick_memory import append_memory, memory_file, quick_memory_text
 from dostuff.helpers.agent.context_usage import context_parts, count_tokens, render_context
-from dostuff.helpers.agent.turn_context import is_turn_context, make_context_step
+from dostuff.helpers.agent.turn_context import (
+    CONSOLIDATE_HINT_USER_FACTS, TurnContext, delivered_episode_ids, delivered_fact_ids, is_turn_context,
+    make_context_step,
+)
 from dostuff.helpers.ui.doctor import doctor_checks, hooks_listing
 from dostuff.helpers.ui.tools_listing import tools_listing
 from dostuff.helpers.ui.ask_answers import one_line as _one_line_answer, parse_answers
@@ -98,6 +102,8 @@ if TYPE_CHECKING:
     from dostuff.lib.mcp.mcp_client import MCPClient
     from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
     from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
+    from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore, HybridFactStore
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
 
 MCP_CONNECT_TIMEOUT_S = 150.0  # covers the 120 s OAuth browser callback
 SHELL_TIMEOUT_S = 110.0  # `!command` typed by the user
@@ -125,6 +131,8 @@ ASK_RESULT_PREFIX = "ask_user: "  # its result is a few short "question → answ
 ASK_SUBMIT_LABEL = "Submit answers"
 ASK_HINT = "↑/↓ select · Enter confirm · ←/→ change question · Esc cancel"
 ASK_INERT_HINT = "answer every question first"
+ASK_REVIEW_LABEL = "Review"  # the tab the review step adds to the strip
+ASK_REVIEW_HINT = "↑/↓ select · Enter on an answer changes it · Enter on Submit sends · ← back · Esc cancel"
 ASK_OTHER_LABEL = "Other (type your own)"
 ASK_EMPTY_INPUT_HINT = "type an answer (Esc cancels the questions)"
 # The current question's tab: bold orange, plus the solid bar `_tabs` puts in front of it. No background:
@@ -763,7 +771,9 @@ class AskUserPanel(Static, can_focus=True):
     it never talks to the adapter or to the tool (tasks.md open point 2).
 
     Nothing submits on a single keystroke: a pick only records the answer and moves on, and the call is
-    submitted from the `Submit answers` row, which is inert until every question has an answer.
+    submitted from the `Submit answers` row, which is inert until every question has an answer. That row
+    opens a review of every answer first; the call is sent only from the review's own `Submit answers` row,
+    and `←` (or picking an answer) goes back to change one.
     """
 
     class Submit(Message):
@@ -790,6 +800,8 @@ class AskUserPanel(Static, can_focus=True):
         self.cursor_question = 0
         self.cursor_row = 0  # an option row, or len(options) for the Other row
         self.submit_focused = False  # the cursor is on the submit row
+        self.reviewing = False  # the review of every answer is up, in place of the questions
+        self.review_row = 0  # in the review: a question's row, or len(questions) for its submit row
 
     # ── State ──────────────────────────────────────────────────────────────────
 
@@ -802,6 +814,8 @@ class AskUserPanel(Static, can_focus=True):
         self.cursor_question = 0
         self.cursor_row = 0
         self.submit_focused = False
+        self.reviewing = False
+        self.review_row = 0
         if self.is_mounted:
             self._render_panel()
 
@@ -885,7 +899,7 @@ class AskUserPanel(Static, can_focus=True):
         for i, question in enumerate(self.questions):
             if i:
                 text.append(" · ", style="dim")
-            here = i == self.cursor_question and not self.submit_focused
+            here = i == self.cursor_question and not self.submit_focused and not self.reviewing
             if here:
                 mark, mark_style = "▌ ", ASK_CURRENT_TAB
             elif self.answered(i):
@@ -895,6 +909,10 @@ class AskUserPanel(Static, can_focus=True):
             text.append(mark, style=mark_style)
             label = _one_line_answer(question.get("header") or f"Q{i + 1}")
             text.append(label, style=ASK_CURRENT_TAB if here else "")
+        if self.reviewing:
+            text.append(" · ", style="dim")
+            text.append("▌ ", style=ASK_CURRENT_TAB)
+            text.append(ASK_REVIEW_LABEL, style=ASK_CURRENT_TAB)
         return text
 
     def _submit_line(self) -> tuple[str, str]:
@@ -922,11 +940,36 @@ class AskUserPanel(Static, can_focus=True):
         rows.append(f"{'✓' if typed else ' '} {number}. {ASK_OTHER_LABEL}" + (f": {typed}" if typed else ""))
         return rows
 
+    def _render_review(self, width: int) -> None:
+        """The review step: every question with its answer under it, then the submit row that sends.
+
+        A question's rows carry `meta={"ask-review": i}`, so a click on the question or on its answer goes
+        back to that question; the answer is shown whole (it wraps) — the review is where it gets read."""
+        text = self._tabs()
+        text.append("\n   Review your answers", style="bold")
+        for i, question in enumerate(self.questions):
+            meta = Style(meta={"ask-review": i})
+            here = i == self.review_row
+            mark = " ❯ " if here else "   "  # the same column as the submit row's `❯`
+            label = _one_line_answer(question.get("question", "")) or f"Q{i + 1}"
+            text.append("\n" + f"{mark}{i + 1}. {label}",
+                        style=(Style(bold=True, color="#8ab4f8") if here else Style()) + meta)
+            text.append("\n" + "      → " + (self.answer(i) or ""), style=Style(color="#98c379") + meta)
+        text.append("\n   " + "─" * max(min(width - 3, 56), 10), style="dim")
+        here = self.review_row >= len(self.questions)
+        text.append("\n" + (" ❯ " if here else "   ") + ASK_SUBMIT_LABEL,
+                    style=Style(color="#8ab4f8", bold=True) + Style(meta={"ask-submit": True}))
+        text.append("\n " + ASK_REVIEW_HINT, style="dim")
+        self.update(text)
+
     def _render_panel(self) -> None:
         if not self.questions:
             self.update(Text(""))
             return
         width = max((self.content_size.width or self.app.size.width) - 4, 20)
+        if self.reviewing:
+            self._render_review(width)
+            return
         index = min(self.cursor_question, len(self.questions) - 1)
         text = self._tabs()
         text.append("\n   " + _one_line_answer(self.questions[index].get("question", "")), style="bold")
@@ -979,10 +1022,24 @@ class AskUserPanel(Static, can_focus=True):
         self._render_quietly()
 
     def _submit(self) -> None:
-        if self.all_answered():
+        """The questions' submit row opens the review; only the review's submit row sends the call."""
+        if not self.all_answered():
+            self.post_message(self.Inert())
+        elif self.reviewing:
             self.post_message(self.Submit([self.answer(i) or "" for i in range(len(self.questions))]))
         else:
-            self.post_message(self.Inert())
+            self.reviewing, self.review_row = True, len(self.questions)  # the cursor starts on Submit
+            self._render_quietly()
+
+    def _leave_review(self, index: int | None = None) -> None:
+        """Back from the review: onto question `index` to change it, or (None) onto the questions' submit
+        row, so Enter there opens the review again."""
+        self.reviewing = False
+        if index is None:
+            self.submit_focused = True
+            self._render_quietly()
+        else:
+            self._go_to_question(index)
 
     def _go_to_question(self, index: int) -> None:
         self._land_on(index % len(self.questions))
@@ -992,7 +1049,9 @@ class AskUserPanel(Static, can_focus=True):
         """Shift+Tab (the app's binding reaches here while the panel is up, D6)."""
         if not self.questions:
             return
-        if self.submit_focused:
+        if self.reviewing:
+            self._leave_review()
+        elif self.submit_focused:
             self._go_to_question(len(self.questions) - 1)
         else:
             self._go_to_question(self.cursor_question - 1)
@@ -1000,17 +1059,50 @@ class AskUserPanel(Static, can_focus=True):
     def on_click(self, event: Click) -> None:
         meta = event.style.meta
         if meta.get("ask-submit"):
-            self.submit_focused = True
+            if self.reviewing:
+                self.review_row = len(self.questions)
+            else:
+                self.submit_focused = True
             self._render_quietly()
             self._submit()
+            return
+        if self.reviewing:
+            index = meta.get("ask-review")
+            if isinstance(index, int) and 0 <= index < len(self.questions):
+                self._leave_review(index)
             return
         row = meta.get("option")  # the same meta key every selector's rows carry
         if isinstance(row, int) and 0 <= row < self._row_count(self.cursor_question):
             self.cursor_row, self.submit_focused = row, False
             self._record_row(row)
 
+    def _review_key(self, key: str) -> bool:
+        """A key in the review; False for one it leaves alone (Esc reaches the app's cancel)."""
+        rows = len(self.questions) + 1  # each answer, then Submit
+        if key in ("up", "k", "down", "j"):
+            step = -1 if key in ("up", "k") else 1
+            self.review_row = (self.review_row + step) % rows
+            self._render_quietly()
+        elif key == "enter":
+            if self.review_row >= len(self.questions):
+                self._submit()
+            else:
+                self._leave_review(self.review_row)
+        elif key in ("left", "shift+tab", "backtab", "backspace"):
+            self._leave_review()
+        elif key.isdigit() and 1 <= int(key) <= len(self.questions):
+            self._leave_review(int(key) - 1)  # the number shown beside a question changes that answer
+        elif key not in ("tab", "right", "space"):
+            return False  # tab/right/space are swallowed: nothing past Submit, and nothing to toggle
+        return True
+
     def on_key(self, event: Key) -> None:
         key = event.key
+        if self.reviewing:
+            if self._review_key(key):
+                event.stop()
+                event.prevent_default()
+            return
         if key in ("tab", "right"):
             if self.submit_focused:
                 return
@@ -1574,6 +1666,10 @@ class TuiAdapter:
         if event_type == "hook" and isinstance(data, dict):
             app._append(hook_line(data), msg_type="system")
             return
+        if event_type == "capabilities_changed":
+            # The loop told the model a skill or agent type changed: follow with `/name`, never a transcript line (D9)
+            app._sync_skill_view()
+            return
         if event_type == "settings_changed":  # the settings tools changed config.yaml or the MCP servers
             app._apply_settings(mcp=data == "mcp")
             return
@@ -1952,8 +2048,8 @@ class DostuffTUI(App):
         )
         # Memory stores and the MCP client need litellm / chromadb / mcp; _load_backend sets them
         # after the first frame, then sets _backend_ready
-        self.memory_store: "SemanticMemoryStore | None" = None
-        self.episodic_store: "EpisodicMemoryStore | None" = None
+        self.memory_store: "SemanticMemoryStore | SQLiteFactStore | HybridFactStore | None" = None
+        self.episodic_store: "EpisodicMemoryStore | SQLiteEpisodeStore | HybridEpisodeStore | None" = None
         self.mcp_client: "MCPClient | None" = None
         self._backend_ready = asyncio.Event()
         self._backend_error = ""
@@ -1968,6 +2064,8 @@ class DostuffTUI(App):
         self._pending_session_start: str | None = None
         self._setup_done = False
         self._system_instructions: str = ""
+        # The capability set _system_instructions lists (mid-run refresh D2): loop() announces what differs from it
+        self._capabilities_baseline: tuple[str, ...] | None = None
         self._loader_widget: Static | None = None  # loader widget at bottom of stream
         self._loader_label = ""  # loader text without the elapsed time / queue count
         self._stream_widgets: dict[str, Static] = {}  # "answer" / "thought" → live widget
@@ -2008,6 +2106,10 @@ class DostuffTUI(App):
         self._agent_view_refreshing = False
         # "/name" → skill or custom command (helpers/skills/skill_command.py)
         self._skill_commands: dict[str, dict[str, Any]] = {}
+        self._custom_commands: list[dict[str, Any]] = []  # .dostuff/commands/, found at mount (not re-read: OUT-007)
+        self._skills_view: list[dict[str, Any]] = []  # the skills behind _skill_commands, manual-only ones included
+        self._prompt_skills: list[dict[str, Any]] = []  # the skills _system_instructions was built with
+        self._skill_view_key: tuple = ()  # what _skills_view was built from, to rebuild only when it moved
         self._mcp_configured: list[str] = []
         self._mcp_server_configs: dict[str, dict] = {}  # as connected; diffed when the settings change
         self._mcp_files_signature: tuple[tuple[int, int] | None, ...] = ()  # set when the backend connects MCP
@@ -2184,7 +2286,9 @@ class DostuffTUI(App):
         except OSError:
             pass
 
-        self._system_instructions, skills = build_base_instructions(interactive=True)
+        built = build_base_instructions(interactive=True)
+        self._take_prompt(built)  # the view again below, once the custom commands are found
+        skills = built[1]
         self.user_id = self.config.get_user_id()
         existing_meta = await self._load_session(self.session_id)
 
@@ -2215,17 +2319,8 @@ class DostuffTUI(App):
             self._append(f" New session '{self.session_id}'.")
 
         custom = await asyncio.to_thread(discover_commands)
-        self._skill_commands = skill_commands(skills, custom)
-        menu_commands = dict(COMMAND_DESCRIPTIONS)
-        for command, skill in self._skill_commands.items():
-            description = " ".join(str(skill.get("description", "")).split())
-            if len(description) > SKILL_MENU_DESCRIPTION_CHARS:
-                description = description[:SKILL_MENU_DESCRIPTION_CHARS - 1] + "…"
-            kind = f"{skill['scope']} command" if skill.get("kind") == "command" else "skill"
-            menu_commands[command] = f"({kind}) {description}".rstrip()
-        self.query_one("#command-menu", CommandMenu).commands = menu_commands
-        inp.commands = menu_commands
-        inp.skills = [c for c, s in self._skill_commands.items() if s.get("kind") != "command"]
+        self._custom_commands = custom
+        self._apply_skill_view(skills)
         if skills:
             skill_names = ", ".join(s["name"] + (" (manual only)" if s.get("disable_model_invocation") else "")
                                     for s in skills)
@@ -2266,17 +2361,35 @@ class DostuffTUI(App):
             from dostuff.lib.memory.stores import get_episodic_store, get_semantic_store, make_tool_registry_store
 
             data_dir = self.config.get_data_dir()
-            # Same instances the save_memory / save_episode tools write to (None without chromadb)
+            # Same instances the save_memory / save_episode tools write to (None only on the chroma backend without chromadb)
             self.memory_store, self.episodic_store, tool_store = await asyncio.to_thread(
                 lambda: (get_semantic_store(), get_episodic_store(), make_tool_registry_store()))
             self.mcp_client = MCPClient(
                 registration_store=MCPClientRegistrationStore(path=str(data_dir / "mcp_client_registrations.json")),
                 tool_registry_store=tool_store,
             )
+            from dostuff.lib.memory.backend import fallback_notice, memory_backend
+            # hybrid or sqlite on a Python without FTS5 runs as chroma: say why, instead of the chroma-only notes
+            fallback = await asyncio.to_thread(fallback_notice)
+            if fallback:
+                self._append(fallback, msg_type="system")
             if self.memory_store is None:
-                self._note_memory_off()
+                if not fallback:
+                    self._note_memory_off()
             else:
-                await self._ensure_embedding_model()
+                if memory_backend() == "chroma":  # the sqlite store has no embedding model and no vector index
+                    await self._ensure_embedding_model()
+                    await self._warn_if_memory_index_damaged()
+                else:
+                    from dostuff.lib.memory.stores import chroma_import_result
+                    imported = await asyncio.to_thread(chroma_import_result)
+                    if imported is not None and imported.message():
+                        self._append(imported.message(), msg_type="error" if imported.status == "failed" else "system")
+                    from dostuff.lib.memory.hybrid_memory_store import IndexSync
+                    if isinstance(self.memory_store, IndexSync):  # hybrid with chromadb
+                        await self._ensure_embedding_model()
+                        self._start_worker(self._sync_memory_index(), name="memory_index_sync")
+                await self._hint_consolidate()
         except Exception as e:
             self._backend_error = str(e)
             self._append(f"Startup failed: {e}", msg_type="error")
@@ -2298,11 +2411,11 @@ class DostuffTUI(App):
             self._append("Running with local tools only.", msg_type="system")
 
     def _note_memory_off(self) -> None:
-        """Without chromadb, say so once if memories were saved before (e.g. an upgrade from 0.1)."""
+        """memory.backend: chroma without chromadb: say so once if memories were saved before."""
         if (self.config.get_data_dir() / "chroma").exists():
             from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
-            self._append(f"Long-term memory is off: chromadb isn't installed. Your saved memories are kept; "
-                         f"run `{MEMORY_INSTALL_HINT}` to turn it back on.", msg_type="system")
+            self._append(f"Long-term memory is off: memory.backend is chroma and chromadb isn't installed. Your saved "
+                         f"memories are kept; run `{MEMORY_INSTALL_HINT}` to turn it back on.", msg_type="system")
 
     async def _ensure_embedding_model(self) -> None:
         """First run: download Chroma's embedding model with a message, before the first turn
@@ -2318,6 +2431,63 @@ class DostuffTUI(App):
                          "Memory recall is off until it succeeds (it retries on the next start).", msg_type="error")
             return
         self._append("Embedding model ready.", msg_type="system")
+
+    async def _hint_consolidate(self) -> None:
+        """Past 30 user facts, say once at startup that they can be merged (memory recall D10): every one of them
+        is sent with each session's first call. A failed count says nothing; /memories shows the same hint."""
+        assert self.memory_store is not None
+        try:
+            user_facts = len(await self.memory_store.list_all(self.user_id, scope="user"))
+        except Exception:
+            return
+        if user_facts > CONSOLIDATE_HINT_USER_FACTS:
+            self._append(f"You have {user_facts} user facts, and each session starts with them. "
+                         "/memories consolidate merges overlapping ones after showing you the change.",
+                         msg_type="system")
+
+    async def _sync_memory_index(self) -> None:
+        """Hybrid backend: index the memories the embedding index doesn't have yet (imported from the old store, saved
+        under the sqlite backend, or missed by a crash). Recall works meanwhile, by keywords for those rows. Says
+        something only when there was work or it failed."""
+        from dostuff.lib.memory.hybrid_memory_store import IndexSync
+        stores = [s for s in (self.memory_store, self.episodic_store) if isinstance(s, IndexSync)]
+        try:
+            reports = [await s.check_index() for s in stores]
+            todo = sum(r.missing + r.stale + r.extra + r.pending for r in reports)
+            if not todo and not any(r.broken for r in reports):
+                return
+            self._append(f"Indexing {todo} memories for search by meaning...", msg_type="system")
+            for store in stores:
+                await store.repair_index()
+        except Exception as e:
+            self._append(f"Couldn't update the memory embedding index: {e}\nRecall still works by keywords; "
+                         "`dostuff memory repair` retries.", msg_type="error")
+            return
+        self._append("Memory index up to date.", msg_type="system")
+
+    async def _warn_if_memory_index_damaged(self) -> None:
+        """Say the memory index needs a rebuild, instead of letting recall quietly return less.
+
+        Chroma can leave a row in its SQLite metadata but not in its HNSW graph (chroma-core/chroma#7032),
+        which makes filtered queries fail until the collection is rebuilt. Reads then fall back to
+        scanning metadata, so memory still works but finds less; without this notice that looks like
+        the agent just forgetting things.
+        """
+        from dostuff.helpers.memory.repair_index import check_collection
+        from dostuff.lib.memory.stores import memory_collections
+
+        damaged = []
+        for name, collection, where in await asyncio.to_thread(memory_collections):
+            if await asyncio.to_thread(check_collection, collection, where):
+                damaged.append(name)
+        if damaged:
+            self._append(
+                "Long-term memory needs a rebuild: "
+                f"{', '.join(damaged)} {'has' if len(damaged) == 1 else 'have'} a vector index that is out of "
+                "sync with its metadata, so recall and saving may miss entries.\n"
+                "Nothing was lost. Run `dostuff memory repair` (stop dostuff first) to rebuild it.",
+                msg_type="error",
+            )
 
     async def _wait_for_backend(self, keep_loader: bool = False) -> bool:
         """Wait for _load_backend (with a loader if it's still running); False if it failed.
@@ -2704,7 +2874,8 @@ class DostuffTUI(App):
     async def _move_to(self, path: Path) -> None:
         """chdir the session to path; tools, the status bar and the system prompt follow the cwd."""
         os.chdir(path)
-        self._system_instructions, _ = await asyncio.to_thread(build_base_instructions, True)
+        # The new cwd's .dostuff/skills: the prompt, its baseline and `/name` follow
+        self._take_prompt(await asyncio.to_thread(build_base_instructions, True))
         meta = await self.store.get_session_meta(self.session_id)
         if meta:
             await self.store.save_session_meta(
@@ -3033,7 +3204,104 @@ class DostuffTUI(App):
 
     def _reload_instructions(self) -> None:
         """Rebuild the system prompt, e.g. after an AGENTS.md change, so the next message sees it."""
-        self._system_instructions, _ = build_base_instructions(interactive=True)
+        self._take_prompt(build_base_instructions(interactive=True))
+
+    # ── Skills as slash commands, and what the session knows of them (mid-run refresh D9, REQ-6) ─────────────
+
+    @staticmethod
+    def _skill_key(skills: list[dict[str, Any]]) -> tuple:
+        return tuple((s.get("name"), s.get("description"), s.get("dir"), bool(s.get("disable_model_invocation")))
+                     for s in skills)
+
+    def _apply_skill_view(self, skills: list[dict[str, Any]]) -> None:
+        """`/name` commands, the "/" menu, ghost text and `/help` from `skills` (+ the custom commands found at mount).
+        Mount, the reloads, a cd and a skill appearing mid-session all come through here."""
+        self._skills_view = list(skills)
+        self._skill_view_key = self._skill_key(skills)
+        self._skill_commands = skill_commands(skills, self._custom_commands)
+        menu_commands = dict(COMMAND_DESCRIPTIONS)
+        for command, skill in self._skill_commands.items():
+            description = " ".join(str(skill.get("description", "")).split())
+            if len(description) > SKILL_MENU_DESCRIPTION_CHARS:
+                description = description[:SKILL_MENU_DESCRIPTION_CHARS - 1] + "…"
+            if skill.get("kind") == "command":
+                kind = f"{skill['scope']} command"
+            else:
+                kind = "skill, manual only" if skill.get("disable_model_invocation") else "skill"
+            menu_commands[command] = f"({kind}) {description}".rstrip()
+        try:
+            self.query_one("#command-menu", CommandMenu).commands = menu_commands
+            inp = self.query_one("#input", EnterSubmits)
+        except Exception:  # not mounted (yet, or any more): the commands themselves are what matter
+            return
+        inp.commands = menu_commands
+        inp.skills = [c for c, s in self._skill_commands.items() if s.get("kind") != "command"]
+
+    def _sync_skill_view(self) -> bool:
+        """Re-read the skills if their files moved (a stat pass, a few ms; discovery only on a change) and rebuild
+        the view when they differ. True if it changed. Blocking but cheap: for the input path, before a `/name` is
+        judged unknown."""
+        from dostuff.agent.capabilities import current_skills
+        return self._take_skill_view(current_skills())
+
+    async def _refresh_skill_view(self) -> bool:
+        """_sync_skill_view off the event loop: at turn start, before the prompt is parsed (REQ-6.1)."""
+        from dostuff.agent.capabilities import current_skills
+        return self._take_skill_view(await asyncio.to_thread(current_skills))
+
+    def _take_skill_view(self, skills: list[dict[str, Any]]) -> bool:
+        if self._skill_key(skills) == self._skill_view_key:
+            return False
+        self._apply_skill_view(skills)
+        return True
+
+    def _skills_listing(self) -> str:
+        """`/skills`: each skill with its dir and whether it is manual only, then how to reload."""
+        skills = self._skills_view
+        if not skills:
+            lines = ["No skills (add one to .dostuff/skills/<name>/SKILL.md or ~/.agents/skills/<name>/SKILL.md)."]
+        else:
+            lines = [f"Skills ({len(skills)}):"]
+            for s in skills:
+                manual = "  (manual only: /" + str(s["name"]) + " runs it, the agent is not told)" \
+                    if s.get("disable_model_invocation") else ""
+                lines.append(f"  {s['name']}  ·  {_rel_path(str(s.get('dir', '')))}{manual}")
+        lines += ["", "A skill added or removed mid-session is picked up on the next message; "
+                      "/skills reload re-reads them now and rebuilds the system prompt."]
+        return "\n".join(lines)
+
+    async def _skills_command(self, arg: str) -> None:
+        """/skills lists the skills; /skills reload re-reads them and rebuilds the system prompt (REQ-7.1, 7.2). A
+        running turn keeps the prompt it started with; the next one gets the new one (D12)."""
+        word = arg.strip().lower()
+        if word not in ("", "reload", "r"):
+            self._append("Usage: /skills [reload]", msg_type="error")
+            return
+        if not word:
+            await self._refresh_skill_view()
+            self._append(self._skills_listing(), msg_type="system")
+            return
+        # Against what the system prompt listed, not the view: a mid-session skill is in the view already
+        before = {str(s["name"]) for s in self._prompt_skills}
+        await self._rebuild_prompt()
+        after = {str(s["name"]) for s in self._prompt_skills}
+        added, removed = sorted(after - before), sorted(before - after)
+        changes = "; ".join(part for part in (
+            f"added {', '.join(added)}" if added else "", f"removed {', '.join(removed)}" if removed else "") if part)
+        self._append(f"Reloaded: {len(after)} skill(s){' — ' + changes if changes else ', no change'}. "
+                     "The system prompt lists them from the next message.", msg_type="system")
+
+    async def _rebuild_prompt(self) -> None:
+        """A manual reload: discovery, the system prompt and its baseline, and the skill view, off the event loop.
+        Pays one cold prompt cache on the next call, which is what the user asked for (D12)."""
+        self._take_prompt(await asyncio.to_thread(build_base_instructions, True))
+
+    def _take_prompt(self, built: tuple[str, list[dict[str, Any]], tuple[str, ...]]) -> None:
+        """A freshly built system prompt (build_base_instructions()), with the skills and the baseline it lists. Every
+        rebuild site comes through here, so prompt, baseline and `/name` commands never disagree."""
+        self._system_instructions, skills, self._capabilities_baseline = built
+        self._prompt_skills = list(skills)
+        self._apply_skill_view(skills)
 
     # ── /memory and `# note`: the AGENTS.md instruction files ──────────────────
 
@@ -3286,8 +3554,10 @@ class DostuffTUI(App):
             return
         if word in ("reload", "r"):
             loaded = await asyncio.to_thread(agent_defs.reload)
+            await self._rebuild_prompt()  # so the model's list matches, from the next message (REQ-7.5)
             note = f" · {len(loaded.warnings)} warning(s), see /agents types" if loaded.warnings else ""
-            self._append(f"Reloaded: {len(loaded.types)} agent types{note}.", msg_type="system")
+            self._append(f"Reloaded: {len(loaded.types)} agent types{note}. The system prompt lists them from the "
+                         "next message.", msg_type="system")
             return
         if name:
             await self._show_agent_type(name)
@@ -3484,7 +3754,9 @@ class DostuffTUI(App):
             return False
         if self.memory_store is None or self.episodic_store is None:
             from dostuff.lib.memory.chroma import MEMORY_INSTALL_HINT
-            self._append(f"Long-term memory is off (chromadb isn't installed). Turn it on with `{MEMORY_INSTALL_HINT}`.", msg_type="system")
+            self._append(f"Long-term memory is off: memory.backend is chroma and chromadb isn't installed. Turn it on with "
+                         f"`{MEMORY_INSTALL_HINT}`, or remove memory.backend from your config to use the built-in store.",
+                         msg_type="system")
             return False
         return True
 
@@ -3492,16 +3764,70 @@ class DostuffTUI(App):
         if not await self._memory_ready():
             return
         assert self.memory_store is not None
+        here = Path.cwd().resolve()
         try:
-            facts = await self.memory_store.list_all(self.user_id)
+            facts = await self.memory_store.list_all(self.user_id, working_dir=str(here))
         except Exception as e:
             self._append(f"Could not load memories: {e}", msg_type="error")
             return
         if not facts:
             self._append("No saved memories.", msg_type="system")
             return
-        lines = [f"- {f['key']}: {f['value']}  ({f['source']})" for f in facts]
-        self._append(f"Saved memories ({len(facts)}):\n" + "\n".join(lines) + "\n\nForget one with /forget <key>.", msg_type="system")
+
+        def row(fact: dict) -> str:
+            epoch = fact.get("updated_at_epoch") or 0
+            when = datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d") if epoch else "no date"
+            return f"- {fact['key']}: {fact['value']}  ({when})"
+
+        user = [f for f in facts if f.get("scope", "user") == "user"]
+        project = [f for f in facts if f.get("scope") == "project"]
+        sections = []
+        if user:
+            sections.append(f"User ({len(user)}):\n" + "\n".join(row(f) for f in user))
+        if project:
+            sections.append(f"This project, {here.name} ({len(project)}):\n" + "\n".join(row(f) for f in project))
+        text = f"Saved memories ({len(facts)}), newest first:\n" + "\n\n".join(sections)
+        text += "\n\nForget one with /forget <key> (/forget user:<key> for a user fact when this project has the same key)."
+        if len(user) > CONSOLIDATE_HINT_USER_FACTS:
+            text += (f"\n\nYou have {len(user)} user facts. Merging overlapping ones keeps the list every session "
+                     "starts with short: /memories consolidate shows the merge before writing it, and /forget "
+                     "removes the ones you no longer need.")
+        self._append(text, msg_type="system")
+
+    async def _consolidate_memories(self) -> None:
+        """/memories consolidate: one model call merges overlapping facts (yours and this project's), the diff is
+        shown, and nothing is written until you say yes (memory recall D10). Auto mode never asks, so it refuses."""
+        if not await self._memory_ready():
+            return
+        assert self.memory_store is not None
+        if (self.permissions.mode or self.config.permission_mode) == "auto":
+            self._append("Merging facts needs your OK, and auto mode never stops to ask. Leave auto mode "
+                         "(shift+tab) or run `dostuff memory consolidate --yes` in a terminal.", msg_type="system")
+            return
+        from dostuff.helpers.memory.consolidate import ConsolidateError, apply, describe, propose, summary
+        here = Path.cwd().resolve()
+        self._append("Asking the model to merge overlapping facts…", msg_type="system")
+        try:
+            changes = await propose(self.memory_store, self.user_id, str(here))
+        except ConsolidateError as error:
+            self._append(f"Can't merge: {error}. Nothing was changed.", msg_type="error")
+            return
+        except Exception as error:
+            self._append(f"Could not load memories: {error}. Nothing was changed.", msg_type="error")
+            return
+        if not changes:
+            self._append("Nothing to merge: no saved facts overlap.", msg_type="system")
+            return
+        if not await self.adapter.confirm(describe(changes, here.name), "Merge these facts?",
+                                          f"Yes, merge ({summary(changes)})", "No, keep them as they are"):
+            self._append("Nothing was changed.", msg_type="system")
+            return
+        try:
+            await apply(self.memory_store, self.user_id, changes)
+        except Exception as error:
+            self._append(f"The merge stopped part-way: {error}. Check /memories.", msg_type="error")
+            return
+        self._append(f"Merged: {summary(changes)}.", msg_type="system")
 
     def _episodes_dir(self) -> str | None:
         """The directory episodes are recalled from (None = all), as `memory.episodic_scope` says."""
@@ -3528,13 +3854,22 @@ class DostuffTUI(App):
                      + "\n\nForget one with /forget <id>.", msg_type="system")
 
     async def _forget(self, target: str) -> None:
-        """Delete the fact with this key, else the episode with this id (or its last part)."""
+        """Delete this project's fact with this key, else the user fact (`user:<key>` skips the project one),
+        else the episode with this id (or its last part)."""
         if not await self._memory_ready():
             return
         assert self.memory_store is not None and self.episodic_store is not None
         try:
-            if await self.memory_store.delete(self.user_id, target):
-                self._append(f"Forgot memory '{target}'.", msg_type="system")
+            user_only = target.startswith("user:")
+            key = target.removeprefix("user:")
+            if not user_only and await self.memory_store.delete(
+                    self.user_id, key, scope="project", working_dir=str(Path.cwd().resolve())):
+                user_keys = {f["key"] for f in await self.memory_store.list_all(self.user_id, scope="user")}
+                note = f" A user-wide '{key}' is still saved: /forget user:{key} removes it." if key in user_keys else ""
+                self._append(f"Forgot this project's memory '{key}'.{note}", msg_type="system")
+                return
+            if await self.memory_store.delete(self.user_id, key):
+                self._append(f"Forgot memory '{key}'.", msg_type="system")
                 return
             episodes = await self.episodic_store.list_all(self.user_id)
             matches = [ep for ep in episodes if ep["id"] == target or ep["id"].endswith(f"_{target}")]
@@ -3603,6 +3938,13 @@ class DostuffTUI(App):
         if cmd == "/memories":
             self._start_worker(self._show_memories(), name="memories")
             return
+        if cmd.split() == ["/memories", "consolidate"]:
+            self._start_worker(self._consolidate_memories(), name="memories")
+            return
+        if cmd.startswith("/"):
+            # Skills added or removed since the last look (a stat pass): a new one is a command, not a typo, and a
+            # removed one is not run (REQ-6.1, REQ-6.4); /help and the menu list what is there now (REQ-6.2)
+            self._sync_skill_view()
         name, _, arg = text.strip().partition(" ")
         name, arg = name.lower(), arg.strip()
         if name in ("/resume", "/model", "/fork", "/worktree", "/config", "/memory") and self._turn_in_progress:
@@ -3652,6 +3994,9 @@ class DostuffTUI(App):
             return
         if name == "/jobs":
             self._start_worker(self._jobs_command(arg), name="jobs")
+            return
+        if name == "/skills":
+            self._start_worker(self._skills_command(arg), name="skills")
             return
         if name == "/agents":
             if arg.strip():
@@ -3704,7 +4049,8 @@ class DostuffTUI(App):
                              if s.get("kind") == "command")
             if custom:
                 custom = f"\n\nCustom commands (/<name> [arguments]; $ARGUMENTS in the file is replaced):{custom}"
-            skills = "".join(f"\n  {c}" for c, s in self._skill_commands.items() if s.get("kind") != "command")
+            skills = "".join(f"\n  {c}" + ("  (manual only)" if s.get("disable_model_invocation") else "")
+                             for c, s in self._skill_commands.items() if s.get("kind") != "command")
             if skills:
                 skills = f"\n\nSkills (/<skill> [arguments] runs one):{skills}"
             self._append(
@@ -4067,9 +4413,9 @@ class DostuffTUI(App):
             return ForkContext(system_instruction=kept.system_instruction, compaction_notes=notes, history=history,
                                tool_names=list(kept.tool_names), session_hook_context=kept.session_hook_context)
         from dostuff.tools.definitions import default_tool_names  # pulls in the tools: after the first frame
-        bundle = await self._build_turn_context(question)
-        if bundle:  # this snapshot's copy only: a side question stores nothing
-            history.append(make_context_step(bundle))
+        bundle = await self._build_turn_context(question, history=history)
+        if bundle.text:  # this snapshot's copy only: a side question stores nothing
+            history.append(make_context_step(bundle.text, bundle.episode_ids, bundle.fact_ids))
         return ForkContext(system_instruction=self._build_instructions(), compaction_notes=notes,
                            history=history, tool_names=default_tool_names(),
                            session_hook_context=dict(self.session_hook_context))
@@ -4164,6 +4510,8 @@ class DostuffTUI(App):
         typed_in = event.text_area if isinstance(event.text_area, EnterSubmits) and not recalled else None
         partial = typed_in.partial_mention() if typed_in else None
         skill = typed_in.partial_slash() if typed_in else None
+        if typed_in and (text == "/" or skill == "/"):
+            self._sync_skill_view()  # the menu is opening: offer a skill added since the last look (REQ-6.2)
         if text.startswith("/") and " " not in text and "\n" not in text and not recalled:
             menu.show_matches(text)
         elif partial is not None and not text.lstrip().startswith("!"):
@@ -4242,9 +4590,13 @@ class DostuffTUI(App):
     def _build_instructions(self) -> str:
         return build_system_instructions(self._system_instructions)
 
-    async def _build_turn_context(self, user_text: str, prompt_context: str = "") -> str:
+    async def _build_turn_context(self, user_text: str, prompt_context: str = "",
+                                  history: list | None = None) -> TurnContext:
+        """The bundle for this prompt; episodes already in `history` (the session's working history) are left out."""
         return await build_turn_context(user_text, memory_store=self.memory_store, episodic_store=self.episodic_store,
-                                        user_id=self.user_id, prompt_context=prompt_context)
+                                        user_id=self.user_id, prompt_context=prompt_context,
+                                        exclude_episode_ids=delivered_episode_ids(history or []),
+                                        exclude_fact_ids=delivered_fact_ids(history or []))
 
     async def _run_turn(self, user_text: str, wake: bool = False) -> None:
         """One agent turn. `wake`: started by a background job ending (D15) — `user_text` is the pending
@@ -4267,6 +4619,8 @@ class DostuffTUI(App):
 
             content: str | list[dict[str, Any]] = user_text  # text and image refs once something is attached
             if not wake:
+                # Skills added or removed since the last look, before `/name` and inline mentions are read (REQ-6.1)
+                await self._refresh_skill_view()
                 # `/<skill> args`: only the args get @mentions and pastes; the SKILL.md text goes around them
                 skill_run = parse_skill_command(user_text, self._skill_commands)
                 mentions = skill_mentions(user_text, self._skill_commands)  # what was typed, before anything expands
@@ -4330,10 +4684,10 @@ class DostuffTUI(App):
 
             # The turn's context rides ahead of the prompt as a hidden step, never in the system prompt (D5). A
             # wake turn has no prompt, but the environment moved and the notice text recalls like one
-            bundle = await self._build_turn_context(user_text, prompt_context)
-            if bundle:
+            bundle = await self._build_turn_context(user_text, prompt_context, working_history)
+            if bundle.text:
                 await append_step(
-                    make_context_step(bundle),
+                    make_context_step(bundle.text, bundle.episode_ids, bundle.fact_ids),
                     self.steps_history,
                     working_history,
                     self.current_session_history,
@@ -4384,6 +4738,13 @@ class DostuffTUI(App):
                 session_hook_context=self.session_hook_context,
                 # D1: the app's mid-turn queue, drained at the next tool boundary (main session only)
                 steering=self._steering,
+                # What the system prompt lists: a skill or agent type that differs is announced (mid-run refresh D2)
+                capabilities_baseline=self._capabilities_baseline,
+                # Every saved fact in a facts step, re-sent only when the list changes (memory recall D2)
+                memory_store=self.memory_store, memory_user_id=self.user_id,
+                facts_project=str(Path.cwd().resolve()),
+                # One line per episode of this project, so a past decision is seen without matching the prompt
+                episodic_store=self.episodic_store,
             )
 
             agent_text = result or "(no response)"

@@ -30,7 +30,7 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Multi-provider LLMs** via [litellm](https://docs.litellm.ai/docs/providers) — OpenAI, Anthropic, Gemini, Groq, Mistral, Ollama, OpenRouter, OpenCode Zen / Go
 - **Persistent sessions** in SQLite; resume with `dostuff -c`, `dostuff resume` or `dostuff --session <id>`, branch one off with `/fork`
 - **Git worktrees** — `/worktree` or `dostuff -w` runs a session on its own branch and checkout; subagents can run in their own worktree too
-- **Long-term memory** (semantic + episodic) backed by ChromaDB — optional, `pip install "dostuff[memory]"`
+- **Long-term memory** (semantic + episodic) in a local SQLite file, searched by keywords and, with `pip install "dostuff[memory]"`, by meaning
 - **MCP server support** — stdio (npx, uvx) and HTTP transports
 - **`@file` mentions** — type `@` in the prompt to pick a file or folder; its content (or listing) is sent with the message
 - **Project instructions** — `AGENTS.md` / `CLAUDE.md` from `~/.dostuff/`, the repo root and every folder down to the current one, combined
@@ -42,12 +42,12 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Hooks** — shell commands on `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart` and `SubagentStop` that can block a tool call or prompt, feed a formatter's output back to the model, or keep the turn going; Claude Code's hook I/O contract, and project hooks run only once you trust them. See [Hooks](#hooks)
 - **Background jobs** — `bash_command(run_in_background=true)` starts dev servers, watchers and long test runs as jobs the agent reads with `bash_output` (`wait_for` a ready line) and stops with `kill_shell`; it hears when one ends. `Ctrl+B` moves a running command to the background, `/jobs` lists them, and none outlives the session. See [Background jobs](#background-jobs)
 - **File sandbox** — file tools stay inside the project directory, plus read-only access to `.dostuff` (the project's and `~/.dostuff/`) and to discovered skill folders; `.env*` files, `mcp_config.json` and `.dostuff/data` (past sessions and prompts, saved MCP client secrets) are never readable
-- **Skills loader** — drop a `SKILL.md` in the right folder, restart, done; run one with `/<skill-name> [args]`, name one mid-message to allow it for that message, or keep one manual-only with `disable-model-invocation`. See [Skills](#skills)
+- **Skills loader** — drop a `SKILL.md` in the right folder and the agent is told about it on your next message, no restart; run one with `/<skill-name> [args]`, name one mid-message to allow it for that message, or keep one manual-only with `disable-model-invocation`. See [Skills](#skills)
 - **Subagents** — the `agent` tool starts agents in parallel, in the foreground or the background, from built-in types (`explore`, `plan`, `general-purpose`), your own Markdown agent files (Claude Code's `.claude/agents/` work too) or a `fork` of the conversation; continue one with `send_message`, stop it with `stop_agent`, see them all in `/agents`. See [Subagents](#subagents)
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
 - **Retries with backoff** for rate limits, timeouts and 5xx errors (6 by default, exponential with jitter, honors `Retry-After`; `loop.max_retries` / `loop.retry_max_delay`); auth / bad-request errors fail fast
 - **Token and cost tracking** — per-turn and cumulative totals in `/status` and the line after each turn (`✻ Worked for 1m 5s · $0.01`); cost in USD from litellm's price table (hidden when the model has no known price). The table bundled with litellm is used, so startup doesn't wait on a download; set `LITELLM_LOCAL_MODEL_COST_MAP=False` to fetch the latest one from GitHub instead
-- **Long-term memory tools** — the agent saves facts (`save_memory`) and notable moments (`save_episode`) as they come up; both are recalled in later sessions
+- **Long-term memory tools** — the agent saves facts (`save_memory`, about you or about this project) and notable moments (`save_episode`) as they come up; saved facts (up to 50, newest first) are shown to the agent in later sessions, episodes related to the prompt are recalled, the agent looks up older ones with `search_memory`, and `/memories consolidate` merges overlapping facts after showing you the change
 - **Graceful exit** — `Ctrl+Q` or `/exit` saves the session, cleans up, and stops background workers
 - **Clean Cancellation** — `Escape` can cancel in-flight agent turns cleanly without corrupting the session
 - **2-state session split** — `session_steps` (full audit) / `working_history` (LLM payload); DB persists both plus `compaction_notes` + `last_input_tokens`
@@ -71,7 +71,7 @@ Optional features come as extras:
 | Install | Adds |
 |---|---|
 | `pip install dostuff` | Everything except the extras below, including MCP (with OAuth tokens kept in the OS keyring) |
-| `pip install "dostuff[memory]"` | Long-term memory (facts and past decisions across sessions) and semantic MCP tool search, via ChromaDB. Large download |
+| `pip install "dostuff[memory]"` | Memory recall by meaning as well as by keywords (a reworded question still finds the memory), and semantic MCP tool search, via ChromaDB. Large download. Memory itself works without it |
 | `pip install "dostuff[search]"` | Steadier `web_search` through the `ddgs` package (several engines) instead of DuckDuckGo's HTML page |
 | `pip install "dostuff[docs]"` | Word, Excel and PowerPoint files (`.docx`, `.xlsx`, `.pptx`), and PDFs for models that can't read them, converted to text for `@path` and `read_file` (`pypdf`, `python-docx`, `openpyxl`, `python-pptx`) |
 | `pip install "dostuff[images]"` | Pillow: large images are downscaled to fit the model's limit, and `Alt+V` reads the clipboard directly |
@@ -97,7 +97,7 @@ For development (editable mode, from a clone):
 git clone https://github.com/kVarunkk/DoStuff.git
 cd DoStuff
 pip install -e .           # core
-pip install -e ".[memory]" # + long-term memory (chromadb)
+pip install -e ".[memory]" # + memory search by meaning (chromadb)
 pip install -e ".[search]" # + ddgs web search
 pip install -e ".[full]"   # + memory + search
 pip install -e ".[dev]"    # + pytest + mypy
@@ -156,6 +156,7 @@ In the TUI:
 | `dostuff setup`          | Pick a model, save its API key, write `~/.dostuff/config.yaml` (runs automatically on first launch) |
 | `dostuff config`         | Show resolved config paths and values           |
 | `dostuff doctor`         | Health check: config, API key, MCP, data dir; prints a fix for each problem |
+| `dostuff memory [check\|repair\|consolidate] [-y]` | Check that long-term memory's indexes match what is saved (`check`, the default): the keyword index, and on the default backend the embedding index (memories not indexed, out of date, or forgotten but still indexed). `repair` fixes what `check` found, rebuilding either index from `memory.db`, which it never changes, so nothing saved is lost. On `memory.backend: chroma` it rebuilds a broken Chroma index after "Error finding id" errors, backing it up to `~/.dostuff/data/chroma-backups/` first. Stop dostuff before repairing. `consolidate` asks the model to merge your overlapping saved facts and this project's, shows the change, and writes it only when you say yes (`-y` skips the question; in auto mode it refuses without `-y`) |
 | `dostuff resume [<id>]`  | Resume the latest session started in the current directory (or the given one; a unique ID prefix is enough). `--fork` resumes a copy, `--worktree` moves it into a new worktree |
 | `dostuff sessions [--all] [-n N]` | List sessions in the current directory with their title or first prompt (`--all`: every directory) |
 | `dostuff sessions rename <id> <title>` | Name a session |
@@ -191,7 +192,8 @@ In the TUI:
 | `Ctrl+B`      | While the agent waits on a shell command or a foreground subagent (the loader says `Ctrl+B to background`): move them to the background; the agent gets what a command printed so far and carries on, and hears from the agent when it ends. Not for `!command`s. See [Background jobs](#background-jobs) and [Subagents](#subagents) |
 | `Shift+Tab`   | Cycle the permission mode for this session: ask → auto → plan → allowlist (shown in the status bar) |
 | `Ctrl+Backspace` / `Ctrl+W` / `Alt+Backspace` | Delete the previous word; `Ctrl+Delete` / `Alt+Delete` the next one |
-| `/agents` / `/agents types` / `/agents reload` | This session's agents (running first): pick one to read its transcript, answer its approval prompt or stop it / the agent types with their source, model and tools (`/agents types <name>`: one type's system prompt and config) / re-read the agent files |
+| `/agents` / `/agents types` / `/agents reload` | This session's agents (running first): pick one to read its transcript, answer its approval prompt or stop it / the agent types with their source, model and tools (`/agents types <name>`: one type's system prompt and config) / re-read the agent files and rebuild the system prompt from them |
+| `/skills` / `/skills reload` | The skills this session knows: each one's folder, and which are manual only / re-read them now and rebuild the system prompt (reports what was added and removed). See [Skills](#skills) |
 | `/exit`       | Save the session and quit           |
 | `/clear`      | Start a new session; the old one stays resumable |
 | `/resume [<id>]` | Pick another session from this directory (or switch to the given one) |
@@ -205,7 +207,7 @@ In the TUI:
 | `/model [<provider/model>] [--active]` | Pick a model: your saved ones (`models:` in config.yaml) first, then "More <provider> models…" for each provider's list (type to filter; Enter on no match uses what you typed). A model that isn't saved yet is added to `~/.dostuff/config.yaml`. A plain `/model` switch lasts only for this session; add `--active` (e.g. `/model --active`, or `/model anthropic/claude-sonnet-5-5 --active`) to make it the default that new sessions start with |
 | `/config [mcp] [project]` | Edit a settings file right in the TUI: pick `config.yaml` or the MCP servers, user (`~/.dostuff`) or project (`./.dostuff`), or name one (`/config mcp project`). `Ctrl+S` checks the file, saves it and applies it without a restart (an invalid file stays open with the error); `Esc` closes, twice if there are unsaved changes. A new file starts with every option commented out. `.env` files aren't offered |
 | `/status`     | Session, directory, model, permission mode, tokens, context use, MCP servers |
-| `/context`    | What fills the context window: system prompt, turn context (the environment, recalled memories and hook context sent with each prompt), tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
+| `/context`    | What fills the context window: system prompt, turn context (the environment and hook context sent with the prompts), memory (the saved facts and recalled episodes the model is shown; listed once any are), tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
 | `/memory [project\|global]` | Edit `AGENTS.md` (this project's or `~/.dostuff/AGENTS.md`) in the same editor as `/config`; `Ctrl+S` saves and the agent follows it from the next message |
 | `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory, hooks), with a fix for each problem |
 | `/tools`      | Every tool the agent has: when it asks (in `ask` mode), whether subagents get it and what it does, then each connected MCP server's tools (reached through `call_mcp_tool`) |
@@ -219,9 +221,9 @@ In the TUI:
 | `/export [<path>]` | Save this session as Markdown (default `dostuff-session-<id>.md`) |
 | `/undo [force]` | Revert the agent's file changes from its last file-editing turn |
 | `/compact`    | Manually trigger context compaction; `/compact auto <1-100\|off>` sets the auto-compaction threshold for this session |
-| `/memories`   | List the facts saved about you (and where each came from) |
+| `/memories`   | List your saved facts and this project's, newest first, with the date each was saved; `/memories consolidate` merges overlapping facts after showing you the change (not in auto mode) |
 | `/episodes`   | List saved episodes (decisions, corrections, fixes) recalled here, newest first |
-| `/forget <key or id>` | Delete a saved fact (by key) or episode (by the id shown in `/episodes`) |
+| `/forget <key or id>` | Delete a saved fact (by key: this project's first, `user:<key>` for the user-wide one) or episode (by the id shown in `/episodes`) |
 | `Ctrl+Q`      | Graceful quit with save             |
 | `Escape`      | Cancel in-flight turn (also answers "no" to an open approval prompt) |
 | `/help`       | Show available in-TUI commands      |
@@ -259,6 +261,7 @@ In the TUI:
 | `web_search` | network | yes; `a` (always) allows every search for the session. Free: DuckDuckGo by default, the `ddgs` package if installed (`pip install "dostuff[search]"`), or your own SearXNG via `search.searxng_url` |
 | `agent`, `send_message`, `stop_agent` | — | no; each subagent's own calls ask, titled with the agent |
 | `ask_user` | read | never (it is the agent talking to you; subagents never get it) |
+| `save_memory`, `save_episode`, `search_memory` | read | never (each save is shown in the TUI; only with the `memory` extra; subagents never get them) |
 | `read_settings` | read | never (MCP `env` / header values are shown as `<redacted>`) |
 | `edit_config`, `set_mcp_server`, `remove_mcp_server`, `create_agent_type` | settings | **yes, in every mode but `auto`, with no "always" option** (shows the diff or the server's command) |
 
@@ -394,9 +397,24 @@ The top line is the tab strip: `▌` marks the question you are on (bold and ora
 answered, and both sit in the same slot so the tabs never shift as you answer. The submit row is dim until
 every question has an answer, then it brightens and the parenthetical hint goes away.
 
-- **Nothing submits on one key.** A pick records the answer and moves to the next question; `Submit answers` is
-  the only thing that sends, and it stays inert (`answer every question first`) until every question has one.
-  `←`/`Shift+Tab` goes back, so an earlier answer can be changed before submitting.
+- **Nothing submits on one key.** A pick records the answer and moves to the next question; `Submit answers`
+  stays inert (`answer every question first`) until every question has one. `←`/`Shift+Tab` goes back, so an
+  earlier answer can be changed before submitting.
+- **You review before it sends.** `Submit answers` opens a review of every question with your answer under it;
+  the review's own `Submit answers` row is what sends. From the review, `←`/`Shift+Tab` goes back to the
+  questions, and Enter on an answer (or its number, or a click) reopens that question to change it:
+
+  ```
+   ✓ DB · ✓ Auth · ▌ Review
+     Review your answers
+     1. Which database should I use?
+        → Postgres
+     2. Which auth methods?
+        → JWT, OAuth
+     ────────────────────────────────────────────────────────
+   ❯ Submit answers
+   ↑/↓ select · Enter on an answer changes it · Enter on Submit sends · ← back · Esc cancel
+  ```
 - **`2-4` options, one line each**, with the trade-off where it matters. A multi-select question toggles with
   `space` or its number, and the joined answer comes back in option order.
 - **`Other`** is always the last row, numbered after the options: pick it and the input takes a typed answer (a
@@ -580,8 +598,12 @@ and can stop one with `stop_agent`.
 | `send_message(to, message, run_in_background)` | Continue an agent. One that has ended runs again with its whole history plus the message; one still running reads it before its next step |
 | `stop_agent(agent_id)` | Stop a running agent; its shell jobs are killed and its worktree is closed out |
 
-A subagent can never start, message or stop agents, delete files, save memories, write the todo list or change
+A subagent can never start, message or stop agents, delete files, save or search memories, write the todo list or change
 settings, whatever its type asks for. At most `agents.max_concurrent` (4) run at once; more are queued.
+
+A typed subagent sees your saved facts (user facts and this project's, read-only) before its first step, the same
+list the main agent gets; `explore`, `plan` and any type with `omit_memory: true` don't. It never gets past episodes.
+A fork already has them in the conversation it inherits.
 
 ### Agent types
 
@@ -595,12 +617,14 @@ settings, whatever its type asks for. At most `agents.max_concurrent` (4) run at
 Your own types are Markdown files with YAML frontmatter. They are searched in this order, and the first file with a
 given `name` wins: `.dostuff/agents/` and `.claude/agents/` in the project, then `~/.dostuff/agents/` and
 `~/.claude/agents/`. `agents.read_claude_agents: false` skips both `.claude` folders. A file can replace a built-in
-type, except `fork`. Files are re-read when they change; `/agents reload` forces it.
+type, except `fork`. Files are re-read when they change, and a type added or removed mid-session is announced to the
+agent before its next model call (see [Adding skills mid-session](#adding-skills-and-agent-types-mid-session));
+`/agents reload` re-reads them now and rebuilds the system prompt.
 
 You can also ask the agent for one ("make a code-reviewer agent"): its `create_agent_type(name, description, prompt,
 tools, model, max_iterations, scope, replace)` tool writes the file to `.dostuff/agents/` (`scope="user"`:
 `~/.dostuff/agents/`) after showing it to you. Like the settings tools, it asks in every mode. The new type can be
-started at once.
+started at once, and the agent is told about it before its next step.
 
 ```markdown
 ---
@@ -609,6 +633,7 @@ description: Reviews a diff for bugs and missing tests. Use after a change.
 tools: Read, Grep, Glob, Bash   # omit for every subagent tool
 model: fast                     # inherit (default), an alias from agents.models, or a litellm model string
 max_iterations: 30              # optional; default agents.max_iterations
+omit_memory: true               # optional; leave out your saved facts (default false)
 ---
 You are a code reviewer. Report findings as a list, most severe first.
 ```
@@ -629,7 +654,8 @@ Unknown and forbidden names are dropped with a warning naming the file; `/agents
 source, resolved model, tools and any warnings, and `/agents types <name>` shows one type's whole config: its
 system prompt, model, tools and max iterations (for `fork`, the task message it gets). `model:` aliases come from `agents.models`; Claude Code's `sonnet`,
 `opus` and `haiku` are looked up there too and fall back to the main model (with a warning in the report) when they
-aren't defined. The call's `model=` wins over the type's `model:`.
+aren't defined. The call's `model=` wins over the type's `model:`. Claude Code's `memory:` field (a per-agent memory
+folder) is ignored with a warning: DoStuff has no per-agent memory.
 
 ### Background agents
 
@@ -911,6 +937,7 @@ loop:
   retry_max_delay: 60            # cap on each wait, seconds; Retry-After is honored
 
 memory:
+  backend: hybrid           # hybrid (default) | sqlite (keywords only) | chroma (the store before hybrid)
   episodic_scope: project   # recall past episodes from this directory (project) or anywhere (user)
 
 permissions:
@@ -1104,7 +1131,7 @@ Detailed instructions for the agent go here.
 
 **Running a skill yourself:** each skill is also a slash command, `/<name> [arguments]` (e.g. `/my-skill src/app.py`), in the TUI and with `dostuff -p "/my-skill ..."`. The turn's message is the skill's `SKILL.md` body plus your arguments (which can use `@path` mentions), so the model follows it straight away instead of deciding whether to read it. The command shows in the `/` menu marked `(skill)` and in `/help`. Built-in commands win a name clash, the first skill found (in the order above) wins between skills, and names with spaces can't be run this way; the model can still use those skills on its own.
 
-**Manual-only skills:** add `disable-model-invocation: true` to the frontmatter and the model is not told about the skill. It is left out of the system prompt and every subagent's prompt, so it only runs when you ask for it, with `/<name>` or a mention (below). It stays in the `/` menu and `/help`, and the `Skills loaded` line at startup marks it `(manual only)`. Only `false`, `no`, `off`, `0` or an empty value leave a skill visible to the model; anything else, a typo included, hides it.
+**Manual-only skills:** add `disable-model-invocation: true` to the frontmatter and the model is not told about the skill. It is left out of the system prompt and every subagent's prompt, so it only runs when you ask for it, with `/<name>` or a mention (below). It stays in the `/` menu and `/help`, where it is marked `manual only`, as it is in the `Skills loaded` line at startup and in `/skills`. Only `false`, `no`, `off`, `0` or an empty value leave a skill visible to the model; anything else, a typo included, hides it.
 
 > [!IMPORTANT]
 > `disable-model-invocation` is **not a security boundary**. It stops the model from discovering and choosing the
@@ -1118,7 +1145,25 @@ A mention follows a space or a new line, can be any case, and may end in one `.`
 
 While you type, `/` after a space opens the menu with skills only. Tab and Enter there replace just that word: your sentence stays and nothing is sent until the next Enter.
 
-Run `dostuff init` to bootstrap a local `.dostuff/skills/` folder. Restart the agent after adding new skills.
+Run `dostuff init` to bootstrap a local `.dostuff/skills/` folder.
+
+### Adding skills and agent types mid-session
+
+No restart is needed. Before every model call dostuff checks the skill folders (a quick look at file sizes and
+times, a few milliseconds; a skill is re-read only when something moved) and the agent folders. When a skill or agent
+type was added, removed, or had its `description` changed since the agent was last told, it gets a short hidden note
+with the name, description and, for a skill, its folder. That includes one the agent made itself mid-turn, e.g. with
+`create_agent_type`: the note arrives before its next step. You don't see the note in the transcript, but `/name`
+works for a new skill from your next message, the `/` menu and `/help` list it, and the file tools can read its
+folder. A removed skill stops being a command and stops being readable at the same moment. Manual-only skills are
+never announced. Subagents get the same notes for skills that appear while they run.
+
+The system prompt itself keeps the lists it was built with, so the provider's prompt cache stays warm; the note is
+added after your message, and a note at the start of a turn joins your message. It is rebuilt when you enter or
+leave a worktree, save `AGENTS.md` (`/memory`, `# note`), or run `/skills reload` or `/agents reload`. Those two re-read everything now and
+rebuild the prompt from the next message (the next request then pays one uncached prompt). Use them after
+editing a skill's `description` on a drive with coarse file times, or whenever you want the prompt itself current.
+Editing a `SKILL.md` body needs nothing: the agent reads the body when it uses the skill.
 
 ### Custom commands
 
@@ -1145,12 +1190,20 @@ after adding a command.
 - **DB:** `~/.dostuff/data/sessions.db` (SQLite)
 - **Resume:** `dostuff resume` (latest in the current dir), `dostuff resume <id>` or `dostuff --session <id>`
 - **List:** `dostuff sessions` (current dir) / `dostuff sessions --all`
-- **Memory stores:** `~/.dostuff/data/chroma/` (needs `pip install "dostuff[memory]"`; without it, saved memories are kept on disk but not used)
+- **Memory store:** `~/.dostuff/data/memory.db` (SQLite), built in; no extra needed. It needs SQLite's FTS5 (full-text search), which almost every Python's `sqlite3` includes; on one without it, memory uses the `chroma` store when the `memory` extra is installed and is off otherwise, and the TUI, `dostuff -p` and `dostuff doctor` say so
   - Semantic (key/value facts)
   - Episodic (events with summaries and timestamps)
-- **Saved when:** the agent decides — `save_memory` stores a key/value fact (an overlapping fact is updated, not duplicated) and `save_episode` stores a decision, correction or lesson (one that rewords an episode already saved in the directory is skipped). Each save is shown in the TUI; nothing is extracted at exit. Subagents can't save memories.
+- **Backends** (`memory.backend`) — `hybrid` (the default) searches `memory.db` two ways at once: by keywords (SQLite full-text search), and, with `pip install "dostuff[memory]"`, by meaning through an embedding index in `~/.dostuff/data/memory-index/`, so a question worded differently from the memory still finds it. Without the extra it searches by keywords only. `sqlite` is keywords only; `chroma` is the embeddings-only store dostuff used before. On a retrieval benchmark (LongMemEval-S, 470 questions), hybrid put the right memory in its top 5 for 97% of questions (keywords alone 96%, embeddings alone 74%) and delivered it to the agent automatically for 85% (59% and 65%).
+- **Upgrading from the chroma store** — on the first start with `hybrid` or `sqlite`, the facts and episodes in `~/.dostuff/data/chroma/` are copied into `memory.db` once (the TUI says how many; `dostuff -p` says it on stderr); `~/.dostuff/data/chroma/` itself is left as it was, so `memory.backend: chroma` still finds them. A memory you forget afterwards is not brought back. If the extra isn't installed, nothing is copied and the TUI says how to bring them in. The embedding index then fills in the background ("Indexing N memories..."); until it has, those memories are found by keywords.
+- **Saved when:** the agent decides — `save_memory` stores a key/value fact (an overlapping fact of the same scope is updated, not duplicated) and `save_episode` stores a decision, correction or lesson (one that rewords an episode already saved in the directory is skipped; for one of the same type that is close but not a near-copy, the model is asked whether it adds anything to the saved one, and it is skipped only when the answer is clearly that it adds nothing (an unclear answer or a failed call saves it); a lesson next to the event it explains is always kept). Each save is shown in the TUI; nothing is extracted at exit. Subagents can't save memories.
+- **Fact scopes** — a fact is about you (`scope="user"`, the default: your name, editor, how you like answers) or about one project (`scope="project"`: its tooling, conventions, decisions), keyed by the directory it was saved in. The same key can be saved once per scope and project. A project fact is only shown in its own directory.
 - **Two step tables** — `session_steps` (full audit, shown on resume) and `working_steps` (what the model sees; compaction flags old rows instead of rewriting them). Each step is one INSERT. DBs from 0.1.6 and earlier are migrated on first open (`PRAGMA user_version`).
-- **Memory recall** — episodic memories come from your past sessions in the same directory (`memory.episodic_scope: user` for all directories). The agent is told never to save facts that only appeared in tool output; only facts and episodes related to the prompt are recalled (an unrelated prompt like "hi" gets none). List them with `/memories` and `/episodes`, delete one with `/forget`.
+- **Fact delivery** — every saved fact (yours plus this project's) is listed for the agent before its first model call, in a hidden step after your prompt, and sent again only when the list changes (a save, an update, `/forget`) or a compaction drops it, so the prompt cache holds. Facts are listed newest first until they fill a budget of about 4,000 tokens (a few hundred typical facts), with project facts taking at most 60% of it; past that, up to 3 of the rest that match the prompt are added to that turn's context (a fact already added earlier in the session isn't added again until a compaction drops it, unless its value changed), and the agent can look up the others with `search_memory`. Typed subagents get the same list (see [Subagents](#subagents)). While some facts are left out, every turn's context says how many, with a reminder to search before writing code or committing.
+- **Episode recall** — episodic memories come from your past sessions in the same directory (`memory.episodic_scope: user` for all directories); only episodes related to the prompt are recalled (an unrelated prompt like "hi" gets none), up to 3 a turn, and one the session already shows isn't recalled again until a compaction drops it. The block says how many matched and (in project scope) how many the project has saved, so the agent knows when more exist. Older episodes rank lower by type: an event loses half its weight in about two weeks, a lesson in about ten, and a decision, preference or correction doesn't fade. A project keeps at most 200 episodes; past that, the lowest-ranked go after each save, never a decision. The agent is told never to save facts that only appeared in tool output. List them with `/memories` and `/episodes`, delete one with `/forget`.
+- **Episode index** — besides the episodes recalled for a prompt, the agent gets a list of the episodes saved in this project, one line each (`[DECISION 2026-10-30] Chose SQLite for the cache`), in a hidden step like the facts: decisions, preferences and corrections first, newest first, then lessons and events by how recent they are, up to about 1,500 tokens (the list says when older ones are left out). It is sent again only when an episode is saved, forgotten or pruned, so the prompt cache holds. It lets the agent see that a decision exists even when the prompt shares no words with it, and look up the detail with `search_memory`. Subagents don't get it.
+- **Searching memory** — `search_memory` lets the agent look past those limits itself: facts that aren't in its list (yours and this project's) and this project's episodes (every directory's with `episodic_scope: user`), ranked by how well they match its query alone, with no fade for age; each result shows its date and, for an episode, its type. A search returns up to 10 facts and 5 episodes (the agent can ask for up to 20 and 10), and says when more facts matched, so the agent can search again with narrower words. For a question about a kind of memory (what was decided, what you corrected, what was learned) the agent can name an episode type: every episode of that type is ranked first, even one that shares no words with the question, followed by the ordinary matches of other types, so a wrong type never hides what the search would otherwise find. When its list doesn't hold every saved fact, it is told to search before it writes code, commits, or changes the database, CI, dependencies or the build, and when an error looks familiar or you ask what was decided. It only reads, so it never asks and works in plan mode; subagents don't get it.
+- **Consolidating facts** — `/memories consolidate` (or `dostuff memory consolidate`) asks the model once to merge overlapping facts (yours and this project's, never across the two), shows what would be removed, changed and added, and writes it only when you say yes. It is never automatic; in auto mode it refuses rather than ask (on the command line, `--yes` merges without asking). The TUI suggests it at startup and in `/memories` once you have more than 30 user facts.
+- **Index repair** — on the default backend, `memory.db` is the record and both indexes are rebuilt from it: every save also queues the change for the embedding index in the same transaction, so a crash or an index error only delays it (the next save or search catches up), a search never returns a memory that `memory.db` no longer has, and the TUI indexes whatever is missing at startup. If the embedding index fails, recall carries on by keywords. `dostuff memory check` reports what is out of step and `dostuff memory repair` fixes it. On `memory.backend: chroma`, if Chroma's vector index gets out of sync with its stored rows (chroma-core/chroma#7032), recall and saving fall back to a slower scan instead of failing, and the TUI warns at startup. `dostuff memory repair` rebuilds the index; rows it can't rebuild are left out but kept in the backup, and a failed rebuild leaves the original as it was. `dostuff memory repair --reembed` also re-embeds facts saved by older versions (as `"User's <key> is <value>"`) as their value alone, after a backup; they keep working without it.
 - **Token persistence** — `prompt_tokens` / `completion_tokens` / `total_tokens` / `last_input_tokens` saved to DB; resume restores percent from DB meta
 
 Long-term memory survives `pip install . --upgrade` because it lives in the user's home directory, not in the package.
@@ -1259,7 +1312,7 @@ dostuff/
 │   ├── files/              # read, write, edit, delete, list
 │   ├── search/             # grep and glob (pure Python, default excludes)
 │   ├── mcp/                # mcp tool search, detail, and execution wrappers
-│   ├── memory/             # save_memory / save_episode
+│   ├── memory/             # save_memory / save_episode / search_memory
 │   ├── settings.py         # read_settings, edit_config, set/remove_mcp_server
 │   ├── web_fetch.py        # read a URL as text
 │   ├── web_search.py       # free web search (SearXNG / ddgs / DuckDuckGo)

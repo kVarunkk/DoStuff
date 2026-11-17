@@ -9,6 +9,51 @@ import pytest
 
 _hook_ids = itertools.count()
 
+# After the last test the process should exit at once. CI jobs instead sat in "Tests" for hours with every
+# test done (the last, partial line of dots never printed): something left running kept the interpreter alive.
+# If it hasn't exited this long after the session, dump every thread's stack and exit 1, so the log says what.
+EXIT_WATCHDOG_S = 120
+
+
+def pytest_unconfigure(config):
+    import faulthandler
+    faulthandler.dump_traceback_later(EXIT_WATCHDOG_S, exit=True)
+
+
+@pytest.fixture(autouse=True)
+def _stop_chroma_clients():
+    """Stop every Chroma client a test opened. Each test has its own data dir, so each app start opens new ones,
+    and chroma's and our caches kept all of them (500+ by the end of test_tui.py, each with its own runtime and
+    SQLite pool). Late in the suite a new PersistentClient then never returned on macOS CI, hanging the job."""
+    yield
+    if "chromadb" not in sys.modules:
+        return
+    from chromadb.api.shared_system_client import SharedSystemClient
+    from dostuff.lib.memory import chroma, stores
+    for cached in (stores._semantic, stores._episodic, stores._hybrid_facts, stores._hybrid_episodes,
+                   stores._sqlite_facts, stores._sqlite_episodes, stores._imported):
+        cached.cache_clear()
+    chroma._clients.clear()
+    systems = SharedSystemClient._identifier_to_system
+    for identifier in list(systems):
+        try:
+            systems.pop(identifier).stop()
+        except Exception:
+            pass
+        SharedSystemClient._identifier_to_refcount.pop(identifier, None)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_global_registries():
+    """Each test starts with no process-wide agent or jobs registry. A TUI test attaches its session store and its
+    listeners to them; once its event loop closed, the next test's subagent queued a store write behind a write
+    into that dead store and waited forever (test_subagent.py hung CI on Ubuntu and macOS)."""
+    yield
+    from dostuff.agent.subagents import registry as agents_module
+    from dostuff.tools.bash import jobs as jobs_module
+    agents_module._agent_registry = None
+    jobs_module._registry = None
+
 
 # --- optional extras (plan/2026-11-08-multimodal-input, CON-010) -------------------------------
 

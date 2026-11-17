@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
+from dostuff.agent.capabilities import ALL_KINDS, SKILL_KINDS
 from dostuff.agent.subagents import current_agent, read_only_shell
 from dostuff.agent.subagents.adapter import SubagentAdapter
 from dostuff.agent.subagents.definitions import UnknownAgentType, get_definitions, resolve_model
@@ -19,6 +20,7 @@ from dostuff.config import DEFAULT_AGENTS_MAX_CONCURRENT
 from dostuff.agent.subagents.run import _close_worktree, resolve_subagent_tools, run_agent_loop
 from dostuff.helpers.hooks.events import SUBAGENT_START_CONTEXT, subagent_start
 from dostuff.helpers.agent.notices import AgentNotice, agent_notice_line, fmt_agent_runtime, get_notice_queue
+from dostuff.helpers.agent.turn_context import facts_source
 from dostuff.helpers.tools.project_root import project_root, use_project_root
 from dostuff.lib.model import current_model, is_main_provider
 from dostuff.lib.worktree import Worktree, create_worktree, detect_worktree
@@ -327,7 +329,8 @@ class AgentRegistry:
             # history is its own (D11)
             if fork is None:
                 raise ValueError("a fork needs the main agent's conversation")
-            run.fork = ForkContext(fork.system_instruction, "", [], fork.tool_names, fork.session_hook_context)
+            run.fork = ForkContext(fork.system_instruction, "", [], fork.tool_names, fork.session_hook_context,
+                                   fork.capabilities_baseline)
         if not run.model:  # a row from before the model was stored: resolve it again
             from dostuff.config import get_config
             definitions = get_definitions()
@@ -415,8 +418,10 @@ class AgentRegistry:
             return missing, "failed"
         transcript = AgentTranscript(self, run) if self._store is not None else None
         if fork is not None:
-            # The main agent's system prompt, byte-identical, so its cached prefix is reused (D11)
+            # The main agent's system prompt, byte-identical, so its cached prefix is reused (D11), and so the lists
+            # it claims: the main's baseline, both kinds (mid-run refresh D10)
             system = fork.system_instruction
+            baseline, kinds = fork.capabilities_baseline, ALL_KINDS
             if run.history:  # a follow-up: its own history goes on (D10)
                 first_steps = [{"role": "user", "content": ctx.prompt}]
             else:  # its first run: the main history as of the call, then the directive
@@ -424,8 +429,11 @@ class AgentRegistry:
                 first_steps = [*fork.history, fork_first_step(ctx.prompt, note)]
                 fork.history = []  # it lives in run.history now
         else:
-            system = await build_subagent_prompt(agent_def, run.worktree)
+            system, baseline = await build_subagent_prompt(agent_def, run.worktree)
+            kinds = SKILL_KINDS
             first_steps = [{"role": "user", "content": ctx.prompt}]
+        # Typed agents read the main session's facts, keyed on its project even in a worktree (memory recall D14)
+        facts = facts_source.get() if fork is None and not agent_def.omit_memory else None
         adapter = SubagentAdapter(ctx.adapter, run, self._set_status)
         with use_project_root(run.worktree.path) if run.worktree else contextlib.nullcontext():
             hook_context = await subagent_start(
@@ -452,6 +460,7 @@ class AgentRegistry:
                     agent_def.max_iterations or get_config().agents_max_iterations,
                     store=transcript, compaction_notes=run.compaction_notes, inbox=run.inbox,
                     session_hook_context=fork.session_hook_context if fork is not None else None,
+                    capabilities_baseline=baseline, capability_kinds=kinds, facts=facts,
                 )
         finally:
             # Its jobs die with it: nobody is left to read them or hear when they end (background shell D8)

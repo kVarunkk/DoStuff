@@ -5,7 +5,7 @@ from typing import Any, Callable
 from rich.text import Text
 
 from dostuff.helpers.agent.attachments import content_text, is_ref, ref_tokens, refs
-from dostuff.helpers.agent.turn_context import is_turn_context
+from dostuff.helpers.agent.turn_context import is_turn_context, memory_sections
 
 # The MCP tools the model is given; each server's own tools are found through them, not sent
 MCP_META_TOOLS = frozenset({"search_mcp_tools", "get_mcp_tool_details", "call_mcp_tool"})
@@ -13,6 +13,7 @@ BAR_WIDTH = 40
 PART_STYLES = {
     "System prompt": "#8a8a8a",
     "Turn context": "#98c379",
+    "Memory": "#d19a66",
     "Tools": "#c678dd",
     "MCP tools": "#d7769f",
     "Project instructions": "#e5c07b",
@@ -62,15 +63,19 @@ def context_parts(system_prompt: str, project_instructions: str, tool_schemas: d
     mcp = [s for name, s in tool_schemas.items() if name in MCP_META_TOOLS]
     context = [m for m in messages if is_turn_context(m)]
     attached = [r for m in messages for r in refs(m.get("content"))]
+    # Saved facts and recalled episodes the model is shown (memory recall D11), counted here and not in Turn context
+    memory = sum(count(section) for m in context for section in memory_sections(m))
     rows = [
         ("System prompt", count(system_prompt)),
-        ("Turn context", count(next_context) + sum(count(_message_text(m)) for m in context)),
+        ("Turn context", count(next_context) + sum(count(_message_text(m)) for m in context) - memory),
         ("Tools", count(json.dumps(tools)) if tools else 0),
         ("MCP tools", count(json.dumps(mcp)) if mcp else 0),
         ("Project instructions", count(project_instructions)),
         ("Summary of earlier messages", count(summary)),
         ("Messages", sum(count(_message_text(m)) for m in messages if not is_turn_context(m))),
     ]
+    if memory:
+        rows.insert(2, ("Memory", memory))
     if attached:  # REQ-7.3, estimated by D9
         rows.append((f"Attachments ({len(attached)})", sum(ref_tokens(r) for r in attached)))
     return rows

@@ -10,7 +10,10 @@ from dostuff.helpers.agent.load_project_instructions import instruction_files, l
 
 @pytest.fixture
 def no_chroma(monkeypatch, tmp_path):
+    """memory.backend: chroma without chromadb installed: the one setup where long-term memory is off."""
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    (tmp_path / "home" / ".dostuff").mkdir(parents=True)
+    (tmp_path / "home" / ".dostuff" / "config.yaml").write_text("memory:\n  backend: chroma\n")
     monkeypatch.chdir(tmp_path)
     from dostuff import config as config_module
     from dostuff.lib.memory import chroma
@@ -30,10 +33,10 @@ def test_without_chromadb_memory_is_off(no_chroma):
     assert not MEMORY_TOOLS & set(names)
     assert set(names) | MEMORY_TOOLS == set(TOOL_SCHEMAS)
 
-    base, _ = build_base_instructions()
+    base, _, _ = build_base_instructions()
     assert "save_memory" not in base and "## Long-term memory" not in base
-    turn = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="user"))
-    assert "<environment>" in turn and "<relevant_user_facts>" not in turn
+    turn = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="user")).text
+    assert "<environment>" in turn and "<other_relevant_facts>" not in turn
 
     from dostuff.tools.memory.save_memory import save_memory
     with pytest.raises(RuntimeError, match=r"dostuff\[memory\]"):
@@ -49,6 +52,21 @@ def test_without_chromadb_mcp_search_matches_keywords(no_chroma):
     client.mcp_tools["gh__create_issue"] = {"server_name": "gh", "tool_name": "create_issue",
                                             "schema": {"description": "Create a GitHub issue"}}
     assert "gh__create_issue" in asyncio.run(_impl_search_mcp_tools("open an issue", client))
+
+
+def test_default_backend_without_chromadb_keeps_memory_on(no_chroma, tmp_path):
+    from dostuff import config as config_module
+    from dostuff.lib.memory import stores
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
+    from dostuff.tools.definitions import MEMORY_TOOLS, default_tool_names
+    (tmp_path / "home" / ".dostuff" / "config.yaml").write_text("")  # the default backend: hybrid
+    config_module.reset_config()
+    assert isinstance(stores.get_semantic_store(), SQLiteFactStore)  # hybrid without chromadb = keywords only
+    assert isinstance(stores.get_episodic_store(), SQLiteEpisodeStore)
+    assert MEMORY_TOOLS <= set(default_tool_names())
+    from dostuff.cli import app
+    result = CliRunner().invoke(app, ["doctor"])
+    assert "Long-term memory: on, keyword search only" in result.output
 
 
 def test_doctor_reports_memory_off(no_chroma):
@@ -97,8 +115,14 @@ class _Store:
             raise self.error
         return self.rows
 
+    async def list_all(self, *args, **kwargs):
+        self.calls.append(("list_all", kwargs))
+        if self.error:
+            raise self.error
+        return self.rows
 
-FACT = {"key": "name", "value": "Ada"}
+
+FACT = {"key": "name", "value": "Ada", "scope": "user", "updated_at_epoch": 0}
 EPISODE = {"event_type": "EVENT", "anchor_event": "shipped", "summary": "it went out", "created_at_iso": "2026-11-05"}
 
 
@@ -113,14 +137,14 @@ def test_no_stale_importer():
     assert not [p for p in root.rglob("*.py") if "build_turn_instructions" in p.read_text(encoding="utf-8")]
 
 
-def test_turn_context_recalls_facts_and_episodes():
+def test_turn_context_recalls_episodes_not_facts_below_the_cap():
+    """Below the facts step's cap every fact is in the facts step already (memory recall D3): no fact query."""
     from dostuff.agent.instructions import build_turn_context
-    from dostuff.lib.memory.semantic_memory_store import MIN_FACT_SIMILARITY
     facts, episodes = _Store([FACT]), _Store([EPISODE])
-    text = asyncio.run(build_turn_context("hi", memory_store=facts, episodic_store=episodes, user_id="u"))
-    assert "<relevant_user_facts>\n- name: Ada\n</relevant_user_facts>" in text
+    text = asyncio.run(build_turn_context("hi", memory_store=facts, episodic_store=episodes, user_id="u")).text
+    assert "facts>" not in text and "- name: Ada" not in text
     assert "  • [EVENT] shipped\n    Summary: it went out\n    Date: 2026-11-05" in text
-    assert facts.calls == [(("u",), {"query_text": "hi", "top_k": 5, "min_similarity": MIN_FACT_SIMILARITY})]
+    assert [c[0] for c in facts.calls] == ["list_all"]
     assert episodes.calls[0][1]["top_k"] == 3 and episodes.calls[0][1]["query_text"] == "hi"
 
 
@@ -129,7 +153,7 @@ def test_turn_context_recall_failure_is_reported(monkeypatch):
     said = []
     monkeypatch.setattr(instructions, "emit", lambda text, kind: said.append((text, kind)))
     text = asyncio.run(instructions.build_turn_context(
-        "hi", memory_store=_Store(error=RuntimeError("no model")), episodic_store=_Store([EPISODE]), user_id="u"))
+        "hi", memory_store=_Store(error=RuntimeError("no model")), episodic_store=_Store([EPISODE]), user_id="u")).text
     assert said == [("Memory recall failed, continuing without it: no model", "error")]
     assert "<environment>" in text and "<past_episodes>" not in text
 
@@ -137,15 +161,15 @@ def test_turn_context_recall_failure_is_reported(monkeypatch):
 def test_turn_context_without_memory_stores():
     from dostuff.agent.instructions import build_turn_context
     text = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="u",
-                                          prompt_context="from a hook"))
+                                          prompt_context="from a hook")).text
     assert "<environment>" in text and "from a hook" in text
-    assert "<relevant_user_facts>" not in text and "<past_episodes>" not in text
+    assert "<other_relevant_facts>" not in text and "<past_episodes>" not in text
 
 
 def test_hook_context_rides_the_bundle():
     from dostuff.agent.instructions import build_turn_context
     text = asyncio.run(build_turn_context("hi", memory_store=None, episodic_store=None, user_id="u",
-                                          prompt_context="from a hook"))
+                                          prompt_context="from a hook")).text
     assert text.startswith("<turn-context>\n") and text.endswith("[Context from UserPromptSubmit hooks]\nfrom a hook\n</turn-context>")
 
 
@@ -165,7 +189,7 @@ def test_skill_headers_point_at_the_dir(monkeypatch):
     from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
     from dostuff.helpers.skills import discover_skills as ds
     monkeypatch.setattr(ds, "SKILLS_DIRS", [])
-    subagent = _sections(BUILTIN_TYPES["general-purpose"], None)
+    subagent, _ = _sections(BUILTIN_TYPES["general-purpose"], None)
     for text in (" ".join(SYSTEM_INSTRUCTIONS.split()), " ".join(subagent.split())):
         assert "read the SKILL.md in its dir" in text
         assert "the files it refers to are relative to that dir" in text
@@ -209,7 +233,7 @@ def test_manual_skill_not_in_prompt(tmp_path, monkeypatch):
     from dostuff.helpers.skills import discover_skills as ds
     _visible_and_manual(tmp_path)
     monkeypatch.setattr(ds, "SKILLS_DIRS", [str(tmp_path)])
-    prompt, skills = build_base_instructions()
+    prompt, skills, _ = build_base_instructions()
     assert "the visible one" in prompt and "the manual one" not in prompt and str(tmp_path / "manual") not in prompt
     assert sorted(s["name"] for s in skills) == ["manual", "visible"]  # the / menu and /help are built from this
 

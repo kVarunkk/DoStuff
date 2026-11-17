@@ -5,6 +5,56 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+A skill or agent type you add while a session is running reaches the agent on your next message, with no restart, and one the agent creates itself mid-turn reaches it before its next step.
+
+Long-term memory keeps working when Chroma's vector index gets out of sync, and `dostuff memory check` / `repair` find and fix it.
+
+Long-term memory now works out of the box and recalls far more reliably: memories live in a local SQLite file searched by keywords and, with the `memory` extra, by meaning; the agent sees every saved fact and a list of this project's past decisions, and can search the rest with `search_memory`. Memories saved by earlier versions are brought over on the first start.
+
+Before the agent gets your answers to its questions, you see them all on one review screen and can change any of them.
+
+### Added
+- **`/skills`** lists the session's skills with their folders, marking the manual-only ones. **`/skills reload`** re-reads them now, rebuilds the system prompt from the next message, and reports which skills were added and removed.
+- **`dostuff memory check`** reports whether long-term memory's indexes still match what is saved, and exits with code 1 when one needs a rebuild. On `memory.backend: chroma` it checks each Chroma collection (facts, episodes and the MCP tool index).
+- **`dostuff memory repair`** fixes what `check` found. On `memory.backend: chroma` it backs a broken collection up to `~/.dostuff/data/chroma-backups/`, then rebuilds it from its stored rows. Rows that can't be rebuilt are left out but kept in the backup, and if the rebuild fails the original is left as it was. It asks first; `-y` skips the question.
+- **A warning when the TUI starts** if a memory index is out of sync, telling you to run `dostuff memory repair`.
+- **Memory works without the `memory` extra.** Facts and episodes are kept in `~/.dostuff/data/memory.db` and found by keywords. With `pip install "dostuff[memory]"`, the default backend also searches them by meaning, so a question worded differently from the memory still finds it. `memory.backend` picks `hybrid` (the default), `sqlite` (keywords only) or `chroma` (the embeddings-only store used before).
+- **Your old memories come with you.** On the first start, the facts and episodes saved by an earlier version are copied into `memory.db` once, and the TUI (or `dostuff -p`, on stderr) says how many. The old store in `~/.dostuff/data/chroma/` is left as it was, and a memory you forget afterwards is not brought back.
+- **The agent sees every saved fact.** Your facts and this project's are listed for it before its first model call, newest first, up to about 4,000 tokens (project facts at most 60%). Past that, up to 3 that match the prompt are added each turn, and the context says how many were left out.
+- **Project facts.** A fact can be about you (the default) or about one project (`scope="project"`: its tooling, conventions, decisions). A project fact is only shown in its own directory. `/memories` lists the two groups with their dates, and `/forget` removes this project's fact before your own of the same key.
+- **`search_memory`**: the agent can look up facts that aren't in its list and this project's past episodes, up to 10 facts and 5 episodes a search (it can ask for 20 and 10), and is told when more matched. It can ask for one kind of episode (what was decided, corrected or learned). When facts are left out of its list, it is told to search before writing code or committing. It only reads, so it never asks and works in plan mode.
+- **Episode index**: the agent gets a one-line list of the episodes saved in this project (decisions, preferences and corrections first, up to about 1,500 tokens), so it knows a past decision exists even when your prompt shares no words with it.
+- **Merging overlapping facts**: `/memories consolidate` or `dostuff memory consolidate` asks the model once to merge them, shows what would change, and writes it only when you say yes (`--yes` skips the question; auto mode refuses without it). The TUI suggests it once you have more than 30 facts.
+- **`/context` shows memory as its own row**: the facts and recalled episodes the model is shown, with their tokens.
+- **Typed subagents get your saved facts**, read-only.
+- **`dostuff memory repair --reembed`** re-embeds facts saved by older versions as their value alone (chroma backend).
+- **Review your answers before they are sent.** After the agent asks you questions with `ask_user`, `Submit answers` opens a review of every question with your answer under it; Enter on an answer reopens that question, and the review's own `Submit answers` sends.
+
+### Changed
+- **`/agents reload`** now also rebuilds the system prompt, so the agent's list of types matches the files from the next message.
+- **Manual-only skills are marked `manual only`** in the `/` menu and `/help`, not just in the startup `Skills loaded` line.
+- **`dostuff memory check` and `repair` cover the new store**: they check the keyword index and the embedding index against `memory.db` (memories not indexed, out of date, or forgotten but still indexed) and rebuild either one from it, never changing what is saved. The TUI also indexes whatever is missing in the background at startup.
+- **Episodes are recalled more selectively.** One the session already shows isn't recalled again until a compaction drops it; the block says how many matched and how many the project has. Older episodes fade by type: an event in about two weeks, a lesson in about ten, while a decision, preference or correction doesn't fade.
+- **Fewer duplicate episodes, without losing lessons.** An episode that rewords one already saved is skipped; for one that is close but not a copy, the model is asked whether it adds anything. A lesson next to the event it explains is always kept. A project keeps at most 200 episodes, never dropping a decision.
+- **Decisions and corrections are saved as episodes too.** When a decision or correction also sets a rule, the agent saves the rule as a fact and what happened, with the reason, as an episode, so asking later what was decided finds it.
+- **`search_memory` names the listed facts that match.** Facts already in the agent's list aren't repeated in full, but the matching ones are named by key, so an empty search no longer reads as "nothing was saved".
+- **Memory tools work in more setups**: `save_memory`, `save_episode` and `search_memory` are offered whenever memory is on, which is now always unless `memory.backend: chroma` is set without the extra.
+- **A Python without SQLite FTS5 falls back to the chroma store.** `memory.db` needs SQLite's full-text search, which almost every Python includes. On one built without it, memory uses the older chroma store when the `memory` extra is installed and is off otherwise, and the TUI, `dostuff -p` and `dostuff doctor` say why; dostuff starts normally either way.
+
+### Fixed
+- **Skills and agent types added mid-session are no longer invisible to the agent.** Before every model call dostuff checks the skill and agent folders (a few milliseconds). If something was added, removed or had its description changed, the agent gets a short hidden note with the name, description and the skill's folder. Before, the list was fixed when the session started, so the agent kept saying a new skill didn't exist until you restarted or changed directory. This includes a type made with `create_agent_type`, which the agent could start but was never told about. The system prompt itself is not rebuilt for this, so the prompt cache stays warm. Manual-only skills are never announced. Subagents get the same notes for skills that appear while they run. `dostuff -p` behaves the same way.
+- **A new skill is usable as `/name` from your next message**, and the `/` menu and `/help` show it, with no restart. A deleted skill stops being a command.
+- **A skill added mid-session can be read by the file tools.** Before, its `SKILL.md` was refused as outside the project until a restart. A removed skill's folder stops being readable at the same time.
+- **Memory no longer fails with "Error finding id"**. Chroma can drop a row from its vector index while keeping it in its database (chroma-core/chroma#7032); recall, saving a fact and MCP tool search then failed outright. They now fall back to a slower scan and keep working, though they can find less until the index is repaired.
+- **A forgotten or changed memory is never recalled in its old form.** Every save also queues the change for the embedding index in the same transaction, so a crash or an index error only delays it, and a search keeps only what `memory.db` still holds, with its current value.
+- **`dostuff memory consolidate` merges the facts you actually use**: it went to the Chroma store whatever the configured backend.
+
+### Documentation
+- README: a new *Adding skills and agent types mid-session* section, the `/skills` row in the TUI controls, and the restart advice for skills removed.
+- README: the memory section now covers the backends, upgrading from the chroma store, fact scopes and delivery, the episode index, `search_memory`, consolidating and index repair; the `memory` extra is described as search by meaning rather than a requirement.
+
 ## [0.2.14] - 2026-11-08
 
 You can show the agent images, PDFs and Word, Excel and PowerPoint files: mention them with `@`, paste a screenshot with `Alt+V`, drag a file into the terminal, or let the agent open one with `read_file`.

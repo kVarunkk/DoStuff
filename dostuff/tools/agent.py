@@ -59,8 +59,9 @@ async def agent(
         description: 3-5 words saying what the agent does, shown to the user (e.g. "find auth code").
         prompt: The task. A typed agent cannot see this conversation, so include every path, constraint and
             goal it needs, and say what its report should contain. For a fork, just the task.
-        subagent_type: Which agent type to start; the system prompt lists them. "fork" starts a copy of you
-            that inherits this conversation.
+        subagent_type: Which agent type to start: one from the system prompt's list (as of when it was written)
+            or from a later turn-context note announcing a new type. "fork" starts a copy of you that inherits
+            this conversation.
         model: A model for this agent: an alias from agents.models or a full model name. Empty uses the
             type's model, which by default is the session's. A fork always uses the session's model.
         run_in_background: True starts the agent and returns its agent_id at once, so you can keep working; its

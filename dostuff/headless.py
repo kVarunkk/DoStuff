@@ -32,6 +32,15 @@ def _err(text: str) -> None:
     print(text, file=sys.stderr, flush=True)
 
 
+def _memory_notices() -> list[str]:
+    """What the TUI says about memory at startup, for stderr: the backend falling back for want of FTS5, and the
+    one-time copy of the old chroma store's memories (how many, or why it didn't happen)."""
+    from dostuff.lib.memory.backend import fallback_notice
+    from dostuff.lib.memory.stores import chroma_import_result
+    imported = chroma_import_result()
+    return [n for n in (fallback_notice(), imported.message() if imported else "") if n]
+
+
 def _parse_ask_line(answer: str, options: list[dict]) -> str:
     """One line of stdin as the answer to one question (D13): `2` / `1,3` pick options in option order,
     anything else is the answer as typed, and an empty line is `(no answer)`."""
@@ -281,7 +290,7 @@ async def run_headless(
     from dostuff.config import get_config
     from dostuff.helpers.agent.append_step import append_step
     from dostuff.helpers.agent.file_mentions import expand_file_mentions
-    from dostuff.helpers.agent.turn_context import make_context_step
+    from dostuff.helpers.agent.turn_context import delivered_episode_ids, delivered_fact_ids, make_context_step
     from dostuff.helpers.mcp.load_mcp_config import load_mcp_config
     from dostuff.helpers.skills.custom_commands import discover_commands
     from dostuff.helpers.skills.skill_command import (
@@ -328,6 +337,8 @@ async def run_headless(
         if warning:
             _err(warning)
             untrusted_notice_given(session_id)
+        for notice in await asyncio.to_thread(_memory_notices):
+            _err(notice)
         if output_format == "stream-json":
             from dostuff.lib.model import get_model
             stream({"type": "init", "session_id": session_id, "model": get_model(), "cwd": str(Path.cwd()),
@@ -335,7 +346,7 @@ async def run_headless(
         servers = load_mcp_config()
         if servers:
             await _connect_mcp(mcp_client, servers, adapter)
-        base, skills = build_base_instructions()
+        base, skills, capabilities_baseline = build_base_instructions()
         meta = await store.get_session_meta(session_id) or {}
         if meta:
             await get_agent_registry().load(session_id, store)  # continuable with send_message (subagents D14)
@@ -369,10 +380,12 @@ async def run_headless(
             raise _Refused(blocked_prompt_message(blocked))
         # The turn's context rides ahead of the prompt as a hidden step, never in the system prompt (D5)
         bundle = await build_turn_context(prompt, memory_store=get_semantic_store(), episodic_store=get_episodic_store(),
-                                          user_id=config.get_user_id(), prompt_context=prompt_context)
-        if bundle:
-            await append_step(make_context_step(bundle), steps_history, working_history,
-                              current_session_history, session_id, store, "interactive_loop")
+                                          user_id=config.get_user_id(), prompt_context=prompt_context,
+                                          exclude_episode_ids=delivered_episode_ids(working_history),
+                                          exclude_fact_ids=delivered_fact_ids(working_history))
+        if bundle.text:
+            await append_step(make_context_step(bundle.text, bundle.episode_ids, bundle.fact_ids), steps_history,
+                              working_history, current_session_history, session_id, store, "interactive_loop")
         await append_step({"role": "user", "content": content}, steps_history, working_history,
                           current_session_history, session_id, store, "interactive_loop")
         turn_instructions = build_system_instructions(base)
@@ -392,6 +405,12 @@ async def run_headless(
                 max_iterations=max_turns or config.max_iterations,
                 permissions=permissions,
                 session_hook_context=session_hook_context,
+                # A skill or agent type written mid-run reaches the next model call (mid-run refresh D11)
+                capabilities_baseline=capabilities_baseline,
+                # Every saved fact in a facts step, re-sent only when the list changes (memory recall D2)
+                memory_store=get_semantic_store(), memory_user_id=config.get_user_id(),
+                facts_project=str(Path.cwd().resolve()),
+                episodic_store=get_episodic_store(),
             )
         result = await turn(prompt, turn_instructions, meta)
         # Background agents are waited for: each batch of their notices gets a turn, like the TUI's wake-up

@@ -298,7 +298,8 @@ def headless(env, monkeypatch):
     async def fake_loop(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
                         current_session_history, steps_history, store, adapter=None, permissions=None, **kwargs):
         calls.append({"text": user_text, "history": list(working_history), "mode": permissions.mode,
-                      "allow": permissions.allow, "max_iterations": kwargs.get("max_iterations")})
+                      "allow": permissions.allow, "max_iterations": kwargs.get("max_iterations"),
+                      "capabilities_baseline": kwargs.get("capabilities_baseline")})
         reply = await adapter.ask("Allow write_file?")
         adapter.emit("tool_call", "write_file(path=a.txt)")
         adapter.emit("usage", {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
@@ -307,6 +308,32 @@ def headless(env, monkeypatch):
         return text
     monkeypatch.setattr(loop_module, "loop", fake_loop)
     return calls
+
+
+def test_headless_episode_not_repeated_in_session(env, headless, monkeypatch):
+    """REQ-3.1 in `dostuff -p --session`: a continued session doesn't recall what its history already shows."""
+    from dostuff import config as config_module
+    from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
+    (env["home"] / ".dostuff" / "config.yaml").write_text("memory:\n  backend: chroma\n")  # the store stubbed below
+    config_module.reset_config()
+    excluded = []
+
+    async def ranked(self, user_id, query_text, top_k=3, working_dir=None, exclude_ids=(), **kwargs):
+        excluded.append(set(exclude_ids))
+        return [{"id": f"e{i}", "event_type": "LEARNING", "anchor_event": f"anchor {i}", "summary": "s",
+                 "created_at_iso": "2026-11-12"} for i in range(1, 6) if f"e{i}" not in set(exclude_ids)][:top_k]
+    monkeypatch.setattr(EpisodicMemoryStore, "query", ranked)
+    first = runner.invoke(env["app"], ["-p", "why is the db locked?", "--json", "-q", "--permission-mode", "auto"])
+    assert first.exit_code == 0, first.output
+    bundle = [s for s in headless[-1]["history"] if (s.get("meta") or {}).get("episode_ids")]
+    assert [s["meta"]["episode_ids"] for s in bundle] == [["e1", "e2", "e3"]]
+
+    again = runner.invoke(env["app"], ["-p", "and the tests?", "-q", "--permission-mode", "auto",
+                                       "--session", json.loads(first.stdout)["session_id"]])
+    assert again.exit_code == 0, again.output
+    assert excluded[-1] == {"e1", "e2", "e3"}
+    bundles = [s for s in headless[-1]["history"] if (s.get("meta") or {}).get("episode_ids")]
+    assert bundles[-1]["meta"]["episode_ids"] == ["e4", "e5"] and "anchor 1" not in bundles[-1]["content"]
 
 
 def test_print_mode(env, headless):
@@ -860,7 +887,8 @@ def test_headless_wake_turn_adds_no_context_step(env, headless_agents, capsys):
     assert _run_headless("[M] start it") == 0
     capsys.readouterr()
     messages = fm.calls_for("[M]")[2]["messages"]
-    assert sum("<turn-context>" in str(m.get("content")) for m in messages) == 1
+    # Not the system prompt: it names `<turn-context>` notes when it explains how new skills are announced
+    assert sum("<turn-context>" in str(m.get("content")) for m in messages if m.get("role") != "system") == 1
     assert "<environment>\ncwd:" not in messages[0]["content"]
 
 
@@ -965,3 +993,37 @@ def test_headless_xlsx_mention_spills(env, headless_agents, monkeypatch, capsys)
     sent = [m for m in fm.calls[0]["messages"] if m["role"] == "user"][-1]["content"]
     assert isinstance(sent, str) and 'converted_from="xlsx" file=".dostuff/attachments/' in sent
     assert "| row299 |" not in sent
+
+
+# --- mid-run skill and agent-type refresh (plan/2026-11-11-mid-run-skill-agent-refresh D11) ------------------
+
+def test_headless_passes_baseline(env, headless, monkeypatch):
+    from dostuff.agent.capabilities import take_snapshot
+    from dostuff.helpers.skills import discover_skills as ds
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [".dostuff/skills"])
+    result = runner.invoke(env["app"], ["-p", "say hi"])
+    assert result.exit_code == 0, result.output
+    assert headless[-1]["capabilities_baseline"] == take_snapshot().capabilities
+
+
+def test_headless_skill_written_mid_run_reaches_next_call(env, headless_agents, monkeypatch):
+    from conftest import fake_response, fake_tool_call
+    from dostuff.agent import call_agent as call_agent_module
+    from dostuff.helpers.skills import discover_skills as ds
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [".dostuff/skills"])
+    fm = headless_agents
+    fm.script("[M]", fake_response(tool_calls=[fake_tool_call("get_current_datetime", {})]), fake_response("used it"))
+    real = fm.acompletion
+
+    async def writes_skill(**kwargs):
+        if not fm.calls:  # what a write_file of the agent's would do, between its two calls
+            d = Path.cwd() / ".dostuff" / "skills" / "deploy"
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text("---\nname: deploy\ndescription: Ship it.\n---\nbody\n", encoding="utf-8")
+        return await real(**kwargs)
+    monkeypatch.setattr(call_agent_module, "acompletion", writes_skill)
+    assert _run_headless("[M] make a skill, then use it", quiet=True) == 0
+    first, second = fm.calls_for("[M]")
+    assert "Skills and agent types: changes" not in json.dumps(first["messages"])
+    last = second["messages"][-1]
+    assert last["role"] == "user" and "- name: deploy" in last["content"] and "Ship it." in last["content"]

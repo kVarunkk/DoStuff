@@ -116,9 +116,16 @@ async def run_agent_loop(
     compaction_notes: str = "",
     inbox: list[str] | None = None,
     session_hook_context: dict[str, str] | None = None,
+    capabilities_baseline: tuple[str, ...] | None = None,
+    capability_kinds: tuple[str, ...] | None = None,
+    facts: Any = None,
 ) -> tuple[str, RunOutcome]:
     """The subagent's loop, plus a partial report if it stopped before a final answer. `store` is the run's
-    transcript (`AgentTranscript`), or None to keep its steps in memory only."""
+    transcript (`AgentTranscript`), or None to keep its steps in memory only. `capabilities_baseline` and
+    `capability_kinds` are what its system prompt lists (mid-run refresh D10): a typed agent's own skills, or a
+    fork's copy of the main agent's lists. `facts` (a `FactsSource`) gives a typed agent the main session's facts
+    step (memory recall D14); None for a fork, an `omit_memory` type, or with memory off."""
+    from dostuff.agent.capabilities import ALL_KINDS
     from dostuff.agent.loop import CANCELLED_TURN, MODEL_ERROR_PREFIX, loop
 
     subagent_result = await loop(
@@ -139,6 +146,11 @@ async def run_agent_loop(
         compaction_notes=compaction_notes,
         inbox=inbox,
         session_hook_context=session_hook_context,  # a fork's: the main agent's SessionStart context (D11)
+        capabilities_baseline=capabilities_baseline,
+        capability_kinds=capability_kinds or ALL_KINDS,
+        memory_store=facts.store if facts is not None else None,
+        memory_user_id=facts.user_id if facts is not None else None,
+        facts_project=facts.project if facts is not None else None,
     )
     if subagent_result == CANCELLED_TURN:
         return subagent_result, "stopped"

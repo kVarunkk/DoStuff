@@ -14,6 +14,7 @@ from dostuff.helpers.agent.tool_attachments import collecting, tool_attachment_s
 import asyncio
 import inspect
 import random
+from pathlib import Path
 from dataclasses import dataclass, field
 from dostuff.agent.permissions import PLAN_MODE_INSTRUCTION, PLAN_MODE_OFF_INSTRUCTION, SessionPermissions
 from dostuff.agent.run_tool import (
@@ -30,7 +31,12 @@ from dostuff.tools.definitions import TOOL_MAP, default_tool_names
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
 from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, frame_steered
-from dostuff.helpers.agent.turn_context import PROMPT_CONTEXT_HEADER, delivered_plan_mode, make_plan_mode_step
+from dostuff.helpers.agent.turn_context import (
+    PROMPT_CONTEXT_HEADER, FactsSource, delivered_capabilities, delivered_episode_index, delivered_facts,
+    delivered_plan_mode, episode_index_content, facts_source, facts_step_content, make_capability_step,
+    make_episode_index_step, make_facts_step, make_plan_mode_step,
+)
+from dostuff.agent.capabilities import ALL_KINDS, delta_text, take_snapshot
 from dostuff.helpers.agent.side_question import (
     compose_system_instruction, plan_mode_on, publish_snapshot, published_snapshot, usage_dict as build_usage_dict,
 )
@@ -196,7 +202,7 @@ def _job_events(owner: str, adapter: Any) -> Iterator[None]:
         registry.remove_listener(on_job)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None, capabilities_baseline: tuple[str, ...] | None = None, capability_kinds: tuple[str, ...] = ALL_KINDS, memory_store: Any = None, memory_user_id: str | None = None, facts_project: str | None = None, episodic_store: Any = None) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction).
 
     `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
@@ -209,6 +215,18 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
 
     `steering` is the TUI's mid-turn messages (steering spec D1): read at the next tool boundary, inside this
     turn. Main session only — a `subagent_loop` never delivers one (CON-008), and `run_agent_loop` doesn't pass it.
+
+    `capabilities_baseline` is the capability set `dynamic_system_instruction` lists (mid-run refresh spec D2): a skill
+    or agent type that differs from it, or from the newest capability step, is announced in a hidden step before the
+    next model call. None never announces (and never looks). `capability_kinds` limits it: a typed subagent's prompt
+    lists skills only (D10).
+
+    `memory_store` (the semantic store; None when memory is off or for a run that gets no memory) and
+    `facts_project` (the project root whose project facts apply) turn on the facts step (memory recall spec D2):
+    every saved fact, re-sent whenever the list differs from the newest facts step in the history.
+    `memory_user_id` defaults to the configured user.
+    `episodic_store` (main session only; subagents never get episodes) adds the episode index step: one line per
+    episode of this project, re-sent when that list changes.
     """
     current_session_id.set(session_id)
     owner = owner or session_id
@@ -217,6 +235,9 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     iteration = 0
     token_limit = get_model_token_limit()
     config = get_config()
+    facts_user = (memory_user_id or config.get_user_id()) if memory_store is not None and facts_project else ""
+    if turn_type == "interactive_loop":  # what a typed subagent started in this turn reads (D14); None turns it off
+        facts_source.set(FactsSource(memory_store, facts_user, facts_project) if facts_user and facts_project else None)
     threshold_percent = getattr(config, "compact_threshold", AUTO_COMPACT_THRESHOLD)  # None: auto-compaction off (overflow still compacts)
     context_token_threshold = int(token_limit * threshold_percent / 100) if threshold_percent else None
     keep_recent_token_budget = min(int(token_limit * 0.15), 20000)
@@ -268,6 +289,75 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
         step = make_plan_mode_step(plan_mode, PLAN_MODE_INSTRUCTION if plan_mode else PLAN_MODE_OFF_INSTRUCTION)
         await append_step(step, steps_history, working_history, current_session_history, session_id, store, turn_type)
         publish_snapshot(session_id, fork_context())
+
+    facts_error_reported = False
+
+    async def sync_facts() -> None:
+        """Send the saved facts when they differ from what the newest facts step delivered (memory recall D2):
+        the first call of a session, after a save or forget, after a compaction dropped the step. A store error
+        is reported once per turn and the call goes ahead without facts (CON-004)."""
+        nonlocal facts_error_reported
+        if not facts_user or not facts_project:
+            return
+        try:
+            facts = await memory_store.list_all(facts_user, working_dir=facts_project)
+        except Exception as e:
+            if not facts_error_reported:
+                facts_error_reported = True
+                await loop_emit("error", f"Could not load saved facts, continuing without them: {e}", adapter=adapter)
+            return
+        text, fingerprint = facts_step_content(facts, facts_project)
+        belief = delivered_facts(working_history)
+        if belief == fingerprint or (belief is None and not fingerprint):
+            return
+        await append_step(make_facts_step(text, fingerprint), steps_history, working_history,
+                          current_session_history, session_id, store, turn_type)
+        publish_snapshot(session_id, fork_context())
+
+    episodes_error_reported = False
+
+    async def sync_episode_index() -> None:
+        """Send this project's episode index when it differs from the newest index step, like sync_facts. Episodes are
+        saved per directory, so the index reads the working directory, as episode recall does."""
+        nonlocal episodes_error_reported
+        if episodic_store is None or not facts_user:
+            return
+        working_dir = str(Path.cwd().resolve()) if config.episodic_scope == "project" else None
+        try:
+            episodes = await episodic_store.list_all(facts_user, working_dir=working_dir)
+        except Exception as e:
+            if not episodes_error_reported:
+                episodes_error_reported = True
+                await loop_emit("error", f"Could not load saved episodes, continuing without them: {e}", adapter=adapter)
+            return
+        text, fingerprint = episode_index_content(episodes, working_dir or facts_project or "")
+        belief = delivered_episode_index(working_history)
+        if belief == fingerprint or (belief is None and not fingerprint):
+            return
+        await append_step(make_episode_index_step(text or "No episodes are saved any more.", fingerprint),
+                          steps_history, working_history, current_session_history, session_id, store, turn_type)
+        publish_snapshot(session_id, fork_context())
+
+    async def sync_capabilities() -> None:
+        """Tell the model which skills and agent types differ from what it was last told (mid-run refresh D3, D6):
+        the newest capability step, else the prompt's baseline. Cumulative, not an event: a change missed for any
+        reason is announced on the next call, and a compaction that dropped the step re-states the whole difference.
+        A stat pass when nothing moved; the system prompt never changes for it, so the cache holds."""
+        if capabilities_baseline is None:
+            return
+        snapshot = await asyncio.to_thread(take_snapshot, capability_kinds)
+        belief = delivered_capabilities(working_history)
+        if belief is None:
+            belief = capabilities_baseline
+        if set(belief) == set(snapshot.capabilities):
+            return
+        text = delta_text(belief, snapshot)
+        if not text:
+            return
+        step = make_capability_step(text, snapshot.capabilities)
+        await append_step(step, steps_history, working_history, current_session_history, session_id, store, turn_type)
+        publish_snapshot(session_id, fork_context())
+        await loop_emit("capabilities_changed", {"capabilities": list(snapshot.capabilities)}, adapter=adapter)
 
     async def deliver_steer(messages: list[SteerMessage]) -> int:
         """D6's drain body, shared by the top-of-iteration drain and D7's final-answer path: a failed
@@ -326,6 +416,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
             history=[dict(step) for step in working_history],
             tool_names=list(tool_names) if tool_names is not None else default_tool_names(),
             session_hook_context=dict(session_hook_context) if session_hook_context is not None else None,
+            capabilities_baseline=capabilities_baseline,
         )
 
     async def check_cancelled() -> bool:
@@ -374,6 +465,9 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                     model_span = None
                     progress = StreamProgress()
                     await sync_plan_mode()  # here, so a retry after an overflow compaction is covered too
+                    await sync_capabilities()  # after it: rarer, so the plan step keeps its place (D6)
+                    await sync_facts()  # last: changes only on a save or forget (memory recall D2)
+                    await sync_episode_index()  # likewise, on an episode save, forget or prune
                     try:
                         interaction, model_span = await call_agent(
                             steps_history=working_history,

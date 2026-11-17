@@ -307,17 +307,13 @@ def test_esc_denies_pending_prompt(tui):
     async def scenario():
         app = cli_tui.DostuffTUI(session_id="esc")
         async with app.run_test() as pilot:
+            # A turn waits for startup; on a slow runner the fixed 2.5 s wait ended first and ESC hit no prompt
+            await app._backend_ready.wait()
             await pilot.pause()
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("do it"))
-            for _ in range(50):
-                await pilot.pause(0.05)
-                if app.adapter.has_pending_confirm():
-                    break
+            await _until(pilot, app.adapter.has_pending_confirm, tries=200)
             await pilot.press("escape")
-            for _ in range(50):
-                await pilot.pause(0.05)
-                if not app._turn_in_progress:
-                    break
+            await _until(pilot, lambda: not app._turn_in_progress, tries=200)
             assert app.steps_history[-1]["content"].endswith("(no)")
             await app._cleanup_and_save_session()
 
@@ -691,8 +687,8 @@ def test_episodes_and_forget_commands(tui):
         async def list_all(self, user_id):
             return [{"key": k, "value": "Uses VS Code", "source": "user_message"} for k in sorted(self.keys)]
 
-        async def delete(self, user_id, key):
-            if key not in self.keys:
+        async def delete(self, user_id, key, scope="user", working_dir=None):
+            if scope != "user" or key not in self.keys:
                 return False
             self.keys.discard(key)
             return True
@@ -739,6 +735,229 @@ def test_episodes_and_forget_commands(tui):
     asyncio.run(scenario())
 
 
+def test_forget_prefers_this_projects_fact(tui):
+    """memory recall T1.4 decision: a key saved as both a user and a project fact → this project's goes first."""
+    cli_tui = tui
+    here = str(Path.cwd().resolve())
+
+    class ScopedFacts:
+        def __init__(self):
+            self.rows = {("user", None, "linter"), ("project", here, "linter"), ("project", "/elsewhere", "linter"),
+                         ("user", None, "name")}
+
+        async def list_all(self, user_id, scope=None, working_dir=None):
+            return [{"key": k} for s, _, k in self.rows if s == "user"]
+
+        async def delete(self, user_id, key, scope="user", working_dir=None):
+            row = (scope, working_dir if scope == "project" else None, key)
+            if row not in self.rows:
+                return False
+            self.rows.discard(row)
+            return True
+
+    class NoEpisodes:
+        async def list_all(self, user_id, working_dir=None):
+            return []
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="forget-scope")
+        async with app.run_test():
+            await app._backend_ready.wait()
+            app.memory_store, app.episodic_store = ScopedFacts(), NoEpisodes()
+            await app._forget("linter")
+            assert any(t.startswith("Forgot this project's memory 'linter'.") and "/forget user:linter" in t
+                       for t in _texts(app))
+            assert ("project", here, "linter") not in app.memory_store.rows
+            assert ("user", None, "linter") in app.memory_store.rows
+            await app._forget("user:linter")
+            assert "Forgot memory 'linter'." in _texts(app)
+            await app._forget("name")  # only a user fact: no qualifier needed
+            assert "Forgot memory 'name'." in _texts(app)
+            assert app.memory_store.rows == {("project", "/elsewhere", "linter")}
+            app.memory_store.rows.add(("project", here, "linter"))
+            await app._forget("linter")  # no user-wide one left: no hint
+            assert "Forgot this project's memory 'linter'." in _texts(app)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+class _ListedFacts:
+    """`list_all` like the real store's: user facts plus `working_dir`'s project facts, newest first."""
+
+    def __init__(self, facts):
+        self.facts, self.listed = facts, []
+
+    async def list_all(self, user_id, scope=None, working_dir=None):
+        self.listed.append(working_dir)
+        return [f for f in sorted(self.facts, key=lambda f: -f["updated_at_epoch"])
+                if (f["scope"] == "user" or f.get("working_dir") == working_dir) and scope in (None, f["scope"])]
+
+
+def _listed_fact(key, value, scope="user", updated=0, working_dir=None):
+    fact = {"key": key, "value": value, "source": "user_message", "scope": scope, "updated_at_epoch": updated,
+            "created_at_epoch": updated}
+    if scope == "project":
+        fact["working_dir"] = working_dir
+    return fact
+
+
+def test_memories_lists_scope_and_date(tui):
+    """memory recall T1.13 (REQ-4.2): user facts and this project's, each with its date; no other project's."""
+    cli_tui = tui
+    here = str(Path.cwd().resolve())
+    store = _ListedFacts([
+        _listed_fact("name", "Admiral Nemo", updated=1_762_905_600),  # 2025-11-12 UTC
+        _listed_fact("editor", "Neovim"),  # saved before facts had dates
+        _listed_fact("linter", "ruff", "project", 1_762_819_200, here),  # 2025-11-11 UTC
+        _listed_fact("linter", "eslint", "project", 1_762_819_200, "/elsewhere"),
+    ])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="memories-scope")
+        async with app.run_test():
+            await app._backend_ready.wait()
+            app.memory_store = store
+            await app._show_memories()
+            listing = next(t for t in _texts(app) if t.startswith("Saved memories"))
+            assert store.listed == [here]
+            assert "User (2):\n- name: Admiral Nemo  (2025-11-12)\n- editor: Neovim  (no date)" in listing
+            assert f"This project, {Path(here).name} (1):\n- linter: ruff  (2025-11-11)" in listing
+            assert "eslint" not in listing and "consolidat" not in listing.lower()
+            assert "/forget user:<key>" in listing
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_memories_consolidate_hint_above_30(tui):
+    cli_tui = tui
+    many = _ListedFacts([_listed_fact(f"k{i:02d}", "v", updated=i) for i in range(31)])
+    thirty = _ListedFacts([_listed_fact(f"k{i:02d}", "v", updated=i) for i in range(30)])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="memories-hint")
+        async with app.run_test():
+            await app._backend_ready.wait()
+            app.memory_store = thirty
+            await app._show_memories()
+            assert not any("31 user facts" in t or "30 user facts" in t for t in _texts(app))
+            app.memory_store = many
+            await app._show_memories()
+            hint = next(t for t in _texts(app) if "31 user facts" in t)
+            assert "merg" in hint.lower() and "/memories consolidate" in hint  # named once T2.7 shipped it
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+class _MergeFacts(_ListedFacts):
+    """_ListedFacts that records the merge's writes."""
+
+    def __init__(self, facts):
+        super().__init__(facts)
+        self.writes = []
+
+    async def upsert_fact(self, user_id, fact, scope="user", working_dir=None):
+        self.writes.append(("upsert", fact["key"], fact["value"], scope))
+
+    async def delete(self, user_id, key, scope="user", working_dir=None):
+        self.writes.append(("delete", key, scope))
+        return True
+
+
+def _merge_scenario(cli_tui, monkeypatch, *, mode=None, reply=True):
+    """Run /memories consolidate against two overlapping user facts; returns (store, model calls, confirms, texts)."""
+    from litellm import ModelResponse
+    from dostuff.helpers.memory import consolidate
+    calls, confirms = [], []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return ModelResponse(choices=[{"message": {"role": "assistant", "content":
+                                       '{"user": [{"key": "editor", "value": "Neovim, for everything"}], "project": []}'}}])
+    monkeypatch.setattr(consolidate, "acompletion", fake_acompletion)
+    store = _MergeFacts([_listed_fact("editor", "Neovim", updated=2), _listed_fact("editor_pref", "Uses Neovim", updated=1)])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="memories-merge")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            app.memory_store = store
+            if mode:
+                app.permissions.mode = mode
+
+            async def confirm(details, question, yes, no):
+                confirms.append(details)
+                return reply
+            app.adapter.confirm = confirm
+            before = len(_texts(app))
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/memories consolidate"))
+            await _until(pilot, lambda: any(w in t for t in _texts(app)[before:]
+                                            for w in ("Merged:", "Nothing was changed", "auto mode")))
+            texts = _texts(app)
+            await app._cleanup_and_save_session()
+            return texts
+
+    return store, calls, confirms, asyncio.run(scenario())
+
+
+def test_memories_consolidate_confirm_writes(tui, monkeypatch):
+    store, calls, confirms, texts = _merge_scenario(tui, monkeypatch)
+    assert len(calls) == 1 and len(confirms) == 1
+    assert "- editor_pref: Uses Neovim" in confirms[0] and "~ editor: Neovim  →  Neovim, for everything" in confirms[0]
+    assert store.writes == [("upsert", "editor", "Neovim, for everything", "user"), ("delete", "editor_pref", "user")]
+    assert any("Merged: 1 removed, 1 changed." in t for t in texts)
+
+
+def test_memories_consolidate_declined_writes_nothing(tui, monkeypatch):
+    store, calls, confirms, texts = _merge_scenario(tui, monkeypatch, reply=False)
+    assert len(confirms) == 1 and store.writes == [] and any("Nothing was changed" in t for t in texts)
+
+
+def test_memories_consolidate_auto_mode_refuses_without_waiting(tui, monkeypatch):
+    store, calls, confirms, texts = _merge_scenario(tui, monkeypatch, mode="auto")
+    assert confirms == [] and calls == [] and store.writes == []
+    assert any("auto mode" in t and "dostuff memory consolidate --yes" in t for t in texts)
+
+
+def test_memories_names_consolidate_above_30(tui):
+    cli_tui = tui
+    store = _ListedFacts([_listed_fact(f"k{i:02d}", "v", updated=i) for i in range(31)])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="memories-hint-cmd")
+        async with app.run_test():
+            await app._backend_ready.wait()
+            app.memory_store = store
+            await app._show_memories()
+            assert any("31 user facts" in t and "/memories consolidate" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("n, hinted", [(31, True), (30, False)])
+def test_startup_consolidate_hint_above_30(tui, monkeypatch, n, hinted):
+    """memory recall D10: startup says so once user facts pass 30 (project facts don't count)."""
+    cli_tui = tui
+    from dostuff.lib.memory import stores
+    facts = [_listed_fact(f"k{i:02d}", "v", updated=i) for i in range(n)]
+    facts += [_listed_fact(f"p{i}", "v", scope="project", working_dir=str(Path.cwd().resolve())) for i in range(5)]
+    monkeypatch.setattr(stores, "get_semantic_store", lambda: _ListedFacts(facts))
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id=f"startup-hint-{n}")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            await pilot.pause()
+            shown = [t for t in _texts(app) if "user facts" in t and "/memories consolidate" in t]
+            assert bool(shown) is hinted and (not shown or f"{n} user facts" in shown[0])
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_embedding_model_download_reported(tui, monkeypatch):
     cli_tui = tui
     from dostuff.lib.memory import chroma
@@ -757,6 +976,29 @@ def test_embedding_model_download_reported(tui, monkeypatch):
             assert any("Downloading the memory embedding model" in t for t in texts)
             assert any("Embedding model download failed: no network" in t for t in texts)
             assert not app._backend_error  # turns still run, just without recall
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_startup_without_fts5_says_memory_is_off_and_does_not_fail(tui, monkeypatch):
+    """A Python whose sqlite3 lacks FTS5 can't run memory.db: the TUI used to show "Startup failed: no such module:
+    fts5" and skip MCP; now memory is off with a reason and the rest of startup runs."""
+    cli_tui = tui
+    from dostuff.lib.memory import backend, chroma
+    monkeypatch.setattr(backend, "fts5_available", lambda: False)
+    monkeypatch.setattr(chroma, "chroma_available", lambda: False)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="nofts5")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            await pilot.pause()
+            texts = _texts(app)
+            assert not app._backend_error and not any("Startup failed" in t for t in texts)
+            assert app.memory_store is None and app.episodic_store is None
+            assert any("Long-term memory is off" in t and "FTS5" in t for t in texts)
+            assert not any("memory.backend is chroma and chromadb" in t for t in texts)  # not the chroma-only note
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -3325,11 +3567,15 @@ def test_pin_transcript_without_ask_user(tui):
     async def scenario() -> list[str]:
         app = cli_tui.DostuffTUI(session_id="pin-transcript")
         async with app.run_test(size=(120, 40)) as pilot:
+            # Startup ends with "Running with local tools only."; on a slow start that landed inside the transcript
+            await app._backend_ready.wait()
             await pilot.pause()
             for step in snapshot:
                 await app.store.append("old", step)
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume old"))
             await _until(pilot, lambda: app.session_id == "old", tries=200)
+            # The transcript renders after the switch; a fixed pause was too short on a slow runner
+            await _until(pilot, lambda: any("Where is auth handled?" in t for t in _message_lines(app)), tries=200)
             await pilot.pause(0.3)
             lines = _message_lines(app)
             idx = max(i for i, t in enumerate(lines) if "Where is auth handled?" in t)
@@ -3594,7 +3840,7 @@ def test_ask_panel_reused_hides_and_shows(tui):
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             first = _ask_questions(app, [DB_QUESTION])
             await _until(pilot, lambda: panel.display and app.focused is panel)
-            await pilot.press("1", "tab", "enter")
+            await pilot.press("1", "tab", "enter", "enter")  # submit opens the review, its submit sends
             await _until(pilot, lambda: first.done())
             assert not panel.display and app.query_one("#input", cli_tui.EnterSubmits).display
             second = _ask_questions(app, [AUTH_QUESTION])
@@ -3667,7 +3913,7 @@ def test_submit_row_inert_until_answered(tui):
             await pilot.pause()
             assert panel.all_answered()
             assert "answer every question first" not in str(panel.content)
-            await pilot.press("tab", "enter")
+            await pilot.press("tab", "enter", "enter")
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "Postgres"), ("Which auth methods?", "JWT")]
             assert not panel.display
@@ -3696,7 +3942,7 @@ def test_change_an_answer_before_submitting(tui):
             await pilot.press("2")
             await pilot.pause()
             assert panel.answers() == ["SQLite"]  # replaced, not appended
-            await pilot.press("tab", "enter")
+            await pilot.press("tab", "enter", "enter")
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "SQLite")]
             await app._cleanup_and_save_session()
@@ -3725,10 +3971,70 @@ def test_single_question_still_needs_submit(tui):
             await pilot.pause()
             assert not captures and not task.done()  # 0 resolutions after the pick
             assert panel.submit_focused  # the only question is answered, so the cursor is on the submit row
+            await pilot.press("enter")  # the review, not the submission
+            await pilot.pause()
+            assert not captures and panel.reviewing
             await pilot.press("enter")
             await _until(pilot, lambda: bool(captures))
             assert len(captures) == 1  # 1 after the submit
             assert captures[0] == [("Which database should I use?", "Postgres")]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_review_before_submitting(tui):
+    """Submit opens a review of every answer; ← goes back without sending, Enter on an answer changes it,
+    and only the review's own submit row resolves the call."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-review")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1", "1", "tab")  # Postgres, JWT, then the submit row
+            await pilot.pause()
+            assert panel.submit_focused and not panel.reviewing
+            await pilot.press("enter")
+            await pilot.pause()
+            content = str(panel.content)
+            assert panel.reviewing and not task.done() and app.adapter.has_pending_ask()
+            assert "Review your answers" in content and "▌ Review" in content
+            assert "Which database should I use?" in content and "→ Postgres" in content
+            assert "Which auth methods?" in content and "→ JWT" in content
+            assert panel.review_row == 2  # the cursor starts on Submit
+
+            # ← leaves the review on the questions' submit row, nothing sent
+            await pilot.press("left")
+            await pilot.pause()
+            assert not panel.reviewing and panel.submit_focused and not task.done()
+            assert "Review your answers" not in str(panel.content)
+
+            # back in, pick the first answer: it reopens that question to change it
+            await pilot.press("enter", "up", "up", "enter")
+            await pilot.pause()
+            assert not panel.reviewing and panel.cursor_question == 0 and not panel.submit_focused
+            await pilot.press("2")  # SQLite; every question answered, so the cursor is on submit again
+            await pilot.pause()
+            assert panel.submit_focused
+            await pilot.press("enter")
+            await pilot.pause()
+            assert panel.reviewing and "→ SQLite" in str(panel.content)
+            # the number beside an answer changes it too, and shift+tab backs out like ←
+            await pilot.press("2")
+            await pilot.pause()
+            assert not panel.reviewing and panel.cursor_question == 1
+            await pilot.press("tab", "enter", "shift+tab")
+            await pilot.pause()
+            assert not panel.reviewing and panel.submit_focused and not task.done()
+
+            await pilot.press("enter", "enter")
+            await _until(pilot, lambda: task.done())
+            assert task.result() == [("Which database should I use?", "SQLite"), ("Which auth methods?", "JWT")]
+            assert not panel.display
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -3753,6 +4059,10 @@ def test_submit_row_click(tui):
             await pilot.press("1")  # auto-advance puts the cursor on the submit row
             await pilot.pause()
             await pilot.click("#ask-panel", offset=(6, 7))
+            await pilot.pause()
+            assert panel.reviewing and not task.done()  # the first submit opens the review
+            # the review's submit row: border, tabs, title, the question and its answer, separator
+            await pilot.click("#ask-panel", offset=(6, 6))
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "Postgres")]
             await app._cleanup_and_save_session()
@@ -3789,7 +4099,7 @@ def test_multi_select_toggles(tui):
             await pilot.press("space")
             await pilot.pause()
             assert panel.answers() == [None]
-            await pilot.press("2", "1", "tab", "enter")
+            await pilot.press("2", "1", "tab", "enter", "enter")
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which auth methods?", "JWT, OAuth")]
             await app._cleanup_and_save_session()
@@ -3820,7 +4130,7 @@ def test_multi_select_with_other(tui):
             assert panel.display and not inp.display and app.focused is panel
             assert panel.answers() == ["JWT, my own"]
             assert "✓ 3. Other (type your own)" in str(panel.content)
-            await pilot.press("3", "tab", "enter")  # Other off again
+            await pilot.press("3", "tab", "enter", "enter")  # Other off again
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which auth methods?", "JWT")]
 
@@ -3832,7 +4142,7 @@ def test_multi_select_with_other(tui):
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("saml"))
             await pilot.pause()
             assert panel.answers() == ["saml"]
-            await pilot.press("enter")  # the cursor is on the submit row
+            await pilot.press("enter", "enter")  # the cursor is on the submit row; then the review's
             await _until(pilot, lambda: panel_task.done())
             assert panel_task.result() == [("Which auth methods?", "saml")]
             await app._cleanup_and_save_session()
@@ -3873,7 +4183,7 @@ def test_other_takes_the_input(tui):
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted(app._pastes.inline("JWT,\n  OAuth")))
             await pilot.pause()
             assert panel.answers()[1] == "JWT, OAuth"
-            await pilot.press("enter")  # the cursor is on the submit row
+            await pilot.press("enter", "enter")  # the cursor is on the submit row; then the review's
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "DuckDB"), ("Which auth methods?", "JWT, OAuth")]
             await app._cleanup_and_save_session()
@@ -3935,7 +4245,7 @@ def test_mixed_call_hands_the_input_over(tui):
             await pilot.pause()
             assert panel.display and not inp.display
             assert panel.answers() == ["Postgres", "Tiger"]
-            await pilot.press("enter")  # every question answered: the cursor is on the submit row
+            await pilot.press("enter", "enter")  # every question answered: submit, then the review's submit
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Which database should I use?", "Postgres"), ("Name the app?", "Tiger")]
             await app._cleanup_and_save_session()
@@ -4866,9 +5176,9 @@ def test_btw_cold_session(btw_tui, monkeypatch):
         app = cli_tui.DostuffTUI(session_id="btw-cold")
         original = app._build_turn_context
 
-        async def build(text, prompt_context=""):
+        async def build(text, prompt_context="", history=None):
             built.append(text)
-            return await original(text, prompt_context)
+            return await original(text, prompt_context, history)
         app._build_turn_context = build  # type: ignore[method-assign]
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -6415,7 +6725,8 @@ def turn_tui(tui, monkeypatch):
 
     async def fake(session_id, turn_id, user_text, instructions, mcp_client, working_history, turn_type,
                    current_session_history, steps_history, store, adapter=None, **kwargs):
-        seen.append({"text": user_text, "instructions": instructions, "history": [dict(s) for s in working_history]})
+        seen.append({"text": user_text, "instructions": instructions, "history": [dict(s) for s in working_history],
+                     "baseline": kwargs.get("capabilities_baseline")})
         text = f"answer to {user_text}"
         await append_step({"role": "assistant", "content": text}, steps_history, working_history,
                           current_session_history, session_id, store, turn_type)
@@ -6472,7 +6783,8 @@ def _context_steps(history):
 
 
 class _Recall:
-    """A memory store: every query recalls its own question, so a different prompt recalls a different fact."""
+    """An episode store: every query recalls its own question, so a different prompt recalls a different episode.
+    (Facts below the cap aren't recalled per prompt any more: they go in the facts step, memory recall D3.)"""
 
     def __init__(self, hits=True):
         self.hits = hits
@@ -6480,12 +6792,54 @@ class _Recall:
 
     async def query(self, *args, **kwargs):
         self.queries.append(kwargs["query_text"])
-        return [{"key": "recalled", "value": kwargs["query_text"]}] if self.hits else []
+        return [{"event_type": "EVENT", "anchor_event": kwargs["query_text"], "summary": "s",
+                 "created_at_iso": "2026-11-12"}] if self.hits else []
+
+    async def list_all(self, *args, **kwargs):  # as the fact store: nothing saved, so no facts step
+        return []
 
 
 def _use_recall(app):
-    app.memory_store, app.episodic_store = _Recall(), _Recall(hits=False)
-    return app.memory_store
+    app.memory_store, app.episodic_store = _Recall(hits=False), _Recall()
+    return app.episodic_store
+
+
+class _RankedRecall:
+    """An episode store with five matches for every prompt, best first, honouring `exclude_ids` (memory recall D8)."""
+
+    def __init__(self):
+        self.excluded = []
+
+    async def query(self, *args, exclude_ids=(), **kwargs):
+        self.excluded.append(set(exclude_ids))
+        return [{"id": f"e{i}", "event_type": "LEARNING", "anchor_event": f"anchor {i}", "summary": "s",
+                 "created_at_iso": "2026-11-12"} for i in range(1, 6) if f"e{i}" not in set(exclude_ids)][:3]
+
+    async def list_all(self, *args, **kwargs):
+        return []
+
+
+def test_episode_not_repeated_across_turns(turn_tui):
+    """REQ-3.1: the second prompt's bundle leaves out what the first one's still shows."""
+    cli_tui, seen = turn_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ctx-episodes")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()  # the real stores load in the background; replace them after
+            app.memory_store, app.episodic_store = _Recall(hits=False), _RankedRecall()
+            _submit(app, cli_tui, "why is the db locked?")
+            await _until(pilot, lambda: not app._turn_in_progress and len(seen) == 1)
+            _submit(app, cli_tui, "and the tests?")
+            await _until(pilot, lambda: not app._turn_in_progress and len(seen) == 2)
+            first, second = seen[0]["history"][-2], seen[1]["history"][-2]
+            assert first["meta"]["episode_ids"] == ["e1", "e2", "e3"]
+            assert app.episodic_store.excluded[1] == {"e1", "e2", "e3"}
+            assert second["meta"]["episode_ids"] == ["e4", "e5"] and "anchor 1" not in second["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
 
 
 def test_run_turn_appends_context_then_prompt(turn_tui):
@@ -6583,7 +6937,7 @@ def test_system_instruction_stable_across_turns(tui, fake_model, monkeypatch):
     assert "new.txt" in second[-1]["content"] and "new.txt" not in first[-1]["content"]
 
 
-def test_model_still_sees_environment_and_facts(tui, fake_model, monkeypatch):
+def test_model_still_sees_environment_and_episodes(tui, fake_model, monkeypatch):
     _real_turns(tui, fake_model, monkeypatch, "one")
 
     async def scenario():
@@ -6602,7 +6956,7 @@ def test_model_still_sees_environment_and_facts(tui, fake_model, monkeypatch):
     bundle = messages[-1]  # the context step and the prompt, one message on the way out
     assert bundle["role"] == "user" and "meta" not in bundle
     assert "<environment>" in bundle["content"]
-    assert "- recalled: what is my name?" in bundle["content"]
+    assert "  • [EVENT] what is my name?" in bundle["content"]
     assert bundle["content"].endswith("</turn-context>\n\nwhat is my name?")
 
 
@@ -7894,6 +8248,641 @@ def test_help_lists_alt_v(tui):
             app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/help"))
             await _until(pilot, lambda: any("Shortcuts:" in t for t in _texts(app)))
             assert any("Alt+V paste an image from the clipboard" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- Mid-run skill and agent-type refresh (plan/2026-11-11-mid-run-skill-agent-refresh/tasks.md) ----------------
+
+def _reset_capability_caches():
+    from dostuff.agent import capabilities as caps
+    from dostuff.agent.subagents import definitions as agent_defs
+    from dostuff.helpers.tools.resolve_safe_path import set_skill_roots
+    caps.reset_cache()
+    agent_defs._cache = None
+    set_skill_roots([])
+
+
+@pytest.fixture
+def skills_tui(turn_tui):
+    """turn_tui with the skill / agent-type caches cleared around the test."""
+    _reset_capability_caches()
+    yield turn_tui
+    _reset_capability_caches()
+
+
+@pytest.fixture
+def real_loop_tui(tui, monkeypatch):
+    """(cli_tui, calls, responses): the TUI on the real loop(), with call_agent faked. Each call records the history
+    and the system string it was given; `responses` is a script, then "ok" answers."""
+    from dostuff.agent import loop as loop_module
+    calls: list[dict] = []
+    responses: list = []
+
+    async def fake_call_agent(steps_history, system_instruction, tool_names=None, stream=False):
+        calls.append({"history": [dict(s) for s in steps_history], "system": system_instruction})
+        if responses:
+            item = responses.pop(0)
+            return (await item() if callable(item) else item), None
+        message = types.SimpleNamespace(content="ok", tool_calls=None)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)], usage=None), None
+
+    async def real(*args, **kwargs):
+        return await loop_module.loop(*args, **kwargs)
+    monkeypatch.setattr(loop_module, "call_agent", fake_call_agent)
+    monkeypatch.setattr(loop_module, "get_model_token_limit", lambda: 100_000)
+    monkeypatch.setattr(tui, "agent_loop", real)
+    _reset_capability_caches()
+    yield tui, calls, responses
+    _reset_capability_caches()
+
+
+def _new_skill(name, desc="Ship the app.", manual=False, root=None):
+    folder = Path(root or Path(".dostuff", "skills"), name)
+    folder.mkdir(parents=True, exist_ok=True)
+    extra = "disable-model-invocation: true\n" if manual else ""
+    (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {desc}\n{extra}---\n\nDo {name}.\n",
+                                     encoding="utf-8")
+    return folder
+
+
+def _new_agent_type(name, desc="Audits code for security holes."):
+    folder = Path(".dostuff", "agents")
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{name}.md").write_text(f"---\nname: {name}\ndescription: {desc}\n---\nYou audit.\n", encoding="utf-8")
+
+
+def _cap_steps(history):
+    return [s for s in history if "capabilities" in (s.get("meta") or {})]
+
+
+def _tool_call_response(name="read_file", args='{"path": "a.txt"}'):
+    tc = types.SimpleNamespace(id="c1", type="function", function=types.SimpleNamespace(name=name, arguments=args))
+    tc.model_dump = lambda: {"id": "c1", "type": "function", "function": {"name": name, "arguments": args}}
+    message = types.SimpleNamespace(content=None, tool_calls=[tc])
+    return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)], usage=None)
+
+
+async def _turn(app, cli_tui, pilot, text, calls, n):
+    _submit(app, cli_tui, text)
+    await _until(pilot, lambda: not app._turn_in_progress and len(calls) >= n)
+
+
+# T0.1 / REQ-4.1 / CON-003
+
+def test_pin_system_prompt_stable_across_three_turns(real_loop_tui):
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-stable")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for n, prompt in enumerate(("one", "two", "three"), start=1):
+                await _turn(app, cli_tui, pilot, prompt, calls, n)
+                if n == 1:
+                    _new_skill("deploy")  # announced, never folded into the prompt
+            assert len(calls) == 3 and calls[0]["system"] == calls[1]["system"] == calls[2]["system"]
+            assert len(_cap_steps(calls[2]["history"])) == 1
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T0.5 / REQ-6.5
+
+def test_pin_skills_loaded_line_once(skills_tui):
+    cli_tui, seen = skills_tui
+    _new_skill("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-loaded")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for n, prompt in enumerate(("one", "two"), start=1):
+                _submit(app, cli_tui, prompt)
+                await _until(pilot, lambda: not app._turn_in_progress and len(seen) == n)
+                if n == 1:
+                    _new_skill("release")
+            assert sum("Skills loaded" in t for t in _texts(app)) == 1
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T0.6 the bug: fixed by T3.x
+
+def test_new_skill_reaches_model_mid_session(real_loop_tui):
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-skill")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            prompt_before = app._build_instructions()
+            _new_skill("deploy")
+            await _turn(app, cli_tui, pilot, "hello", calls, 1)
+            [note] = _cap_steps(calls[0]["history"])
+            assert "- name: deploy" in note["content"] and "Ship the app." in note["content"]
+            assert calls[0]["system"].startswith(prompt_before)  # the prompt itself never moved
+            assert "name: deploy" not in prompt_before
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_new_agent_type_reaches_model_mid_turn(real_loop_tui, monkeypatch):
+    from dostuff.agent import loop as loop_module
+    cli_tui, calls, responses = real_loop_tui
+
+    async def dispatch(name, args, **kw):
+        _new_agent_type("security-auditor")  # what create_agent_type does
+        return "done"
+    monkeypatch.setattr(loop_module, "dispatch_tool", dispatch)
+    responses.append(_tool_call_response())
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-agent")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _turn(app, cli_tui, pilot, "make an auditor", calls, 2)
+            assert _cap_steps(calls[0]["history"]) == []
+            last = calls[1]["history"][-1]
+            assert _cap_steps([last]) and "- name: security-auditor" in last["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T2.3
+
+def test_tui_stores_baseline_on_mount(skills_tui):
+    from dostuff.agent.capabilities import take_snapshot
+    cli_tui, seen = skills_tui
+    _new_skill("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-mount")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._capabilities_baseline == take_snapshot().capabilities
+            assert any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert seen[0]["baseline"] == app._capabilities_baseline
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_move_to_refreshes_baseline(skills_tui, tmp_path):
+    cli_tui, _ = skills_tui
+    other = tmp_path / "other"
+    _new_skill("deploy", root=other / ".dostuff" / "skills")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-move")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            assert not any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            await app._move_to(other)
+            assert any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            assert "name: deploy" in app._system_instructions and "/deploy" in app._skill_commands
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_reload_instructions_refreshes_baseline(skills_tui):
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-reload-ins")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            app._reload_instructions()  # what an AGENTS.md save does
+            assert any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            assert "name: deploy" in app._system_instructions
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_clear_keeps_baseline(skills_tui):
+    """/clear is not a rebuild site (CON-003): same prompt, same baseline, a fresh history."""
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-clear")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            baseline, prompt = app._capabilities_baseline, app._system_instructions
+            _new_skill("deploy")
+            await app._clear_session()
+            assert app._capabilities_baseline == baseline and app._system_instructions == prompt
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T4.1 - T4.5
+
+def test_capabilities_changed_prints_nothing(skills_tui):
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-event")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            app.adapter.emit("capabilities_changed", {"capabilities": ["skill:deploy:x"]})
+            await pilot.pause()
+            assert not any("CAPABILITIES" in t for t in _texts(app))
+            assert "/deploy" in app._skill_commands  # the event refreshed the view
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_new_skill_parses_as_command_next_message(skills_tui):
+    cli_tui, seen = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-command")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _new_skill("deploy")
+            got = _record_appends(app)
+            _submit(app, cli_tui, "/deploy")  # a lone /word: a command now, not "Unknown command"
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert not any("Unknown command" in text for text, _ in got), got
+            assert "Do deploy." in str(seen[0]["history"][-1]["content"])
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_inline_mention_of_new_skill_recognised(skills_tui):
+    from dostuff.helpers.agent.file_mentions import MENTION_NOTE_HEAD
+    cli_tui, seen = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-mention")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            _submit(app, cli_tui, "please use /deploy for this")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert MENTION_NOTE_HEAD in str(seen[0]["history"][-1]["content"])
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_menu_and_help_list_new_skill(skills_tui):
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-menu")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/help")
+            await pilot.pause()
+            assert app.query_one("#command-menu", cli_tui.CommandMenu).commands["/deploy"] == "(skill) Ship the app."
+            inp = app.query_one("#input", cli_tui.EnterSubmits)
+            assert "/deploy" in inp.skills and "/deploy" in inp.commands
+            assert any("Skills (/<skill>" in t and "/deploy" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_manual_only_marked_in_menu_and_help(skills_tui):
+    cli_tui, _ = skills_tui
+    _new_skill("deploy", manual=True)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-manual")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            menu = app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            assert menu["/deploy"] == "(skill, manual only) Ship the app."
+            _submit(app, cli_tui, "/help")
+            await pilot.pause()
+            assert any("/deploy  (manual only)" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_removed_skill_stops_being_command(skills_tui):
+    import shutil
+    cli_tui, _ = skills_tui
+    folder = _new_skill("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-removed")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "/deploy" in app._skill_commands
+            shutil.rmtree(folder)
+            got = _record_appends(app)
+            _submit(app, cli_tui, "/deploy")
+            await pilot.pause()
+            assert ("Unknown command /deploy. Type / to see commands.", "error") in got
+            assert "/deploy" not in app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_queued_prompt_naming_removed_skill_is_plain_text(skills_tui):
+    import shutil
+    cli_tui, seen = skills_tui
+    folder = _new_skill("deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-queued")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            shutil.rmtree(folder)
+            got = _record_appends(app)
+            app._turn_in_progress = True
+            await app._run_turn("/deploy now")  # how a queued prompt runs
+            assert seen[-1]["history"][-1]["content"] == "/deploy now"
+            assert not any("Turn error" in text for text, _ in got), got
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_new_skill_md_and_neighbour_readable_after_refresh(skills_tui, monkeypatch, tmp_path):
+    from dostuff.helpers.skills import discover_skills
+    from dostuff.helpers.tools.resolve_safe_path import resolve_safe_path
+    from dostuff.lib.exceptions import PathOutsideProject
+    cli_tui, seen = skills_tui
+    outside = tmp_path / "home" / ".agents" / "skills"  # outside the project, and not ~/.dostuff
+    monkeypatch.setattr(discover_skills, "SKILLS_DIRS", [".dostuff/skills", str(outside)])
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-read")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            folder = _new_skill("deploy", root=outside)
+            (folder / "steps.md").write_text("step one", encoding="utf-8")
+            with pytest.raises(PathOutsideProject):
+                resolve_safe_path(str(folder / "SKILL.md"), for_read=True)
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            for name in ("SKILL.md", "steps.md"):
+                assert resolve_safe_path(str(folder / name), for_read=True).read_text(encoding="utf-8")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T4.6, T4.7
+
+def test_esc_esc_takes_capability_step_with_prompt(real_loop_tui):
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-back")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _turn(app, cli_tui, pilot, "first", calls, 1)
+            _new_skill("deploy")
+            await _turn(app, cli_tui, pilot, "second", calls, 2)
+            assert len(_cap_steps(app.steps_history)) == 1
+            await app._edit_previous_prompt()
+            assert _cap_steps(app.steps_history) == []
+            assert _cap_steps(await app.store.load(app.session_id)) == []
+            assert app.query_one("#input", cli_tui.EnterSubmits).text == "second"
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_capability_step_not_rendered(tui):
+    from dostuff.helpers.agent.turn_context import make_capability_step
+
+    async def scenario():
+        app = tui.DostuffTUI(session_id="cap-render")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.steps_history = [{"role": "user", "content": "the prompt"},
+                                 make_capability_step("## Skills and agent types: changes\nNew skill: x", ("s",)),
+                                 {"role": "assistant", "content": "the answer"}]
+            app._render_history()
+            await pilot.pause()
+            texts = "\n".join(_texts(app))
+            assert "the prompt" in texts and "Skills and agent types" not in texts and "<turn-context>" not in texts
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# T5.1 - T5.5
+
+def test_skills_command_lists_dir_and_manual_only(skills_tui):
+    cli_tui, _ = skills_tui
+    _new_skill("deploy")
+    _new_skill("release", manual=True)
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-list")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "/skills")
+            await _until(pilot, lambda: any(t.startswith("Skills (2)") for t in _texts(app)))
+            text = next(t for t in _texts(app) if t.startswith("Skills (2)"))
+            deploy, release = (line for line in text.splitlines() if "deploy" in line or "release  ·" in line)
+            assert str(Path(".dostuff", "skills", "deploy")) in deploy and "manual only" not in deploy
+            assert str(Path(".dostuff", "skills", "release")) in release and "manual only" in release
+            assert "/skills reload" in text
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def _reloaded(app):
+    return next((t for t in _texts(app) if t.startswith("Reloaded:")), None)
+
+
+def test_skills_reload_rebuilds_prompt_and_view(skills_tui):
+    cli_tui, seen = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-skills-reload")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            before = app._system_instructions
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            assert app._system_instructions != before and "name: deploy" in app._system_instructions
+            assert any(c.startswith("skill:deploy:") for c in app._capabilities_baseline)
+            assert "/deploy" in app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            assert "name: deploy" in seen[0]["instructions"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_skills_reload_reports_added_removed(skills_tui):
+    import shutil
+    cli_tui, _ = skills_tui
+    old = _new_skill("old-deploy")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-skills-report")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            shutil.rmtree(old)
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            assert _reloaded(app).startswith("Reloaded: 1 skill(s) — added deploy; removed old-deploy.")
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_reload_edits_no_history(skills_tui):
+    cli_tui, seen = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-reload-history")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "hello")
+            await _until(pilot, lambda: not app._turn_in_progress and seen)
+            stored = await app.store.load(app.session_id)
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            assert await app.store.load(app.session_id) == stored and app.steps_history == stored
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_after_reload_no_change_no_step(real_loop_tui):
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-after-reload")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            await _turn(app, cli_tui, pilot, "hello", calls, 1)
+            assert _cap_steps(calls[0]["history"]) == []  # the rebuilt prompt already lists it
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_after_reload_at_most_one_redundant_note(real_loop_tui):
+    """D2: a note older than the reload, then a change, then the reload: one redundant note, then none."""
+    cli_tui, calls, _ = real_loop_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-redundant")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _new_skill("deploy")
+            await _turn(app, cli_tui, pilot, "one", calls, 1)  # announces deploy
+            _new_skill("release")
+            _submit(app, cli_tui, "/skills reload")  # the prompt now lists both
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            await _turn(app, cli_tui, pilot, "two", calls, 2)
+            await _turn(app, cli_tui, pilot, "three", calls, 3)
+            assert [len(_cap_steps(c["history"])) for c in calls] == [1, 2, 2]
+            assert "- name: release" in _cap_steps(calls[1]["history"])[-1]["content"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_reload_mid_turn_leaves_running_request_alone(real_loop_tui, monkeypatch):
+    """D12 / REQ-7.3: the running turn keeps the prompt it started with; the next turn gets the rebuilt one."""
+    from dostuff.agent import loop as loop_module
+    cli_tui, calls, responses = real_loop_tui
+    release = asyncio.Event()
+
+    async def dispatch(name, args, **kw):
+        await release.wait()
+        return "done"
+    monkeypatch.setattr(loop_module, "dispatch_tool", dispatch)
+    responses.append(_tool_call_response())
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-mid-reload")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _submit(app, cli_tui, "work")
+            await _until(pilot, lambda: len(calls) == 1)
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/skills reload")  # not refused mid-turn: no new refusal (REQ-7.3)
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            release.set()
+            await _until(pilot, lambda: not app._turn_in_progress and len(calls) == 2)
+            assert calls[0]["system"] == calls[1]["system"] and "name: deploy" not in calls[1]["system"]
+            await _turn(app, cli_tui, pilot, "next", calls, 3)
+            assert "name: deploy" in calls[2]["system"]
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_agents_reload_rebuilds_prompt_and_skill_view(skills_tui):
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-agents-reload")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._backend_ready.wait()
+            _new_agent_type("security-auditor")
+            _new_skill("deploy")
+            _submit(app, cli_tui, "/agents reload")
+            await _until(pilot, lambda: _reloaded(app) is not None)
+            assert _reloaded(app).startswith("Reloaded: 4 agent types")
+            assert "security-auditor" in app._system_instructions
+            assert any(c.startswith("agent:security-auditor:") for c in app._capabilities_baseline)
+            assert "/deploy" in app._skill_commands
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_skills_and_agents_in_command_tables(skills_tui):
+    from dostuff.helpers.agent.constants import COMMAND_ARGS, COMMAND_DESCRIPTIONS
+    assert "/skills reload" in COMMAND_DESCRIPTIONS["/skills"] and COMMAND_ARGS["/skills"] == "[reload]"
+    assert "rebuilds the system prompt" in COMMAND_DESCRIPTIONS["/agents"] and "reload" in COMMAND_ARGS["/agents"]
+    cli_tui, _ = skills_tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="cap-tables")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "/skills" in app.query_one("#command-menu", cli_tui.CommandMenu).commands
+            _submit(app, cli_tui, "/help")
+            await pilot.pause()
+            assert any("/skills" in t and "/agents" in t for t in _texts(app))
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

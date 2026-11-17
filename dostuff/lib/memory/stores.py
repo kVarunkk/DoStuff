@@ -1,17 +1,23 @@
 """One semantic and one episodic store per data dir, shared by the TUI (recall) and the memory tools (save).
 
-Each getter returns None when chromadb isn't installed: long-term memory is then off.
+The backend is `memory.backend`: hybrid (the default) and sqlite keep memories in `<data>/memory.db` and always work;
+hybrid adds an embedding index when chromadb is installed. On those two, the first getter call copies the chroma
+backend's memories into memory.db (migrate.py). On `chroma`, each getter returns None without chromadb (memory off).
 """
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from dostuff.config import get_config
 from dostuff.lib.memory import chroma
+from dostuff.lib.memory.backend import memory_backend
 from dostuff.lib.memory.episodic_memory_store import EpisodicMemoryStore
 from dostuff.lib.memory.semantic_memory_store import SemanticMemoryStore
 
 if TYPE_CHECKING:
     from dostuff.lib.mcp.mcp_tool_registry_store import MCPToolRegistryStore
+    from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore, HybridFactStore
+    from dostuff.lib.memory.migrate import ImportResult
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore, SQLiteFactStore
 
 
 def _persist_path() -> str:
@@ -28,11 +34,81 @@ def _episodic(persist_path: str) -> EpisodicMemoryStore:
     return EpisodicMemoryStore(persist_path=persist_path)
 
 
-def get_semantic_store() -> SemanticMemoryStore | None:
+@lru_cache(maxsize=None)
+def _sqlite_facts(db_path: str) -> "SQLiteFactStore":
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteFactStore
+    return SQLiteFactStore(db_path)
+
+
+@lru_cache(maxsize=None)
+def _sqlite_episodes(db_path: str) -> "SQLiteEpisodeStore":
+    from dostuff.lib.memory.sqlite_memory_store import SQLiteEpisodeStore
+    return SQLiteEpisodeStore(db_path)
+
+
+@lru_cache(maxsize=None)
+def _hybrid_facts(db_path: str, index_path: str) -> "HybridFactStore":
+    from dostuff.lib.memory.hybrid_memory_store import HybridFactStore
+    return HybridFactStore(db_path, index_path)
+
+
+@lru_cache(maxsize=None)
+def _hybrid_episodes(db_path: str, index_path: str) -> "HybridEpisodeStore":
+    from dostuff.lib.memory.hybrid_memory_store import HybridEpisodeStore
+    return HybridEpisodeStore(db_path, index_path)
+
+
+def _index_path() -> str:
+    """The hybrid backend's embedding index: its own Chroma dir, so a chroma-backend store beside it is never mixed in."""
+    return str(get_config().get_data_dir() / "memory-index")
+
+
+def _keywords_only() -> bool:
+    """sqlite, or hybrid without chromadb (then it is sqlite: same memory.db, no embedding side)."""
+    backend = memory_backend()
+    return backend == "sqlite" or (backend == "hybrid" and not chroma.chroma_available())
+
+
+def _sqlite_path() -> str:
+    data_dir = get_config().get_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return str(data_dir / "memory.db")
+
+
+@lru_cache(maxsize=None)
+def _imported(db_path: str, chroma_path: str, queue_for_index: bool) -> "ImportResult":
+    """Memories of the chroma backend copied into memory.db, once per process (and once ever: migrate.py)."""
+    from dostuff.lib.memory.migrate import import_from_chroma
+    # The store's tables first: the import writes into them
+    from dostuff.lib.memory.sqlite_memory_store import _Db
+    _Db(db_path)
+    return import_from_chroma(db_path, chroma_path, queue_for_index=queue_for_index)
+
+
+def chroma_import_result() -> "ImportResult | None":
+    """What bringing in the chroma backend's memories did this run, or None on the chroma backend."""
+    if memory_backend() == "chroma":
+        return None
+    return _imported(_sqlite_path(), _persist_path(), not _keywords_only())
+
+
+def get_semantic_store() -> "SemanticMemoryStore | SQLiteFactStore | HybridFactStore | None":
+    if memory_backend() != "chroma":
+        chroma_import_result()
+    if _keywords_only():
+        return _sqlite_facts(_sqlite_path())
+    if memory_backend() == "hybrid":
+        return _hybrid_facts(_sqlite_path(), _index_path())
     return _semantic(_persist_path()) if chroma.chroma_available() else None
 
 
-def get_episodic_store() -> EpisodicMemoryStore | None:
+def get_episodic_store() -> "EpisodicMemoryStore | SQLiteEpisodeStore | HybridEpisodeStore | None":
+    if memory_backend() != "chroma":
+        chroma_import_result()
+    if _keywords_only():
+        return _sqlite_episodes(_sqlite_path())
+    if memory_backend() == "hybrid":
+        return _hybrid_episodes(_sqlite_path(), _index_path())
     return _episodic(_persist_path()) if chroma.chroma_available() else None
 
 
@@ -42,3 +118,28 @@ def make_tool_registry_store() -> "MCPToolRegistryStore | None":
         return None
     from dostuff.lib.mcp.mcp_tool_registry_store import MCPToolRegistryStore
     return MCPToolRegistryStore(persist_path=_persist_path())
+
+
+def memory_collections() -> list[tuple[str, object, dict | None]]:
+    """(name, collection, filter a real query uses) for a health check, skipping empty/missing ones.
+
+    The filter matters: an unfiltered query can succeed where the filtered one callers run fails.
+    Returns [] without chromadb.
+    """
+    if not chroma.chroma_available() or memory_backend() != "chroma":
+        return []
+    client = chroma.get_chroma_client(_persist_path())
+    existing = {collection.name for collection in client.list_collections()}
+    user_id = get_config().get_user_id()
+    found: list[tuple[str, object, dict | None]] = []
+    for name in ("semantic_memory", "episodic_memory", "mcp_tools_index"):
+        if name not in existing:
+            continue
+        collection = client.get_collection(name)
+        if collection.count() <= 0:
+            continue
+        # mcp_tools_index is keyed by server rather than user; check_collection picks a real
+        # server_name from the rows, since an empty filter would test a different code path
+        where = None if name == "mcp_tools_index" else {"user_id": user_id}
+        found.append((name, collection, where))
+    return found
