@@ -155,7 +155,7 @@ def test_cache_breakpoints_only_for_claude(monkeypatch, provider, model, enabled
     assert model_module.uses_explicit_prompt_caching() is expected
 
     monkeypatch.setattr(call_agent_module, "completion_kwargs", lambda: {"model": model})
-    monkeypatch.setattr(call_agent_module, "_supports_reasoning", lambda m: False)
+    monkeypatch.setattr(call_agent_module, "supports_reasoning", lambda m: False)
     kwargs = call_agent_module.build_request_kwargs(stream=False)
     assert ("cache_control_injection_points" in kwargs) is expected
 
@@ -169,3 +169,32 @@ def test_undo_restores_multi_edit(project):
     result = store.undo("s1")
     assert result is not None and result.restored
     assert (root / "a.txt").read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+@pytest.mark.parametrize("effort,reasoning,expected", [
+    ("auto", True, None), ("high", True, "high"), ("off", True, "none"), ("high", False, None),
+])
+def test_reasoning_effort_request(monkeypatch, effort, reasoning, expected):
+    monkeypatch.setattr(call_agent_module, "completion_kwargs", lambda: {"model": "anthropic/claude-sonnet-5-5"})
+    monkeypatch.setattr(call_agent_module, "supports_reasoning", lambda m: reasoning)
+    monkeypatch.setattr(call_agent_module, "get_config", lambda: SimpleNamespace(reasoning_effort=effort))
+    monkeypatch.setattr(call_agent_module, "uses_explicit_prompt_caching", lambda: False)
+    assert call_agent_module.build_request_kwargs(stream=False).get("reasoning_effort") == expected
+
+
+def test_reasoning_effort_config_and_session(tmp_path):
+    from dostuff.config import Config
+    path = tmp_path / "config.yaml"
+    path.write_text("loop:\n  reasoning_effort: Medium\n", encoding="utf-8")
+    cfg = Config(path)
+    assert cfg.reasoning_effort == "medium"
+    cfg.session_reasoning_effort = "low"
+    cfg.reload()
+    assert cfg.reasoning_effort == "low"
+    path.write_text("loop:\n  reasoning_effort: off\n  other: 1\n", encoding="utf-8")
+    cfg.session_reasoning_effort = None
+    cfg.reload()
+    assert cfg.reasoning_effort == "off"
+    path.write_text("loop:\n  reasoning_effort: bogus\n", encoding="utf-8")
+    cfg.reload()
+    assert cfg.reasoning_effort == "auto"

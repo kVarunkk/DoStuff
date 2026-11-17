@@ -19,6 +19,7 @@ loop:
   max_iterations: 100  # max agent turns before forced exit; ESC cancels anytime
   # subagent_max_iterations: 25  # older name for agents.max_iterations; still read when that isn't set
   prompt_caching: true  # Claude models: cache the system prompt and history between calls (cheaper, faster)
+  reasoning_effort: auto  # how hard reasoning models think: auto (provider default), off, minimal, low, medium, high; /thinking changes it per session
   # context_window: 128000     # override the model's context window (tokens) if dostuff/litellm can't tell
   max_tool_output_chars: 30000 # longer tool results keep head + tail with a truncation marker
   max_retries: 6               # retries on rate limits, timeouts and 5xx (0 = fail at once)

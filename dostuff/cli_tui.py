@@ -34,7 +34,7 @@ from rich.text import Text
 from rich.markdown import Markdown as RichMarkdown
 from textual.events import Click, Key, Paste, TextSelected
 from dostuff import __version__
-from dostuff.config import NOTIFY_KINDS, STATUS_BAR_ITEMS, get_config, parse_compact_threshold
+from dostuff.config import NOTIFY_KINDS, REASONING_EFFORTS, STATUS_BAR_ITEMS, get_config, parse_compact_threshold
 from dostuff.agent.permissions import PERMISSION_MODES, ApprovalReply, SessionPermissions, next_mode, parse_answer
 from dostuff.agent.instructions import build_base_instructions, build_system_instructions, build_turn_context
 from dostuff.helpers.agent.constants import COMMAND_DESCRIPTIONS, COMMAND_FLAGS
@@ -49,7 +49,7 @@ from dostuff.tools.bash.jobs import (
 from dostuff.lib.memory.session_store import SQLiteSessionStore
 from dostuff.lib.checkpoints import CHECKPOINT_TOOLS, UndoResult, get_checkpoint_store
 from dostuff.lib.worktree import Worktree, WorktreeError, create_worktree, detect_worktree, has_changes, remove_worktree, worktree_changes
-from dostuff.lib.model import get_model
+from dostuff.lib.model import get_litellm_model, get_model, supports_reasoning
 from dostuff.lib.tracing import session_id_var, turn_id_var
 from dostuff.helpers.agent.append_step import append_step
 from dostuff.helpers.agent.loop_check_cancelled import CANCELLED_TURN
@@ -3108,6 +3108,21 @@ class DostuffTUI(App):
             msg_type="system",
         )
 
+    def _thinking_command(self, arg: str) -> None:
+        """/thinking [auto|off|minimal|low|medium|high]: the model's thinking level (session only)."""
+        current = self.config.reasoning_effort
+        if not arg:
+            self._append(f"Thinking: {current}. Usage: /thinking {'|'.join(REASONING_EFFORTS)} "
+                         "(loop.reasoning_effort in config.yaml sets the default; auto leaves it to the provider).",
+                         msg_type="system")
+            return
+        if arg not in REASONING_EFFORTS:
+            self._append(f"Usage: /thinking {'|'.join(REASONING_EFFORTS)}", msg_type="error")
+            return
+        self.config.session_reasoning_effort = arg
+        note = "" if supports_reasoning(get_litellm_model()) else f" ({get_model()} has no reasoning control, so it is ignored)"
+        self._append(f"Thinking set to {arg} for this session{note}.", msg_type="system")
+
     def _notifications_command(self, arg: str) -> None:
         """/notifications [on|off|bell|osc9]: notify when a turn finishes or an approval waits (session only)."""
         if not arg:
@@ -3964,6 +3979,9 @@ class DostuffTUI(App):
             return
         if name == "/permissions":
             self._permissions_command(arg)
+            return
+        if name == "/thinking":
+            self._thinking_command(arg.lower())
             return
         if name == "/copy" and not arg:
             self._copy_last_answer()

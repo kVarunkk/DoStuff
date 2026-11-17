@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+You can now choose how hard reasoning models think, per session with `/thinking` or by default in `config.yaml`.
+
+### Added
+- **`/thinking <level>`** sets the thinking level for this session: `auto`, `off`, `minimal`, `low`, `medium` or `high`. Without a level it shows the current one. **`loop.reasoning_effort`** in `config.yaml` sets the default for new sessions. `auto` leaves it to the provider, as before; models without reasoning support ignore the setting.
+
 ## [0.2.15] - 2026-11-17
 
 A skill or agent type you add while a session is running reaches the agent on your next message, with no restart, and one the agent creates itself mid-turn reaches it before its next step.

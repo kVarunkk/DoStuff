@@ -80,6 +80,15 @@ def model_supports(kind: Literal["vision", "pdf"]) -> bool:
         return False
 
 
+def supports_reasoning(model: str) -> bool:
+    """Does litellm know `model` to have a thinking/reasoning control? Unknown models are False."""
+    try:
+        import litellm
+        return bool(litellm.supports_reasoning(model=model))
+    except Exception:
+        return False
+
+
 def completion_kwargs() -> dict[str, Any]:
     """Common kwargs for every litellm call: the model, plus `api_key` when `api_key_env` is set and the
     model is on the main provider (another provider's key comes from its usual environment variable)."""
