@@ -21,6 +21,7 @@ class AgentDef:
     source: str = "built-in"  # a file path, or "built-in"
     read_only_shell: bool = False  # bash_command limited to permissions.is_read_only_shell (D3)
     omit_memory: bool = False  # no saved facts in its context (memory recall D14)
+    skills: tuple[str, ...] = ()  # skills whose SKILL.md text goes into its system prompt (subagent capabilities D1)
 
 
 # explore / plan: look, don't touch. The shell is limited to read-only commands (read_only_shell).
@@ -171,15 +172,37 @@ def parse_agent_file(path: Path) -> tuple[AgentDef | None, list[str]]:
             max_iterations = max(int(front["max_iterations"]), 1)
         except (TypeError, ValueError):
             warnings.append(f"{path}: max_iterations '{front['max_iterations']}' is not a number; ignored")
+    skills, skills_warning = parse_skills(front.get("skills"), str(path))
+    if skills_warning:
+        warnings.append(skills_warning)
     if front.get("memory") not in (None, ""):
         warnings.append(f"{path}: memory '{front['memory']}' ignored: dostuff has no per-agent memory "
                         "(saved facts reach typed subagents unless omit_memory: true)")
     agent_def = AgentDef(
         name=name, description=description, prompt=match.group(2).strip(), tools=tools,
         model=str(front.get("model") or "inherit").strip(), max_iterations=max_iterations, source=str(path),
-        omit_memory=str(front.get("omit_memory")).strip().lower() == "true",
+        omit_memory=str(front.get("omit_memory")).strip().lower() == "true", skills=skills,
     )
     return agent_def, warnings
+
+
+def parse_skills(raw: Any, source: str) -> tuple[tuple[str, ...], str | None]:
+    """`skills:` (YAML list or comma-separated string) → (distinct names in order, warning). A value of any other
+    shape gives no skills and a warning; the type still loads (CON-3)."""
+    if raw in (None, ""):
+        return (), None
+    if isinstance(raw, str):
+        items: list[Any] = raw.split(",")
+    elif isinstance(raw, list) and all(isinstance(n, str) for n in raw):
+        items = raw
+    else:
+        return (), f"{source}: skills ignored: expected a list of skill names or a comma-separated string"
+    names: list[str] = []
+    for item in items:
+        name = item.strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names), None
 
 
 def _agent_files(folder: Path) -> list[Path]:
@@ -336,6 +359,8 @@ def types_listing(loaded: Definitions, config: Any) -> str:
             tools += " (read-only shell)"
         lines += [f"{name}  ·  {agent_def.source}", f"  {agent_def.description}",
                   f"  model: {model}", f"  tools: {tools}"]
+        if agent_def.skills:
+            lines.append(f"  skills: {', '.join(agent_def.skills)}")
     lines += _fork_summary(config)
     lines += ["", "/agents types <name> shows a type's system prompt and full config."]
     if warnings:
@@ -380,6 +405,8 @@ def type_detail(name: str, loaded: Definitions, config: Any) -> str | None:
     iterations = f"{agent_def.max_iterations} (set in the file)" if agent_def.max_iterations is not None else cap
     lines = [f"{agent_def.name}  ·  {agent_def.source}", f"  {agent_def.description}", model_line,
              f"  tools: {tools}", f"  max iterations: {iterations}"]
+    if agent_def.skills:
+        lines.append(f"  skills: {', '.join(agent_def.skills)}")
     if model_warning:
         lines.append(f"  ⚠ {model_warning}")
     lines += ["", "System prompt:", "", _indent(agent_def.prompt) if agent_def.prompt.strip() else "  (empty)"]

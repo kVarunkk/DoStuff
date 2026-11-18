@@ -528,7 +528,7 @@ def test_subagent_run_passes_own_baseline(agents, fake_model, monkeypatch):
         seen.append((kwargs.get("capabilities_baseline"), kwargs.get("capability_kinds")))
         return await real(*args, **kwargs)
 
-    async def prompt(agent_def, worktree=None):
+    async def prompt(agent_def, worktree=None, preloaded=None):
         return "SUB SYSTEM", ("skill:own:1",)
     monkeypatch.setattr(registry_module, "run_agent_loop", spy)
     monkeypatch.setattr(registry_module, "build_subagent_prompt", prompt)
@@ -550,3 +550,91 @@ def test_claude_code_memory_field_warns(tmp_path):
     assert agent_def is not None and not agent_def.omit_memory
     assert warnings == [f"{path}: memory 'project' ignored: dostuff has no per-agent memory "
                         "(saved facts reach typed subagents unless omit_memory: true)"]
+
+
+# --- subagent capabilities Phase 1: `skills:` preload (T1.2 to T1.4) -----------------------------------------
+
+
+def _skill_dirs(tmp_path, monkeypatch, **skills):
+    """One skills folder (with a space in its path). Each value is a body, or (body, extra frontmatter lines)."""
+    from dostuff.agent import capabilities as caps
+    from dostuff.helpers.skills import discover_skills as ds
+    root = tmp_path / "skills dir"
+    for name, spec in skills.items():
+        body, extra = spec if isinstance(spec, tuple) else (spec, "")
+        (root / name).mkdir(parents=True)
+        (root / name / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: the {name} one\n{extra}---\n{body}\n", encoding="utf-8")
+    monkeypatch.setattr(ds, "SKILLS_DIRS", [str(root)])
+    caps.reset_cache()
+    return root
+
+
+def test_preloaded_skill_body_in_system_prompt(tmp_path, monkeypatch):
+    from dostuff.agent.subagents.definitions import AgentDef
+    from dostuff.agent.subagents.prompt import _sections, load_preloaded
+    root = _skill_dirs(tmp_path, monkeypatch, demo="DEMO BODY line", other="OTHER BODY")
+    agent_def = AgentDef(name="t", description="d", prompt="TYPE BODY", skills=("demo",))
+    preloaded = load_preloaded(agent_def)
+    text, baseline = _sections(agent_def, None, preloaded)
+    assert text.index("TYPE BODY") < text.index('<skill name="demo"')  # after the type's body
+    assert "DEMO BODY line" in text and "description: the demo one" not in text  # the frontmatter is dropped
+    assert f"relative to {root / 'demo'}" in text
+    assert "- name: demo" not in text and "- name: other" in text  # the plain list names only what is not preloaded
+    assert "OTHER BODY" not in text
+    assert any(c.startswith("skill:demo:") for c in baseline)  # so a mid-run refresh does not call demo new
+    assert preloaded.skipped == ()
+
+
+def test_typed_run_gets_preloaded_skill_and_untyped_does_not(agents, fake_model, monkeypatch, tmp_path):
+    from dostuff.agent.subagents.definitions import BUILTIN_TYPES, AgentDef
+    _skill_dirs(tmp_path, monkeypatch, demo="DEMO BODY")
+    monkeypatch.setitem(BUILTIN_TYPES, "pre", AgentDef(name="pre", description="d", skills=("demo",)))
+    fake_model.script("[A]", fake_response("a done"))
+    fake_model.script("[B]", fake_response("b done"))
+
+    async def go():
+        typed = await _start(agents, "[A] x", agent_type="pre")
+        await typed.done
+        plain = await _start(agents, "[B] x")
+        await plain.done
+    asyncio.run(go())
+    assert "DEMO BODY" in fake_model.calls_for("[A]")[0]["messages"][0]["content"]
+    assert "DEMO BODY" not in fake_model.calls_for("[B]")[0]["messages"][0]["content"]
+
+
+def test_preload_unknown_and_manual_only_skills_warn(agents, fake_model, monkeypatch, tmp_path):
+    from dostuff.agent.subagents.definitions import BUILTIN_TYPES, AgentDef
+    _skill_dirs(tmp_path, monkeypatch, demo="DEMO BODY", manual=("M BODY", "disable-model-invocation: true\n"))
+    monkeypatch.setitem(BUILTIN_TYPES, "pre", AgentDef(name="pre", description="d", skills=("demo", "ghost", "manual")))
+    fake_model.script("[A]", fake_response("the report"))
+
+    async def go():
+        run = await _start(agents, "[A] x", agent_type="pre")
+        return await run.done
+    report = asyncio.run(go())
+    system = fake_model.calls_for("[A]")[0]["messages"][0]["content"]
+    assert "DEMO BODY" in system and "M BODY" not in system
+    assert report == "[warning] Skills not preloaded: ghost (not found), manual (manual-only)\n\nthe report"
+
+
+def test_preload_budget_keeps_list_order(tmp_path, monkeypatch):
+    from dostuff.agent.subagents.definitions import AgentDef
+    from dostuff.agent.subagents.prompt import load_preloaded
+    from dostuff.config import get_config
+    _skill_dirs(tmp_path, monkeypatch, a="A" * 500, b="B" * 500, c="C" * 500)
+    one = load_preloaded(AgentDef(name="t", description="d", skills=("a",)))
+    assert one.skipped == () and "A" * 500 in one.text
+    monkeypatch.setattr(get_config(), "agents_max_preload_chars", len(one.text) + 5)
+    both = load_preloaded(AgentDef(name="t", description="d", skills=("a", "b", "c")))
+    assert both.names == ("a",) and "B" * 500 not in both.text
+    assert both.skipped == ("b (over budget)", "c (over budget)")
+
+
+def test_preload_takes_at_most_32_skills(tmp_path, monkeypatch):
+    from dostuff.agent.subagents.definitions import AgentDef
+    from dostuff.agent.subagents.prompt import load_preloaded
+    names = tuple(f"s{i:02d}" for i in range(33))
+    _skill_dirs(tmp_path, monkeypatch, **{n: "tiny" for n in names})
+    got = load_preloaded(AgentDef(name="t", description="d", skills=names))
+    assert got.names == names[:32] and got.skipped == ("s32 (over the limit of 32 skills)",)

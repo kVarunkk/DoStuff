@@ -520,3 +520,42 @@ def test_read_only_types_have_no_edit_tool(proj, agents_home):
     loaded = load_definitions(proj, agents_home)
     for name in ("explore", "plan"):
         assert "multi_edit" not in (loaded.types[name].tools or ())
+
+
+# --- subagent capabilities T1.1: `skills:` ------------------------------------------------------------
+
+
+def test_agent_file_skills_list_and_string(proj, agents_home):
+    folder = proj / ".dostuff" / "agents"
+    _agent_file(folder, "a.md", name="a", description="d", skills="[x, y, x]")
+    _agent_file(folder, "b.md", name="b", description="d", skills="x, y")
+    _agent_file(folder, "c.md", name="c", description="d", skills="{x: 1}")
+    _agent_file(folder, "d.md", name="d", description="d")
+    loaded = load_definitions(proj, agents_home)
+    assert loaded.types["a"].skills == ("x", "y")  # a repeated name is one skill
+    assert loaded.types["b"].skills == ("x", "y")
+    assert loaded.types["c"].skills == () and loaded.types["d"].skills == ()  # a bad value still loads the type
+    warned = [w for w in loaded.warnings if "skills" in w]
+    assert len(warned) == 1 and "c.md" in warned[0]
+
+
+def test_agent_file_skills_crlf_and_space_in_path(tmp_path, agents_home):
+    proj = tmp_path / "my proj"
+    folder = proj / ".dostuff" / "agents"
+    folder.mkdir(parents=True)
+    (folder / "a.md").write_bytes(b"---\r\nname: a\r\ndescription: d\r\nskills:\r\n  - one\r\n  - two\r\n---\r\nbody\r\n")
+    assert load_definitions(proj, agents_home).types["a"].skills == ("one", "two")
+
+
+def test_agents_types_and_info_show_skills(proj, agents_home):
+    from types import SimpleNamespace
+
+    from dostuff.agent.subagents.definitions import type_detail, types_listing
+    _agent_file(proj / ".dostuff" / "agents", "rev.md", name="rev", description="d", skills="[x, y]")
+    _agent_file(proj / ".dostuff" / "agents", "plain.md", name="plain", description="d")
+    loaded = load_definitions(proj, agents_home)
+    config = SimpleNamespace(model_name="m", agents_max_iterations=10, agents_models={}, agents_explore_model="inherit")
+    assert "  skills: x, y" in type_detail("rev", loaded, config).splitlines()
+    assert "skills:" not in type_detail("plain", loaded, config)
+    listing = types_listing(loaded, config)
+    assert listing.count("  skills: x, y") == 1 and listing.count("skills:") == 1

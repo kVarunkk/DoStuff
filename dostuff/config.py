@@ -7,6 +7,7 @@ from dostuff.helpers.agent.constants import MAX_ITERATIONS
 from dostuff.helpers.hooks.load_hooks import HookEntry, load_merged_hooks
 
 DEFAULT_AGENTS_MAX_CONCURRENT = 4  # running + waiting_approval agents at once; more are queued (subagents D4)
+DEFAULT_AGENTS_MAX_PRELOAD_CHARS = 60000  # characters of preloaded skill text in one agent's prompt (subagent capabilities D1)
 MAX_TOOL_OUTPUT_CHARS = 30_000
 MAX_RETRIES = 6
 RETRY_MAX_DELAY_S = 60.0
@@ -180,6 +181,7 @@ class Config:
         self.agents_wake_on_end = str(agents.get("wake_on_end", True)).lower() not in ("0", "false", "no", "off")
         self.agents_read_claude_agents = str(agents.get("read_claude_agents", True)).lower() not in ("0", "false", "no", "off")
         self.agents_explore_model = str(agents.get("explore_model") or "inherit").strip()
+        self.agents_max_preload_chars = max(int(agents.get("max_preload_chars") or DEFAULT_AGENTS_MAX_PRELOAD_CHARS), 1)
         models = agents.get("models")
         self.agents_models = {str(k).strip(): str(v).strip() for k, v in models.items() if v} if isinstance(models, dict) else {}
         # TUI status bar: which items show, in this order; unknown names are reported once at startup
