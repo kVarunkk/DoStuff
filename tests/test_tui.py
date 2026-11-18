@@ -2372,11 +2372,12 @@ def test_jobs_bar(tui, registry, monkeypatch, _py):
             await pilot.click("#jobs-bar")
             await _until(pilot, lambda: question() == "Background jobs")
             labels = [label for _, label in app.query_one("#picker", cli_tui.PermissionPrompt)._all_options]
-            assert len(labels) == 2 and labels[0].startswith("dev  running  since ") and "main" in labels[0]
-            assert labels[1].startswith("lint  running  since ") and sleeper[:40] in labels[1]
-            # clicking a row picks it, on any of its lines (line 0 is the question; dev's label wraps)
+            # the most recently started first: lint began after dev
+            assert len(labels) == 2 and labels[0].startswith("lint  running  since ") and sleeper[:40] in labels[0]
+            assert labels[1].startswith("dev  running  since ") and "main" in labels[1]
+            # clicking a row picks it, on any of its lines (line 0 is the question; lint's label wraps)
             await pilot.click("#picker", offset=(5, 2))
-            await _until(pilot, lambda: question().startswith('Job "dev"'))
+            await _until(pilot, lambda: question().startswith('Job "lint"'))
             # clicking the item again closes the list, and once more opens it; Esc closes it too
             await pilot.click("#jobs-bar")
             await _until(pilot, lambda: not app._picker_open())
@@ -2386,8 +2387,8 @@ def test_jobs_bar(tui, registry, monkeypatch, _py):
             await _until(pilot, lambda: not app._picker_open())
             await pilot.click("#jobs-bar")
             await _until(pilot, lambda: question() == "Background jobs")
-            # pick dev → its actions; "Stop it" kills it and the agent is told
-            await pilot.press("enter")
+            # pick dev (the second row) → its actions; "Stop it" kills it and the agent is told
+            await pilot.press("down", "enter")
             await _until(pilot, lambda: question().startswith('Job "dev"'))
             await pilot.press("2")
             await _until(pilot, lambda: dev.ended is not None, tries=200)
@@ -8883,6 +8884,57 @@ def test_skills_and_agents_in_command_tables(skills_tui):
             _submit(app, cli_tui, "/help")
             await pilot.pause()
             assert any("/skills" in t and "/agents" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- jobs and agents lists: the most recent first; ask_user panel fits a short terminal ------------
+
+def test_agents_list_most_recent_first(tui, agents):
+    cli_tui = tui
+    from dostuff.agent.subagents.registry import AgentRun
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="agent-order")
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            registry = agents
+            for n, (name, started, status) in enumerate([("old", 100.0, "completed"), ("mid", 200.0, "running"),
+                                                         ("new", 300.0, "completed")]):
+                run = AgentRun(id=name, owner="agent-order", agent_type="general", description=name, model="m", status=status)
+                run.started = started
+                registry._runs[name] = run
+            assert [r.id for r in app._session_agents()] == ["new", "mid", "old"]  # recency, not running-first
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ask_panel_fits_short_terminal(tui):
+    """A long question and long descriptions wrap in full, and the options window shrinks so the submit row and
+    the hint stay on screen instead of falling off the bottom."""
+    cli_tui = tui
+    long_q = {"question": "Which approach should I take to restructure the configuration loading so that project "
+                          "settings override user settings while environment variables still win? " * 2,
+              "header": "Config",
+              "options": [{"label": f"Option {i}", "description": "a long description " * 8} for i in range(1, 6)]}
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-fit")
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [long_q])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.pause()
+            content = str(panel.content)
+            assert "…" not in content.replace("↑", "").replace("↓", "")  # no description is cut
+            assert content.count("a long description") >= 8  # the first option's description, whole
+            assert "Submit answers" in content and "Esc cancel" in content
+            assert panel.region.bottom <= app.size.height
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

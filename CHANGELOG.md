@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-You can now choose how hard reasoning models think, per session with `/thinking` or by default in `config.yaml`.
+You can now choose how hard reasoning models think, per session with `/thinking` or by default in `config.yaml`. The jobs and agents lists show the newest first, and `ask_user` questions no longer get cut off.
 
 ### Added
 - **`/thinking <level>`** sets the thinking level for this session: `auto`, `off`, `minimal`, `low`, `medium` or `high`. Without a level it shows the current one. **`loop.reasoning_effort`** in `config.yaml` sets the default for new sessions. `auto` leaves it to the provider, as before; models without reasoning support ignore the setting.
+
+### Changed
+- The background jobs list (click the shells item, or `/jobs`) and the `/agents` list now put the most recently started first, instead of running ones first.
+
+### Fixed
+- **`ask_user`** option descriptions wrap in full instead of ending in `…`, and the options shown shrink to fit a short terminal, so a long question no longer pushes the options, the submit row and the hint off the bottom of the screen.
 
 ## [0.2.15] - 2026-11-17
 
