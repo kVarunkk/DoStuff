@@ -650,6 +650,117 @@ def test_tool_results_expand_and_collapse(tui):
     asyncio.run(scenario())
 
 
+def test_tool_call_summary_wording(tui):
+    """One clause per kind of call, counted, in call order; the same kinds count together."""
+    summarize = tui.summarize_tool_calls
+    assert summarize(["bash_command"]) == "Ran 1 shell command"
+    assert summarize(["read_file", "grep", "read_file", "glob"]) == "Read 2 files, searched for 2 patterns"
+    assert summarize(["edit_file", "multi_edit", "bash_command"]) == "Edited 2 files, ran 1 shell command"
+    assert summarize(["read_file"], running=True) == "Reading 1 file…"
+    assert summarize(["get_current_datetime", "get_current_datetime"]) == "Checked the date"
+    assert summarize(["mcp__github__search", "some_tool"]) == "Ran 2 tools"
+    # every built-in tool either groups under its own words or keeps its own line
+    from dostuff.tools.names import BUILTIN_TOOL_NAMES
+    assert BUILTIN_TOOL_NAMES <= set(tui.TOOL_SUMMARY_NOUNS) | tui.UNGROUPED_TOOLS
+
+
+def _group_text(group) -> str:
+    return group.render().plain
+
+
+def test_consecutive_tool_calls_fold_into_one_line(tui):
+    """A run of calls is one `● Read 2 files…` line; a click shows each call with its result, Ctrl+O all."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="groups")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            emit = app.adapter.emit
+            emit("tool_call", 'read_file(path="a.py")')
+            emit("tool_call", 'bash_command(command="pytest")')
+            emit("tool_call", 'read_file(path="b.py")')
+            await pilot.pause()
+            group, = app.query(cli_tui.ToolGroup)
+            assert _group_text(group) == "● Reading 2 files, running 1 shell command… (ctrl+o to expand)"
+            # the loop runs read-only calls first: results come back out of call order, matched by name
+            emit("tool_result", "read_file: A")
+            emit("tool_result", "read_file: " + "\n".join(f"b{i}" for i in range(20)))
+            emit("tool_result", "bash_command: Error: exit 1")
+            await pilot.pause()
+            assert not app.query(cli_tui.ToolResult)  # no `⎿` lines of their own
+            assert _group_text(group) == "● Read 2 files, ran 1 shell command · 1 failed (ctrl+o to expand)"
+
+            group.on_click()
+            text = _group_text(group)
+            assert 'read_file(path="a.py")\n    ⎿  A\n  bash_command(command="pytest")\n    ⎿  Error: exit 1' in text
+            assert "b7" in text and "b8" not in text and "… +12 lines" in text
+            await pilot.press("ctrl+o")
+            assert "b19" in _group_text(group)
+            await pilot.press("ctrl+o")
+            assert _group_text(group).endswith("(ctrl+o to expand)")
+
+            # anything between two calls starts a new group; a plan keeps its own line
+            emit("partial", "Now the tests.")
+            emit("stream_end", None)
+            emit("tool_call", 'grep(pattern="x")')
+            emit("tool_call", "todo_write(todos=[])")
+            await pilot.pause()
+            groups = list(app.query(cli_tui.ToolGroup))
+            assert len(groups) == 2 and _group_text(groups[1]).startswith("● Searching for 1 pattern…")
+            assert any(str(w.content) == "● todo_write(todos=[])" for w in app.query(".msg-tool"))
+            # the turn ends with the grep never run (Esc): the group stops saying it is running
+            app._tool_groups.close()
+            groups[1].on_click()
+            assert _group_text(groups[1]).startswith("● Searched for 1 pattern\n")
+            assert "⎿  (did not run)" in _group_text(groups[1])
+            # a result nothing is waiting for still shows
+            emit("tool_result", "grep: late")
+            await pilot.pause()
+            assert len(app.query(cli_tui.ToolResult)) == 1
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_resumed_session_folds_tool_calls_the_same_way(tui):
+    """/resume renders a stored run of calls as the one group the live turn showed."""
+    cli_tui = tui
+
+    def call(cid, name, args):
+        return {"id": cid, "type": "function", "function": {"name": name, "arguments": args}}
+
+    steps = [
+        {"role": "user", "content": "look around"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [call("c1", "read_file", '{"path": "a.py"}'), call("c2", "grep", '{"pattern": "x"}')]},
+        {"role": "tool", "name": "read_file", "tool_call_id": "c1", "content": "A"},
+        {"role": "tool", "name": "grep", "tool_call_id": "c2", "content": "a.py:1: x"},
+        {"role": "assistant", "content": None, "tool_calls": [call("c3", "bash_command", '{"command": "ls"}')]},
+        {"role": "tool", "name": "bash_command", "tool_call_id": "c3", "content": "a.py"},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="groups-resume")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await app._backend_ready.wait()
+            await pilot.pause()
+            for step in steps:
+                await app.store.append("groups-old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume groups-old"))
+            await _until(pilot, lambda: app.session_id == "groups-old" and app.query(cli_tui.ToolGroup), tries=200)
+            group, = app.query(cli_tui.ToolGroup)
+            assert _group_text(group) == ("● Read 1 file, searched for 1 pattern, ran 1 shell command"
+                                          " (ctrl+o to expand)")
+            assert not app.query(cli_tui.ToolResult)
+            group.on_click()
+            assert "bash_command(command=\"ls\")\n    ⎿  a.py" in _group_text(group)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_select_to_copy_and_input_keeps_focus(tui, monkeypatch):
     cli_tui = tui
     monkeypatch.setattr(cli_tui.sys, "platform", "linux")  # no clip.exe in tests
@@ -3359,7 +3470,9 @@ def test_agents_command(tui, agents, fake_model):
             main_before = _texts(app)
             await app._picker_callback(done.id)
             await _until(pilot, lambda: any("report D" in t for t in _view_agent_texts(app)))
-            assert any(t.startswith("● ") and "get_current_datetime" in t for t in _view_texts(app))
+            view_groups = list(app.query("#agent-view-msgs ToolGroup").results(cli_tui.ToolGroup))
+            assert any(call.name == "get_current_datetime" for g in view_groups for call in g.calls)
+            assert any(t.startswith("● Checked the date") for t in _view_texts(app))
             assert any("[D] x" in t for t in _view_texts(app))
             assert not app.query_one("#conversation").display
             assert _texts(app) == main_before  # nothing of the agent's lands in the conversation
