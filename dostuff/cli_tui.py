@@ -199,8 +199,9 @@ def _preview_clipped(text: str, max_lines: int) -> bool:
     return len(lines) > max_lines or sum(map(len, lines)) > max_lines * PREVIEW_CHARS_PER_LINE
 
 
-def _preview(text: str, max_lines: int) -> str:
-    """First max_lines lines and at most max_lines * PREVIEW_CHARS_PER_LINE chars, with a marker for the rest."""
+def _preview(text: str, max_lines: int, hint: str = "ctrl+o to expand") -> str:
+    """First max_lines lines and at most max_lines * PREVIEW_CHARS_PER_LINE chars, with a marker for the rest
+    (`hint` says how to see it)."""
     lines = text.rstrip("\n").splitlines() or [""]
     budget = max_lines * PREVIEW_CHARS_PER_LINE
     shown: list[str] = []
@@ -208,18 +209,18 @@ def _preview(text: str, max_lines: int) -> str:
         if len(line) > budget:  # a long line (minified JSON, base64…) would wrap over the whole screen
             shown.append(line[:budget])
             hidden = len(line) - budget + sum(map(len, lines[len(shown):]))
-            return "\n".join(shown + [f"… +{hidden} chars (ctrl+o to expand)"])
+            return "\n".join(shown + [f"… +{hidden} chars ({hint})"])
         shown.append(line)
         budget -= len(line)
     extra = len(lines) - max_lines
     if extra > 0:
-        shown.append(f"… +{extra} lines (ctrl+o to expand)")
+        shown.append(f"… +{extra} lines ({hint})")
     return "\n".join(shown)
 
 
-def _tool_result_line(text: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES) -> str:
+def _tool_result_line(text: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES, hint: str = "ctrl+o to expand") -> str:
     """Tool output under its call, Claude Code style: '  ⎿  first line' + indented rest."""
-    return "  ⎿  " + _preview(text, max_lines).replace("\n", "\n     ")
+    return "  ⎿  " + _preview(text, max_lines, hint).replace("\n", "\n     ")
 
 
 class MessageStatic(Static):
@@ -449,13 +450,80 @@ class _GroupedCall:
         return self.result is not None and self.result.startswith("Error")
 
 
-class ToolGroup(MessageStatic):
+TOOL_RUNNING_COLOR, TOOL_FAILED_COLOR, TOOL_DIM_COLOR = "#8ab4f8", "#e06c75", "#8a8a8a"
+
+
+class _ToolGroupHeader(MessageStatic):
+    """A ToolGroup's `● Read 2 files, ran 1 shell command` line; a click opens or closes the group."""
+
+    def on_click(self) -> None:
+        if self.screen.get_selected_text():
+            return  # the end of a mouse selection, not a click
+        group = self.parent
+        if isinstance(group, ToolGroup):
+            group.set_expanded(not group.expanded, full=False if group.expanded else group.full)
+
+
+class _ToolGroupCall(MessageStatic):
+    """One call in an open ToolGroup: `● label` in its own state's colour, and a preview of its result. A
+    click shows that one result in full (or its preview again) and leaves the group open."""
+
+    def __init__(self, call: _GroupedCall, full: bool = False, closed: bool = False, **kwargs: Any) -> None:
+        self.call = call
+        self.full = full
+        self.closed = closed  # the group's turn ended: no result now means the call never ran
+        super().__init__(self._content(), markup=False, **kwargs)
+
+    @property
+    def collapsible(self) -> bool:
+        return self.call.result is not None and _preview_clipped(self.call.result, self.call.max_lines)
+
+    def _content(self) -> Text:
+        call = self.call
+        if call.result is None:
+            bullet = TOOL_DIM_COLOR if self.closed else TOOL_RUNNING_COLOR
+            body = "  ⎿  (did not run)" if self.closed else "  ⎿  …"
+        else:
+            bullet = TOOL_FAILED_COLOR if call.failed else ""
+            body = _tool_result_line(call.result, len(call.result) if self.full else call.max_lines,
+                                     hint="click to show all")
+            if self.full and self.collapsible:
+                body += "\n     (click to collapse)"
+        text = Text("  ")
+        text.append("● ", style=bullet)
+        text.append(call.label)
+        body = "\n" + ("  " + body).replace("\n", "\n  ")  # the `⎿` under the call's label, not under its `●`
+        text.append_text(Text.from_ansi(body, style=TOOL_DIM_COLOR) if "\033[" in body
+                         else Text(body, style=TOOL_DIM_COLOR))
+        return text
+
+    def refresh_content(self) -> None:
+        if self.is_mounted:
+            _update_static(self, self._content())
+        else:
+            self.update(self._content(), layout=False)
+
+    def set_full(self, full: bool) -> None:
+        if full != self.full:
+            self.full = full
+            self.refresh_content()
+
+    def on_click(self) -> None:
+        if self.screen.get_selected_text():
+            return  # the end of a mouse selection, not a click
+        if self.collapsible:
+            self.set_full(not self.full)
+
+
+class ToolGroup(Vertical):
     """A run of consecutive tool calls as one line, `● Read 2 files, ran 1 shell command`, like Claude Code.
 
-    A click shows each call with a preview of its result; Ctrl+O (DostuffTUI.action_toggle_tool_results)
-    opens every group with the results in full. Calls join the group until another message is mounted below
-    it; their results arrive later, matched by tool name in call order (the loop announces every call of a
-    step before it runs any, and runs the read-only ones first)."""
+    A click on that line opens the group: each call on its own `● label` row (blue while it runs, red when
+    it failed) with a preview of its result, and a click on a row shows that result in full. Ctrl+O
+    (DostuffTUI.action_toggle_tool_results) opens every group with every result in full. Calls join the
+    group until another message is mounted below it; their results arrive later, matched by tool name in
+    call order (the loop announces every call of a step before it runs any, and runs the read-only ones
+    first). The rows are made the first time the group opens, so a closed group stays one line widget."""
 
     def __init__(self, prefix: str = "", expanded: bool = False, **kwargs: Any) -> None:
         self.prefix = prefix
@@ -463,7 +531,9 @@ class ToolGroup(MessageStatic):
         self.expanded = expanded
         self.full = expanded
         self.closed = False  # the turn ended: a call still without a result never ran
-        super().__init__(self._content(), markup=False, **kwargs)
+        self.rows: list[_ToolGroupCall] = []
+        self.header = _ToolGroupHeader(self._header(), markup=False)
+        super().__init__(self.header, **kwargs)
 
     @property
     def running(self) -> bool:
@@ -471,62 +541,74 @@ class ToolGroup(MessageStatic):
 
     def add_call(self, name: str, label: str) -> None:
         self.calls.append(_GroupedCall(name, label))
-        self._refresh_content()
+        self._refresh()
 
     def take_result(self, name: str, result: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES) -> bool:
         """Give the first call of `name` still waiting its result; False when none is waiting."""
         if self.closed:
             return False
-        for call in self.calls:
+        for index, call in enumerate(self.calls):
             if call.name == name and call.result is None:
                 call.result, call.max_lines = result, max_lines
-                self._refresh_content()
+                if index < len(self.rows):
+                    self.rows[index].refresh_content()
+                self._refresh()
                 return True
         return False
 
     def close(self) -> None:
         if not self.closed:
             self.closed = True
-            self._refresh_content()
+            for row in self.rows:
+                row.closed = True
+                row.refresh_content()
+            self._refresh()
 
     def set_expanded(self, expanded: bool, full: bool | None = None) -> None:
+        """Open or close the group; a changed `full` (Ctrl+O) sets every row to its whole result or preview."""
         full = self.full if full is None else full
-        if (expanded, full) != (self.expanded, self.full):
-            self.expanded, self.full = expanded, full
-            self._refresh_content()
+        if (expanded, full) == (self.expanded, self.full):
+            return
+        if full != self.full:
+            for row in self.rows:
+                row.set_full(full)
+        self.expanded, self.full = expanded, full
+        self._refresh()
 
-    def _refresh_content(self) -> None:
-        if self.is_mounted:
-            _update_static(self, self._content())
+    def on_mount(self) -> None:
+        self._sync_rows()  # opened (Ctrl+O) before it was mounted
+
+    def _refresh(self) -> None:
+        content = self._header()
+        if self.header.is_mounted:
+            _update_static(self.header, content)
         else:
-            self.update(self._content(), layout=False)
+            self.header.update(content, layout=False)
+        self._sync_rows()
 
-    def _content(self) -> Text:
+    def _sync_rows(self) -> None:
+        """A row for each call not shown yet, once the group is open (and mounted: a widget takes no
+        children before), and every row shown or hidden with the group."""
+        if not self.is_mounted:
+            return
+        if self.expanded and len(self.rows) < len(self.calls):
+            new = [_ToolGroupCall(call, full=self.full, closed=self.closed) for call in self.calls[len(self.rows):]]
+            self.rows.extend(new)
+            self.mount(*new)
+        for row in self.rows:
+            if row.display != self.expanded:
+                row.display = self.expanded
+
+    def _header(self) -> Text:
         failed = sum(call.failed for call in self.calls)
         text = Text(self.prefix)
-        text.append("● ", style="#e06c75" if failed else ("#8ab4f8" if self.running else ""))
-        text.append(summarize_tool_calls([call.name for call in self.calls], self.running), style="#8a8a8a")
+        text.append("● ", style=TOOL_FAILED_COLOR if failed else (TOOL_RUNNING_COLOR if self.running else ""))
+        text.append(summarize_tool_calls([call.name for call in self.calls], self.running), style=TOOL_DIM_COLOR)
         if failed:
-            text.append(f" · {failed} failed", style="#e06c75")
+            text.append(f" · {failed} failed", style=TOOL_FAILED_COLOR)
         if not self.expanded:
-            text.append(" (ctrl+o to expand)", style="#8a8a8a")
-            return text
-        for call in self.calls:
-            text.append("\n  ")
-            text.append(call.label, style="#8a8a8a")
-            if call.result is None:
-                body = "  ⎿  (did not run)" if self.closed else "  ⎿  …"
-            else:
-                body = _tool_result_line(call.result, len(call.result) if self.full else call.max_lines)
-            body = "\n" + ("  " + body).replace("\n", "\n  ")  # the `⎿` under the call's label, not the `●`
-            text.append_text(Text.from_ansi(body, style="#8a8a8a") if "\033[" in body
-                             else Text(body, style="#8a8a8a"))
+            text.append(" (ctrl+o to expand)", style=TOOL_DIM_COLOR)
         return text
-
-    def on_click(self) -> None:
-        if self.screen.get_selected_text():
-            return  # the end of a mouse selection, not a click
-        self.set_expanded(not self.expanded, full=False if self.expanded else self.full)
 
 
 class _ToolGroups:
@@ -2218,6 +2300,8 @@ class DostuffTUI(App):
     .msg-loader { color: #8ab4f8; }
     .msg-thought { color: #8a8a8a; text-style: italic; }
     .msg-tool { }
+    ToolGroup.msg { height: auto; }
+    ToolGroup > Static { width: 100%; height: auto; }
     .msg-tool-result { color: #8a8a8a; margin-top: 0; }
     .msg-diff { margin-top: 0; }
     .msg-shell { color: #d7769f; }
@@ -2380,7 +2464,7 @@ class DostuffTUI(App):
         self._viewport_before_prompt: int | None = None
         self._picker_callback: Callable[[str], Awaitable[None]] | None = None
         self._message_target = "#msg-container"  # where _append mounts; the agent view swaps it while rendering
-        self._mount_batch: list[Static] | None = None  # _batched_mounts collects messages here
+        self._mount_batch: list[Widget] | None = None  # _batched_mounts collects messages here
         self._history_hidden = 0  # steps of a resumed session not rendered yet, above `#history-more`
         self._history_loading = False  # a chunk is mounted and its scroll offset not yet kept
         self._history_prepending = False  # rendering an older chunk: a prompt in it doesn't scroll to the end
@@ -5970,7 +6054,7 @@ class DostuffTUI(App):
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
-    def _mount_message(self, widget: Static) -> None:
+    def _mount_message(self, widget: Widget) -> None:
         """Mount above the loader (so the loader stays at the bottom). While the agent view renders a
         transcript, `_message_target` points at that view's container instead of the conversation.
         Inside `_batched_mounts` the widget is queued and mounted with the rest of the batch."""
@@ -5981,7 +6065,7 @@ class DostuffTUI(App):
             return
         self._mount_widgets([widget])
 
-    def _mount_widgets(self, widgets: list[Static]) -> None:
+    def _mount_widgets(self, widgets: list[Widget]) -> None:
         if not widgets:
             return
         msg_container = self.query_one(self._message_target, Vertical)
@@ -5993,7 +6077,7 @@ class DostuffTUI(App):
             msg_container.mount(*widgets)
 
     @contextlib.contextmanager
-    def _collected_messages(self) -> Iterator[list[Static]]:
+    def _collected_messages(self) -> Iterator[list[Widget]]:
         """The messages appended inside the block, built but not mounted: the caller mounts them."""
         outer, self._mount_batch = self._mount_batch, []
         try:
@@ -6009,7 +6093,7 @@ class DostuffTUI(App):
         if self._mount_batch is not None:  # already batching: the outer block mounts these too
             yield
             return
-        widgets: list[Static] = []
+        widgets: list[Widget] = []
         try:
             with self._collected_messages() as widgets:
                 yield

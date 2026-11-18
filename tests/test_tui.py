@@ -665,11 +665,20 @@ def test_tool_call_summary_wording(tui):
 
 
 def _group_text(group) -> str:
-    return group.render().plain
+    """The group as shown: its `●` line, then the rows of its calls while it is open."""
+    return "\n".join(w.render().plain for w in [group.header, *group.rows] if w.display)
+
+
+def _bullet_color(row) -> str:
+    """The colour of a call row's own `●`."""
+    text = row.content
+    start = text.plain.index("●")
+    return next((str(span.style) for span in text.spans if span.start <= start < span.end), "")
 
 
 def test_consecutive_tool_calls_fold_into_one_line(tui):
-    """A run of calls is one `● Read 2 files…` line; a click shows each call with its result, Ctrl+O all."""
+    """A run of calls is one `● Read 2 files…` line; a click shows each call on its own `●` row with a
+    preview, a click on a row shows that result in full, Ctrl+O all of them."""
     cli_tui = tui
 
     async def scenario():
@@ -683,6 +692,12 @@ def test_consecutive_tool_calls_fold_into_one_line(tui):
             await pilot.pause()
             group, = app.query(cli_tui.ToolGroup)
             assert _group_text(group) == "● Reading 2 files, running 1 shell command… (ctrl+o to expand)"
+            assert not group.rows  # a closed group is its one line: rows are made when it opens
+            group.header.on_click()  # opened while the calls run: each row is blue until its result comes
+            await pilot.pause()
+            assert [_bullet_color(row) for row in group.rows] == [cli_tui.TOOL_RUNNING_COLOR] * 3
+            group.header.on_click()
+            await pilot.pause()
             # the loop runs read-only calls first: results come back out of call order, matched by name
             emit("tool_result", "read_file: A")
             emit("tool_result", "read_file: " + "\n".join(f"b{i}" for i in range(20)))
@@ -691,14 +706,31 @@ def test_consecutive_tool_calls_fold_into_one_line(tui):
             assert not app.query(cli_tui.ToolResult)  # no `⎿` lines of their own
             assert _group_text(group) == "● Read 2 files, ran 1 shell command · 1 failed (ctrl+o to expand)"
 
-            group.on_click()
+            await pilot.click(group.header)
+            await pilot.pause()
             text = _group_text(group)
-            assert 'read_file(path="a.py")\n    ⎿  A\n  bash_command(command="pytest")\n    ⎿  Error: exit 1' in text
-            assert "b7" in text and "b8" not in text and "… +12 lines" in text
+            assert text.startswith("● Read 2 files, ran 1 shell command · 1 failed\n")
+            assert ('  ● read_file(path="a.py")\n    ⎿  A\n'
+                    '  ● bash_command(command="pytest")\n    ⎿  Error: exit 1') in text
+            assert "b7" in text and "b8" not in text and "… +12 lines (click to show all)" in text
+            a_row, bash_row, b_row = group.rows
+            assert [_bullet_color(r) for r in group.rows] == ["", cli_tui.TOOL_FAILED_COLOR, ""]
+            # a click on a call opens that one result, and the group stays open
+            await pilot.click(b_row)
+            await pilot.pause()
+            assert group.expanded and b_row.full and not a_row.full
+            assert "b19" in _group_text(group) and "(click to collapse)" in _group_text(group)
+            await pilot.click(b_row)
+            await pilot.pause()
+            assert group.expanded and "b19" not in _group_text(group)
+            await pilot.click(a_row)  # nothing hidden in its result: the click changes nothing
+            await pilot.pause()
+            assert group.expanded and not a_row.full
             await pilot.press("ctrl+o")
             assert "b19" in _group_text(group)
             await pilot.press("ctrl+o")
-            assert _group_text(group).endswith("(ctrl+o to expand)")
+            await pilot.pause()
+            assert _group_text(group).endswith("(ctrl+o to expand)") and not any(r.display for r in group.rows)
 
             # anything between two calls starts a new group; a plan keeps its own line
             emit("partial", "Now the tests.")
@@ -708,12 +740,14 @@ def test_consecutive_tool_calls_fold_into_one_line(tui):
             await pilot.pause()
             groups = list(app.query(cli_tui.ToolGroup))
             assert len(groups) == 2 and _group_text(groups[1]).startswith("● Searching for 1 pattern…")
-            assert any(str(w.content) == "● todo_write(todos=[])" for w in app.query(".msg-tool"))
+            assert any(str(w.content) == "● todo_write(todos=[])" for w in app.query("Static.msg-tool"))
             # the turn ends with the grep never run (Esc): the group stops saying it is running
             app._tool_groups.close()
-            groups[1].on_click()
+            groups[1].header.on_click()
+            await pilot.pause()
             assert _group_text(groups[1]).startswith("● Searched for 1 pattern\n")
             assert "⎿  (did not run)" in _group_text(groups[1])
+            assert _bullet_color(groups[1].rows[0]) == cli_tui.TOOL_DIM_COLOR
             # a result nothing is waiting for still shows
             emit("tool_result", "grep: late")
             await pilot.pause()
@@ -754,8 +788,9 @@ def test_resumed_session_folds_tool_calls_the_same_way(tui):
             assert _group_text(group) == ("● Read 1 file, searched for 1 pattern, ran 1 shell command"
                                           " (ctrl+o to expand)")
             assert not app.query(cli_tui.ToolResult)
-            group.on_click()
-            assert "bash_command(command=\"ls\")\n    ⎿  a.py" in _group_text(group)
+            group.header.on_click()
+            await pilot.pause()
+            assert "  ● bash_command(command=\"ls\")\n    ⎿  a.py" in _group_text(group)
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
