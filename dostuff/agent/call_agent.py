@@ -57,6 +57,16 @@ def _as_blocks(content: Any) -> list[Any]:
     return [{"type": "text", "text": content}] if content else []
 
 
+def _is_blank(content: Any) -> bool:
+    """No text worth sending: None, "", whitespace, or a block list made only of such text blocks."""
+    if isinstance(content, list):
+        return all(isinstance(b, dict) and b.get("type") == "text" and not str(b.get("text") or "").strip()
+                   for b in content)
+    if content is None or isinstance(content, str):
+        return not (content or "").strip()
+    return False
+
+
 def _join_user_content(first: Any, second: Any) -> Any:
     if isinstance(first, list) or isinstance(second, list):
         return _as_blocks(first) + _as_blocks(second)  # an image block must survive, so no flattening to text
@@ -70,10 +80,17 @@ def provider_messages(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     `meta` is dostuff's own (the turn-context marker), so it is dropped. Adjacent user steps become one message,
     because Perplexity and strict chat templates (vLLM's Gemma, Mistral) reject two in a row, and a turn's context
     step always sits right before its prompt. Same history, same result, so the cached prefix holds.
+
+    An assistant step that only calls tools goes out with `content: None`, not "": litellm turns an empty
+    text into a "[System: Empty message content sanitised ...]" block on Anthropic routes, which the model
+    then reads as its own words and starts repeating. Stored steps keep their "", so resumed sessions benefit too.
     """
     messages: list[dict[str, Any]] = []
     for step in steps:
         message = {k: v for k, v in step.items() if k != "meta"} if "meta" in step else step
+        if (message.get("role") == "assistant" and message.get("tool_calls") and message.get("content") is not None
+                and _is_blank(message["content"])):
+            message = {**message, "content": None}
         if messages and message.get("role") == "user" and messages[-1].get("role") == "user":
             messages[-1] = {**messages[-1], "content": _join_user_content(messages[-1].get("content"), message.get("content"))}
         else:
