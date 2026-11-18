@@ -1,10 +1,10 @@
 from typing import Any
 
-import litellm
 from litellm import acompletion
+from dostuff.config import get_config
 from dostuff.helpers.agent.attachments import content_text, hydrate
 from dostuff.tools.definitions import TOOL_SCHEMAS, default_tool_names
-from dostuff.lib.model import completion_kwargs, uses_explicit_prompt_caching
+from dostuff.lib.model import completion_kwargs, supports_reasoning, uses_explicit_prompt_caching
 from dostuff.lib.tracing import content_attr, tracer
 from opentelemetry.trace import Status, StatusCode
 
@@ -30,13 +30,6 @@ CACHE_BREAKPOINTS: list[dict[str, Any]] = [
 ]
 
 
-def _supports_reasoning(model: str) -> bool:
-    try:
-        return bool(litellm.supports_reasoning(model=model))
-    except Exception:
-        return False
-
-
 def build_request_kwargs(stream: bool) -> dict[str, Any]:
     """Model, api key and only the optional params this model/stream mode can use."""
     kwargs = completion_kwargs()
@@ -44,7 +37,12 @@ def build_request_kwargs(stream: bool) -> dict[str, Any]:
     kwargs["stream"] = stream
     if stream:
         kwargs["stream_options"] = {"include_usage": True}
-    if _supports_reasoning(kwargs["model"]) and kwargs["model"].startswith(("gemini/", "vertex_ai/")):
+    effort = get_config().reasoning_effort
+    if effort != "auto" and supports_reasoning(kwargs["model"]):
+        # litellm maps this to each provider's own knob (Anthropic budget, Gemini thinking budget, OpenAI effort);
+        # "off" is its "none". For Gemini it also decides whether thoughts are streamed.
+        kwargs["reasoning_effort"] = "none" if effort == "off" else effort
+    elif supports_reasoning(kwargs["model"]) and kwargs["model"].startswith(("gemini/", "vertex_ai/")):
         # Ask Gemini to stream its thoughts (rendered as partial_thought)
         kwargs["thinking_config"] = {"include_thoughts": True}
     if uses_explicit_prompt_caching():
