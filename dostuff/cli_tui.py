@@ -17,7 +17,7 @@ import uuid
 from bisect import bisect_right
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, Literal
 from textual.app import App, ComposeResult
 from textual.geometry import Region
 from textual.message import Message
@@ -122,6 +122,10 @@ QUEUE_BAR_MAX_ROWS = 4  # queued prompts listed above the input; /queue lists th
 QUEUE_DETAIL_LINES = 8  # rows of a queued prompt shown in its picker
 PREVIEW_CHARS_PER_LINE = 200  # preview char budget = lines * this, so one giant line can't flood the screen
 PICKER_MAX_SESSIONS = 9  # /resume picker: number keys reach every option
+# A resumed session paints its last steps; older ones load a chunk at a time when the user scrolls to the top
+HISTORY_TAIL_STEPS = 60
+HISTORY_CHUNK_STEPS = 120
+HISTORY_LOAD_ROWS = 2  # this close to the top, the next older chunk loads
 PICKER_MAX_VISIBLE = 10  # longer option lists scroll with the cursor
 EDIT_PROMPT_ESC_SECONDS = 1.5  # Esc, then Esc again within this, takes back the last prompt
 QUIT_HINT = "ctrl+q or /exit to quit"  # flashed when Esc / Ctrl+C has nothing to do
@@ -141,9 +145,12 @@ ASK_EMPTY_OTHER_HINT = "type an answer (Esc goes back to the options)"
 # under the ansi-dark theme a hex `on` colour snaps to black, which is invisible on a dark terminal.
 ASK_CURRENT_TAB = "bold #e5c07b"
 # Gemini sends reasoning as whole summary paragraphs ~1 s apart; each new chunk is typed out
-# over THOUGHT_REVEAL_TICKS ticks so it reads like streaming instead of popping in as a block
-THOUGHT_REVEAL_INTERVAL_S = 0.03
-THOUGHT_REVEAL_TICKS = 25
+# over THOUGHT_REVEAL_TICKS ticks so it reads like streaming instead of popping in as a block.
+# A tick that wraps onto a new row re-lays-out the screen (see _update_static), so not every 30 ms
+THOUGHT_REVEAL_INTERVAL_S = 0.1
+THOUGHT_REVEAL_TICKS = 8
+# Streamed answer text reaches the screen at most this often; the chunks in between are coalesced
+STREAM_RENDER_INTERVAL_S = 1 / 15
 
 
 def _mcp_files_signature() -> tuple[tuple[int, int] | None, ...]:
@@ -215,7 +222,42 @@ def _tool_result_line(text: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES) -> 
     return "  ⎿  " + _preview(text, max_lines).replace("\n", "\n     ")
 
 
-class SelectableStatic(Static):
+class MessageStatic(Static):
+    """A conversation message: its height at a width is measured once per content, not on every layout.
+
+    Textual drops a widget's own height cache on every `refresh()`, and a newly mounted message refreshes,
+    so the next screen layout wrapped every message's text again. A resumed session lays out its
+    whole transcript at least twice before the first paint, and that re-wrapping was most of the wait.
+    The key is the content object (a new one on every `update()`) and, for a Text, its length, which
+    changes when it is appended to in place."""
+
+    _height_cache: tuple[object, int, int, int] | None = None
+
+    def get_content_height(self, container: Any, viewport: Any, width: int) -> int:
+        content = self.content
+        length = len(content.plain) if isinstance(content, Text) else -1
+        cached = self._height_cache
+        if cached is not None and cached[0] is content and cached[1] == width and cached[2] == length:
+            return cached[3]
+        height = self._measure_height(container, viewport, width)
+        self._height_cache = (content, width, length, height)
+        return height
+
+    def _measure_height(self, container: Any, viewport: Any, width: int) -> int:
+        return super().get_content_height(container, viewport, width)
+
+
+class HistoryMore(Static):
+    """`↑ N earlier steps` at the top of a resumed session; a click loads the next older chunk too (when
+    the shown steps fit on screen there is nothing to scroll)."""
+
+    def on_click(self) -> None:
+        load = getattr(self.app, "_load_older_history", None)
+        if load is not None:
+            load()
+
+
+class SelectableStatic(MessageStatic):
     """Static whose Rich renderables (Markdown) are flattened to Text at the current width.
 
     Textual can only select Text / Content, so a plain Static holding RichMarkdown can't be
@@ -245,14 +287,49 @@ class SelectableStatic(Static):
         return text
 
     def render(self) -> Any:
-        flat = self._flat(self.content_size.width)
+        if not isinstance(self.content, RichMarkdown):
+            return super().render()
+        # The width from `outer_size`, not `content_size`: that looks the widget up in the compositor's full
+        # map, which a reflow has just invalidated, so each message's render rebuilt the whole
+        # conversation's layout (a long resumed session took seconds to paint).
+        flat = self._flat(self.outer_size.width - self.styles.gutter.width)
         return flat if flat is not None else super().render()
 
-    def get_content_height(self, container: Any, viewport: Any, width: int) -> int:
+    def _measure_height(self, container: Any, viewport: Any, width: int) -> int:
         flat = self._flat(width)
         if flat is not None:
             return len(flat.plain.split("\n"))
-        return super().get_content_height(container, viewport, width)
+        return super()._measure_height(container, viewport, width)
+
+
+def _update_static(widget: Static, content: Any, relayout: bool = True) -> bool:
+    """`widget.update(content)`, laying out the screen only when the widget's size changes.
+
+    Textual answers a layout refresh by arranging the whole screen, every message of the conversation
+    included: ~0.4 s at 1,200 messages. The loader tick, streamed text and the status bar update many
+    times a second during a turn and mostly keep their size, so for them that pass was pure lag (typing
+    and scrolling waited behind it). Only this widget is measured here, from `outer_size`: `.size` would
+    look the widget up in the compositor's full map, itself a walk of the whole conversation.
+
+    With `relayout=False` a size change is not laid out either: the widget keeps its old size (new rows
+    past it stay hidden) and True is returned, so the caller can lay it out later."""
+    outer = widget.outer_size
+    parent = widget.parent
+    if not widget.is_mounted or not outer or not isinstance(parent, Widget):
+        widget.update(content)  # never laid out (or hidden): nothing to compare against
+        return False
+    widget.update(content, layout=False)  # also clears the widget's cached content size
+    styles, gutter, viewport = widget.styles, widget.styles.gutter, widget.app.size
+    width = outer.width - gutter.width
+    resized = (
+        (styles.width is not None and styles.width.is_auto
+         and widget.get_content_width(parent.outer_size, viewport) != width)
+        or ((styles.height is None or styles.height.is_auto)
+            and widget.get_content_height(parent.outer_size, viewport, width) != outer.height - gutter.height)
+    )
+    if resized and relayout:
+        widget.refresh(layout=True)
+    return resized and not relayout
 
 
 def _copy_to_clipboard(app: App, text: str) -> None:
@@ -270,7 +347,7 @@ def _copy_to_clipboard(app: App, text: str) -> None:
     threading.Thread(target=run_clip, daemon=True).start()
 
 
-class ToolResult(Static):
+class ToolResult(MessageStatic):
     """A tool or shell result: its first max_lines lines, or all of it once expanded.
 
     A click toggles this one; Ctrl+O toggles every result (DostuffTUI.action_toggle_tool_results).
@@ -325,7 +402,7 @@ class StickyPrompt(Static):
         self.target = target
         self.display = target is not None
         if target is not None:
-            self.update(" ".join(str(target.content).split()))
+            _update_static(self, " ".join(str(target.content).split()))
             self.set_class(target.has_class("msg-shell"), "-shell")
 
     def on_click(self) -> None:
@@ -1954,7 +2031,12 @@ class DostuffTUI(App):
     # grey band (like Claude Code) so turns are easy to find when scrolling.
     CSS = """
     Screen { background: transparent; }
-    #messages { height: 1fr; background: transparent; scrollbar-size-vertical: 1; layers: base sticky; }
+    /* scrollbar-gutter: stable keeps the messages' width fixed when the conversation first overflows, so a
+       long resumed session is wrapped once instead of again at the narrower width (MessageStatic). */
+    #messages {
+        height: 1fr; background: transparent; scrollbar-size-vertical: 1; scrollbar-gutter: stable;
+        layers: base sticky;
+    }
     #msg-container { height: auto; min-height: 100%; }
     .msg { width: 100%; height: auto; padding: 0 1; margin-top: 1; background: transparent; }
     .msg-user { color: #d0d0d0; background: #373737; }
@@ -2105,6 +2187,9 @@ class DostuffTUI(App):
         self._thought_shown = 0  # chars of the live thought text revealed so far
         self._thought_step = 1
         self._thought_timer: Timer | None = None
+        self._answer_timer: Timer | None = None  # a coalesced answer render, due within STREAM_RENDER_INTERVAL_S
+        self._answer_rendered_at = 0.0  # time.monotonic() of the last one
+        self._stream_growth_held = False  # streamed rows not laid out while scrolled up (_render_stream_text)
         self._last_streamed_answer: str = ""
         self._prompt_queue: list = []
         # Mid-turn steering (plan/2026-11-04-steering): one queue per app, filled at submit and drained by
@@ -2132,6 +2217,10 @@ class DostuffTUI(App):
         self._viewport_before_prompt: int | None = None
         self._picker_callback: Callable[[str], Awaitable[None]] | None = None
         self._message_target = "#msg-container"  # where _append mounts; the agent view swaps it while rendering
+        self._mount_batch: list[Static] | None = None  # _batched_mounts collects messages here
+        self._history_hidden = 0  # steps of a resumed session not rendered yet, above `#history-more`
+        self._history_loading = False  # a chunk is mounted and its scroll offset not yet kept
+        self._history_prepending = False  # rendering an older chunk: a prompt in it doesn't scroll to the end
         self._agent_view_run: "AgentRun | None" = None  # the agent whose transcript the agent view shows
         self._agent_view_rendered = 0  # steps of it already rendered there
         self._agent_view_timer: Timer | None = None
@@ -2228,12 +2317,33 @@ class DostuffTUI(App):
             # Set directly; widget.focus() would defer one more message hop
             self.screen.set_focus(inp)
 
+    def _scrolled_up(self) -> bool:
+        """The user has scrolled the conversation away from its end."""
+        messages = self.query_one("#messages", VerticalScroll)
+        return messages._anchor_released and not messages.is_vertical_scroll_end
+
     def _update_jump_to_bottom(self) -> None:
         """Show the jump-to-bottom bar only while the user has scrolled away from the end."""
-        messages = self.query_one("#messages", VerticalScroll)
-        self.query_one("#jump-bottom", JumpToBottom).display = (
-            messages._anchor_released and not messages.is_vertical_scroll_end
-        )
+        scrolled_up = self._scrolled_up()
+        self.query_one("#jump-bottom", JumpToBottom).display = scrolled_up
+        if not scrolled_up:
+            self._release_stream_growth()
+
+    def _render_stream_text(self, widget: Static, content: Any) -> None:
+        """Draw streamed text. While the user is scrolled up, a new row is not laid out: that is a pass
+        over the whole conversation (~0.4 s at 1,200 messages) for text below what they are reading,
+        and the scrolling stuttered behind it. The rows are laid out once they are back at the end."""
+        if _update_static(widget, content, relayout=not self._scrolled_up()):
+            self._stream_growth_held = True
+
+    def _release_stream_growth(self) -> None:
+        """Lay out the streamed text whose new rows `_render_stream_text` held back."""
+        if not self._stream_growth_held:
+            return
+        self._stream_growth_held = False
+        for widget in self._stream_widgets.values():
+            if widget.parent is not None:
+                widget.refresh(layout=True)
 
     def on_text_selected(self, event: TextSelected) -> None:
         """Select to copy, like Claude Code: releasing the mouse copies the selection."""
@@ -2302,6 +2412,7 @@ class DostuffTUI(App):
         messages = self.query_one("#messages", VerticalScroll)
         messages.anchor()
         self.watch(messages, "scroll_y", self._update_jump_to_bottom, init=False)
+        self.watch(messages, "scroll_y", self._maybe_load_older_history, init=False)
         inp = self.query_one("#input", EnterSubmits)
         inp.focus()
         self.watch(self.screen, "focused", self._keep_input_focus, init=False)
@@ -2586,8 +2697,81 @@ class DostuffTUI(App):
         self._update_status(context_window_percent=f"{percent:.1f}%/{limit_str}" if limit_str else f"{percent:.1f}%")
 
     def _render_history(self) -> None:
-        for step in self.steps_history:
-            self._render_history_step(step)
+        """Render the end of the session. The older steps wait behind a line at the top and load a chunk at
+        a time as the user scrolls up to it: painting a long session's every message took seconds."""
+        self._remove_history_more()
+        start = self._history_chunk_start(len(self.steps_history), HISTORY_TAIL_STEPS)
+        self._history_hidden = start
+        with self._batched_mounts():
+            if start:
+                self._mount_message(HistoryMore(self._history_more_text(), id="history-more",
+                                                classes="msg msg-system", markup=False))
+            for step in self.steps_history[start:]:
+                self._render_history_step(step)
+
+    def _history_chunk_start(self, end: int, count: int) -> int:
+        """Where the chunk of about `count` steps that ends at `end` starts: never on a tool result, so a
+        call's `⎿` result stays under its `●` line."""
+        start = max(0, end - count)
+        while start > 0 and self.steps_history[start].get("role") == "tool":
+            start -= 1
+        return start
+
+    def _history_more_text(self) -> str:
+        n = self._history_hidden
+        return f"↑ {n} earlier step{'s' if n != 1 else ''} · scroll up or click to load"
+
+    def _remove_history_more(self) -> None:
+        self._history_hidden = 0
+        for widget in self.query("#history-more"):
+            widget.remove()
+
+    def _maybe_load_older_history(self) -> None:
+        """scroll_y watcher: near the top of the conversation, load the next older chunk."""
+        if self._history_hidden and self.query_one("#messages", VerticalScroll).scroll_y <= HISTORY_LOAD_ROWS:
+            self._load_older_history()
+
+    def _load_older_history(self) -> None:
+        """Mount the chunk of steps just above what is shown, under the `↑ N earlier steps` line, and move
+        the scroll offset by the height it adds, so the rows the user was reading stay where they were."""
+        if self._history_hidden <= 0 or self._history_loading:
+            return
+        more = next(iter(self.query("#history-more").results(HistoryMore)), None)
+        if more is None or not isinstance(more.parent, Widget):
+            self._history_hidden = 0  # the conversation was cleared under it
+            return
+        messages = self.query_one("#messages", VerticalScroll)
+        end = self._history_hidden
+        start = self._history_chunk_start(end, HISTORY_CHUNK_STEPS)
+        self._history_prepending = True
+        try:
+            with self._collected_messages() as widgets:
+                for step in self.steps_history[start:end]:
+                    self._render_history_step(step)
+        finally:
+            self._history_prepending = False
+        self._history_hidden = start
+        siblings = list(more.parent.children)
+        index = siblings.index(more)
+        anchor = siblings[index + 1] if index + 1 < len(siblings) else None  # the oldest message shown so far
+        old_y, old_scroll = (anchor.virtual_region.y, messages.scroll_y) if anchor is not None else (0, 0.0)
+        if widgets:
+            more.parent.mount(*widgets, after=more)
+        if start:
+            more.update(self._history_more_text())
+        else:
+            more.remove()
+        if anchor is None or not widgets:
+            return
+        self._history_loading = True
+
+        def keep_place() -> None:
+            self._history_loading = False
+            moved = anchor.virtual_region.y - old_y
+            if moved > 0:
+                messages.scroll_to(y=old_scroll + moved, animate=False, immediate=True)
+
+        self.call_after_refresh(keep_place)
 
     def _warn_if_model_unconfigured(self) -> None:
         if not self._backend_ready.is_set():
@@ -3726,10 +3910,11 @@ class DostuffTUI(App):
             if new or show_result:
                 self._message_target = "#agent-view-msgs"
                 try:
-                    for step in new:
-                        self._render_history_step(step)
-                    if show_result:
-                        self._append(run.result or "", msg_type="agent")
+                    with self._batched_mounts():
+                        for step in new:
+                            self._render_history_step(step)
+                        if show_result:
+                            self._append(run.result or "", msg_type="agent")
                 finally:
                     self._message_target = "#msg-container"
                 self._agent_view_rendered = len(steps) or (1 if show_result else 0)
@@ -5074,7 +5259,7 @@ class DostuffTUI(App):
     def _render_loader(self) -> None:
         widget = self._loader_widget
         if widget is not None and widget.parent is not None:
-            widget.update(self._loader_text())
+            _update_static(widget, self._loader_text())  # once a second: the elapsed time
 
     def _stop_loader(self, loader_widget: Static | None) -> None:
         """Remove the loader widget from the conversation stream."""
@@ -5110,13 +5295,34 @@ class DostuffTUI(App):
             self._stream_widgets[kind] = widget
             if kind == "thought":
                 self._thought_shown = 0
+            else:
+                self._answer_rendered_at = time.monotonic()
             self._mount_message(widget)
         elif kind == "answer":
-            widget.update(text)
+            # A provider sends a chunk every few ms; drawing each one kept the UI thread busy. The first
+            # chunk shows at once, later ones at most every STREAM_RENDER_INTERVAL_S with the latest text
+            wait = self._answer_rendered_at + STREAM_RENDER_INTERVAL_S - time.monotonic()
+            if wait <= 0:
+                self._render_streamed_answer()
+            elif self._answer_timer is None:
+                self._answer_timer = self.set_timer(wait, self._render_streamed_answer)
         if kind == "thought":
             self._thought_step = max(1, (len(text) - self._thought_shown) // THOUGHT_REVEAL_TICKS)
             if self._thought_timer is None:
                 self._thought_timer = self.set_interval(THOUGHT_REVEAL_INTERVAL_S, self._reveal_thought)
+
+    def _render_streamed_answer(self) -> None:
+        """Draw the latest streamed answer text (now, or when the coalescing timer fires)."""
+        self._stop_answer_timer()
+        self._answer_rendered_at = time.monotonic()
+        widget = self._stream_widgets.get("answer")
+        if widget is not None and widget.parent is not None:
+            self._render_stream_text(widget, self._stream_texts.get("answer", ""))
+
+    def _stop_answer_timer(self) -> None:
+        if self._answer_timer is not None:
+            self._answer_timer.stop()
+            self._answer_timer = None
 
     def _reveal_thought(self) -> None:
         """Timer tick: show the next slice of the live thought text."""
@@ -5126,7 +5332,7 @@ class DostuffTUI(App):
             self._stop_thought_reveal()
             return
         self._thought_shown = min(len(target), self._thought_shown + self._thought_step)
-        widget.update(_thought_text(target[:self._thought_shown]))
+        self._render_stream_text(widget, _thought_text(target[:self._thought_shown]))
         if self._thought_shown >= len(target):
             self._stop_thought_reveal()
 
@@ -5138,6 +5344,8 @@ class DostuffTUI(App):
     def _finish_stream_widgets(self, interrupted: bool = False) -> None:
         """End of one model call: render the answer as markdown and detach the live widgets."""
         self._stop_thought_reveal()
+        self._stop_answer_timer()  # the update below draws the whole text
+        self._stream_growth_held = False  # ...and lays it out, held rows included
         thought_widget = self._stream_widgets.get("thought")
         if thought_widget is not None and thought_widget.parent is not None:
             thought_widget.update(_thought_text(self._stream_texts.get("thought", "")))
@@ -5588,30 +5796,63 @@ class DostuffTUI(App):
 
     def _mount_message(self, widget: Static) -> None:
         """Mount above the loader (so the loader stays at the bottom). While the agent view renders a
-        transcript, `_message_target` points at that view's container instead of the conversation."""
+        transcript, `_message_target` points at that view's container instead of the conversation.
+        Inside `_batched_mounts` the widget is queued and mounted with the rest of the batch."""
+        if self._mount_batch is not None:
+            self._mount_batch.append(widget)
+            return
+        self._mount_widgets([widget])
+
+    def _mount_widgets(self, widgets: list[Static]) -> None:
+        if not widgets:
+            return
         msg_container = self.query_one(self._message_target, Vertical)
         loader = self._loader_widget
         # Children, not is_mounted: a loader mounted moments ago (before the hooks' trust question) isn't yet
         if loader is not None and loader.parent is msg_container and loader in msg_container.children:
-            msg_container.mount(widget, before=loader)
+            msg_container.mount(*widgets, before=loader)
         else:
-            msg_container.mount(widget)
+            msg_container.mount(*widgets)
+
+    @contextlib.contextmanager
+    def _collected_messages(self) -> Iterator[list[Static]]:
+        """The messages appended inside the block, built but not mounted: the caller mounts them."""
+        outer, self._mount_batch = self._mount_batch, []
+        try:
+            yield self._mount_batch
+        finally:
+            self._mount_batch = outer
+
+    @contextlib.contextmanager
+    def _batched_mounts(self) -> Iterator[None]:
+        """Mount every message appended inside the block in one call. Textual walks the container's
+        children on each mount, so a resumed session's transcript mounted one widget at a time is
+        quadratic in its length; one mount of the lot is not."""
+        if self._mount_batch is not None:  # already batching: the outer block mounts these too
+            yield
+            return
+        widgets: list[Static] = []
+        try:
+            with self._collected_messages() as widgets:
+                yield
+        finally:
+            self._mount_widgets(widgets)
 
     def _append(self, line: str, msg_type: str = "agent") -> None:
         """Add a message widget; msg_type picks its CSS class (text color, spacing)."""
         known = ("agent", "user", "confirm", "system", "error", "tool", "tool-result", "diff", "shell", "shell-output")
         css_class = f"msg msg-{msg_type if msg_type in known else 'agent'}"
-        if msg_type in ("user", "shell"):
+        if msg_type in ("user", "shell") and not self._history_prepending:
             # Sending a message jumps back to the bottom even if the user had scrolled up
             self.query_one("#messages", VerticalScroll).anchor()
         if msg_type == "user":
-            msg = Static(Text("> " + line.replace("\n", "\n  ")), classes=css_class, markup=False)
+            msg = MessageStatic(Text("> " + line.replace("\n", "\n  ")), classes=css_class, markup=False)
         elif msg_type == "agent" and line:
             msg = SelectableStatic(RichMarkdown(line), classes=css_class, markup=False)
         elif "\033[" in line:
-            msg = Static(Text.from_ansi(line), classes=css_class, markup=False)
+            msg = MessageStatic(Text.from_ansi(line), classes=css_class, markup=False)
         else:
-            msg = Static(line, classes=css_class, markup=False)
+            msg = MessageStatic(line, classes=css_class, markup=False)
         self._mount_message(msg)
 
     def _append_tool_result(self, text: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES,
@@ -5794,7 +6035,7 @@ class DostuffTUI(App):
             else:
                 break  # one item left: Static crops it
         try:
-            self.query_one("#status", Static).update(line())
+            _update_static(self.query_one("#status", Static), line())  # on every usage event
         except Exception:
             pass  # not mounted yet / shutting down
 
@@ -5812,7 +6053,7 @@ class DostuffTUI(App):
             return  # not mounted yet / shutting down
         bar.display = text is not None
         if text is not None:
-            bar.update(text)
+            _update_static(bar, text)
         self._render_status()  # the status items get more or less room
 
     def _agents_bar_text(self) -> Text | None:
@@ -5836,7 +6077,7 @@ class DostuffTUI(App):
             return  # not mounted yet / shutting down
         bar.display = text is not None
         if text is not None:
-            bar.update(text)
+            _update_static(bar, text)
         self._render_status()
 
     def action_show_agents(self) -> None:
