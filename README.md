@@ -196,7 +196,7 @@ In the TUI:
 | `/skills` / `/skills reload` | The skills this session knows: each one's folder, and which are manual only / re-read them now and rebuild the system prompt (reports what was added and removed). See [Skills](#skills) |
 | `/exit`       | Save the session and quit           |
 | `/clear`      | Start a new session; the old one stays resumable |
-| `/resume [<id>]` | Pick another session from this directory (or switch to the given one) |
+| `/resume [<id>]` | Pick another session from this directory (or switch to the given one). A long session shows its last 60 steps under an `↑ N earlier steps` line; scroll to the top or click the line to load older ones |
 | `/fork [title] [--worktree]` | Copy this session into a new one and switch to it; the original is unchanged |
 | `/worktree [name]` / `/worktree exit` | Move the session into a new git worktree on branch `dostuff/<name>` / leave it (removed if unchanged, otherwise keep or remove) |
 | `/permissions [mode]` | Show or change the permission mode for this session (`ask`, `allowlist`, `auto`, `plan`) |
@@ -423,8 +423,12 @@ every question has an answer, then it brightens and the parenthetical hint goes 
   in the tab strip; **Enter** (or `o`) on it takes the input, and `←`/`Tab` still move between questions — so
   landing on a free-text question never traps you in the input. A call where *every* question is free text skips
   the panel entirely and the input takes each answer in turn, with the last Enter as the submission.
-- **Esc** cancels the questions and ends the turn, like Esc on an approval prompt. **Ctrl+Q** / `/exit` with a
+- **Esc** while typing an `Other` answer goes back to the options, recording nothing and keeping the answers you
+  already gave. Esc on the options cancels the questions and ends the turn, like Esc on an approval prompt (in a
+  call with no panel, where every question is free text, Esc in the input cancels). **Ctrl+Q** / `/exit` with a
   question open cancel it first and then quit.
+- Long labels and descriptions wrap in full rather than being cut, but the model is told to keep each part short:
+  the question one sentence, a label 1-5 words, a description about 15 words at most.
 - Up to 4 questions per call. The prompt tells the model when to ask: when the answer changes what it builds and
   the repo can't tell it; never to confirm a plan, to ask permission, or for anything `grep` / `read_file` answers.
 
@@ -635,9 +639,17 @@ tools: Read, Grep, Glob, Bash   # omit for every subagent tool
 model: fast                     # inherit (default), an alias from agents.models, or a litellm model string
 max_iterations: 30              # optional; default agents.max_iterations
 omit_memory: true               # optional; leave out your saved facts (default false)
+skills: code-style, testing     # optional; these skills' instructions go into its system prompt
 ---
 You are a code reviewer. Report findings as a list, most severe first.
 ```
+
+`skills:` (a list, or names separated by commas) puts each named skill's `SKILL.md` instructions into the agent's
+system prompt, after the type's own body, so the agent follows them without having to load them first. At most 32
+skills and `agents.max_preload_chars` characters (default 60000) go in. A skill that isn't found, is manual-only or
+can't be read is skipped, and so is everything after the first one that doesn't fit. The run's report starts with a
+`[warning] Skills not preloaded: ...` line naming each skipped skill and the reason. `fork` has no type, so it
+preloads nothing.
 
 `tools:` takes DoStuff names or Claude Code's, so Claude Code agent files work unchanged:
 
@@ -694,6 +706,7 @@ agents:
   wake_on_end: true         # a finished background agent resumes the idle TUI
   read_claude_agents: true  # also load .claude/agents/
   explore_model: inherit    # model of the built-in explore type
+  max_preload_chars: 60000  # most skill text an agent file's skills: puts in its system prompt
   models:                   # aliases for model: and model=
     fast: anthropic/claude-haiku-5-5
 ```
