@@ -3197,7 +3197,7 @@ def _view_agent_texts(app):
 
 
 def test_agents_command(tui, agents, fake_model):
-    """/agents lists the session's agents (running first); picking one shows its transcript in the agent view (in
+    """/agents lists the session's agents (newest first); picking one shows its transcript in the agent view (in
     place of the conversation, never in it) and offers Stop it (running) or Answer approval (waiting); loaded
     interrupted agents are listed too (subagents T5.7)."""
     from conftest import fake_response, fake_tool_call
@@ -3236,7 +3236,7 @@ def test_agents_command(tui, agents, fake_model):
             submit("/agents")
             await _until(pilot, app._picker_open)
             inp.text = "typing"  # submitting cleared it
-            assert [v for v, _ in picker._options] == [running.id, waiting.id, done.id]
+            assert [v for v, _ in picker._options] == [waiting.id, running.id, done.id]
             labels = dict(picker._options)
             for part in (done.id, "do D", "general-purpose", "completed", "tokens", "$", "foreground"):
                 assert part in labels[done.id], (part, labels[done.id])
@@ -3252,7 +3252,7 @@ def test_agents_command(tui, agents, fake_model):
             assert _texts(app) == main_before  # nothing of the agent's lands in the conversation
             assert [v for v, _ in picker._options] == ["type", "back"]
             await app._picker_callback("back")
-            await _until(pilot, lambda: [v for v, _ in picker._options] == [running.id, waiting.id, done.id])
+            await _until(pilot, lambda: [v for v, _ in picker._options] == [waiting.id, running.id, done.id])
             assert not app._agent_view_open() and app.query_one("#conversation").display
 
             # a running agent's view fills in live, and Esc closes it
