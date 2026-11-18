@@ -15,7 +15,7 @@ from dostuff.agent.subagents import current_agent, read_only_shell
 from dostuff.agent.subagents.adapter import SubagentAdapter
 from dostuff.agent.subagents.definitions import UnknownAgentType, get_definitions, resolve_model
 from dostuff.agent.subagents.fork import FORK_TYPE, MODEL_IGNORED, ForkContext, fork_first_step
-from dostuff.agent.subagents.prompt import build_subagent_prompt, worktree_note
+from dostuff.agent.subagents.prompt import Preloaded, build_subagent_prompt, load_preloaded, worktree_note
 from dostuff.config import DEFAULT_AGENTS_MAX_CONCURRENT
 from dostuff.agent.subagents.run import _close_worktree, resolve_subagent_tools, run_agent_loop
 from dostuff.helpers.hooks.events import SUBAGENT_START_CONTEXT, subagent_start
@@ -404,6 +404,7 @@ class AgentRegistry:
         from dostuff.config import get_config
         agent_def = get_definitions().get(run.agent_type) or get_definitions()["general-purpose"]
         fork = run.fork if run.agent_type == FORK_TYPE else None
+        preloaded = Preloaded()  # a fork has no type, so no `skills:` (subagent capabilities D2)
         if fork is not None:
             requested: list[str] | None = fork.fork_tools()  # the main agent's tools minus D12 (D11)
         else:
@@ -429,7 +430,8 @@ class AgentRegistry:
                 first_steps = [*fork.history, fork_first_step(ctx.prompt, note)]
                 fork.history = []  # it lives in run.history now
         else:
-            system, baseline = await build_subagent_prompt(agent_def, run.worktree)
+            preloaded = await asyncio.to_thread(load_preloaded, agent_def)
+            system, baseline = await build_subagent_prompt(agent_def, run.worktree, preloaded)
             kinds = SKILL_KINDS
             first_steps = [{"role": "user", "content": ctx.prompt}]
         # Typed agents read the main session's facts, keyed on its project even in a worktree (memory recall D14)
@@ -470,6 +472,8 @@ class AgentRegistry:
                 report = f"{report}\n\n{note}" if report else note
         if dropped:
             report = f"[warning] Tools not granted to the subagent (restricted or unknown): {', '.join(dropped)}\n\n{report}"
+        if preloaded.skipped:
+            report = f"[warning] Skills not preloaded: {', '.join(preloaded.skipped)}\n\n{report}"
         if ctx.warnings:
             report = "\n".join(ctx.warnings) + f"\n\n{report}"
         return report, status

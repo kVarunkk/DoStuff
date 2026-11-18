@@ -80,6 +80,16 @@ def mention_line(skills: list[dict[str, Any]]) -> str:
     return f"Skill{'s' if len(skills) > 1 else ''} available for this message: " + ", ".join(s["name"] for s in skills)
 
 
+def skill_body(location: Path) -> str:
+    """A SKILL.md without its frontmatter. Raises OSError if the file can't be read."""
+    return _FRONTMATTER_RE.sub("", location.read_text(encoding="utf-8"), count=1).strip()
+
+
+def skill_block(name: str, location: Path, body: str) -> str:
+    """The wrapper a skill's text travels in, for a `/name` run and for a subagent's preloaded skills alike."""
+    return f'<skill name="{name}" path="{location}">\n{body}\n</skill>'
+
+
 def skill_prompt(skill: dict[str, Any], args: str) -> str:
     """The user message for a skill run: its SKILL.md body (frontmatter dropped), then the args.
     For a custom command, its template with $ARGUMENTS filled in. Raises OSError if the file
@@ -87,10 +97,10 @@ def skill_prompt(skill: dict[str, Any], args: str) -> str:
     if skill.get("kind") == "command":
         return command_prompt(skill, args)
     location = Path(skill["location"])
-    body = _FRONTMATTER_RE.sub("", location.read_text(encoding="utf-8"), count=1).strip()
+    body = skill_body(location)
     return (
         f"The user ran the /{skill['name']} skill. Follow its instructions below. Files it refers to "
         f"are relative to {location.parent}.\n"
-        f'<skill name="{skill["name"]}" path="{location}">\n{body}\n</skill>\n\n'
+        f"{skill_block(skill['name'], location, body)}\n\n"
         + (f"Arguments: {args}" if args else "(no arguments)")
     )

@@ -67,6 +67,7 @@ agents:
   wake_on_end: true         # a background agent that ends resumes the idle TUI (at most 3 turns in a row)
   read_claude_agents: true  # also load agent files from .claude/agents/
   explore_model: inherit    # model of the built-in explore type; inherit = the main model
+  max_preload_chars: 60000  # most characters of skill text an agent file's `skills:` puts in its system prompt
   models:                   # aliases for an agent's `model:` and the agent tool's model=
     # fast: anthropic/claude-haiku-5-5
 
