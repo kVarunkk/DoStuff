@@ -21,21 +21,21 @@ from dostuff.helpers.ui.ask_answers import (
     CANCELLED_ASK_RESULT, UNAVAILABLE_ASK_RESULT, NoUserAvailable, format_answers, one_line,
 )
 
-# Limits (D4). The tool refuses past them rather than truncating a question away.
+# Limits (D4). The tool refuses past them rather than truncating a question away. Labels and descriptions
+# have no length cap: the panel wraps them in full, and a cut one hides what the user is choosing between.
 ASK_MAX_QUESTIONS = 4
 ASK_MAX_OPTIONS = 4
 ASK_HEADER_CHARS = 12
-ASK_LABEL_CHARS = 60
-ASK_DESCRIPTION_CHARS = 200
 
 
 class AskOption(TypedDict):
     label: Annotated[str, Field(description="What the user picks, 1-5 words.")]
-    description: NotRequired[Annotated[str, Field(description="The trade-off, one line.")]]
+    description: NotRequired[Annotated[str, Field(description="The trade-off in one short phrase (about 15 words "
+                                                              "at most), not a paragraph.")]]
 
 
 class AskQuestion(TypedDict):
-    question: Annotated[str, Field(description="The question, one sentence, ending with '?'.")]
+    question: Annotated[str, Field(description="The question: one short sentence ending with '?', no background.")]
     header: NotRequired[Annotated[str, Field(description="Short tab label, up to 12 chars.")]]
     options: NotRequired[Annotated[list[AskOption], Field(description="2-4 choices; omit for a free-text answer.")]]
     multi_select: NotRequired[Annotated[bool, Field(description="Allow several picks; needs options. Default false.")]]
@@ -49,6 +49,10 @@ async def ask_user(questions: list[AskQuestion], adapter: Any = None) -> str:
     confirm a plan, to ask permission (the approval prompt does that), or for anything grep and
     read_file can answer. Ask everything you need in one call instead of several turns. Give 2-4
     concrete options with the trade-off, one line each, or leave `options` out for a free-text answer.
+
+    Keep every part short; the user takes in the panel at a glance. The question is one plain sentence,
+    a label 1-5 words, a description one short phrase (about 15 words at most), never a paragraph. Put any
+    background the user needs in your message before the call, not in the question or the options.
 
     Args:
         questions: The questions, 1 to 4 of them.
@@ -100,9 +104,9 @@ def _clean_options(raw: object) -> list[dict[str, str]]:
     for option in raw:
         if not isinstance(option, dict) or not _has_text(option.get("label")):
             continue
-        entry = {"label": _clamp(option["label"], ASK_LABEL_CHARS)}
+        entry = {"label": one_line(option["label"])}
         if _has_text(option.get("description")):
-            entry["description"] = _clamp(option["description"], ASK_DESCRIPTION_CHARS)
+            entry["description"] = one_line(option["description"])
         cleaned.append(entry)
     return cleaned
 

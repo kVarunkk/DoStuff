@@ -472,6 +472,117 @@ def test_thought_chunks_typed_out_and_formatted(tui):
     asyncio.run(scenario())
 
 
+def test_same_size_update_skips_screen_layout(tui):
+    """A screen layout arranges every message of the conversation (~0.4 s at 1,200 of them), so the loader
+    tick and the status bar must not ask for one unless their size changes — and must when it does."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="layout")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()  # startup mounts its own notices: not what is counted here
+            await pilot.pause()
+            screen = app.screen
+            layouts = []
+            real = screen._refresh_layout
+            screen._refresh_layout = lambda *a, **k: (layouts.append(k.get("scroll", False)), real(*a, **k))[1]
+            full = lambda: sum(1 for scroll in layouts if not scroll)  # noqa: E731
+
+            app._turn_start_time = time.time()
+            loader = app._show_loader("Working...")
+            await pilot.pause()
+            status = app.query_one("#status")
+            cli_tui._update_static(status, "x" * 20)  # a known width, well inside the 80-column test screen
+            await pilot.pause()
+            assert status.outer_size.width == 22  # padding: 1 cell each side
+            layouts.clear()
+            for i in range(3):
+                app._render_loader()
+                cli_tui._update_static(status, str(i) * 20)  # new text, same cells
+                await pilot.pause()
+            assert full() == 0 and str(status.content) == "2" * 20
+
+            cli_tui._update_static(status, "x" * 30)  # wider: the row must make room for it
+            await pilot.pause()
+            assert full() >= 1 and status.outer_size.width == 32
+            layouts.clear()
+            app._loader_label = "word " * 80  # wraps onto more rows: the conversation must grow
+            app._render_loader()
+            await pilot.pause()
+            assert full() >= 1 and loader.outer_size.height > 1
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_streamed_answer_coalesced(tui):
+    """Chunks arriving faster than STREAM_RENDER_INTERVAL_S are drawn together, with the latest text;
+    the end of the stream draws the whole answer and leaves no timer behind."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="coalesce")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._update_stream_widget("answer", "first")
+            widget = app._stream_widgets["answer"]
+            assert str(widget.content) == "first"  # the first chunk shows at once
+            for i in range(20):
+                app._update_stream_widget("answer", f"first chunk {i}")
+            assert str(widget.content) != "first chunk 19" and app._answer_timer is not None
+            await _until(pilot, lambda: str(widget.content) == "first chunk 19")
+            assert app._answer_timer is None
+
+            app._update_stream_widget("answer", "first chunk 19 **done**")
+            app._finish_stream_widgets()
+            assert app._answer_timer is None and "**" not in str(widget.render())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_streamed_rows_wait_while_scrolled_up(tui):
+    """A screen layout arranges the whole conversation, so streamed text growing below a user who scrolled
+    up must not ask for one; scrolling back to the end lays the held rows out."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="held")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            for i in range(40):
+                app._append(f"message {i}", "system")
+            app._update_stream_widget("answer", "start")
+            widget = app._stream_widgets["answer"]
+            await pilot.pause()
+            messages = app.query_one("#messages")
+            messages.scroll_relative(y=-20, animate=False)
+            await pilot.pause()
+            assert app._scrolled_up()
+
+            screen = app.screen
+            layouts = []
+            real = screen._refresh_layout
+            screen._refresh_layout = lambda *a, **k: (layouts.append(k.get("scroll", False)), real(*a, **k))[1]
+            text = "start"
+            for i in range(10):
+                text += "\nline %d" % i
+                app._update_stream_widget("answer", text)
+                await _until(pilot, lambda: app._answer_timer is None)
+            app._reveal_thought()  # no thought streaming: a no-op, never a layout
+            await pilot.pause()
+            assert not [s for s in layouts if not s] and app._stream_growth_held
+            assert widget.outer_size.height == 1  # the new rows are not laid out yet
+
+            messages.scroll_end(animate=False)
+            await _until(pilot, lambda: widget.outer_size.height == 11)
+            assert not app._scrolled_up() and not app._stream_growth_held
+            app._finish_stream_widgets()
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_input_newline_keys():
     from textual.app import App
     from dostuff.cli_tui import EnterSubmits
@@ -2690,6 +2801,8 @@ def test_orphan_warning(tui, jobs_home, monkeypatch, tmp_path):
     import os
     import time
     cli_tui = tui
+    # pid 4812 is made up: report it as alive, or the liveness check drops the job before it is warned about
+    monkeypatch.setattr("dostuff.tools.bash.jobs._process_start", lambda pid: (True, None))
     stale = jobs_home / "old-session"
     stale.mkdir(parents=True)
     (stale / "jobs.json").write_text(json.dumps([
@@ -4327,7 +4440,8 @@ def test_esc_mid_question(tui):
 
 
 def test_esc_while_typing_other(tui):
-    """Esc during the `Other` input cancels the call: the typed draft is not sent, and the input is normal."""
+    """Esc during the `Other` input goes back to the panel: nothing is recorded, the call stays open and the
+    turn keeps running. A second Esc, on the panel, cancels the call."""
     cli_tui = tui
 
     async def scenario():
@@ -4336,12 +4450,20 @@ def test_esc_while_typing_other(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
-            task = _ask_questions(app, [DB_QUESTION])
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
             await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")  # answer the first question, then type into the second's `Other`
+            await pilot.pause()
             await pilot.press("3")
             await pilot.pause()
             assert inp.display and inp.has_class("feedback-mode")
             inp.text = "half-typed"
+            await app.action_cancel()
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            assert not task.done() and app.adapter.has_pending_ask()
+            assert not app.adapter._cancelled and not app.adapter._other_mode
+            assert not inp.display and not inp.has_class("feedback-mode")
+            assert panel.answers()[0] == "Postgres" and not panel.answered(1)  # kept; the draft not recorded
             await app.action_cancel()
             await _until(pilot, lambda: task.done())
             assert task.result() is None
@@ -7105,6 +7227,91 @@ def test_context_step_not_rendered_on_resume(tui):
     asyncio.run(scenario())
 
 
+def test_resume_mounts_transcript_in_one_batch(tui):
+    """A long resumed session paints in one mount, not one per message (each mount walks the container's
+    children, so per-message mounts are quadratic), in order and above the loader."""
+    from textual.containers import Vertical
+
+    async def scenario():
+        app = tui.DostuffTUI(session_id="batch")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await asyncio.wait_for(app._backend_ready.wait(), 30)  # its startup notices mount on their own
+            await pilot.pause(0.5)
+            container = app.query_one("#msg-container", Vertical)
+            loader = app._show_loader("Working...")
+            await pilot.pause()
+            app.steps_history = [
+                step for i in range(30) for step in (
+                    {"role": "user", "content": f"prompt {i}"},
+                    {"role": "assistant", "content": f"answer {i}"},
+                )
+            ]
+            calls = []
+            real_mount = container.mount
+            container.mount = lambda *ws, **kw: calls.append(len(ws)) or real_mount(*ws, **kw)  # type: ignore[method-assign]
+            app._render_history()
+            await pilot.pause()
+            assert calls == [60]
+            texts = _texts(app)
+            assert [t for t in texts if t.startswith("> prompt")] == [f"> prompt {i}" for i in range(30)]
+            assert list(container.children)[-1] is loader
+            app._stop_loader(loader)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_resume_paints_tail_and_loads_older_on_scroll_up(tui):
+    """A long resumed session paints its last steps; scrolling to the top loads the next older chunk above
+    them without moving what the user was reading, until every step is shown and the `↑` line is gone."""
+    from textual.containers import VerticalScroll
+
+    async def scenario():
+        app = tui.DostuffTUI(session_id="tail")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            turns = 150  # 300 steps: the tail and at least two older chunks
+            app.steps_history = [
+                step for i in range(turns) for step in (
+                    {"role": "user", "content": f"prompt {i}"},
+                    {"role": "assistant", "content": f"answer {i}"},
+                )
+            ]
+            app._render_history()
+            await pilot.pause()
+
+            def prompts():
+                return [t for t in _texts(app) if t.startswith("> prompt")]
+
+            tail, chunk = tui.HISTORY_TAIL_STEPS // 2, tui.HISTORY_CHUNK_STEPS // 2  # in turns (2 steps each)
+            assert prompts() == [f"> prompt {i}" for i in range(turns - tail, turns)]
+            more = app.query_one("#history-more", tui.HistoryMore)
+            assert f"{2 * (turns - tail)} earlier steps" in str(more.content)
+
+            messages = app.query_one("#messages", VerticalScroll)
+            loads = -(-(turns - tail) // chunk)  # every older chunk, the last one partial
+            assert loads >= 2
+            for loaded in range(1, loads + 1):
+                first = next(w for w in app.query("#msg-container .msg-user") if str(w.content).startswith("> prompt"))
+                messages.scroll_home(animate=False, immediate=True)  # the user scrolls to the top: a load
+                row_on_screen = first.virtual_region.y  # with scroll_y 0
+                for _ in range(10):
+                    await pilot.pause()
+                    if not app._history_loading:
+                        break
+                assert len(prompts()) == min(turns, tail + chunk * loaded)
+                # What the user was reading stays on the same screen row; the new chunk is above it
+                assert first.virtual_region.y - round(messages.scroll_y) == row_on_screen
+                assert messages.scroll_y > tui.HISTORY_LOAD_ROWS
+            assert prompts() == [f"> prompt {i}" for i in range(turns)]
+            assert not app.query("#history-more")
+            assert app._history_hidden == 0
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_agent_view_skips_context_step(tui):
     """The /agents view renders a run's transcript with the same function, and a prefix."""
     async def scenario():
@@ -8912,13 +9119,15 @@ def test_agents_list_most_recent_first(tui, agents):
 
 
 def test_ask_panel_fits_short_terminal(tui):
-    """A long question and long descriptions wrap in full, and the options window shrinks so the submit row and
+    """A long question, label and descriptions wrap in full, and the options window shrinks so the submit row and
     the hint stay on screen instead of falling off the bottom."""
     cli_tui = tui
     long_q = {"question": "Which approach should I take to restructure the configuration loading so that project "
                           "settings override user settings while environment variables still win? " * 2,
               "header": "Config",
               "options": [{"label": f"Option {i}", "description": "a long description " * 8} for i in range(1, 6)]}
+    long_label = "Use the existing greetings module and extend it rather than adding a second module beside it"
+    long_q["options"][0]["label"] = long_label
 
     async def scenario():
         app = cli_tui.DostuffTUI(session_id="ask-fit")
@@ -8931,6 +9140,7 @@ def test_ask_panel_fits_short_terminal(tui):
             content = str(panel.content)
             assert "…" not in content.replace("↑", "").replace("↓", "")  # no description is cut
             assert content.count("a long description") >= 8  # the first option's description, whole
+            assert "".join(long_label.split()) in "".join(content.split())  # a long label wraps, whole
             assert "Submit answers" in content and "Esc cancel" in content
             assert panel.region.bottom <= app.size.height
             app.adapter.cancel_pending_ask()

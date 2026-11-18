@@ -7,16 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-You can now choose how hard reasoning models think, per session with `/thinking` or by default in `config.yaml`. The jobs and agents lists show the newest first, and `ask_user` questions no longer get cut off.
+You can now choose how hard reasoning models think, per session with `/thinking` or by default in `config.yaml`. An agent file's `skills:` now puts those skills' instructions into the agent's prompt. Long sessions stay responsive while the answer streams, and a long session resumes in about a second. The jobs and agents lists show the newest first, and `ask_user` questions no longer get cut off.
 
 ### Added
 - **`/thinking <level>`** sets the thinking level for this session: `auto`, `off`, `minimal`, `low`, `medium` or `high`. Without a level it shows the current one. **`loop.reasoning_effort`** in `config.yaml` sets the default for new sessions. `auto` leaves it to the provider, as before; models without reasoning support ignore the setting.
+- **`skills:` in agent files** (yours or Claude Code's) is no longer ignored: each named skill's instructions go into that agent's system prompt, up to 32 skills and `agents.max_preload_chars` characters (default 60000). Skills that are missing, manual-only, unreadable or over the limit are named in a warning at the top of the agent's report. `/agents types` shows the field.
 
 ### Changed
+- **Resuming a long session** shows its last 60 steps right away, under an `↑ N earlier steps` line; scroll to the top (or click the line) to load 120 more at a time, without losing your place.
+- **`ask_user`**: Esc while typing an `Other` answer now takes you back to the options, keeping the answers you already gave; Esc on the options themselves still cancels the questions. The agent is also told to keep its questions short: one sentence, short options, no paragraphs.
 - The background jobs list (click the shells item, or `/jobs`) and the `/agents` list now put the most recently started first, instead of running ones first.
 
 ### Fixed
-- **`ask_user`** option descriptions wrap in full instead of ending in `…`, and the options shown shrink to fit a short terminal, so a long question no longer pushes the options, the submit row and the hint off the bottom of the screen.
+- **Typing and scrolling no longer lag in long sessions** while the agent is working: the loader, the streamed answer and the status bar no longer re-lay out the whole conversation on every update, and new answer rows wait while you are scrolled up.
+- **A resumed long session paints in about a second** instead of several.
+- The agent no longer sees or repeats `[System: Empty message content sanitised to satisfy protocol]` on Claude models after steps that only call tools.
+- The startup warning about background jobs left from an earlier session lists only jobs whose process is still running, instead of every unfinished entry for a week.
+- **`ask_user`** option labels and descriptions wrap in full, however long, instead of ending in `…`, and the options shown shrink to fit a short terminal, so a long question no longer pushes the options, the submit row and the hint off the bottom of the screen.
 
 ## [0.2.15] - 2026-11-17
 
