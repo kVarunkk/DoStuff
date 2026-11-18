@@ -382,6 +382,168 @@ class ToolResult(MessageStatic):
         self.set_expanded(not self.expanded)
 
 
+# How a run of tool calls reads in its one summary line: (past, present, one, many). Tools that share a tuple
+# count together (grep + glob are both "patterns"); `many` None means the noun takes no count ("checked the date").
+_ToolNoun = tuple[str, str, str, "str | None"]
+_FILES_READ: _ToolNoun = ("read", "reading", "file", "files")
+_PATTERNS: _ToolNoun = ("searched for", "searching for", "pattern", "patterns")
+_EDITS: _ToolNoun = ("edited", "editing", "file", "files")
+_MCP_LOOKUPS: _ToolNoun = ("looked up", "looking up", "MCP tool", "MCP tools")
+_MEMORIES: _ToolNoun = ("saved", "saving", "memory", "memories")
+_SETTINGS: _ToolNoun = ("changed", "changing", "setting", "settings")
+_OTHER_TOOLS: _ToolNoun = ("ran", "running", "tool", "tools")
+TOOL_SUMMARY_NOUNS: dict[str, _ToolNoun] = {
+    "read_file": _FILES_READ,
+    "write_file": ("wrote", "writing", "file", "files"),
+    "edit_file": _EDITS, "multi_edit": _EDITS,
+    "delete_file": ("deleted", "deleting", "file", "files"),
+    "list_files": ("listed", "listing", "directory", "directories"),
+    "grep": _PATTERNS, "glob": _PATTERNS,
+    "bash_command": ("ran", "running", "shell command", "shell commands"),
+    "bash_output": ("checked", "checking", "background shell", "background shells"),
+    "kill_shell": ("stopped", "stopping", "background shell", "background shells"),
+    "web_fetch": ("fetched", "fetching", "page", "pages"),
+    "web_search": ("ran", "running", "web search", "web searches"),
+    "search_memory": ("searched", "searching", "memory", None),
+    "save_memory": _MEMORIES, "save_episode": _MEMORIES,
+    "search_mcp_tools": _MCP_LOOKUPS, "get_mcp_tool_details": _MCP_LOOKUPS,
+    "call_mcp_tool": ("called", "calling", "MCP tool", "MCP tools"),
+    "read_settings": ("read", "reading", "the settings", None),
+    "edit_config": _SETTINGS, "set_mcp_server": _SETTINGS, "remove_mcp_server": _SETTINGS,
+    "get_current_datetime": ("checked", "checking", "the date", None),
+    "send_message": ("sent", "sending", "message to an agent", "messages to agents"),
+    "stop_agent": ("stopped", "stopping", "agent", "agents"),
+    "create_agent_type": ("created", "creating", "agent type", "agent types"),
+}
+# Calls that keep their own `● call` line: what they show is the point (the plan, the answers, a subagent's task)
+UNGROUPED_TOOLS = frozenset({"todo_write", "ask_user", "agent", "delegate_to_subagent"})
+
+
+def summarize_tool_calls(names: list[str], running: bool = False) -> str:
+    """`Read 2 files, ran 1 shell command`: one clause per kind of call, in the order they were made."""
+    counts: dict[_ToolNoun, int] = {}
+    for name in names:
+        noun = TOOL_SUMMARY_NOUNS.get(name, _OTHER_TOOLS)
+        counts[noun] = counts.get(noun, 0) + 1
+    clauses = []
+    for (past, present, one, many), count in counts.items():
+        verb = present if running else past
+        clauses.append(f"{verb} {one}" if many is None else f"{verb} {count} {one if count == 1 else many}")
+    text = ", ".join(clauses)
+    return (text[:1].upper() + text[1:]) + ("…" if running else "")
+
+
+class _GroupedCall:
+    """One call in a ToolGroup: its label and, once it has run, its result."""
+
+    __slots__ = ("name", "label", "result", "max_lines")
+
+    def __init__(self, name: str, label: str) -> None:
+        self.name = name
+        self.label = label
+        self.result: str | None = None
+        self.max_lines = TOOL_RESULT_PREVIEW_LINES
+
+    @property
+    def failed(self) -> bool:
+        return self.result is not None and self.result.startswith("Error")
+
+
+class ToolGroup(MessageStatic):
+    """A run of consecutive tool calls as one line, `● Read 2 files, ran 1 shell command`, like Claude Code.
+
+    A click shows each call with a preview of its result; Ctrl+O (DostuffTUI.action_toggle_tool_results)
+    opens every group with the results in full. Calls join the group until another message is mounted below
+    it; their results arrive later, matched by tool name in call order (the loop announces every call of a
+    step before it runs any, and runs the read-only ones first)."""
+
+    def __init__(self, prefix: str = "", expanded: bool = False, **kwargs: Any) -> None:
+        self.prefix = prefix
+        self.calls: list[_GroupedCall] = []
+        self.expanded = expanded
+        self.full = expanded
+        self.closed = False  # the turn ended: a call still without a result never ran
+        super().__init__(self._content(), markup=False, **kwargs)
+
+    @property
+    def running(self) -> bool:
+        return not self.closed and any(call.result is None for call in self.calls)
+
+    def add_call(self, name: str, label: str) -> None:
+        self.calls.append(_GroupedCall(name, label))
+        self._refresh_content()
+
+    def take_result(self, name: str, result: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES) -> bool:
+        """Give the first call of `name` still waiting its result; False when none is waiting."""
+        if self.closed:
+            return False
+        for call in self.calls:
+            if call.name == name and call.result is None:
+                call.result, call.max_lines = result, max_lines
+                self._refresh_content()
+                return True
+        return False
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._refresh_content()
+
+    def set_expanded(self, expanded: bool, full: bool | None = None) -> None:
+        full = self.full if full is None else full
+        if (expanded, full) != (self.expanded, self.full):
+            self.expanded, self.full = expanded, full
+            self._refresh_content()
+
+    def _refresh_content(self) -> None:
+        if self.is_mounted:
+            _update_static(self, self._content())
+        else:
+            self.update(self._content(), layout=False)
+
+    def _content(self) -> Text:
+        failed = sum(call.failed for call in self.calls)
+        text = Text(self.prefix)
+        text.append("● ", style="#e06c75" if failed else ("#8ab4f8" if self.running else ""))
+        text.append(summarize_tool_calls([call.name for call in self.calls], self.running), style="#8a8a8a")
+        if failed:
+            text.append(f" · {failed} failed", style="#e06c75")
+        if not self.expanded:
+            text.append(" (ctrl+o to expand)", style="#8a8a8a")
+            return text
+        for call in self.calls:
+            text.append("\n  ")
+            text.append(call.label, style="#8a8a8a")
+            if call.result is None:
+                body = "  ⎿  (did not run)" if self.closed else "  ⎿  …"
+            else:
+                body = _tool_result_line(call.result, len(call.result) if self.full else call.max_lines)
+            body = "\n" + ("  " + body).replace("\n", "\n  ")  # the `⎿` under the call's label, not the `●`
+            text.append_text(Text.from_ansi(body, style="#8a8a8a") if "\033[" in body
+                             else Text(body, style="#8a8a8a"))
+        return text
+
+    def on_click(self) -> None:
+        if self.screen.get_selected_text():
+            return  # the end of a mouse selection, not a click
+        self.set_expanded(not self.expanded, full=False if self.expanded else self.full)
+
+
+class _ToolGroups:
+    """Where tool calls and results go: the group that takes the next call, and the groups whose calls
+    still wait for a result. One per transcript being built (the conversation, the agent view, an older
+    chunk of history), so a call in one never joins a group in another."""
+
+    def __init__(self) -> None:
+        self.open: ToolGroup | None = None
+        self.pending: list[ToolGroup] = []
+
+    def close(self) -> None:
+        for group in self.pending:
+            group.close()
+        self.open, self.pending = None, []
+
+
 class StickyPrompt(Static):
     """The top row of the conversation while its turn's prompt is scrolled out of view: that prompt on one
     row, like a sticky section header. A click goes back to the prompt.
@@ -1755,7 +1917,8 @@ class TuiAdapter:
             app._append(str(data), msg_type="diff")
             return
         if event_type == "tool_call":
-            app._append(f"● {data}", msg_type="tool")
+            label = str(data)
+            app._append_tool_call(label.partition("(")[0], label)
             return
         if event_type == "tool_result":
             text = str(data)
@@ -2237,6 +2400,8 @@ class DostuffTUI(App):
         self._settings_check_running = False
         self._reported_load_error = ""  # a broken config.yaml is reported once, not every check
         self._tool_results_expanded = False  # Ctrl+O; new results follow it
+        self._tool_groups = _ToolGroups()  # the conversation's `● Read 2 files` groups still taking calls/results
+        self._agent_view_tool_groups = _ToolGroups()  # the same for the transcript in the agent view
         self._history_path = self.config.get_data_dir() / "prompt_history.jsonl"
         self._pastes = PasteStore()  # collapsed pastes in the input (helpers/agent/pastes.py)
         self._images = clipboard.PastedImages()  # alt+v images in the input, `[Image #N]` (multimodal REQ-3)
@@ -2702,12 +2867,14 @@ class DostuffTUI(App):
         self._remove_history_more()
         start = self._history_chunk_start(len(self.steps_history), HISTORY_TAIL_STEPS)
         self._history_hidden = start
+        self._tool_groups.close()
         with self._batched_mounts():
             if start:
                 self._mount_message(HistoryMore(self._history_more_text(), id="history-more",
                                                 classes="msg msg-system", markup=False))
             for step in self.steps_history[start:]:
                 self._render_history_step(step)
+        self._tool_groups.close()  # a stored call with no result never ran; the next live call starts afresh
 
     def _history_chunk_start(self, end: int, count: int) -> int:
         """Where the chunk of about `count` steps that ends at `end` starts: never on a tool result, so a
@@ -2744,11 +2911,14 @@ class DostuffTUI(App):
         end = self._history_hidden
         start = self._history_chunk_start(end, HISTORY_CHUNK_STEPS)
         self._history_prepending = True
+        live_groups, self._tool_groups = self._tool_groups, _ToolGroups()  # a running turn keeps its groups
         try:
             with self._collected_messages() as widgets:
                 for step in self.steps_history[start:end]:
                     self._render_history_step(step)
         finally:
+            self._tool_groups.close()
+            self._tool_groups = live_groups
             self._history_prepending = False
         self._history_hidden = start
         siblings = list(more.parent.children)
@@ -2801,7 +2971,7 @@ class DostuffTUI(App):
                 if pairs is not None:  # the same block the live view showed (T5.2, CON-007)
                     self._append_answers_block(pairs)
                     return
-            self._append_call_result(f"{prefix}{step.get('name', '')}: {content}")
+            self._append_call_result(f"{step.get('name', '')}: {content}", prefix=prefix)
             return
         if role == "user":
             if is_tool_attachment_step(step):  # what read_file / an MCP tool opened: the chips the live view showed
@@ -2836,8 +3006,8 @@ class DostuffTUI(App):
             self._append(prefix + content, msg_type="agent")
         for tc in step.get("tool_calls") or []:
             fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-            self._append(f"{prefix}● {format_call_label(fn.get('name', '?'), fn.get('arguments', ''))}",
-                         msg_type="tool")
+            name = fn.get("name", "?")
+            self._append_tool_call(name, format_call_label(name, fn.get("arguments", "")), prefix=prefix)
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -3889,6 +4059,7 @@ class DostuffTUI(App):
         await self.mount(panel, before="#queue-bar")
         self._agent_view_run = run
         self._agent_view_rendered = 0
+        self._agent_view_tool_groups = _ToolGroups()
         await self._refresh_agent_view()
         self.query_one("#agent-view-scroll", VerticalScroll).anchor()
         self._agent_view_timer = self.set_interval(1.0, self._refresh_agent_view)
@@ -3909,6 +4080,7 @@ class DostuffTUI(App):
             show_result = ended and run.result and not steps and self._agent_view_rendered == 0
             if new or show_result:
                 self._message_target = "#agent-view-msgs"
+                live_groups, self._tool_groups = self._tool_groups, self._agent_view_tool_groups
                 try:
                     with self._batched_mounts():
                         for step in new:
@@ -3916,6 +4088,9 @@ class DostuffTUI(App):
                         if show_result:
                             self._append(run.result or "", msg_type="agent")
                 finally:
+                    if ended:
+                        self._tool_groups.close()
+                    self._tool_groups = live_groups
                     self._message_target = "#msg-container"
                 self._agent_view_rendered = len(steps) or (1 if show_result else 0)
             self.query_one("#agent-view-title", Static).update(self._agent_view_title(run))
@@ -5008,6 +5183,7 @@ class DostuffTUI(App):
                 # Front of `_prompt_queue`, in order — and ahead of the queued prompts on the way back in
                 self._prompt_queue[0:0] = [msg.raw for msg in leftovers]
             self._finish_stream_widgets()
+            self._tool_groups.close()  # a call cancelled before it started gets no result: say it did not run
             self._stop_loader(loader_widget)
             if started is not None:
                 self._append_turn_summary(time.time() - started, cancelled)
@@ -5798,6 +5974,8 @@ class DostuffTUI(App):
         """Mount above the loader (so the loader stays at the bottom). While the agent view renders a
         transcript, `_message_target` points at that view's container instead of the conversation.
         Inside `_batched_mounts` the widget is queued and mounted with the rest of the batch."""
+        if widget is not self._tool_groups.open:
+            self._tool_groups.open = None  # anything below a group ends it: the next call starts a new one
         if self._mount_batch is not None:
             self._mount_batch.append(widget)
             return
@@ -5862,13 +6040,44 @@ class DostuffTUI(App):
         self._mount_message(ToolResult(text, max_lines, expanded=self._tool_results_expanded,
                                        classes=f"msg msg-{msg_type}"))
 
-    def _append_call_result(self, text: str) -> None:
-        """A tool call's result; one Ctrl+B moved to the background collapses to that fact."""
-        job_id = detached_job_id(text) if text.startswith("bash_command: ") else None
-        if job_id is None:
-            self._append_tool_result(text)
-        else:
-            self._append_tool_result(f'moved to background as "{job_id}"\n{text}', max_lines=1)
+    def _append_tool_call(self, name: str, label: str, prefix: str = "") -> None:
+        """A tool call: it joins the group just above, or starts one (`● Ran 1 shell command`). The calls in
+        UNGROUPED_TOOLS keep their own `● label` line."""
+        if name in UNGROUPED_TOOLS:
+            self._append(f"{prefix}● {label}", msg_type="tool")
+            return
+        groups = self._tool_groups
+        group = groups.open
+        if group is None or group.prefix != prefix or not self._still_shown(group):
+            group = ToolGroup(prefix, expanded=self._tool_results_expanded, classes="msg msg-tool")
+            self._mount_message(group)
+            groups.open = group
+        if group not in groups.pending:  # one whose calls had all finished waits again for this one
+            groups.pending.append(group)
+        group.add_call(name, label)
+
+    def _still_shown(self, widget: Widget) -> bool:
+        """Mounted, or waiting in the batch being built: not removed by a /clear under it."""
+        return widget.parent is not None or (self._mount_batch is not None and widget in self._mount_batch)
+
+    def _append_call_result(self, text: str, prefix: str = "") -> None:
+        """A tool call's result (`name: result`), under its call in its group; one Ctrl+B moved to the
+        background collapses to that fact. A result no call is waiting for gets its own `⎿` line."""
+        name, _, body = text.partition(": ")
+        job_id = detached_job_id(text) if name == "bash_command" else None
+        max_lines = TOOL_RESULT_PREVIEW_LINES
+        if job_id is not None:
+            moved = f'moved to background as "{job_id}"\n'
+            text, body, max_lines = moved + text, moved + body, 1
+        shown = truncate_tool_output(body, self.config.max_tool_output_chars)
+        for group in self._tool_groups.pending:
+            if self._still_shown(group) and group.take_result(name, shown, max_lines):
+                if not group.running:
+                    self._tool_groups.pending.remove(group)
+                if job_id is None:
+                    return
+                break  # a job still running is worth its own line: the jobs bar alone doesn't say which call it was
+        self._append_tool_result(prefix + text, max_lines)
 
     def _append_answers_block(self, pairs: list[tuple[str, str]]) -> None:
         """`ask_user`'s answers as one full `⎿` block, a row per pair (D9): no preview cap and no Ctrl+O,
@@ -5892,6 +6101,8 @@ class DostuffTUI(App):
         self._tool_results_expanded = not self._tool_results_expanded
         for widget in self.query(ToolResult):
             widget.set_expanded(self._tool_results_expanded)
+        for group in self.query(ToolGroup):
+            group.set_expanded(self._tool_results_expanded, full=self._tool_results_expanded)
         self._flash_input_hint("tool output expanded · ctrl+o to collapse" if self._tool_results_expanded
                                else "tool output collapsed · ctrl+o to expand")
 

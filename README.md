@@ -188,7 +188,7 @@ In the TUI:
 | `Up` / `Down` | On the first / last line of the input: previous / next prompt typed in this directory (saved in `~/.dostuff/data/prompt_history.jsonl`) |
 | `Ctrl+R`      | Search the prompts typed in this directory (type to filter, `Enter` puts the prompt in the input) |
 | `Esc` `Esc`   | With an empty input: take back your last prompt. It and everything after it (answer, tool calls) leave the conversation and the prompt goes back in the input to edit and resend. Files that turn changed stay as they are; `/undo` restores them |
-| `Ctrl+O`      | Expand / collapse every truncated tool and shell result (click one to toggle just that one) |
+| `Ctrl+O`      | Expand / collapse every tool-call line and truncated shell result, with tool output in full (click one to open just that one, with a preview of each result) |
 | `Ctrl+B`      | While the agent waits on a shell command or a foreground subagent (the loader says `Ctrl+B to background`): move them to the background; the agent gets what a command printed so far and carries on, and hears from the agent when it ends. Not for `!command`s. See [Background jobs](#background-jobs) and [Subagents](#subagents) |
 | `Shift+Tab`   | Cycle the permission mode for this session: ask → auto → plan → allowlist (shown in the status bar) |
 | `Ctrl+Backspace` / `Ctrl+W` / `Alt+Backspace` | Delete the previous word; `Ctrl+Delete` / `Alt+Delete` the next one |
@@ -231,7 +231,11 @@ In the TUI:
 
 **Visual elements:**
 
-- **Messages** — `>` for your prompts (on a grey band), `●` for agent replies and tool calls, `⎿` for tool results; the terminal background shows through
+- **Messages** — `>` for your prompts (on a grey band), `●` for agent replies, `⎿` for tool and shell output; the terminal background shows through
+- **Tool calls** — a run of calls with nothing between them is one line, such as `● Read 2 files, ran 1 shell command`
+  (`Reading…` while they run, `· 1 failed` in red when one returned an error). Click it to see each call and the start
+  of its result; `Ctrl+O` opens them all in full. Plans (`todo_write`), `ask_user` questions and subagents keep their
+  own `●` line, and file edits still show their diff
 - **Sticky prompt** — once a prompt or `!command` scrolls off the top, it stays pinned there on one row while you are in its turn, as the answer streams or when you scroll back through an old one, until the next prompt reaches the top. Click it to go back to the start of the turn; `↓ Jump to bottom` returns you to the latest message
 - **Approvals** — a selector (arrows, a number, or `y` = allow once, `a` = always this session, `n` = deny with an optional note); several calls in one response can be approved together
 - **Turn summary** — `✻ Worked for 1m 5s · $0.01 · done 12:59 PM` after each turn
