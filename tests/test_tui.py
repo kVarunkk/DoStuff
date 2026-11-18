@@ -2690,6 +2690,8 @@ def test_orphan_warning(tui, jobs_home, monkeypatch, tmp_path):
     import os
     import time
     cli_tui = tui
+    # pid 4812 is made up: report it as alive, or the liveness check drops the job before it is warned about
+    monkeypatch.setattr("dostuff.tools.bash.jobs._process_start", lambda pid: (True, None))
     stale = jobs_home / "old-session"
     stale.mkdir(parents=True)
     (stale / "jobs.json").write_text(json.dumps([
