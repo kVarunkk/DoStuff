@@ -503,12 +503,20 @@ OLD_SAVE_EPISODE = (
 )
 # save_episode's tags before the sqlite-fts work asked for the other words a later question may use
 OLD_SAVE_EPISODE_TAGS = "Key topics or technologies involved, e.g. ['sqlite', 'wal_mode']."
+# ask_user before it asked for short questions: no "Keep every part short" paragraph, these field descriptions
+OLD_ASK_USER_PARAGRAPH = (
+    "\n\nKeep every part short; the user takes in the panel at a glance. The question is one plain sentence,\n"
+    "a label 1-5 words, a description one short phrase (about 15 words at most), never a paragraph. Put any\n"
+    "background the user needs in your message before the call, not in the question or the options."
+)
+OLD_ASK_QUESTION = "The question, one sentence, ending with '?'."
+OLD_ASK_DESCRIPTION = "The trade-off, one line."
 
 
 def test_tool_schema_snapshot_only_agent_description_changed():
     """Since 30d3629 only these schemas changed on purpose: `agent`'s subagent_type description, `save_memory`
-    (its `scope` parameter and description), the new `search_memory` (memory recall D12) and save_episode's description
-    and `tags` description. Everything else must be 30d3629's, byte for byte."""
+    (its `scope` parameter and description), the new `search_memory` (memory recall D12), save_episode's description
+    and `tags` description, and ask_user's short-questions wording. Everything else must be 30d3629's, byte for byte."""
     import hashlib
     import json
     snapshot = json.loads((Path(__file__).parent / "snapshots" / "tool_schemas.json").read_text(encoding="utf-8"))
@@ -525,4 +533,13 @@ def test_tool_schema_snapshot_only_agent_description_changed():
     save_episode = snapshot["save_episode"]["function"]
     assert save_episode["description"] != OLD_SAVE_EPISODE
     save_episode["description"] = OLD_SAVE_EPISODE
+    ask_user = snapshot["ask_user"]["function"]
+    assert ask_user["description"].endswith(OLD_ASK_USER_PARAGRAPH)
+    ask_user["description"] = ask_user["description"][:-len(OLD_ASK_USER_PARAGRAPH)]
+    question = ask_user["parameters"]["properties"]["questions"]["items"]["properties"]
+    assert question["question"]["description"] != OLD_ASK_QUESTION
+    question["question"]["description"] = OLD_ASK_QUESTION
+    option = question["options"]["items"]["properties"]["description"]
+    assert option["description"] != OLD_ASK_DESCRIPTION
+    option["description"] = OLD_ASK_DESCRIPTION
     assert hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == SCHEMAS_30D3629

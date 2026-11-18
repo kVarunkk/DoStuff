@@ -4327,7 +4327,8 @@ def test_esc_mid_question(tui):
 
 
 def test_esc_while_typing_other(tui):
-    """Esc during the `Other` input cancels the call: the typed draft is not sent, and the input is normal."""
+    """Esc during the `Other` input goes back to the panel: nothing is recorded, the call stays open and the
+    turn keeps running. A second Esc, on the panel, cancels the call."""
     cli_tui = tui
 
     async def scenario():
@@ -4336,12 +4337,20 @@ def test_esc_while_typing_other(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
-            task = _ask_questions(app, [DB_QUESTION])
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
             await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")  # answer the first question, then type into the second's `Other`
+            await pilot.pause()
             await pilot.press("3")
             await pilot.pause()
             assert inp.display and inp.has_class("feedback-mode")
             inp.text = "half-typed"
+            await app.action_cancel()
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            assert not task.done() and app.adapter.has_pending_ask()
+            assert not app.adapter._cancelled and not app.adapter._other_mode
+            assert not inp.display and not inp.has_class("feedback-mode")
+            assert panel.answers()[0] == "Postgres" and not panel.answered(1)  # kept; the draft not recorded
             await app.action_cancel()
             await _until(pilot, lambda: task.done())
             assert task.result() is None
@@ -8912,13 +8921,15 @@ def test_agents_list_most_recent_first(tui, agents):
 
 
 def test_ask_panel_fits_short_terminal(tui):
-    """A long question and long descriptions wrap in full, and the options window shrinks so the submit row and
+    """A long question, label and descriptions wrap in full, and the options window shrinks so the submit row and
     the hint stay on screen instead of falling off the bottom."""
     cli_tui = tui
     long_q = {"question": "Which approach should I take to restructure the configuration loading so that project "
                           "settings override user settings while environment variables still win? " * 2,
               "header": "Config",
               "options": [{"label": f"Option {i}", "description": "a long description " * 8} for i in range(1, 6)]}
+    long_label = "Use the existing greetings module and extend it rather than adding a second module beside it"
+    long_q["options"][0]["label"] = long_label
 
     async def scenario():
         app = cli_tui.DostuffTUI(session_id="ask-fit")
@@ -8931,6 +8942,7 @@ def test_ask_panel_fits_short_terminal(tui):
             content = str(panel.content)
             assert "…" not in content.replace("↑", "").replace("↓", "")  # no description is cut
             assert content.count("a long description") >= 8  # the first option's description, whole
+            assert "".join(long_label.split()) in "".join(content.split())  # a long label wraps, whole
             assert "Submit answers" in content and "Esc cancel" in content
             assert panel.region.bottom <= app.size.height
             app.adapter.cancel_pending_ask()

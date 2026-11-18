@@ -94,8 +94,8 @@ def test_limits_are_named():
     assert ask_user_module.ASK_MAX_QUESTIONS == 4
     assert ask_user_module.ASK_MAX_OPTIONS == 4
     assert ask_user_module.ASK_HEADER_CHARS == 12
-    assert ask_user_module.ASK_LABEL_CHARS == 60
-    assert ask_user_module.ASK_DESCRIPTION_CHARS == 200
+    assert not hasattr(ask_user_module, "ASK_LABEL_CHARS")  # labels are never cut
+    assert not hasattr(ask_user_module, "ASK_DESCRIPTION_CHARS")  # descriptions are never cut
 
 
 def test_tool_schema_shape():
@@ -153,8 +153,8 @@ def test_cleaning_clamps():
     q = cleaned[0]
     assert q["question"] == "Which database should I use?"
     assert q["header"] == "A" * 12  # hard cut, no ellipsis: it is a fixed-width tab strip
-    assert len(q["options"][0]["label"]) == 60 and q["options"][0]["label"].endswith("…")
-    assert len(q["options"][0]["description"]) == 200 and q["options"][0]["description"].endswith("…")
+    assert q["options"][0]["label"] == "L" * 90  # wrapped in full by the panel, never cut
+    assert q["options"][0]["description"] == "D" * 400  # wrapped in full by the panel, never cut
     assert q["options"][1] == {"label": "Short", "description": "one line"}
     assert q["multi_select"] is False
 
@@ -205,7 +205,7 @@ def test_cleaned_questions_reach_the_adapter(ask_script):
     assert adapter.questions == [[{
         "question": "Which database should I use?",
         "header": "A" * 12,
-        "options": [{"label": "L" * 59 + "…"}, {"label": "Short"}],
+        "options": [{"label": "L" * 90}, {"label": "Short"}],
         "multi_select": False,
     }]]
 

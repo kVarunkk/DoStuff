@@ -136,6 +136,7 @@ ASK_REVIEW_LABEL = "Review"  # the tab the review step adds to the strip
 ASK_REVIEW_HINT = "↑/↓ select · Enter on an answer changes it · Enter on Submit sends · ← back · Esc cancel"
 ASK_OTHER_LABEL = "Other (type your own)"
 ASK_EMPTY_INPUT_HINT = "type an answer (Esc cancels the questions)"
+ASK_EMPTY_OTHER_HINT = "type an answer (Esc goes back to the options)"
 # The current question's tab: bold orange, plus the solid bar `_tabs` puts in front of it. No background:
 # under the ansi-dark theme a hex `on` colour snaps to black, which is invisible on a dark terminal.
 ASK_CURRENT_TAB = "bold #e5c07b"
@@ -1912,7 +1913,7 @@ class TuiAdapter:
             # answer to this question, so a number is text too; otherwise it answers the "Other" row.
             answer = _one_line_answer(text)
             if not answer:  # open point 4: an empty Enter records nothing; Esc is the way out
-                self._app._flash_input_hint(ASK_EMPTY_INPUT_HINT)
+                self._app._flash_input_hint(ASK_EMPTY_OTHER_HINT if self._ask_panel_owns_input else ASK_EMPTY_INPUT_HINT)
                 return
             if self._ask_panel_owns_input:
                 self._app._ask_panel_other(self._other_index, answer)
@@ -4266,9 +4267,9 @@ class DostuffTUI(App):
         if not (question.get("options") or []):
             # A free-text question's one row *is* "Other", so naming it in the placeholder would read
             # "Other (type your own): Name the app?" — the question alone is clearer.
-            self._hand_input_over(prompt or "Type your answer (Enter sends, Esc cancels)")
+            self._hand_input_over(prompt or "Type your answer (Enter sends, Esc goes back)")
             return
-        self._hand_input_over(f"{ASK_OTHER_LABEL}: {prompt or 'Type your answer (Enter sends, Esc cancels)'}")
+        self._hand_input_over(f"{ASK_OTHER_LABEL}: {prompt or 'Type your answer (Enter sends, Esc goes back)'}")
 
     def on_ask_user_panel_inert(self, event: AskUserPanel.Inert) -> None:
         panel = self._ask_panel()
@@ -4277,8 +4278,13 @@ class DostuffTUI(App):
 
     def _ask_panel_other(self, index: int, text: str) -> None:
         """The typed `Other` answer came back: record it, give the input back and re-focus the panel."""
+        self._ask_panel().record_other(index, text)
+        self._ask_panel_back()
+
+    def _ask_panel_back(self) -> None:
+        """Leave the `Other` input for the panel: after a typed answer, or on Esc with nothing recorded (the
+        row keeps any answer it had, and the call stays open)."""
         panel = self._ask_panel()
-        panel.record_other(index, text)
         self.adapter.end_other()
         self._give_input_back()  # the draft and the placeholder come back...
         self.query_one("#input", EnterSubmits).display = False  # ...but the panel still owns the screen
@@ -5154,6 +5160,9 @@ class DostuffTUI(App):
         menu = self.query_one("#command-menu", CommandMenu)
         if menu.display:
             menu.display = False
+            return
+        if self.adapter._other_mode and self.adapter._ask_panel_owns_input:
+            self._ask_panel_back()  # typing an `Other` answer: Esc leaves the input, not the questions
             return
         if self._btw_open() and not self.adapter.has_pending_prompt():
             self._close_btw()  # closes the side answer; the turn keeps running (btw spec D6)
