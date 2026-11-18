@@ -179,6 +179,35 @@ def test_merge_skips_empty_content():
     assert sent == [{"role": "user", "content": "go"}]
 
 
+@pytest.mark.parametrize("content", ["", "  \n", None, [{"type": "text", "text": ""}]])
+def test_tool_only_assistant_step_goes_out_without_text(content):
+    """An empty text beside tool calls becomes litellm's "[System: Empty message content sanitised ...]"
+    block on Anthropic routes, which the model then echoes; send no text instead."""
+    call = {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    step = {"role": "assistant", "content": content, "tool_calls": [call]}
+    [_, sent, _] = provider_messages([{"role": "user", "content": "go"}, step,
+                                      {"role": "tool", "tool_call_id": "c1", "content": "r"}])
+    assert sent == {"role": "assistant", "content": None, "tool_calls": [call]}
+    assert step["content"] == content  # the stored step is left alone
+
+
+def test_assistant_text_beside_tool_calls_is_kept():
+    call = {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    [sent] = provider_messages([{"role": "assistant", "content": "Reading it.", "tool_calls": [call]}])
+    assert sent["content"] == "Reading it."
+
+
+def test_no_sanitiser_placeholder_reaches_an_anthropic_request():
+    """End to end through litellm's own Anthropic formatter: no placeholder, the tool_use block intact."""
+    factory = pytest.importorskip("litellm.litellm_core_utils.prompt_templates.factory")
+    call = {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+    sent = provider_messages([{"role": "user", "content": "go"}, {"role": "assistant", "content": "", "tool_calls": [call]},
+                              {"role": "tool", "tool_call_id": "c1", "content": "r"}])
+    formatted = factory.anthropic_messages_pt(sent, model="claude-sonnet-4-5", llm_provider="anthropic")
+    assert "sanitised" not in json.dumps(formatted)
+    assert [b["type"] for b in formatted[1]["content"]] == ["tool_use"]
+
+
 def test_a_later_turn_only_extends_what_the_last_one_sent():
     """The cache rests on this: every message of a call is unchanged, in place, in the next call."""
     first = [_context_step("<turn-context>1</turn-context>"), {"role": "user", "content": "one"}]
