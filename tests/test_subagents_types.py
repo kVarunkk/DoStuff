@@ -559,3 +559,138 @@ def test_agents_types_and_info_show_skills(proj, agents_home):
     assert "skills:" not in type_detail("plain", loaded, config)
     listing = types_listing(loaded, config)
     assert listing.count("  skills: x, y") == 1 and listing.count("skills:") == 1
+
+
+# --- per-agent max_tokens --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value,expected,warns", [
+    ("32000", 32000, None), ("lots", None, "not a number"), ("0", None, "at least 1")])
+def test_agent_file_max_tokens(proj, agents_home, value, expected, warns):
+    from dostuff.agent.subagents.definitions import parse_agent_file
+    path = _agent_file(proj / ".dostuff" / "agents", "w.md", name="w", description="d", max_tokens=value)
+    agent_def, warnings = parse_agent_file(path)
+    assert agent_def is not None and agent_def.max_tokens == expected
+    assert (warns is None and warnings == []) or (warns is not None and warns in warnings[0])
+
+
+def test_run_sends_its_type_max_tokens(agents, fake_model, agent_type, main_model, monkeypatch):
+    import asyncio
+
+    from conftest import fake_response
+    from dostuff.lib.model import current_max_tokens
+    monkeypatch.setattr(main_model, "max_tokens", 4096)
+    agent_type("writer", max_tokens=32000)
+    fake_model.script("[A]", fake_response(None, tool_calls=[_glob_call()]), _slow("a done"))
+    fake_model.script("[B]", fake_response(None, tool_calls=[_glob_call()]), _slow("b done"))
+
+    async def go():
+        return await asyncio.gather(_start_agent("[A] x", "writer"), _start_agent("[B] x"))
+    a, b = asyncio.run(go())
+    assert a.startswith("a done") and b.startswith("b done")
+    assert [c.get("max_tokens") for c in fake_model.calls_for("[A]")] == [32000] * 2  # its own cap, every call
+    assert [c.get("max_tokens") for c in fake_model.calls_for("[B]")] == [4096] * 2  # loop.max_tokens
+    assert current_max_tokens.get() is None  # the main agent's context is untouched
+
+
+def test_agents_types_shows_max_tokens(proj, agents_home):
+    from types import SimpleNamespace
+
+    from dostuff.agent.subagents.definitions import type_detail
+    _agent_file(proj / ".dostuff" / "agents", "w.md", name="w", description="d", max_tokens=32000)
+    _agent_file(proj / ".dostuff" / "agents", "plain.md", name="plain", description="d")
+    loaded = load_definitions(proj, agents_home)
+    config = SimpleNamespace(model_name="m", agents_max_iterations=10, agents_models={}, agents_explore_model="inherit",
+                             max_tokens=0)
+    assert "  max output tokens: 32000 (set in the file)" in type_detail("w", loaded, config).splitlines()
+    assert "  max output tokens: provider default" in type_detail("plain", loaded, config).splitlines()
+    config.max_tokens = 8000
+    assert "  max output tokens: 8000 (loop.max_tokens)" in type_detail("plain", loaded, config).splitlines()
+
+
+# --- per-agent compaction threshold (plan/2026-11-16-compaction-improvements/tasks.md T0.1) ----------
+
+
+@pytest.mark.parametrize("value,expected,warns", [
+    ("40", 40, None), ("25%", 25, None), ("off", 0, None), ("150", None, "1-100 or off"),
+    ("lots", None, "1-100 or off")])
+def test_agent_file_compact_threshold(proj, agents_home, value, expected, warns):
+    from dostuff.agent.subagents.definitions import parse_agent_file
+    path = _agent_file(proj / ".dostuff" / "agents", "w.md", name="w", description="d", compact_threshold=value)
+    agent_def, warnings = parse_agent_file(path)
+    assert agent_def is not None and agent_def.compact_threshold == expected
+    assert (warns is None and warnings == []) or (warns is not None and warns in warnings[0])
+
+
+@pytest.mark.parametrize("own,agents_cfg,main,fork,expected", [
+    (30, None, 50, False, (30, "set in the file")),
+    (0, 40, 50, False, (None, "set in the file")),               # off in the file wins over the config
+    (None, 40, 50, False, (40, "agents.compact_threshold")),
+    (None, 0, 50, False, (None, "agents.compact_threshold")),
+    (None, None, 50, False, (50, "the main agent's")),
+    (None, None, None, False, (None, "the main agent's")),       # main agent's auto-compaction is off
+    (30, 40, 50, True, (40, "agents.compact_threshold")),        # a fork has no type
+    (30, None, 50, True, (50, "the main agent's")),
+])
+def test_subagent_compact_threshold_precedence(own, agents_cfg, main, fork, expected):
+    from types import SimpleNamespace
+
+    from dostuff.agent.subagents.definitions import AgentDef, subagent_compact_threshold
+    agent_def = AgentDef(name="w", description="d", compact_threshold=own)
+    config = SimpleNamespace(agents_compact_threshold=agents_cfg, compact_threshold=main)
+    assert subagent_compact_threshold(agent_def, config, fork=fork) == expected
+
+
+def test_run_sets_its_compact_threshold(agents, fake_model, agent_type, main_model, monkeypatch):
+    import asyncio
+
+    from conftest import fake_response
+    from dostuff.agent.subagents import registry as registry_module
+    from dostuff.lib.model import current_compact_threshold
+    seen: dict[str, object] = {}
+    real = registry_module.run_agent_loop
+
+    async def spy(prompt, *args, **kwargs):
+        seen[prompt[:3]] = current_compact_threshold.get()
+        return await real(prompt, *args, **kwargs)
+    monkeypatch.setattr(registry_module, "run_agent_loop", spy)
+    monkeypatch.setattr(main_model, "agents_compact_threshold", None)
+    agent_type("small", compact_threshold=20)
+    agent_type("never", compact_threshold=0)
+    fake_model.script("[A]", fake_response("a done"))
+    fake_model.script("[B]", fake_response("b done"))
+    fake_model.script("[C]", fake_response("c done"))
+
+    async def go():
+        return await asyncio.gather(_start_agent("[A] x", "small"), _start_agent("[B] x", "never"),
+                                    _start_agent("[C] x"))
+    asyncio.run(go())
+    main = main_model.compact_threshold
+    assert seen == {"[A]": (20,), "[B]": (None,), "[C]": (main,)}
+    assert current_compact_threshold.get() is None  # the main agent's context is untouched
+
+
+def test_agents_types_shows_compact_threshold(proj, agents_home):
+    from types import SimpleNamespace
+
+    from dostuff.agent.subagents.definitions import type_detail
+    _agent_file(proj / ".dostuff" / "agents", "w.md", name="w", description="d", compact_threshold=30)
+    _agent_file(proj / ".dostuff" / "agents", "plain.md", name="plain", description="d")
+    loaded = load_definitions(proj, agents_home)
+    config = SimpleNamespace(model_name="m", agents_max_iterations=10, agents_models={}, agents_explore_model="inherit",
+                             max_tokens=0, agents_compact_threshold=None, compact_threshold=50)
+    assert "  compact threshold: 30% (set in the file)" in type_detail("w", loaded, config).splitlines()
+    assert "  compact threshold: 50% (the main agent's)" in type_detail("plain", loaded, config).splitlines()
+    config.agents_compact_threshold = 0
+    assert "  compact threshold: off (agents.compact_threshold)" in type_detail("plain", loaded, config).splitlines()
+    assert "  compact threshold: off (agents.compact_threshold)" in type_detail("fork", loaded, config).splitlines()
+
+
+@pytest.mark.parametrize("yaml_value,expected", [("30", 30), ("off", 0), ("lots", None), (None, None)])
+def test_config_agents_compact_threshold(tmp_path, monkeypatch, yaml_value, expected):
+    from dostuff.config import Config
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "config.yaml"
+    body = f"agents:\n  compact_threshold: {yaml_value}\n" if yaml_value is not None else "agents:\n  max_concurrent: 2\n"
+    path.write_text(body, encoding="utf-8")
+    assert Config(path).agents_compact_threshold == expected

@@ -561,6 +561,9 @@ def test_streamed_rows_wait_while_scrolled_up(tui):
             assert app._scrolled_up()
 
             screen = app.screen
+            # Scrolling up shows the jump-to-bottom bar, a layout of its own; the screen's update timer can
+            # still owe it after the pause, and would flush it inside the window counted below
+            await _until(pilot, lambda: not screen._layout_required)
             layouts = []
             real = screen._refresh_layout
             screen._refresh_layout = lambda *a, **k: (layouts.append(k.get("scroll", False)), real(*a, **k))[1]
@@ -752,6 +755,71 @@ def test_consecutive_tool_calls_fold_into_one_line(tui):
             emit("tool_result", "grep: late")
             await pilot.pause()
             assert len(app.query(cli_tui.ToolResult)) == 1
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_subagent_tool_results_join_their_calls(tui):
+    """A foreground subagent's `[agent: …] name: result` goes under its call in the group, not on a `⎿` line
+    of its own while the call waits forever: the prefix's `: ` is not where the tool name ends."""
+    cli_tui = tui
+    assert cli_tui.split_agent_prefix("[agent: Probe] bash_command: Denied") == ("[agent: Probe] ",
+                                                                                 "bash_command: Denied")
+    assert cli_tui.split_agent_prefix("read_file: A") == ("", "read_file: A")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="subagent-groups")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            emit = app.adapter.emit
+            emit("tool_call", '[agent: Write spec] read_file(path="a.md")')
+            emit("tool_call", '[agent: Write spec] read_file(path="b.md")')
+            emit("tool_result", "[agent: Write spec] read_file: A")
+            emit("tool_result", "[agent: Write spec] read_file: B")
+            await pilot.pause()
+            group, = app.query(cli_tui.ToolGroup)
+            assert not app.query(cli_tui.ToolResult)
+            assert _group_text(group) == "[agent: Write spec] ● Read 2 files (ctrl+o to expand)"
+            await pilot.click(group.header)
+            await pilot.pause()
+            assert ('  ● read_file(path="a.md")\n    ⎿  A\n  ● read_file(path="b.md")\n    ⎿  B'
+                    in _group_text(group))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tool_group_lines_highlight_on_hover(tui):
+    """The group's header and a call row whose result a click expands light up under the mouse; a row
+    a click does nothing to stays plain."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="groups-hover")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            emit = app.adapter.emit
+            emit("tool_call", 'read_file(path="a.md")')
+            emit("tool_call", 'read_file(path="b.md")')
+            emit("tool_result", "read_file: " + "\n".join(f"line {i}" for i in range(40)))
+            emit("tool_result", "read_file: B")
+            await pilot.pause()
+            group, = app.query(cli_tui.ToolGroup)
+            plain = group.header.styles.background
+            await pilot.hover(group.header)
+            await pilot.pause()
+            assert group.header.styles.background != plain
+            await pilot.click(group.header)
+            await pilot.pause()
+            long_row, short_row = group.rows
+            assert long_row.has_class("-clickable") and not short_row.has_class("-clickable")
+            await pilot.hover(long_row)
+            await pilot.pause()
+            assert long_row.styles.background != plain
+            await pilot.hover(short_row)
+            await pilot.pause()
+            assert short_row.styles.background == plain
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -4477,6 +4545,37 @@ def test_free_text_only_skips_the_panel(tui):
             await _until(pilot, lambda: task.done())
             assert task.result() == [("Name the app?", "Tiger"), ("Who is it for?", "me")]
             assert not inp.has_class("feedback-mode") and inp.placeholder == ""
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tab_headers_are_whole_when_they_fit_and_cut_with_ellipsis_when_not(tui):
+    """A header longer than the schema's 12 chars ("Repeat output") was hard-cut to "Repeat outpu". Now a tab
+    keeps its whole header when the strip fits, and on a narrow panel only the tabs you are not on are cut,
+    with `…` so the cut shows."""
+    cli_tui = tui
+    two = [{"label": "A"}, {"label": "B"}]
+    headers = ["Repeat flags", "Repeat output", "JSON with times", "Config error"]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-tab-fit")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [{"question": f"{h}?", "header": h, "options": two} for h in headers])
+            await _until(pilot, lambda: panel.display)
+            await pilot.press("1")  # answered the first, on the second
+            await pilot.pause()
+            wide = panel._tabs(120).plain
+            assert all(h in wide for h in headers), wide
+            assert "…" not in wide
+            narrow = panel._tabs(48).plain
+            assert len(narrow) <= 48, narrow
+            assert "▌ Repeat output" in narrow  # the current tab is never cut
+            assert "…" in narrow and "Repeat outpu " not in narrow
+            await pilot.press("escape")
+            await _until(pilot, lambda: task.done())
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

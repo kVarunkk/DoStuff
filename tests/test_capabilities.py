@@ -516,7 +516,7 @@ OLD_ASK_DESCRIPTION = "The trade-off, one line."
 def test_tool_schema_snapshot_only_agent_description_changed():
     """Since 30d3629 only these schemas changed on purpose: `agent`'s subagent_type description, `save_memory`
     (its `scope` parameter and description), the new `search_memory` (memory recall D12), save_episode's description
-    and `tags` description, and ask_user's short-questions wording. Everything else must be 30d3629's, byte for byte."""
+    and `tags` description, ask_user's short-questions wording, and create_agent_type's `max_tokens` parameter. Everything else must be 30d3629's, byte for byte."""
     import hashlib
     import json
     snapshot = json.loads((Path(__file__).parent / "snapshots" / "tool_schemas.json").read_text(encoding="utf-8"))
@@ -542,4 +542,6 @@ def test_tool_schema_snapshot_only_agent_description_changed():
     option = question["options"]["items"]["properties"]["description"]
     assert option["description"] != OLD_ASK_DESCRIPTION
     option["description"] = OLD_ASK_DESCRIPTION
+    create_props = snapshot["create_agent_type"]["function"]["parameters"]["properties"]
+    assert create_props.pop("max_tokens")["anyOf"] == [{"type": "integer"}, {"type": "null"}]
     assert hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == SCHEMAS_30D3629

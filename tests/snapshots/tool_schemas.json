@@ -210,6 +210,17 @@
             ],
             "description": "Its tool-loop cap. Leave out for the configured agents.max_iterations."
           },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Its output-token cap per model call, for a type that writes long replies or files. Leave out for loop.max_tokens (or the provider's default). Keep it within its model's output limit."
+          },
           "model": {
             "description": "An alias from agents.models or a full model name. Empty uses the session's model.",
             "type": "string"

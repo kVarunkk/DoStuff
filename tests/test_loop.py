@@ -11,6 +11,8 @@ from dostuff.agent import loop as loop_module
 from dostuff.agent.loop import (
     CANCELLED_RESULT,
     EMPTY_RESPONSE_NUDGE,
+    OUTPUT_LIMIT_NOTE,
+    OUTPUT_LIMIT_RETRIES,
     classify_model_error,
     loop,
     truncate_tool_output,
@@ -19,9 +21,10 @@ from dostuff.helpers.agent.consume_stream import consume_stream
 from dostuff.helpers.agent.manage_context import split_by_token_budget
 
 
-def _msg(content=None, tool_calls=None):
+def _msg(content=None, tool_calls=None, finish_reason=None):
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))],
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls),
+                                 finish_reason=finish_reason)],
         usage=None,
     )
 
@@ -100,6 +103,52 @@ def test_empty_response_nudges_once_then_ends(monkeypatch):
     assert "empty response twice" in result
 
 
+def test_reply_cut_off_at_output_limit_is_not_the_answer(monkeypatch):
+    """A reply the provider stopped at its output cap goes back to the model, not to the caller as a result."""
+    adapter = Adapter()
+    responses = [_msg(content="Planning TASK-101 ... Decision", finish_reason="length"), _msg(content="done")]
+    result, working, _ = _run(monkeypatch, responses, adapter=adapter)
+    assert result == "done"
+    assert {"role": "user", "content": OUTPUT_LIMIT_NOTE} in working
+    assert {"role": "assistant", "content": "Planning TASK-101 ... Decision"} in working  # the model sees what it wrote
+    assert any(kind == "system" and "output-token limit" in str(data) for kind, data in adapter.events)
+
+
+def test_cut_off_replies_in_a_row_end_the_turn_marked_incomplete(monkeypatch):
+    responses = [_msg(content=f"part {i}", finish_reason="length") for i in range(OUTPUT_LIMIT_RETRIES + 1)]
+    result, working, calls = _run(monkeypatch, responses)
+    assert len(calls) == OUTPUT_LIMIT_RETRIES + 1
+    assert result.startswith(f"part {OUTPUT_LIMIT_RETRIES}") and "incomplete" in result and "loop.max_tokens" in result
+
+
+def test_cut_off_count_resets_after_a_complete_reply(monkeypatch):
+    monkeypatch.setattr(loop_module, "OUTPUT_LIMIT_RETRIES", 1)  # without the reset, the second cut-off ends the turn
+    tc = _tc("read_file", '{"path": "a"}', "c1")
+    responses = [_msg(content="x", finish_reason="length"), _msg(tool_calls=[tc], finish_reason="tool_calls"),
+                 _msg(content="y", finish_reason="length"), _msg(content="done")]
+
+    async def dispatch(name, args, **kwargs):
+        return "contents"
+
+    monkeypatch.setattr(loop_module, "authorize_tool", lambda *a, **k: _none())
+    result, _, _ = _run(monkeypatch, responses, dispatch=dispatch, tool_names=["read_file"])
+    assert result == "done"
+
+
+def test_tool_arguments_cut_off_at_output_limit_say_so(monkeypatch):
+    responses = [_msg(tool_calls=[_tc("write_file", '{"path": "tasks.md", "content": "# Ta', "c1")],
+                      finish_reason="length"), _msg(content="done")]
+    result, working, _ = _run(monkeypatch, responses)
+    assert result == "done"
+    tool_step = next(s for s in working if s["role"] == "tool")
+    assert "cut off at the output-token limit" in tool_step["content"] and "split" in tool_step["content"]
+
+
+def test_reasoning_that_fills_the_output_limit_gets_the_limit_note(monkeypatch):
+    result, working, _ = _run(monkeypatch, [_msg(finish_reason="length"), _msg(content="ok")])
+    assert result == "ok" and {"role": "user", "content": OUTPUT_LIMIT_NOTE} in working
+
+
 def test_retry_with_backoff_then_fail_fast(monkeypatch):
     monkeypatch.setattr(loop_module, "retry_delay", lambda *a: 0.0)
     responses = [litellm.RateLimitError("slow down", "openai", "m"), _msg(content="ok")]
@@ -107,6 +156,23 @@ def test_retry_with_backoff_then_fail_fast(monkeypatch):
     result, _, calls = _run(monkeypatch, [litellm.AuthenticationError("bad key", "openai", "m")])
     assert result.startswith("Model call failed") and len(calls) == 1
 
+
+# The gateway's real reply when minimax-m3 got a cap above its limit (NOTES.md 2026-11-19)
+_MINIMAX_CAP_ERROR = ('AnthropicException - {"type":"error","error":{"type":"invalid_request_error","message":'
+                      '"invalid params, model[MiniMax-M3] does not support max tokens > 524288 (2013)"}}')
+
+
+def test_rejected_output_cap_names_the_setting_that_sent_it(monkeypatch):
+    monkeypatch.setattr(loop_module, "request_max_tokens", lambda: (10_000_000, "loop.max_tokens"))
+    result, _, calls = _run(monkeypatch, [litellm.BadRequestError(_MINIMAX_CAP_ERROR, "m", "anthropic")])
+    assert result.startswith("Model call failed") and "524288" in result and len(calls) == 1
+    assert "max_tokens=10000000 from loop.max_tokens" in result
+
+
+def test_other_bad_requests_get_no_output_cap_hint(monkeypatch):
+    monkeypatch.setattr(loop_module, "request_max_tokens", lambda: (32_000, "loop.max_tokens"))
+    result, _, _ = _run(monkeypatch, [litellm.BadRequestError("tools[0].name is invalid", "m", "openai")])
+    assert result.startswith("Model call failed") and "loop.max_tokens" not in result
 
 def test_retries_stop_at_configured_max(monkeypatch):
     monkeypatch.setattr(loop_module, "retry_delay", lambda *a: 0.0)
@@ -191,9 +257,14 @@ def test_cancel_keeps_completed_results(monkeypatch):
 
 
 def test_unavailable_tool_rejected(monkeypatch):
-    responses = [_msg(tool_calls=[_tc("delete_file", json.dumps({"path": "a"}), "c1")]), _msg(content="done")]
+    """A tool outside the run's list is refused; in a subagent, a main-agent-only one says so (subagents D12)."""
+    from dostuff.agent.loop import SUBAGENT_TOOL_REFUSED
+    responses = [_msg(tool_calls=[_tc("glob", json.dumps({"pattern": "*"}), "c1"),
+                                  _tc("delete_file", json.dumps({"path": "a"}), "c2")]), _msg(content="done")]
     _, working, _ = _run(monkeypatch, responses, tool_names=["read_file"])
-    assert "not available" in next(s for s in working if s["role"] == "tool")["content"]
+    results = {s["tool_call_id"]: s["content"] for s in working if s["role"] == "tool"}
+    assert "not available" in results["c1"]
+    assert results["c2"].startswith(SUBAGENT_TOOL_REFUSED.format(name="delete_file"))
 
 
 # ── consume_stream ───────────────────────────────────────────────────────────
@@ -1691,3 +1762,31 @@ def test_fork_does_not_reannounce_parent_delta(disk, agents, fake_model):
     assert asyncio.run(go()) == "fork report"
     [call] = fake_model.calls_for("[F]")
     assert json.dumps(call["messages"]).count("Skills and agent types: changes") == 1  # the parent's, once
+
+
+# --- per-subagent compaction threshold (plan/2026-11-16-compaction-improvements/tasks.md T0.1) --------
+
+
+@pytest.mark.parametrize("turn_type,override,last_input,compacts", [
+    ("subagent_loop", (20,), 30_000, True),       # its own 20% of 100k: compacts below the main 50%
+    ("interactive_loop", (20,), 30_000, False),   # the main agent ignores a subagent's threshold
+    ("subagent_loop", (None,), 90_000, False),    # off for this subagent
+    ("interactive_loop", (None,), 90_000, True),
+    ("subagent_loop", None, 60_000, True),        # no override: the main agent's 50%
+])
+def test_subagent_compact_threshold_override(monkeypatch, turn_type, override, last_input, compacts):
+    from dostuff.config import get_config
+    from dostuff.lib.model import current_compact_threshold
+    monkeypatch.setattr(get_config(), "session_compact_threshold", (50,))
+    called: list[int] = []
+
+    async def fake_compact(steps, keep_budget, notes, limit):
+        called.append(keep_budget)
+        return steps[-1:], "SUMMARY"
+    monkeypatch.setattr(loop_module, "compact_context", fake_compact)
+    token = current_compact_threshold.set(override)
+    try:
+        _interactive(monkeypatch, [_msg(content="ok")], turn_type=turn_type, last_input_tokens=last_input)
+    finally:
+        current_compact_threshold.reset(token)
+    assert bool(called) is compacts

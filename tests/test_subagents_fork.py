@@ -43,7 +43,7 @@ def _tool_names(call) -> set[str]:
 # --- T6.1 fork history, directive and prompt ----------------------------------------------------
 
 def test_fork_first_call(agents, fake_model):
-    from dostuff.agent.subagents.fork import FORK_DIRECTIVE
+    from dostuff.agent.subagents.fork import fork_directive
     fake_model.script("[MAIN]", fake_response(tool_calls=[_fork_call()]), fake_response("main done"))
     fake_model.script("[F]", fake_response("fork report"))
     working = [dict(s) for s in EARLIER]
@@ -61,7 +61,7 @@ def test_fork_first_call(agents, fake_model):
     assert fork_first["messages"][1:-1] == main_first["messages"][1:-1]
     # (c) then the directive and the task, which extend the last user message: it ended on a user step
     last = fork_first["messages"][-1]
-    directive = FORK_DIRECTIVE.format(prompt="[F] X")
+    directive = fork_directive("[F] X")
     assert last["role"] == "user" and last["content"] == main_first["messages"][-1]["content"] + "\n\n" + directive
     assert "Your task: [F] X" in last["content"]
     # the main history was copied, not shared
@@ -104,8 +104,9 @@ def test_fork_model_and_tools(agents, fake_model, monkeypatch, agents_home, tmp_
     assert "[warning]" in report and "model" in report and "fast" in report and "ignored" in report
     assert report.rstrip().endswith(FOOTER.format(id=agents.runs()[0].id))
     main_tools = _tool_names(fake_model.calls[0])
-    assert main_tools == set(default_tool_names())
-    assert _tool_names(fork_first) == main_tools - RESTRICTED_SUBAGENT_TOOLS
+    assert main_tools == set(default_tool_names()) and main_tools & RESTRICTED_SUBAGENT_TOOLS
+    # the schemas are the main's, in its order: they head the cached prefix (D11)
+    assert fork_first["tools"] == fake_model.calls[0]["tools"]
     # a file can't take the fork name (T3.4 guard)
     project = tmp_path / "proj"
     (project / ".dostuff" / "agents").mkdir(parents=True)
@@ -115,7 +116,7 @@ def test_fork_model_and_tools(agents, fake_model, monkeypatch, agents_home, tmp_
 
 
 def test_fork_keeps_a_restricted_main_tool_list(agents, fake_model):
-    """A main loop with its own tool list: the fork gets that list minus D12, not every tool."""
+    """A main loop with its own tool list: the fork is sent that list, not every tool."""
     fake_model.script("[MAIN]", fake_response(tool_calls=[_fork_call()]), fake_response("main done"))
     fake_model.script("[F]", fake_response("fork report"))
     main_tools = ["read_file", "glob", "agent", "send_message", "todo_write"]
@@ -123,7 +124,35 @@ def test_fork_keeps_a_restricted_main_tool_list(agents, fake_model):
     asyncio.run(_main_turn([dict(s) for s in EARLIER], tool_names=main_tools))
 
     [fork_first] = _fork_calls(fake_model)
-    assert _tool_names(fork_first) == {"read_file", "glob"}
+    assert [t["function"]["name"] for t in fork_first["tools"]] == main_tools
+
+
+def test_fork_refuses_a_main_agent_tool(agents, fake_model, monkeypatch):
+    """A fork sees the D12 tools' schemas but may not run them: the call is refused before dispatch, with a
+    result that says why, and the fork goes on (D11, D12)."""
+    from dostuff.agent import loop as loop_mod
+    from dostuff.agent.loop import SUBAGENT_TOOL_REFUSED
+    ran: list[str] = []
+    real = loop_mod.dispatch_tool
+
+    async def spy(name, *args, **kwargs):
+        ran.append(name)
+        return await real(name, *args, **kwargs)
+
+    monkeypatch.setattr(loop_mod, "dispatch_tool", spy)
+    todo = fake_tool_call("todo_write", {"todos": [{"content": "x", "status": "pending"}]}, "f1")
+    fake_model.script("[MAIN]", fake_response(tool_calls=[_fork_call()]), fake_response("main done"))
+    fake_model.script("[F]", fake_response(tool_calls=[todo]), fake_response("fork report"))
+
+    asyncio.run(_main_turn([dict(s) for s in EARLIER]))
+
+    fork_calls = _fork_calls(fake_model)
+    assert len(fork_calls) == 2 and "todo_write" in _tool_names(fork_calls[0])
+    result = next(m for m in fork_calls[1]["messages"] if m.get("role") == "tool" and m.get("tool_call_id") == "f1")
+    assert result["content"].startswith(SUBAGENT_TOOL_REFUSED.format(name="todo_write"))
+    assert "todo_write" not in ran
+    [run] = agents.runs()
+    assert run.status == "completed"
 
 
 # --- T6.3 fork is an ordinary run otherwise -----------------------------------------------------
@@ -146,7 +175,7 @@ class _Store:
 
 
 def test_fork_background_follow_up(agents, fake_model):
-    from dostuff.agent.subagents.fork import FORK_DIRECTIVE
+    from dostuff.agent.subagents.fork import fork_directive
     from dostuff.helpers.agent.notices import get_notice_queue
     from dostuff.tools.send_message import send_message
     store = _Store()
@@ -173,13 +202,13 @@ def test_fork_background_follow_up(agents, fake_model):
     second = _fork_calls(fake_model)[-1]["messages"]
     contents = [m.get("content") for m in second[1:]]
     # its own history: the copy it started from, its report, the follow-up; no fresh copy of the main one
-    assert sum(FORK_DIRECTIVE.format(prompt="[F] X") in str(c) for c in contents) == 1
+    assert sum(fork_directive("[F] X") in str(c) for c in contents) == 1
     assert contents[-2:] == ["fork report 1", "[F] and then?"]
     assert "main done" not in contents
     assert second[0] == fake_model.calls[0]["messages"][0]  # the same system message as when it started
     # its steps are stored under its id, never in the main history
     stored = [s.get("content") for s in store.steps[run.id]]
-    assert stored[-4:] == [FORK_DIRECTIVE.format(prompt="[F] X"), "fork report 1", "[F] and then?", "fork report 2"]
+    assert stored[-4:] == [fork_directive("[F] X"), "fork report 1", "[F] and then?", "fork report 2"]
     assert store.rows[run.id]["agent_type"] == "fork" and store.rows[run.id]["status"] == "completed"
 
 
@@ -245,7 +274,7 @@ def test_fork_is_listed_as_a_type(name, agents_home):
 # --- Cache-stable context, T4.1 ----------------------------------------------------------------------------------
 
 def test_fork_copies_context_steps(agents, fake_model):
-    from dostuff.agent.subagents.fork import FORK_DIRECTIVE
+    from dostuff.agent.subagents.fork import fork_directive
     from dostuff.helpers.agent.turn_context import make_context_step
     fake_model.script("[MAIN]", fake_response(tool_calls=[_fork_call()]), fake_response("main done"))
     fake_model.script("[F]", fake_response("fork report"))
@@ -260,7 +289,7 @@ def test_fork_copies_context_steps(agents, fake_model):
     kept = fork_first["messages"][1]
     assert kept["content"].startswith(bundle + "\n\n") and "meta" not in kept  # kept, and no `meta` on the wire
     assert fork_first["messages"][1:-1] == main_first["messages"][1:-1]  # so the copied prefix still matches
-    assert fork_first["messages"][-1]["content"].endswith(FORK_DIRECTIVE.format(prompt="[F] X"))
+    assert fork_first["messages"][-1]["content"].endswith(fork_directive("[F] X"))
 
 
 # --- a /btw fork-out and the live snapshot -----------------------------------------------------------------------

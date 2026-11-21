@@ -92,3 +92,12 @@ def test_main_agent_only_and_always_asks():
 def test_system_prompt_mentions_it():
     from dostuff.helpers.agent.constants import SYSTEM_INSTRUCTIONS
     assert "`create_agent_type`" in SYSTEM_INSTRUCTIONS
+
+
+
+def test_writes_max_tokens(proj):
+    create_agent_type(name="writer", description="Writes long files.", prompt="Write.", max_tokens=32000)
+    agent_def, warnings = parse_agent_file(proj / ".dostuff" / "agents" / "writer.md")
+    assert warnings == [] and agent_def is not None and agent_def.max_tokens == 32000
+    with pytest.raises(ValueError, match="max_tokens must be at least 1"):
+        create_agent_type(name="bad", description="D.", prompt="P.", max_tokens=0)
