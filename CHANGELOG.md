@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-You can now choose how hard reasoning models think, per session with `/thinking` or by default in `config.yaml`. An agent file's `skills:` now puts those skills' instructions into the agent's prompt. Long sessions stay responsive while the answer streams, and a long session resumes in about a second. The jobs and agents lists show the newest first, and `ask_user` questions no longer get cut off.
+You can now choose how hard reasoning models think, per session with `/thinking` or by default in `config.yaml`. An agent file's `skills:` now puts those skills' instructions into the agent's prompt. Long sessions stay responsive while the answer streams, and a long session resumes in about a second. The jobs and agents lists show the newest first, and `ask_user` questions no longer get cut off. Runs of tool calls fold into one expandable line. A reply cut off at the model's output limit is no longer taken as the answer, and you can cap output tokens and set the compaction threshold per agent type. Missing optional extras are named where you look for them, and forks now actually reuse the main agent's prompt cache.
 
 ### Added
+- **Output-limit recovery**: a reply the provider stops at its output-token cap is never handed back as the answer. The model is told it was cut off and continues (a `Reply cut off at the output-token limit` line shows it), up to 3 times in a row; after that the turn ends with the text marked incomplete. A tool call whose arguments were cut off gets an error telling the model to send less per call instead of a generic invalid-JSON error.
+- **`loop.max_tokens`** sets the output-token cap sent with every model call, main agent and subagents (unset: the provider's default). An agent file's **`max_tokens:`** sets it for that type, and `create_agent_type` takes `max_tokens`. When a provider rejects the cap, the error names the setting it came from. `/agents types <name>` shows `max output tokens:`.
+- **`compact_threshold:` in agent files** (1–100 or `off`) and **`agents.compact_threshold`** set when subagents auto-compact; by default they still use the main agent's threshold. `/agents types <name>` shows it and where it came from.
+- **Optional extras are named where you look**: `dostuff doctor` and `/doctor` list every extra, installed or not, with the command that adds it; `dostuff setup` ends by naming the ones you don't have; `/tools` says what each missing one changes. The first search that falls back to DuckDuckGo's HTML page shows a one-time hint about the `search` extra.
+
+### Changed
+- **Consecutive tool calls fold into one line**, such as `● Ran 3 shell commands (ctrl+o to expand)`. Click it to open it, with a preview of each result: each call gets its own bullet (blue running, red failed) and a click on a call shows its full result. Ctrl+O opens every group in full. The header and clickable calls light up under the mouse.
+- **`ask_user` tab headers** keep up to 20 characters, and on a narrow panel only the tabs you are not on are shortened, with `…`, instead of every header being cut at 12 (`Repeat outpu`).
 - **`/thinking <level>`** sets the thinking level for this session: `auto`, `off`, `minimal`, `low`, `medium` or `high`. Without a level it shows the current one. **`loop.reasoning_effort`** in `config.yaml` sets the default for new sessions. `auto` leaves it to the provider, as before; models without reasoning support ignore the setting.
 - **`skills:` in agent files** (yours or Claude Code's) is no longer ignored: each named skill's instructions go into that agent's system prompt, up to 32 skills and `agents.max_preload_chars` characters (default 60000). Skills that are missing, manual-only, unreadable or over the limit are named in a warning at the top of the agent's report. `/agents types` shows the field.
 
@@ -19,6 +27,8 @@ You can now choose how hard reasoning models think, per session with `/thinking`
 - The background jobs list (click the shells item, or `/jobs`) and the `/agents` list now put the most recently started first, instead of running ones first.
 
 ### Fixed
+- **A fork now reuses the main agent's prompt cache.** It used to be sent a shorter tool list than the main agent, so the cached prefix never matched, although earlier notes said it was reused. It is now sent the main agent's tools unchanged, and the ones no subagent may use are refused when it calls them.
+- A foreground subagent's tool calls no longer show twice in a group (once stuck at `⎿ …`, once as a separate `[agent: …]` line).
 - **Typing and scrolling no longer lag in long sessions** while the agent is working: the loader, the streamed answer and the status bar no longer re-lay out the whole conversation on every update, and new answer rows wait while you are scrolled up.
 - **A resumed long session paints in about a second** instead of several.
 - The agent no longer sees or repeats `[System: Empty message content sanitised to satisfy protocol]` on Claude models after steps that only call tools.

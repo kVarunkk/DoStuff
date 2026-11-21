@@ -46,12 +46,13 @@ DoStuff is a terminal AI agent that runs anywhere `pip` runs. It gives you a ful
 - **Subagents** — the `agent` tool starts agents in parallel, in the foreground or the background, from built-in types (`explore`, `plan`, `general-purpose`), your own Markdown agent files (Claude Code's `.claude/agents/` work too) or a `fork` of the conversation; continue one with `send_message`, stop it with `stop_agent`, see them all in `/agents`. See [Subagents](#subagents)
 - **Per-tool timeout** (120s) to prevent hung servers; long tool output is truncated (head + tail) before it reaches the model
 - **Retries with backoff** for rate limits, timeouts and 5xx errors (6 by default, exponential with jitter, honors `Retry-After`; `loop.max_retries` / `loop.retry_max_delay`); auth / bad-request errors fail fast
+- **Output-limit recovery** — a reply the provider stops at its output-token cap is never taken as the answer: the model is told it was cut off and continues (3 times in a row at most, then the turn ends with the text marked incomplete), and a tool call whose arguments were cut off is reported as such so the model retries it smaller. `loop.max_tokens` sets the cap for every model call, main agent and subagents (unset: the provider's default — on Anthropic-style routes, such as Claude or MiniMax through OpenCode Go, litellm then sends 4096 for models it doesn't know); an agent file's `max_tokens:` overrides it for that type, e.g. one that writes long files. If the provider rejects a cap above the model's limit, the error says which setting sent it
 - **Token and cost tracking** — per-turn and cumulative totals in `/status` and the line after each turn (`✻ Worked for 1m 5s · $0.01`); cost in USD from litellm's price table (hidden when the model has no known price). The table bundled with litellm is used, so startup doesn't wait on a download; set `LITELLM_LOCAL_MODEL_COST_MAP=False` to fetch the latest one from GitHub instead
 - **Long-term memory tools** — the agent saves facts (`save_memory`, about you or about this project) and notable moments (`save_episode`) as they come up; saved facts (up to 50, newest first) are shown to the agent in later sessions, episodes related to the prompt are recalled, the agent looks up older ones with `search_memory`, and `/memories consolidate` merges overlapping facts after showing you the change
 - **Graceful exit** — `Ctrl+Q` or `/exit` saves the session, cleans up, and stops background workers
 - **Clean Cancellation** — `Escape` can cancel in-flight agent turns cleanly without corrupting the session
 - **2-state session split** — `session_steps` (full audit) / `working_history` (LLM payload); DB persists both plus `compaction_notes` + `last_input_tokens`
-- **Auto & Manual Compaction** — Manual `/compact` runs compaction and saves it. Auto-compaction triggers automatically during the agent loop if context usage (`last_input_tokens`) exceeds `loop.auto_compact_threshold` (default 50%) of the model's token limit; `off` disables it (an overflowing window is still compacted), and `/compact auto <N|off>` changes it for the session. It keeps at least 15% or 20k tokens of the most recent steps in the working history, summarizing the rest into `compaction_notes` which are appended to system instructions.
+- **Auto & Manual Compaction** — Manual `/compact` runs compaction and saves it. Auto-compaction triggers automatically during the agent loop if context usage (`last_input_tokens`) exceeds `loop.auto_compact_threshold` (default 50%) of the model's token limit; `off` disables it (an overflowing window is still compacted), and `/compact auto <N|off>` changes it for the session. It keeps at least 15% or 20k tokens of the most recent steps in the working history, summarizing the rest into `compaction_notes` which are appended to system instructions. Each subagent compacts its own history at the same percent of its own model's window, unless `agents.compact_threshold` or the agent file's `compact_threshold:` sets another (`/agents types <name>` shows which applies).
 - **Tracing (opt-in)** — OTLP tracing support built into `lib/tracing.py`; prompt and tool content are redacted from spans by default
 
 ---
@@ -80,7 +81,8 @@ Optional features come as extras:
 
 Extras combine, e.g. `pip install "dostuff[memory,search]"`. Without `memory` everything else
 works: the memory tools are hidden from the model and MCP tool search matches keywords instead of
-meaning. `dostuff doctor` shows whether memory is on.
+meaning. `dostuff doctor` lists every extra, installed or not, with the command that adds it; `dostuff setup`
+ends by naming the ones you don't have, and `/tools` says what each missing one changes about the tools.
 
 ### Other install methods
 
@@ -155,7 +157,7 @@ In the TUI:
 | `dostuff init [--force]` | Create `.dostuff/` config/skills in current dir (won't overwrite without `--force`) |
 | `dostuff setup`          | Pick a model, save its API key, write `~/.dostuff/config.yaml` (runs automatically on first launch) |
 | `dostuff config`         | Show resolved config paths and values           |
-| `dostuff doctor`         | Health check: config, API key, MCP, data dir; prints a fix for each problem |
+| `dostuff doctor`         | Health check: config, API key, MCP, data dir, memory and the optional extras; prints a fix for each problem |
 | `dostuff memory [check\|repair\|consolidate] [-y]` | Check that long-term memory's indexes match what is saved (`check`, the default): the keyword index, and on the default backend the embedding index (memories not indexed, out of date, or forgotten but still indexed). `repair` fixes what `check` found, rebuilding either index from `memory.db`, which it never changes, so nothing saved is lost. On `memory.backend: chroma` it rebuilds a broken Chroma index after "Error finding id" errors, backing it up to `~/.dostuff/data/chroma-backups/` first. Stop dostuff before repairing. `consolidate` asks the model to merge your overlapping saved facts and this project's, shows the change, and writes it only when you say yes (`-y` skips the question; in auto mode it refuses without `-y`) |
 | `dostuff resume [<id>]`  | Resume the latest session started in the current directory (or the given one; a unique ID prefix is enough). `--fork` resumes a copy, `--worktree` moves it into a new worktree |
 | `dostuff sessions [--all] [-n N]` | List sessions in the current directory with their title or first prompt (`--all`: every directory) |
@@ -210,8 +212,8 @@ In the TUI:
 | `/status`     | Session, directory, model, permission mode, tokens, context use, MCP servers |
 | `/context`    | What fills the context window: system prompt, turn context (the environment and hook context sent with the prompts), memory (the saved facts and recalled episodes the model is shown; listed once any are), tools, MCP tools, project instructions, compaction summary and messages, with tokens, % and a bar |
 | `/memory [project\|global]` | Edit `AGENTS.md` (this project's or `~/.dostuff/AGENTS.md`) in the same editor as `/config`; `Ctrl+S` saves and the agent follows it from the next message |
-| `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory, hooks), with a fix for each problem |
-| `/tools`      | Every tool the agent has: when it asks (in `ask` mode), whether subagents get it and what it does, then each connected MCP server's tools (reached through `call_mcp_tool`) |
+| `/doctor`     | The `dostuff doctor` checks (config, API key, MCP config, memory, optional extras, hooks), with a fix for each problem |
+| `/tools`      | Every tool the agent has: when it asks (in `ask` mode), whether subagents get it and what it does, then what each missing optional extra changes, then each connected MCP server's tools (reached through `call_mcp_tool`) |
 | `/hooks [r]`  | List the configured hooks per event: file, matcher, timeout, `fail_closed`, and whether each runs (`user` / `trusted` / `untrusted` / `disabled` / `broken`). `/hooks r` re-reads the config files. See [Hooks](#hooks) |
 | `/queue` / `/queue clear` | List the prompts waiting for the current turn: edit one (back into the input), run it next or remove it / drop them all |
 | `/jobs [<id>]` / `/jobs kill <id>` | List this session's background jobs (id, owner, status, runtime, command) / show a job's last 40 lines of output and its log files / stop one (the agent is told). See [Background jobs](#background-jobs) |
@@ -264,7 +266,7 @@ In the TUI:
 | `bash_command` | shell | yes, unless every part of the command is on the read-only allow-list (`ls`, `cat`, `git status`, `git diff`, …) with no redirection or substitution |
 | `call_mcp_tool` | mcp | yes |
 | `web_fetch` | network | yes; `a` (always) allows that domain for the session |
-| `web_search` | network | yes; `a` (always) allows every search for the session. Free: DuckDuckGo by default, the `ddgs` package if installed (`pip install "dostuff[search]"`), or your own SearXNG via `search.searxng_url` |
+| `web_search` | network | yes; `a` (always) allows every search for the session. Free: DuckDuckGo by default, the `ddgs` package if installed (`pip install "dostuff[search]"`), or your own SearXNG via `search.searxng_url`. The first search that falls back to DuckDuckGo's HTML page says so once in the TUI |
 | `agent`, `send_message`, `stop_agent` | — | no; each subagent's own calls ask, titled with the agent |
 | `ask_user` | read | never (it is the agent talking to you; subagents never get it) |
 | `save_memory`, `save_episode`, `search_memory` | read | never (each save is shown in the TUI; only with the `memory` extra; subagents never get them) |
@@ -622,7 +624,7 @@ A fork already has them in the conversation it inherits.
 | `general-purpose` | every subagent tool | research and multi-step tasks, including changing files. The default |
 | `explore` | read-only (its `bash_command` only runs read-only commands) | finding code and answering where things are; model: `agents.explore_model` |
 | `plan` | read-only | investigating and returning a step-by-step plan |
-| `fork` | the main agent's | a copy of the main agent that inherits the whole conversation (same system prompt, so a Claude model reuses the prompt cache). Costly: only when the task needs the conversation. Always the main model |
+| `fork` | the main agent's list; the ones no subagent gets (starting or messaging agents, memory, todos, `ask_user`, settings) are refused when called | a copy of the main agent that inherits the whole conversation (same system prompt and tool list, so on a Claude model its first call reads the conversation from the prompt cache). Costly: only when the task needs the conversation. Always the main model |
 
 Your own types are Markdown files with YAML frontmatter. They are searched in this order, and the first file with a
 given `name` wins: `.dostuff/agents/` and `.claude/agents/` in the project, then `~/.dostuff/agents/` and
@@ -632,7 +634,7 @@ agent before its next model call (see [Adding skills mid-session](#adding-skills
 `/agents reload` re-reads them now and rebuilds the system prompt.
 
 You can also ask the agent for one ("make a code-reviewer agent"): its `create_agent_type(name, description, prompt,
-tools, model, max_iterations, scope, replace)` tool writes the file to `.dostuff/agents/` (`scope="user"`:
+tools, model, max_iterations, max_tokens, scope, replace)` tool writes the file to `.dostuff/agents/` (`scope="user"`:
 `~/.dostuff/agents/`) after showing it to you. Like the settings tools, it asks in every mode. The new type can be
 started at once, and the agent is told about it before its next step.
 
@@ -643,6 +645,8 @@ description: Reviews a diff for bugs and missing tests. Use after a change.
 tools: Read, Grep, Glob, Bash   # omit for every subagent tool
 model: fast                     # inherit (default), an alias from agents.models, or a litellm model string
 max_iterations: 30              # optional; default agents.max_iterations
+max_tokens: 32000               # optional; output-token cap per model call, default loop.max_tokens
+compact_threshold: 30           # optional; auto-compact at this % of its window (1-100 or off), default agents.compact_threshold
 omit_memory: true               # optional; leave out your saved facts (default false)
 skills: code-style, testing     # optional; these skills' instructions go into its system prompt
 ---
@@ -712,6 +716,7 @@ agents:
   read_claude_agents: true  # also load .claude/agents/
   explore_model: inherit    # model of the built-in explore type
   max_preload_chars: 60000  # most skill text an agent file's skills: puts in its system prompt
+  # compact_threshold: 30   # auto-compaction % for subagents (1-100 or off); default: the main agent's
   models:                   # aliases for model: and model=
     fast: anthropic/claude-haiku-5-5
 ```
@@ -954,6 +959,7 @@ loop:
   max_tool_output_chars: 30000   # longer tool results keep head + tail
   max_retries: 6                 # retries on rate limits, timeouts, 5xx (0 = none)
   retry_max_delay: 60            # cap on each wait, seconds; Retry-After is honored
+  # max_tokens: 16000            # output-token cap per model call (unset: the provider's default); keep it within the model's output limit
 
 memory:
   backend: hybrid           # hybrid (default) | sqlite (keywords only) | chroma (the store before hybrid)
