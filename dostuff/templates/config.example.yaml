@@ -69,6 +69,8 @@ agents:
   read_claude_agents: true  # also load agent files from .claude/agents/
   explore_model: inherit    # model of the built-in explore type; inherit = the main model
   max_preload_chars: 60000  # most characters of skill text an agent file's `skills:` puts in its system prompt
+  # compact_threshold: 30   # auto-compaction % for subagents (1-100 or off); an agent file's compact_threshold:
+                            # wins; default: the main agent's loop.auto_compact_threshold (or /compact auto)
   models:                   # aliases for an agent's `model:` and the agent tool's model=
     # fast: anthropic/claude-haiku-5-5
 

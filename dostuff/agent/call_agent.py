@@ -4,7 +4,7 @@ from litellm import acompletion
 from dostuff.config import get_config
 from dostuff.helpers.agent.attachments import content_text, hydrate
 from dostuff.tools.definitions import TOOL_SCHEMAS, default_tool_names
-from dostuff.lib.model import completion_kwargs, supports_reasoning, uses_explicit_prompt_caching
+from dostuff.lib.model import completion_kwargs, current_max_tokens, supports_reasoning, uses_explicit_prompt_caching
 from dostuff.lib.tracing import content_attr, tracer
 from opentelemetry.trace import Status, StatusCode
 
@@ -30,6 +30,14 @@ CACHE_BREAKPOINTS: list[dict[str, Any]] = [
 ]
 
 
+def request_max_tokens() -> tuple[int, str]:
+    """The output-token cap a model call sends, and the setting it came from (for error hints); 0 = none sent.
+    The running subagent type's own cap wins over loop.max_tokens (main agent, forks, untyped runs)."""
+    if own := current_max_tokens.get():
+        return own, "the agent type's max_tokens:"
+    return int(getattr(get_config(), "max_tokens", 0) or 0), "loop.max_tokens"
+
+
 def build_request_kwargs(stream: bool) -> dict[str, Any]:
     """Model, api key and only the optional params this model/stream mode can use."""
     kwargs = completion_kwargs()
@@ -37,7 +45,11 @@ def build_request_kwargs(stream: bool) -> dict[str, Any]:
     kwargs["stream"] = stream
     if stream:
         kwargs["stream_options"] = {"include_usage": True}
-    effort = get_config().reasoning_effort
+    config = get_config()
+    max_tokens, _ = request_max_tokens()
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens  # litellm maps it per provider (max_output_tokens on the Responses route)
+    effort = config.reasoning_effort
     if effort != "auto" and supports_reasoning(kwargs["model"]):
         # litellm maps this to each provider's own knob (Anthropic budget, Gemini thinking budget, OpenAI effort);
         # "off" is its "none". For Gemini it also decides whether thoughts are streamed.

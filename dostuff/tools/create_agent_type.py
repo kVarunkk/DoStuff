@@ -41,7 +41,8 @@ def check_name(name: str) -> str:
 
 
 def agent_file_text(name: str, description: str, prompt: str, tools: list[str] | None = None,
-                    model: str = "", max_iterations: int | None = None) -> tuple[str, list[str]]:
+                    model: str = "", max_iterations: int | None = None,
+                    max_tokens: int | None = None) -> tuple[str, list[str]]:
     """(the agent file's text, warnings). Raises ValueError for a type that couldn't load."""
     name = check_name(name)
     description = " ".join(description.split())
@@ -62,6 +63,10 @@ def agent_file_text(name: str, description: str, prompt: str, tools: list[str] |
         if max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
         front["max_iterations"] = int(max_iterations)
+    if max_tokens is not None:
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be at least 1")
+        front["max_tokens"] = int(max_tokens)
     head = yaml.safe_dump(front, sort_keys=False, allow_unicode=True, width=10_000)
     return f"---\n{head}---\n\n{prompt.strip()}\n", warnings
 
@@ -73,7 +78,7 @@ def create_agent_type_preview(args: dict[str, Any]) -> str:
         path = agent_type_path(name, str(args.get("scope") or "project"))
         text, warnings = agent_file_text(
             name, str(args.get("description", "")), str(args.get("prompt", "")), args.get("tools"),
-            str(args.get("model") or ""), args.get("max_iterations"))
+            str(args.get("model") or ""), args.get("max_iterations"), args.get("max_tokens"))
     except Exception as e:
         return f"  ({e}; it will fail)"
     verb = "replaces" if path.is_file() else "creates"
@@ -88,6 +93,7 @@ def create_agent_type(
     tools: list[str] | None = None,
     model: str = "",
     max_iterations: int | None = None,
+    max_tokens: int | None = None,
     scope: Scope = "project",
     replace: bool = False,
 ) -> str:
@@ -106,6 +112,8 @@ def create_agent_type(
             tools are never given to subagents.
         model: An alias from agents.models or a full model name. Empty uses the session's model.
         max_iterations: Its tool-loop cap. Leave out for the configured agents.max_iterations.
+        max_tokens: Its output-token cap per model call, for a type that writes long replies or files. Leave
+            out for loop.max_tokens (or the provider's default). Keep it within its model's output limit.
         scope: 'project' for ./.dostuff/agents (this project), 'user' for ~/.dostuff/agents (every project).
         replace: True replaces an existing file of the same name in that scope.
 
@@ -117,7 +125,7 @@ def create_agent_type(
     existed = path.is_file()
     if existed and not replace:
         raise ValueError(f"{_display(path)} already exists. Pass replace=true to replace it, or pick another name.")
-    text, warnings = agent_file_text(name, description, prompt, tools, model, max_iterations)
+    text, warnings = agent_file_text(name, description, prompt, tools, model, max_iterations, max_tokens)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
     agent_def, parse_warnings = parse_agent_file(path)

@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable, Literal
 from dostuff.agent.capabilities import ALL_KINDS, SKILL_KINDS
 from dostuff.agent.subagents import current_agent, read_only_shell
 from dostuff.agent.subagents.adapter import SubagentAdapter
-from dostuff.agent.subagents.definitions import UnknownAgentType, get_definitions, resolve_model
+from dostuff.agent.subagents.definitions import UnknownAgentType, get_definitions, resolve_model, subagent_compact_threshold
 from dostuff.agent.subagents.fork import FORK_TYPE, MODEL_IGNORED, ForkContext, fork_first_step
 from dostuff.agent.subagents.prompt import Preloaded, build_subagent_prompt, load_preloaded, worktree_note
 from dostuff.config import DEFAULT_AGENTS_MAX_CONCURRENT
@@ -22,7 +22,7 @@ from dostuff.helpers.hooks.events import SUBAGENT_START_CONTEXT, subagent_start
 from dostuff.helpers.agent.notices import AgentNotice, agent_notice_line, fmt_agent_runtime, get_notice_queue
 from dostuff.helpers.agent.turn_context import facts_source
 from dostuff.helpers.tools.project_root import project_root, use_project_root
-from dostuff.lib.model import current_model, is_main_provider
+from dostuff.lib.model import current_compact_threshold, current_max_tokens, current_model, is_main_provider
 from dostuff.lib.worktree import Worktree, create_worktree, detect_worktree
 from dostuff.tools.bash.jobs import get_registry
 
@@ -412,6 +412,8 @@ class AgentRegistry:
                 list(agent_def.tools) if agent_def.tools is not None else None)
         tool_names, dropped = resolve_subagent_tools(requested)
         current_model.set(run.model)  # this task's context only: the whole run uses its model (D15)
+        current_max_tokens.set(agent_def.max_tokens if fork is None else None)  # a fork has no type
+        current_compact_threshold.set((subagent_compact_threshold(agent_def, get_config(), fork=fork is not None)[0],))
         read_only_shell.set(agent_def.read_only_shell)  # (D3)
         current_agent.set(run)
         missing = await _missing_key(run.model)
@@ -463,6 +465,8 @@ class AgentRegistry:
                     store=transcript, compaction_notes=run.compaction_notes, inbox=run.inbox,
                     session_hook_context=fork.session_hook_context if fork is not None else None,
                     capabilities_baseline=baseline, capability_kinds=kinds, facts=facts,
+                    # A fork sends the main agent's tools as they are: they head the cached prefix (D11)
+                    schema_tool_names=list(fork.tool_names) if fork is not None else None,
                 )
         finally:
             # Its jobs die with it: nobody is left to read them or hear when they end (background shell D8)

@@ -119,12 +119,15 @@ async def run_agent_loop(
     capabilities_baseline: tuple[str, ...] | None = None,
     capability_kinds: tuple[str, ...] | None = None,
     facts: Any = None,
+    schema_tool_names: list[str] | None = None,
 ) -> tuple[str, RunOutcome]:
     """The subagent's loop, plus a partial report if it stopped before a final answer. `store` is the run's
     transcript (`AgentTranscript`), or None to keep its steps in memory only. `capabilities_baseline` and
     `capability_kinds` are what its system prompt lists (mid-run refresh D10): a typed agent's own skills, or a
     fork's copy of the main agent's lists. `facts` (a `FactsSource`) gives a typed agent the main session's facts
-    step (memory recall D14); None for a fork, an `omit_memory` type, or with memory off."""
+    step (memory recall D14); None for a fork, an `omit_memory` type, or with memory off. `schema_tool_names` is a
+    fork's: the main agent's tool list, sent unchanged so the cached prefix holds, while only `allowed_tool_names`
+    may run (D11)."""
     from dostuff.agent.capabilities import ALL_KINDS
     from dostuff.agent.loop import CANCELLED_TURN, MODEL_ERROR_PREFIX, loop
 
@@ -151,12 +154,14 @@ async def run_agent_loop(
         memory_store=facts.store if facts is not None else None,
         memory_user_id=facts.user_id if facts is not None else None,
         facts_project=facts.project if facts is not None else None,
+        schema_tool_names=schema_tool_names,
     )
     if subagent_result == CANCELLED_TURN:
         return subagent_result, "stopped"
     outcome: RunOutcome = "failed" if subagent_result.startswith(MODEL_ERROR_PREFIX) else "completed"
     if not _finished(working_history):
         # Max iterations, model error or empty replies: keep the work instead of only the error
-        report = await _partial_report(working_history, subagent_system_instruction, allowed_tool_names)
+        report = await _partial_report(working_history, subagent_system_instruction,
+                                       schema_tool_names if schema_tool_names is not None else allowed_tool_names)
         subagent_result = f"[subagent did not finish: {subagent_result}]\n\nPartial report:\n{report}"
     return subagent_result, outcome

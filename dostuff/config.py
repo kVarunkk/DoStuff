@@ -117,6 +117,11 @@ class Config:
         # Overrides litellm's model info; useful for models litellm doesn't know
         self.context_window = int(loop_cfg.get("context_window") or 0)
         self.max_tool_output_chars = int(loop_cfg.get("max_tool_output_chars") or MAX_TOOL_OUTPUT_CHARS)
+        # Output-token cap sent with every model call (main agent and subagents); 0 = the provider's own default
+        try:
+            self.max_tokens = max(int(loop_cfg.get("max_tokens") or 0), 0)
+        except (TypeError, ValueError):
+            self.max_tokens = 0
         # Big TUI pastes go to .dostuff/pastes/ and the model gets a path + preview (helpers/agent/pastes.py)
         file_lines = loop_cfg.get("paste_file_lines")
         self.paste_file_lines = max(int(file_lines), 0) if file_lines is not None else PASTE_FILE_LINES
@@ -182,6 +187,14 @@ class Config:
         self.agents_read_claude_agents = str(agents.get("read_claude_agents", True)).lower() not in ("0", "false", "no", "off")
         self.agents_explore_model = str(agents.get("explore_model") or "inherit").strip()
         self.agents_max_preload_chars = max(int(agents.get("max_preload_chars") or DEFAULT_AGENTS_MAX_PRELOAD_CHARS), 1)
+        # Auto-compaction percent for subagents (an agent file's compact_threshold: wins); None = the main agent's,
+        # 0 = off
+        try:
+            sub_threshold = agents.get("compact_threshold")
+            self.agents_compact_threshold: int | None = (
+                None if sub_threshold is None else parse_compact_threshold(sub_threshold) or 0)
+        except ValueError:
+            self.agents_compact_threshold = None
         models = agents.get("models")
         self.agents_models = {str(k).strip(): str(v).strip() for k, v in models.items() if v} if isinstance(models, dict) else {}
         # TUI status bar: which items show, in this order; unknown names are reported once at startup

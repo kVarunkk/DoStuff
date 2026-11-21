@@ -11,6 +11,11 @@ current_session_id: ContextVar[str] = ContextVar("current_session_id", default=u
 # A subagent run's own model (subagents spec D15), set inside the run's task; None = the main model.
 # Context variables follow tasks and asyncio.to_thread, so the whole run (and only the run) uses it.
 current_model: ContextVar[str | None] = ContextVar("current_model", default=None)
+# A subagent run's own output-token cap (its type's `max_tokens:`), set beside current_model; None = loop.max_tokens
+current_max_tokens: ContextVar[int | None] = ContextVar("current_max_tokens", default=None)
+# A subagent run's auto-compaction percent, set beside current_model: a 1-tuple so "off" (None) differs from
+# "not set" (None = the main agent's threshold). Only the subagent loop reads it.
+current_compact_threshold: ContextVar[tuple[int | None] | None] = ContextVar("current_compact_threshold", default=None)
 
 
 def _run_model() -> str | None:
