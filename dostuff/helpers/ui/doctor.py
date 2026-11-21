@@ -35,6 +35,15 @@ def _config_secret_checks(path: Path) -> list[Check]:
     return [Check(f"Secret in {path}: {', '.join(found)}", False, SECRET_HINT)] if found else []
 
 
+def extras_checks() -> list[Check]:
+    """One line per optional extra (memory has its own lines): installed, or what is missing and how to add it."""
+    from dostuff.helpers.extras import EXTRAS, extra_installed, install_hint
+
+    return [Check(f"Extra {extra.name}: installed ({extra.adds})" if extra_installed(extra)
+                  else f"Extra {extra.name}: not installed, so {extra.without} (optional; `{install_hint(extra.name)}`)",
+                  None) for extra in EXTRAS]
+
+
 def doctor_checks() -> list[Check]:
     """Config files, the model's API key, MCP config, data dir, memory and permission mode."""
     from dostuff.config import get_config
@@ -86,6 +95,7 @@ def doctor_checks() -> list[Check]:
                                 "`dostuff memory check`)", None))
         checks.append(Check("Memory embedding model: " + ("not downloaded yet (~80 MB; the TUI fetches it on first start)"
                                                           if embedding_model_missing() else "downloaded"), None))
+    checks += extras_checks()
     checks.append(Check(f"Permission mode: {cfg.permission_mode}", None))
     return checks + hooks_checks()
 

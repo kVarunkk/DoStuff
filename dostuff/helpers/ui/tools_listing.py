@@ -21,6 +21,18 @@ def _summary(description: str | None) -> str:
     return text[:end + 1] if end != -1 else text
 
 
+def _extras_lines() -> list[str]:
+    """What the missing optional extras would change about the tools above (none when all are installed)."""
+    from dostuff.config import get_config
+    from dostuff.helpers.extras import install_hint, missing_extras
+
+    missing = [e for e in missing_extras() if not (e.name == "search" and get_config().searxng_url)]
+    if not missing:
+        return []
+    lines = [f"  Without the {e.name} extra: {e.without}" for e in missing]
+    return lines + [f"  ({install_hint(*(e.name for e in missing))} adds them; `dostuff doctor` lists every extra)"]
+
+
 def tools_listing(mcp_tools: dict[str, dict[str, Any]] | None = None) -> str:
     """The built-in tools (name, when it asks, subagents, what it does), then each connected MCP server's
     tools as `call_mcp_tool` names them. `mcp_tools` is MCPClient.mcp_tools."""
@@ -39,6 +51,7 @@ def tools_listing(mcp_tools: dict[str, dict[str, Any]] | None = None) -> str:
     off = [n for n in TOOL_MAP if n not in offered and n in MEMORY_TOOLS]
     if off:
         lines.append(f"  Off: {', '.join(off)} (memory.backend: chroma needs the memory extra: pip install \"dostuff[memory]\"; the default backend doesn't)")
+    lines += _extras_lines()
 
     servers: dict[str, list[dict[str, Any]]] = {}
     for info in (mcp_tools or {}).values():

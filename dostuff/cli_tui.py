@@ -2489,6 +2489,7 @@ class DostuffTUI(App):
         self._history_path = self.config.get_data_dir() / "prompt_history.jsonl"
         self._pastes = PasteStore()  # collapsed pastes in the input (helpers/agent/pastes.py)
         self._images = clipboard.PastedImages()  # alt+v images in the input, `[Image #N]` (multimodal REQ-3)
+        self._search_extra_noted = False  # said once that web_search is on DuckDuckGo's HTML page
         self.worktree: Worktree | None = None  # set while the cwd is a dostuff git worktree
         self.exit_note = ""  # printed by cli.py after the TUI closes (e.g. a kept worktree)
         self._notify_kind = self.config.notifications  # /notifications changes it for the session
@@ -2801,6 +2802,17 @@ class DostuffTUI(App):
             self._start_worker(self._connect_mcp_servers(mcp_servers), name="mcp_connect")
         else:
             self._append("Running with local tools only.", msg_type="system")
+
+    def _note_search_fallback(self) -> None:
+        """After the first web_search that read DuckDuckGo's HTML page: say once that the search extra is steadier."""
+        from dostuff.tools.web_search import html_fallback_used
+
+        if self._search_extra_noted or not html_fallback_used():
+            return
+        self._search_extra_noted = True
+        from dostuff.helpers.extras import install_hint
+        self._append("web_search is using DuckDuckGo's HTML page, which rate-limits. For steadier search through "
+                     f"several engines, run `{install_hint('search')}` (or set search.searxng_url).", msg_type="system")
 
     def _note_memory_off(self) -> None:
         """memory.backend: chroma without chromadb: say so once if memories were saved before."""
