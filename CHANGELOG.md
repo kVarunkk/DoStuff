@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.16] - 2026-11-21
 
 You can now choose how hard reasoning models think, per session with `/thinking` or by default in `config.yaml`. An agent file's `skills:` now puts those skills' instructions into the agent's prompt. Long sessions stay responsive while the answer streams, and a long session resumes in about a second. The jobs and agents lists show the newest first, and `ask_user` questions no longer get cut off. Runs of tool calls fold into one expandable line. A reply cut off at the model's output limit is no longer taken as the answer, and you can cap output tokens and set the compaction threshold per agent type. Missing optional extras are named where you look for them, and forks now actually reuse the main agent's prompt cache.
 
