@@ -8,6 +8,7 @@ which hops back to the UI thread when needed.
 import asyncio
 import contextlib
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -420,6 +421,17 @@ TOOL_SUMMARY_NOUNS: dict[str, _ToolNoun] = {
 UNGROUPED_TOOLS = frozenset({"todo_write", "ask_user", "agent", "delegate_to_subagent"})
 
 
+_AGENT_PREFIX = re.compile(r"(?:\[agent: .*?\] )+")
+
+
+def split_agent_prefix(text: str) -> tuple[str, str]:
+    """`[agent: spec] read_file: …` → (`[agent: spec] `, `read_file: …`). A foreground subagent's calls and
+    results come prefixed (SubagentAdapter); the prefix is not part of the tool name a result is matched by,
+    and the `[agent: …]` description itself holds a `: `."""
+    match = _AGENT_PREFIX.match(text)
+    return (match.group(0), text[match.end():]) if match else ("", text)
+
+
 def summarize_tool_calls(names: list[str], running: bool = False) -> str:
     """`Read 2 files, ran 1 shell command`: one clause per kind of call, in the order they were made."""
     counts: dict[_ToolNoun, int] = {}
@@ -473,6 +485,7 @@ class _ToolGroupCall(MessageStatic):
         self.full = full
         self.closed = closed  # the group's turn ended: no result now means the call never ran
         super().__init__(self._content(), markup=False, **kwargs)
+        self.set_class(self.collapsible, "-clickable")
 
     @property
     def collapsible(self) -> bool:
@@ -502,6 +515,7 @@ class _ToolGroupCall(MessageStatic):
             _update_static(self, self._content())
         else:
             self.update(self._content(), layout=False)
+        self.set_class(self.collapsible, "-clickable")  # hover highlights only a row a click changes
 
     def set_full(self, full: bool) -> None:
         if full != self.full:
@@ -532,7 +546,7 @@ class ToolGroup(Vertical):
         self.full = expanded
         self.closed = False  # the turn ended: a call still without a result never ran
         self.rows: list[_ToolGroupCall] = []
-        self.header = _ToolGroupHeader(self._header(), markup=False)
+        self.header = _ToolGroupHeader(self._header(), markup=False, classes="tool-group-header")
         super().__init__(self.header, **kwargs)
 
     @property
@@ -592,7 +606,8 @@ class ToolGroup(Vertical):
         if not self.is_mounted:
             return
         if self.expanded and len(self.rows) < len(self.calls):
-            new = [_ToolGroupCall(call, full=self.full, closed=self.closed) for call in self.calls[len(self.rows):]]
+            new = [_ToolGroupCall(call, full=self.full, closed=self.closed, classes="tool-group-call")
+                   for call in self.calls[len(self.rows):]]
             self.rows.extend(new)
             self.mount(*new)
         for row in self.rows:
@@ -1211,14 +1226,38 @@ class AskUserPanel(Static, can_focus=True):
     def on_mount(self) -> None:
         self._render_panel()
 
-    def _tabs(self) -> Text:
+    def _tab_labels(self, width: int | None) -> list[str]:
+        """The tab labels, shortened with `…` only as far as the strip needs to fit on one `width`-cell line.
+        The current tab keeps its whole label; the others are capped to a shared length, longest first."""
+        labels = [_one_line_answer(q.get("header") or f"Q{i + 1}") for i, q in enumerate(self.questions)]
+        if width is None:
+            return labels
+        current = self.cursor_question if not self.submit_focused and not self.reviewing else -1
+        # each tab is a 2-cell mark plus its label, with ` · ` between tabs (and before the review tab)
+        overhead = 2 * len(labels) + 3 * (len(labels) - 1)
+        if self.reviewing:
+            overhead += 5 + len(ASK_REVIEW_LABEL)
+
+        def capped(cap: int) -> list[str]:
+            return [label if i == current or len(label) <= cap else label[:cap - 1] + "…"
+                    for i, label in enumerate(labels)]
+
+        cap = max((len(label) for label in labels), default=0)
+        fitted = labels
+        while cap > 4 and overhead + sum(len(label) for label in fitted) > width:
+            cap -= 1
+            fitted = capped(cap)
+        return fitted
+
+    def _tabs(self, width: int | None = None) -> Text:
         """The tab strip (D6): one tab per question, the current one unmistakable.
 
         The strip is the only thing that says which question you are on, so the current tab is bold orange
         and carries a solid bar; an answered one carries `✓` in the same slot, so every tab is the same
         width and the strip does not re-flow as answers land. Plain glyphs, never emoji: this line shares
-        its marks with the option rows' own `❯`/`✓`."""
+        its marks with the option rows' own `❯`/`✓`. Given `width`, the labels are fitted to it."""
         text = Text()
+        labels = self._tab_labels(width)
         for i, question in enumerate(self.questions):
             if i:
                 text.append(" · ", style="dim")
@@ -1230,8 +1269,7 @@ class AskUserPanel(Static, can_focus=True):
             else:
                 mark, mark_style = "  ", ""
             text.append(mark, style=mark_style)
-            label = _one_line_answer(question.get("header") or f"Q{i + 1}")
-            text.append(label, style=ASK_CURRENT_TAB if here else "")
+            text.append(labels[i], style=ASK_CURRENT_TAB if here else "")
         if self.reviewing:
             text.append(" · ", style="dim")
             text.append("▌ ", style=ASK_CURRENT_TAB)
@@ -1291,7 +1329,7 @@ class AskUserPanel(Static, can_focus=True):
 
         A question's rows carry `meta={"ask-review": i}`, so a click on the question or on its answer goes
         back to that question; the answer is shown whole (it wraps) — the review is where it gets read."""
-        text = self._tabs()
+        text = self._tabs(width + 4)
         text.append("\n   Review your answers", style="bold")
         for i, question in enumerate(self.questions):
             meta = Style(meta={"ask-review": i})
@@ -1317,14 +1355,14 @@ class AskUserPanel(Static, can_focus=True):
             self._render_review(width)
             return
         index = min(self.cursor_question, len(self.questions) - 1)
-        text = self._tabs()
+        text = self._tabs(width + 4)
         text.append("\n   " + _one_line_answer(self.questions[index].get("question", "")), style="bold")
         rows = self._row_texts(index, width)
         cursor = min(self.cursor_row, len(rows) - 1)
         start, end = _option_window(len(rows), cursor)
         # lines the panel needs besides the options: tabs, question, rule, submit row, hint; and the screen's own
         # (border, status row, margins) that it must leave
-        fixed = (len(textwrap.wrap(self._tabs().plain, width + 4) or [""])
+        fixed = (len(textwrap.wrap(self._tabs(width + 4).plain, width + 4) or [""])
                  + len(textwrap.wrap(_one_line_answer(self.questions[index].get("question", "")), width + 1) or [""])
                  + 3 + 6)
         start, end = self._fit_window(rows, cursor, start, end, self.app.size.height - fixed)
@@ -1999,8 +2037,8 @@ class TuiAdapter:
             app._append(str(data), msg_type="diff")
             return
         if event_type == "tool_call":
-            label = str(data)
-            app._append_tool_call(label.partition("(")[0], label)
+            prefix, label = split_agent_prefix(str(data))
+            app._append_tool_call(label.partition("(")[0], label, prefix=prefix)
             return
         if event_type == "tool_result":
             text = str(data)
@@ -2012,7 +2050,10 @@ class TuiAdapter:
                 if pairs is not None:
                     app._append_answers_block(pairs)
                     return  # a cancelled or refused result has no pairs and falls through to the usual line
-            app._append_call_result(text)
+            prefix, text = split_agent_prefix(text)
+            app._append_call_result(text, prefix=prefix)
+            if text.startswith("web_search: "):
+                app._note_search_fallback()
             return
         if event_type in ("confirm", "system", "error"):
             app._append(str(data), msg_type=event_type)
@@ -2302,6 +2343,8 @@ class DostuffTUI(App):
     .msg-tool { }
     ToolGroup.msg { height: auto; }
     ToolGroup > Static { width: 100%; height: auto; }
+    /* Clickable, so they light up under the mouse like the jobs/agents bars */
+    ToolGroup > .tool-group-header:hover, ToolGroup > .tool-group-call.-clickable:hover { background: #2c2c2c; }
     .msg-tool-result { color: #8a8a8a; margin-top: 0; }
     .msg-diff { margin-top: 0; }
     .msg-shell { color: #d7769f; }

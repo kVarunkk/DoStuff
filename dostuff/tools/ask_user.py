@@ -25,7 +25,9 @@ from dostuff.helpers.ui.ask_answers import (
 # have no length cap: the panel wraps them in full, and a cut one hides what the user is choosing between.
 ASK_MAX_QUESTIONS = 4
 ASK_MAX_OPTIONS = 4
-ASK_HEADER_CHARS = 12
+# The schema asks for 12; models routinely send a word or two more ("Repeat output"), so the tool keeps up
+# to 20 and the panel fits the strip to its width. A longer one is cut with `…` so the cut shows.
+ASK_HEADER_CHARS = 20
 
 
 class AskOption(TypedDict):
@@ -134,7 +136,7 @@ def _clean_questions(raw: object) -> list[dict[str, Any]]:
     for i, question in enumerate(kept, 1):  # Q<n> counts the dropped questions out
         entry: dict[str, Any] = {
             "question": one_line(question["question"]),
-            "header": _clamp(question["header"], ASK_HEADER_CHARS, ellipsis=False)
+            "header": _clamp(question["header"], ASK_HEADER_CHARS)
             if _has_text(question.get("header")) else f"Q{i}",
             "options": _clean_options(question.get("options")),
             "multi_select": question.get("multi_select") is True,
