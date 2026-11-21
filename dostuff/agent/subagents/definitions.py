@@ -18,9 +18,12 @@ class AgentDef:
     tools: tuple[str, ...] | None = None  # None: every tool a subagent of this type may have
     model: str = "inherit"
     max_iterations: int | None = None  # None: the configured subagent cap
+    max_tokens: int | None = None  # output-token cap per model call; None: loop.max_tokens
+    compact_threshold: int | None = None  # auto-compaction percent; 0 = off; None: agents.compact_threshold
     source: str = "built-in"  # a file path, or "built-in"
     read_only_shell: bool = False  # bash_command limited to permissions.is_read_only_shell (D3)
     omit_memory: bool = False  # no saved facts in its context (memory recall D14)
+    skills: tuple[str, ...] = ()  # skills whose SKILL.md text goes into its system prompt (subagent capabilities D1)
 
 
 # explore / plan: look, don't touch. The shell is limited to read-only commands (read_only_shell).
@@ -171,15 +174,55 @@ def parse_agent_file(path: Path) -> tuple[AgentDef | None, list[str]]:
             max_iterations = max(int(front["max_iterations"]), 1)
         except (TypeError, ValueError):
             warnings.append(f"{path}: max_iterations '{front['max_iterations']}' is not a number; ignored")
+    max_tokens: int | None = None
+    if front.get("max_tokens") is not None:
+        try:
+            max_tokens = int(front["max_tokens"])
+        except (TypeError, ValueError):
+            warnings.append(f"{path}: max_tokens '{front['max_tokens']}' is not a number; ignored")
+        else:
+            if max_tokens < 1:
+                warnings.append(f"{path}: max_tokens must be at least 1; ignored")
+                max_tokens = None
+    compact_threshold: int | None = None
+    if front.get("compact_threshold") is not None:
+        from dostuff.config import parse_compact_threshold
+        try:
+            compact_threshold = parse_compact_threshold(front["compact_threshold"]) or 0
+        except ValueError:
+            warnings.append(f"{path}: compact_threshold '{front['compact_threshold']}' must be 1-100 or off; ignored")
+    skills, skills_warning = parse_skills(front.get("skills"), str(path))
+    if skills_warning:
+        warnings.append(skills_warning)
     if front.get("memory") not in (None, ""):
         warnings.append(f"{path}: memory '{front['memory']}' ignored: dostuff has no per-agent memory "
                         "(saved facts reach typed subagents unless omit_memory: true)")
     agent_def = AgentDef(
         name=name, description=description, prompt=match.group(2).strip(), tools=tools,
-        model=str(front.get("model") or "inherit").strip(), max_iterations=max_iterations, source=str(path),
-        omit_memory=str(front.get("omit_memory")).strip().lower() == "true",
+        model=str(front.get("model") or "inherit").strip(), max_iterations=max_iterations, max_tokens=max_tokens,
+        compact_threshold=compact_threshold, source=str(path),
+        omit_memory=str(front.get("omit_memory")).strip().lower() == "true", skills=skills,
     )
     return agent_def, warnings
+
+
+def parse_skills(raw: Any, source: str) -> tuple[tuple[str, ...], str | None]:
+    """`skills:` (YAML list or comma-separated string) → (distinct names in order, warning). A value of any other
+    shape gives no skills and a warning; the type still loads (CON-3)."""
+    if raw in (None, ""):
+        return (), None
+    if isinstance(raw, str):
+        items: list[Any] = raw.split(",")
+    elif isinstance(raw, list) and all(isinstance(n, str) for n in raw):
+        items = raw
+    else:
+        return (), f"{source}: skills ignored: expected a list of skill names or a comma-separated string"
+    names: list[str] = []
+    for item in items:
+        name = item.strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names), None
 
 
 def _agent_files(folder: Path) -> list[Path]:
@@ -336,6 +379,8 @@ def types_listing(loaded: Definitions, config: Any) -> str:
             tools += " (read-only shell)"
         lines += [f"{name}  ·  {agent_def.source}", f"  {agent_def.description}",
                   f"  model: {model}", f"  tools: {tools}"]
+        if agent_def.skills:
+            lines.append(f"  skills: {', '.join(agent_def.skills)}")
     lines += _fork_summary(config)
     lines += ["", "/agents types <name> shows a type's system prompt and full config."]
     if warnings:
@@ -343,10 +388,26 @@ def types_listing(loaded: Definitions, config: Any) -> str:
     return "\n".join(lines)
 
 
+def subagent_compact_threshold(agent_def: AgentDef, config: Any, *, fork: bool = False) -> tuple[int | None, str]:
+    """A subagent run's auto-compaction percent (None = off) and where it came from: the type's
+    `compact_threshold:`, then `agents.compact_threshold`, then the main agent's threshold. A fork has no type."""
+    for value, source in ((None if fork else agent_def.compact_threshold, "set in the file"),
+                          (getattr(config, "agents_compact_threshold", None), "agents.compact_threshold")):
+        if value is not None:
+            return value or None, source
+    return getattr(config, "compact_threshold", None), "the main agent's"
+
+
+def _threshold_line(agent_def: AgentDef, config: Any, *, fork: bool = False) -> str:
+    percent, source = subagent_compact_threshold(agent_def, config, fork=fork)
+    return f"  compact threshold: {f'{percent}%' if percent else 'off'} ({source})"
+
+
 def _fork_summary(config: Any) -> list[str]:
     from dostuff.agent.subagents.fork import FORK_DESCRIPTION, FORK_TYPE
     return [f"{FORK_TYPE}  ·  built-in", f"  {FORK_DESCRIPTION}", f"  model: {config.model_name} (always the main model)",
-            "  tools: the main agent's tools, minus agent, send_message, stop_agent and the other restricted ones"]
+            "  tools: the main agent's list, sent unchanged so the prompt cache holds; agent, send_message, stop_agent "
+            "and the other restricted ones are refused when called"]
 
 
 def _indent(text: str) -> str:
@@ -355,15 +416,15 @@ def _indent(text: str) -> str:
 
 def type_detail(name: str, loaded: Definitions, config: Any) -> str | None:
     """`/agents types <name>`: one type's whole config, its system prompt included. None for an unknown name."""
-    from dostuff.agent.subagents.fork import FORK_DIRECTIVE, FORK_TYPE
+    from dostuff.agent.subagents.fork import FORK_TYPE, fork_directive
     from dostuff.agent.subagents.run import resolve_subagent_tools
     cap = f"{config.agents_max_iterations} (agents.max_iterations)"
     if name == FORK_TYPE:
         return "\n".join(_fork_summary(config) + [
-            f"  max iterations: {cap}",
+            f"  max iterations: {cap}", _threshold_line(BUILTIN_TYPES["general-purpose"], config, fork=True),
             "", "System prompt: the main agent's, unchanged (a fork inherits the whole conversation).",
             "", "Task message it gets after the copied conversation:", "",
-            _indent(FORK_DIRECTIVE.replace("{prompt}", "<the agent tool's prompt>"))])
+            _indent(fork_directive("<the agent tool's prompt>"))])
     agent_def = loaded.types.get(name)
     if agent_def is None:
         return None
@@ -378,8 +439,15 @@ def type_detail(name: str, loaded: Definitions, config: Any) -> str | None:
     if agent_def.model.strip() not in ("", "inherit", model):
         model_line += f" (from `{agent_def.model.strip()}`)"
     iterations = f"{agent_def.max_iterations} (set in the file)" if agent_def.max_iterations is not None else cap
+    if agent_def.max_tokens is not None:
+        output_cap = f"{agent_def.max_tokens} (set in the file)"
+    else:
+        output_cap = f"{config.max_tokens} (loop.max_tokens)" if getattr(config, "max_tokens", 0) else "provider default"
     lines = [f"{agent_def.name}  ·  {agent_def.source}", f"  {agent_def.description}", model_line,
-             f"  tools: {tools}", f"  max iterations: {iterations}"]
+             f"  tools: {tools}", f"  max iterations: {iterations}", f"  max output tokens: {output_cap}",
+             _threshold_line(agent_def, config)]
+    if agent_def.skills:
+        lines.append(f"  skills: {', '.join(agent_def.skills)}")
     if model_warning:
         lines.append(f"  ⚠ {model_warning}")
     lines += ["", "System prompt:", "", _indent(agent_def.prompt) if agent_def.prompt.strip() else "  (empty)"]

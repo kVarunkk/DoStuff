@@ -7,11 +7,14 @@ from dostuff.helpers.agent.constants import MAX_ITERATIONS
 from dostuff.helpers.hooks.load_hooks import HookEntry, load_merged_hooks
 
 DEFAULT_AGENTS_MAX_CONCURRENT = 4  # running + waiting_approval agents at once; more are queued (subagents D4)
+DEFAULT_AGENTS_MAX_PRELOAD_CHARS = 60000  # characters of preloaded skill text in one agent's prompt (subagent capabilities D1)
 MAX_TOOL_OUTPUT_CHARS = 30_000
 MAX_RETRIES = 6
 RETRY_MAX_DELAY_S = 60.0
 KNOWN_PROVIDERS = ("gemini", "anthropic", "openai", "groq", "mistral", "openrouter", "ollama", "opencode-go", "opencode")
 STATUS_BAR_ITEMS = ("help", "cwd", "session", "model", "mode", "tokens", "cost", "context")
+# loop.reasoning_effort / /thinking: "auto" sends nothing (the provider's own default)
+REASONING_EFFORTS = ("auto", "off", "minimal", "low", "medium", "high")
 DEFAULT_STATUS_BAR = ("cwd", "model", "mode", "context")
 # Former items, accepted without a warning: "timer" moved to the loader message, "jobs" to an item that is always shown
 RETIRED_STATUS_BAR_ITEMS = ("timer", "jobs")
@@ -87,6 +90,8 @@ class Config:
         self._session_model: dict[str, str] | None = None
         # Set by /compact auto <N|off>: a 1-tuple so "off" (None) differs from "not set"
         self.session_compact_threshold: tuple[int | None] | None = None
+        # Set by /thinking for the rest of the process; wins over loop.reasoning_effort
+        self.session_reasoning_effort: str | None = None
         # Tracing config (env vars override config.yaml)
         t = _block(self.raw, "tracing")
         self.tracing_enabled = (
@@ -112,6 +117,11 @@ class Config:
         # Overrides litellm's model info; useful for models litellm doesn't know
         self.context_window = int(loop_cfg.get("context_window") or 0)
         self.max_tool_output_chars = int(loop_cfg.get("max_tool_output_chars") or MAX_TOOL_OUTPUT_CHARS)
+        # Output-token cap sent with every model call (main agent and subagents); 0 = the provider's own default
+        try:
+            self.max_tokens = max(int(loop_cfg.get("max_tokens") or 0), 0)
+        except (TypeError, ValueError):
+            self.max_tokens = 0
         # Big TUI pastes go to .dostuff/pastes/ and the model gets a path + preview (helpers/agent/pastes.py)
         file_lines = loop_cfg.get("paste_file_lines")
         self.paste_file_lines = max(int(file_lines), 0) if file_lines is not None else PASTE_FILE_LINES
@@ -132,6 +142,10 @@ class Config:
             self.auto_compact_threshold = AUTO_COMPACT_THRESHOLD
         # Cache breakpoints on Claude models (see lib/model.uses_explicit_prompt_caching)
         self.prompt_caching = str(loop_cfg.get("prompt_caching", True)).lower() not in ("0", "false", "no")
+        effort = str(loop_cfg.get("reasoning_effort", "auto")).strip().lower()
+        if loop_cfg.get("reasoning_effort") is False:  # YAML reads a bare `off` as false
+            effort = "off"
+        self.reasoning_effort_default = effort if effort in REASONING_EFFORTS else "auto"
         mem = _block(self.raw, "memory")
         scope = str(mem.get("episodic_scope") or "project").lower()
         self.episodic_scope = scope if scope in ("project", "user") else "project"
@@ -172,6 +186,15 @@ class Config:
         self.agents_wake_on_end = str(agents.get("wake_on_end", True)).lower() not in ("0", "false", "no", "off")
         self.agents_read_claude_agents = str(agents.get("read_claude_agents", True)).lower() not in ("0", "false", "no", "off")
         self.agents_explore_model = str(agents.get("explore_model") or "inherit").strip()
+        self.agents_max_preload_chars = max(int(agents.get("max_preload_chars") or DEFAULT_AGENTS_MAX_PRELOAD_CHARS), 1)
+        # Auto-compaction percent for subagents (an agent file's compact_threshold: wins); None = the main agent's,
+        # 0 = off
+        try:
+            sub_threshold = agents.get("compact_threshold")
+            self.agents_compact_threshold: int | None = (
+                None if sub_threshold is None else parse_compact_threshold(sub_threshold) or 0)
+        except ValueError:
+            self.agents_compact_threshold = None
         models = agents.get("models")
         self.agents_models = {str(k).strip(): str(v).strip() for k, v in models.items() if v} if isinstance(models, dict) else {}
         # TUI status bar: which items show, in this order; unknown names are reported once at startup
@@ -190,7 +213,9 @@ class Config:
         """Re-read config.yaml in place (after a settings change); /model and /compact auto choices for this session stay."""
         session_model, key_env = self._session_model, self.api_key_env_explicit
         session_compact = self.session_compact_threshold
+        session_effort = self.session_reasoning_effort
         self.__init__(self.path)  # type: ignore[misc]
+        self.session_reasoning_effort = session_effort
         if session_model:
             self._session_model, self.api_key_env_explicit = session_model, key_env
         self.session_compact_threshold = session_compact
@@ -201,6 +226,11 @@ class Config:
         if self.session_compact_threshold is not None:
             return self.session_compact_threshold[0]
         return self.auto_compact_threshold
+
+    @property
+    def reasoning_effort(self) -> str:
+        """Thinking level: /thinking for this session, else loop.reasoning_effort (one of REASONING_EFFORTS)."""
+        return self.session_reasoning_effort or self.reasoning_effort_default
 
     def configured_models(self) -> list[dict[str, Any]]:
         """The `models:` entries from config.yaml (name, provider, active, api_key_env)."""

@@ -13,16 +13,16 @@ from typing import Any, Awaitable, Callable, Literal
 from dostuff.agent.capabilities import ALL_KINDS, SKILL_KINDS
 from dostuff.agent.subagents import current_agent, read_only_shell
 from dostuff.agent.subagents.adapter import SubagentAdapter
-from dostuff.agent.subagents.definitions import UnknownAgentType, get_definitions, resolve_model
+from dostuff.agent.subagents.definitions import UnknownAgentType, get_definitions, resolve_model, subagent_compact_threshold
 from dostuff.agent.subagents.fork import FORK_TYPE, MODEL_IGNORED, ForkContext, fork_first_step
-from dostuff.agent.subagents.prompt import build_subagent_prompt, worktree_note
+from dostuff.agent.subagents.prompt import Preloaded, build_subagent_prompt, load_preloaded, worktree_note
 from dostuff.config import DEFAULT_AGENTS_MAX_CONCURRENT
 from dostuff.agent.subagents.run import _close_worktree, resolve_subagent_tools, run_agent_loop
 from dostuff.helpers.hooks.events import SUBAGENT_START_CONTEXT, subagent_start
 from dostuff.helpers.agent.notices import AgentNotice, agent_notice_line, fmt_agent_runtime, get_notice_queue
 from dostuff.helpers.agent.turn_context import facts_source
 from dostuff.helpers.tools.project_root import project_root, use_project_root
-from dostuff.lib.model import current_model, is_main_provider
+from dostuff.lib.model import current_compact_threshold, current_max_tokens, current_model, is_main_provider
 from dostuff.lib.worktree import Worktree, create_worktree, detect_worktree
 from dostuff.tools.bash.jobs import get_registry
 
@@ -404,6 +404,7 @@ class AgentRegistry:
         from dostuff.config import get_config
         agent_def = get_definitions().get(run.agent_type) or get_definitions()["general-purpose"]
         fork = run.fork if run.agent_type == FORK_TYPE else None
+        preloaded = Preloaded()  # a fork has no type, so no `skills:` (subagent capabilities D2)
         if fork is not None:
             requested: list[str] | None = fork.fork_tools()  # the main agent's tools minus D12 (D11)
         else:
@@ -411,6 +412,8 @@ class AgentRegistry:
                 list(agent_def.tools) if agent_def.tools is not None else None)
         tool_names, dropped = resolve_subagent_tools(requested)
         current_model.set(run.model)  # this task's context only: the whole run uses its model (D15)
+        current_max_tokens.set(agent_def.max_tokens if fork is None else None)  # a fork has no type
+        current_compact_threshold.set((subagent_compact_threshold(agent_def, get_config(), fork=fork is not None)[0],))
         read_only_shell.set(agent_def.read_only_shell)  # (D3)
         current_agent.set(run)
         missing = await _missing_key(run.model)
@@ -429,7 +432,8 @@ class AgentRegistry:
                 first_steps = [*fork.history, fork_first_step(ctx.prompt, note)]
                 fork.history = []  # it lives in run.history now
         else:
-            system, baseline = await build_subagent_prompt(agent_def, run.worktree)
+            preloaded = await asyncio.to_thread(load_preloaded, agent_def)
+            system, baseline = await build_subagent_prompt(agent_def, run.worktree, preloaded)
             kinds = SKILL_KINDS
             first_steps = [{"role": "user", "content": ctx.prompt}]
         # Typed agents read the main session's facts, keyed on its project even in a worktree (memory recall D14)
@@ -461,6 +465,8 @@ class AgentRegistry:
                     store=transcript, compaction_notes=run.compaction_notes, inbox=run.inbox,
                     session_hook_context=fork.session_hook_context if fork is not None else None,
                     capabilities_baseline=baseline, capability_kinds=kinds, facts=facts,
+                    # A fork sends the main agent's tools as they are: they head the cached prefix (D11)
+                    schema_tool_names=list(fork.tool_names) if fork is not None else None,
                 )
         finally:
             # Its jobs die with it: nobody is left to read them or hear when they end (background shell D8)
@@ -470,6 +476,8 @@ class AgentRegistry:
                 report = f"{report}\n\n{note}" if report else note
         if dropped:
             report = f"[warning] Tools not granted to the subagent (restricted or unknown): {', '.join(dropped)}\n\n{report}"
+        if preloaded.skipped:
+            report = f"[warning] Skills not preloaded: {', '.join(preloaded.skipped)}\n\n{report}"
         if ctx.warnings:
             report = "\n".join(ctx.warnings) + f"\n\n{report}"
         return report, status

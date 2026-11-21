@@ -472,6 +472,120 @@ def test_thought_chunks_typed_out_and_formatted(tui):
     asyncio.run(scenario())
 
 
+def test_same_size_update_skips_screen_layout(tui):
+    """A screen layout arranges every message of the conversation (~0.4 s at 1,200 of them), so the loader
+    tick and the status bar must not ask for one unless their size changes — and must when it does."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="layout")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()  # startup mounts its own notices: not what is counted here
+            await pilot.pause()
+            screen = app.screen
+            layouts = []
+            real = screen._refresh_layout
+            screen._refresh_layout = lambda *a, **k: (layouts.append(k.get("scroll", False)), real(*a, **k))[1]
+            full = lambda: sum(1 for scroll in layouts if not scroll)  # noqa: E731
+
+            app._turn_start_time = time.time()
+            loader = app._show_loader("Working...")
+            await pilot.pause()
+            status = app.query_one("#status")
+            cli_tui._update_static(status, "x" * 20)  # a known width, well inside the 80-column test screen
+            await pilot.pause()
+            assert status.outer_size.width == 22  # padding: 1 cell each side
+            layouts.clear()
+            for i in range(3):
+                app._render_loader()
+                cli_tui._update_static(status, str(i) * 20)  # new text, same cells
+                await pilot.pause()
+            assert full() == 0 and str(status.content) == "2" * 20
+
+            cli_tui._update_static(status, "x" * 30)  # wider: the row must make room for it
+            await pilot.pause()
+            assert full() >= 1 and status.outer_size.width == 32
+            layouts.clear()
+            app._loader_label = "word " * 80  # wraps onto more rows: the conversation must grow
+            app._render_loader()
+            await pilot.pause()
+            assert full() >= 1 and loader.outer_size.height > 1
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_streamed_answer_coalesced(tui):
+    """Chunks arriving faster than STREAM_RENDER_INTERVAL_S are drawn together, with the latest text;
+    the end of the stream draws the whole answer and leaves no timer behind."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="coalesce")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._update_stream_widget("answer", "first")
+            widget = app._stream_widgets["answer"]
+            assert str(widget.content) == "first"  # the first chunk shows at once
+            for i in range(20):
+                app._update_stream_widget("answer", f"first chunk {i}")
+            assert str(widget.content) != "first chunk 19" and app._answer_timer is not None
+            await _until(pilot, lambda: str(widget.content) == "first chunk 19")
+            assert app._answer_timer is None
+
+            app._update_stream_widget("answer", "first chunk 19 **done**")
+            app._finish_stream_widgets()
+            assert app._answer_timer is None and "**" not in str(widget.render())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_streamed_rows_wait_while_scrolled_up(tui):
+    """A screen layout arranges the whole conversation, so streamed text growing below a user who scrolled
+    up must not ask for one; scrolling back to the end lays the held rows out."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="held")
+        async with app.run_test() as pilot:
+            await app._backend_ready.wait()
+            for i in range(40):
+                app._append(f"message {i}", "system")
+            app._update_stream_widget("answer", "start")
+            widget = app._stream_widgets["answer"]
+            await pilot.pause()
+            messages = app.query_one("#messages")
+            messages.scroll_relative(y=-20, animate=False)
+            await pilot.pause()
+            assert app._scrolled_up()
+
+            screen = app.screen
+            # Scrolling up shows the jump-to-bottom bar, a layout of its own; the screen's update timer can
+            # still owe it after the pause, and would flush it inside the window counted below
+            await _until(pilot, lambda: not screen._layout_required)
+            layouts = []
+            real = screen._refresh_layout
+            screen._refresh_layout = lambda *a, **k: (layouts.append(k.get("scroll", False)), real(*a, **k))[1]
+            text = "start"
+            for i in range(10):
+                text += "\nline %d" % i
+                app._update_stream_widget("answer", text)
+                await _until(pilot, lambda: app._answer_timer is None)
+            app._reveal_thought()  # no thought streaming: a no-op, never a layout
+            await pilot.pause()
+            assert not [s for s in layouts if not s] and app._stream_growth_held
+            assert widget.outer_size.height == 1  # the new rows are not laid out yet
+
+            messages.scroll_end(animate=False)
+            await _until(pilot, lambda: widget.outer_size.height == 11)
+            assert not app._scrolled_up() and not app._stream_growth_held
+            app._finish_stream_widgets()
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_input_newline_keys():
     from textual.app import App
     from dostuff.cli_tui import EnterSubmits
@@ -534,6 +648,217 @@ def test_tool_results_expand_and_collapse(tui):
             assert long_result.expanded
             long_result.on_click()
             assert not long_result.expanded
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tool_call_summary_wording(tui):
+    """One clause per kind of call, counted, in call order; the same kinds count together."""
+    summarize = tui.summarize_tool_calls
+    assert summarize(["bash_command"]) == "Ran 1 shell command"
+    assert summarize(["read_file", "grep", "read_file", "glob"]) == "Read 2 files, searched for 2 patterns"
+    assert summarize(["edit_file", "multi_edit", "bash_command"]) == "Edited 2 files, ran 1 shell command"
+    assert summarize(["read_file"], running=True) == "Reading 1 file…"
+    assert summarize(["get_current_datetime", "get_current_datetime"]) == "Checked the date"
+    assert summarize(["mcp__github__search", "some_tool"]) == "Ran 2 tools"
+    # every built-in tool either groups under its own words or keeps its own line
+    from dostuff.tools.names import BUILTIN_TOOL_NAMES
+    assert BUILTIN_TOOL_NAMES <= set(tui.TOOL_SUMMARY_NOUNS) | tui.UNGROUPED_TOOLS
+
+
+def _group_text(group) -> str:
+    """The group as shown: its `●` line, then the rows of its calls while it is open."""
+    return "\n".join(w.render().plain for w in [group.header, *group.rows] if w.display)
+
+
+def _bullet_color(row) -> str:
+    """The colour of a call row's own `●`."""
+    text = row.content
+    start = text.plain.index("●")
+    return next((str(span.style) for span in text.spans if span.start <= start < span.end), "")
+
+
+def test_consecutive_tool_calls_fold_into_one_line(tui):
+    """A run of calls is one `● Read 2 files…` line; a click shows each call on its own `●` row with a
+    preview, a click on a row shows that result in full, Ctrl+O all of them."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="groups")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            emit = app.adapter.emit
+            emit("tool_call", 'read_file(path="a.py")')
+            emit("tool_call", 'bash_command(command="pytest")')
+            emit("tool_call", 'read_file(path="b.py")')
+            await pilot.pause()
+            group, = app.query(cli_tui.ToolGroup)
+            assert _group_text(group) == "● Reading 2 files, running 1 shell command… (ctrl+o to expand)"
+            assert not group.rows  # a closed group is its one line: rows are made when it opens
+            group.header.on_click()  # opened while the calls run: each row is blue until its result comes
+            await pilot.pause()
+            assert [_bullet_color(row) for row in group.rows] == [cli_tui.TOOL_RUNNING_COLOR] * 3
+            group.header.on_click()
+            await pilot.pause()
+            # the loop runs read-only calls first: results come back out of call order, matched by name
+            emit("tool_result", "read_file: A")
+            emit("tool_result", "read_file: " + "\n".join(f"b{i}" for i in range(20)))
+            emit("tool_result", "bash_command: Error: exit 1")
+            await pilot.pause()
+            assert not app.query(cli_tui.ToolResult)  # no `⎿` lines of their own
+            assert _group_text(group) == "● Read 2 files, ran 1 shell command · 1 failed (ctrl+o to expand)"
+
+            await pilot.click(group.header)
+            await pilot.pause()
+            text = _group_text(group)
+            assert text.startswith("● Read 2 files, ran 1 shell command · 1 failed\n")
+            assert ('  ● read_file(path="a.py")\n    ⎿  A\n'
+                    '  ● bash_command(command="pytest")\n    ⎿  Error: exit 1') in text
+            assert "b7" in text and "b8" not in text and "… +12 lines (click to show all)" in text
+            a_row, bash_row, b_row = group.rows
+            assert [_bullet_color(r) for r in group.rows] == ["", cli_tui.TOOL_FAILED_COLOR, ""]
+            # a click on a call opens that one result, and the group stays open
+            await pilot.click(b_row)
+            await pilot.pause()
+            assert group.expanded and b_row.full and not a_row.full
+            assert "b19" in _group_text(group) and "(click to collapse)" in _group_text(group)
+            await pilot.click(b_row)
+            await pilot.pause()
+            assert group.expanded and "b19" not in _group_text(group)
+            await pilot.click(a_row)  # nothing hidden in its result: the click changes nothing
+            await pilot.pause()
+            assert group.expanded and not a_row.full
+            await pilot.press("ctrl+o")
+            assert "b19" in _group_text(group)
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            assert _group_text(group).endswith("(ctrl+o to expand)") and not any(r.display for r in group.rows)
+
+            # anything between two calls starts a new group; a plan keeps its own line
+            emit("partial", "Now the tests.")
+            emit("stream_end", None)
+            emit("tool_call", 'grep(pattern="x")')
+            emit("tool_call", "todo_write(todos=[])")
+            await pilot.pause()
+            groups = list(app.query(cli_tui.ToolGroup))
+            assert len(groups) == 2 and _group_text(groups[1]).startswith("● Searching for 1 pattern…")
+            assert any(str(w.content) == "● todo_write(todos=[])" for w in app.query("Static.msg-tool"))
+            # the turn ends with the grep never run (Esc): the group stops saying it is running
+            app._tool_groups.close()
+            groups[1].header.on_click()
+            await pilot.pause()
+            assert _group_text(groups[1]).startswith("● Searched for 1 pattern\n")
+            assert "⎿  (did not run)" in _group_text(groups[1])
+            assert _bullet_color(groups[1].rows[0]) == cli_tui.TOOL_DIM_COLOR
+            # a result nothing is waiting for still shows
+            emit("tool_result", "grep: late")
+            await pilot.pause()
+            assert len(app.query(cli_tui.ToolResult)) == 1
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_subagent_tool_results_join_their_calls(tui):
+    """A foreground subagent's `[agent: …] name: result` goes under its call in the group, not on a `⎿` line
+    of its own while the call waits forever: the prefix's `: ` is not where the tool name ends."""
+    cli_tui = tui
+    assert cli_tui.split_agent_prefix("[agent: Probe] bash_command: Denied") == ("[agent: Probe] ",
+                                                                                 "bash_command: Denied")
+    assert cli_tui.split_agent_prefix("read_file: A") == ("", "read_file: A")
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="subagent-groups")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            emit = app.adapter.emit
+            emit("tool_call", '[agent: Write spec] read_file(path="a.md")')
+            emit("tool_call", '[agent: Write spec] read_file(path="b.md")')
+            emit("tool_result", "[agent: Write spec] read_file: A")
+            emit("tool_result", "[agent: Write spec] read_file: B")
+            await pilot.pause()
+            group, = app.query(cli_tui.ToolGroup)
+            assert not app.query(cli_tui.ToolResult)
+            assert _group_text(group) == "[agent: Write spec] ● Read 2 files (ctrl+o to expand)"
+            await pilot.click(group.header)
+            await pilot.pause()
+            assert ('  ● read_file(path="a.md")\n    ⎿  A\n  ● read_file(path="b.md")\n    ⎿  B'
+                    in _group_text(group))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_tool_group_lines_highlight_on_hover(tui):
+    """The group's header and a call row whose result a click expands light up under the mouse; a row
+    a click does nothing to stays plain."""
+    cli_tui = tui
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="groups-hover")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            emit = app.adapter.emit
+            emit("tool_call", 'read_file(path="a.md")')
+            emit("tool_call", 'read_file(path="b.md")')
+            emit("tool_result", "read_file: " + "\n".join(f"line {i}" for i in range(40)))
+            emit("tool_result", "read_file: B")
+            await pilot.pause()
+            group, = app.query(cli_tui.ToolGroup)
+            plain = group.header.styles.background
+            await pilot.hover(group.header)
+            await pilot.pause()
+            assert group.header.styles.background != plain
+            await pilot.click(group.header)
+            await pilot.pause()
+            long_row, short_row = group.rows
+            assert long_row.has_class("-clickable") and not short_row.has_class("-clickable")
+            await pilot.hover(long_row)
+            await pilot.pause()
+            assert long_row.styles.background != plain
+            await pilot.hover(short_row)
+            await pilot.pause()
+            assert short_row.styles.background == plain
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_resumed_session_folds_tool_calls_the_same_way(tui):
+    """/resume renders a stored run of calls as the one group the live turn showed."""
+    cli_tui = tui
+
+    def call(cid, name, args):
+        return {"id": cid, "type": "function", "function": {"name": name, "arguments": args}}
+
+    steps = [
+        {"role": "user", "content": "look around"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [call("c1", "read_file", '{"path": "a.py"}'), call("c2", "grep", '{"pattern": "x"}')]},
+        {"role": "tool", "name": "read_file", "tool_call_id": "c1", "content": "A"},
+        {"role": "tool", "name": "grep", "tool_call_id": "c2", "content": "a.py:1: x"},
+        {"role": "assistant", "content": None, "tool_calls": [call("c3", "bash_command", '{"command": "ls"}')]},
+        {"role": "tool", "name": "bash_command", "tool_call_id": "c3", "content": "a.py"},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="groups-resume")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await app._backend_ready.wait()
+            await pilot.pause()
+            for step in steps:
+                await app.store.append("groups-old", step)
+            app.on_enter_submits_submitted(cli_tui.EnterSubmits.Submitted("/resume groups-old"))
+            await _until(pilot, lambda: app.session_id == "groups-old" and app.query(cli_tui.ToolGroup), tries=200)
+            group, = app.query(cli_tui.ToolGroup)
+            assert _group_text(group) == ("● Read 1 file, searched for 1 pattern, ran 1 shell command"
+                                          " (ctrl+o to expand)")
+            assert not app.query(cli_tui.ToolResult)
+            group.header.on_click()
+            await pilot.pause()
+            assert "  ● bash_command(command=\"ls\")\n    ⎿  a.py" in _group_text(group)
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())
@@ -2372,11 +2697,12 @@ def test_jobs_bar(tui, registry, monkeypatch, _py):
             await pilot.click("#jobs-bar")
             await _until(pilot, lambda: question() == "Background jobs")
             labels = [label for _, label in app.query_one("#picker", cli_tui.PermissionPrompt)._all_options]
-            assert len(labels) == 2 and labels[0].startswith("dev  running  since ") and "main" in labels[0]
-            assert labels[1].startswith("lint  running  since ") and sleeper[:40] in labels[1]
-            # clicking a row picks it, on any of its lines (line 0 is the question; dev's label wraps)
+            # the most recently started first: lint began after dev
+            assert len(labels) == 2 and labels[0].startswith("lint  running  since ") and sleeper[:40] in labels[0]
+            assert labels[1].startswith("dev  running  since ") and "main" in labels[1]
+            # clicking a row picks it, on any of its lines (line 0 is the question; lint's label wraps)
             await pilot.click("#picker", offset=(5, 2))
-            await _until(pilot, lambda: question().startswith('Job "dev"'))
+            await _until(pilot, lambda: question().startswith('Job "lint"'))
             # clicking the item again closes the list, and once more opens it; Esc closes it too
             await pilot.click("#jobs-bar")
             await _until(pilot, lambda: not app._picker_open())
@@ -2386,8 +2712,8 @@ def test_jobs_bar(tui, registry, monkeypatch, _py):
             await _until(pilot, lambda: not app._picker_open())
             await pilot.click("#jobs-bar")
             await _until(pilot, lambda: question() == "Background jobs")
-            # pick dev → its actions; "Stop it" kills it and the agent is told
-            await pilot.press("enter")
+            # pick dev (the second row) → its actions; "Stop it" kills it and the agent is told
+            await pilot.press("down", "enter")
             await _until(pilot, lambda: question().startswith('Job "dev"'))
             await pilot.press("2")
             await _until(pilot, lambda: dev.ended is not None, tries=200)
@@ -2689,6 +3015,8 @@ def test_orphan_warning(tui, jobs_home, monkeypatch, tmp_path):
     import os
     import time
     cli_tui = tui
+    # pid 4812 is made up: report it as alive, or the liveness check drops the job before it is warned about
+    monkeypatch.setattr("dostuff.tools.bash.jobs._process_start", lambda pid: (True, None))
     stale = jobs_home / "old-session"
     stale.mkdir(parents=True)
     (stale / "jobs.json").write_text(json.dumps([
@@ -3196,7 +3524,7 @@ def _view_agent_texts(app):
 
 
 def test_agents_command(tui, agents, fake_model):
-    """/agents lists the session's agents (running first); picking one shows its transcript in the agent view (in
+    """/agents lists the session's agents (newest first); picking one shows its transcript in the agent view (in
     place of the conversation, never in it) and offers Stop it (running) or Answer approval (waiting); loaded
     interrupted agents are listed too (subagents T5.7)."""
     from conftest import fake_response, fake_tool_call
@@ -3235,7 +3563,7 @@ def test_agents_command(tui, agents, fake_model):
             submit("/agents")
             await _until(pilot, app._picker_open)
             inp.text = "typing"  # submitting cleared it
-            assert [v for v, _ in picker._options] == [running.id, waiting.id, done.id]
+            assert [v for v, _ in picker._options] == [waiting.id, running.id, done.id]
             labels = dict(picker._options)
             for part in (done.id, "do D", "general-purpose", "completed", "tokens", "$", "foreground"):
                 assert part in labels[done.id], (part, labels[done.id])
@@ -3245,13 +3573,15 @@ def test_agents_command(tui, agents, fake_model):
             main_before = _texts(app)
             await app._picker_callback(done.id)
             await _until(pilot, lambda: any("report D" in t for t in _view_agent_texts(app)))
-            assert any(t.startswith("● ") and "get_current_datetime" in t for t in _view_texts(app))
+            view_groups = list(app.query("#agent-view-msgs ToolGroup").results(cli_tui.ToolGroup))
+            assert any(call.name == "get_current_datetime" for g in view_groups for call in g.calls)
+            assert any(t.startswith("● Checked the date") for t in _view_texts(app))
             assert any("[D] x" in t for t in _view_texts(app))
             assert not app.query_one("#conversation").display
             assert _texts(app) == main_before  # nothing of the agent's lands in the conversation
             assert [v for v, _ in picker._options] == ["type", "back"]
             await app._picker_callback("back")
-            await _until(pilot, lambda: [v for v, _ in picker._options] == [running.id, waiting.id, done.id])
+            await _until(pilot, lambda: [v for v, _ in picker._options] == [waiting.id, running.id, done.id])
             assert not app._agent_view_open() and app.query_one("#conversation").display
 
             # a running agent's view fills in live, and Esc closes it
@@ -4220,6 +4550,37 @@ def test_free_text_only_skips_the_panel(tui):
     asyncio.run(scenario())
 
 
+def test_tab_headers_are_whole_when_they_fit_and_cut_with_ellipsis_when_not(tui):
+    """A header longer than the schema's 12 chars ("Repeat output") was hard-cut to "Repeat outpu". Now a tab
+    keeps its whole header when the strip fits, and on a narrow panel only the tabs you are not on are cut,
+    with `…` so the cut shows."""
+    cli_tui = tui
+    two = [{"label": "A"}, {"label": "B"}]
+    headers = ["Repeat flags", "Repeat output", "JSON with times", "Config error"]
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-tab-fit")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [{"question": f"{h}?", "header": h, "options": two} for h in headers])
+            await _until(pilot, lambda: panel.display)
+            await pilot.press("1")  # answered the first, on the second
+            await pilot.pause()
+            wide = panel._tabs(120).plain
+            assert all(h in wide for h in headers), wide
+            assert "…" not in wide
+            narrow = panel._tabs(48).plain
+            assert len(narrow) <= 48, narrow
+            assert "▌ Repeat output" in narrow  # the current tab is never cut
+            assert "…" in narrow and "Repeat outpu " not in narrow
+            await pilot.press("escape")
+            await _until(pilot, lambda: task.done())
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_mixed_call_hands_the_input_over(tui):
     """Some option questions, some free text: the panel is used, and the free-text question's Enter
     takes the input (it never grabs it — see `test_free_text_question_does_not_take_the_input_by_surprise`)."""
@@ -4326,7 +4687,8 @@ def test_esc_mid_question(tui):
 
 
 def test_esc_while_typing_other(tui):
-    """Esc during the `Other` input cancels the call: the typed draft is not sent, and the input is normal."""
+    """Esc during the `Other` input goes back to the panel: nothing is recorded, the call stays open and the
+    turn keeps running. A second Esc, on the panel, cancels the call."""
     cli_tui = tui
 
     async def scenario():
@@ -4335,12 +4697,20 @@ def test_esc_while_typing_other(tui):
             await pilot.pause()
             panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
             inp = app.query_one("#input", cli_tui.EnterSubmits)
-            task = _ask_questions(app, [DB_QUESTION])
+            task = _ask_questions(app, [DB_QUESTION, AUTH_QUESTION])
             await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.press("1")  # answer the first question, then type into the second's `Other`
+            await pilot.pause()
             await pilot.press("3")
             await pilot.pause()
             assert inp.display and inp.has_class("feedback-mode")
             inp.text = "half-typed"
+            await app.action_cancel()
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            assert not task.done() and app.adapter.has_pending_ask()
+            assert not app.adapter._cancelled and not app.adapter._other_mode
+            assert not inp.display and not inp.has_class("feedback-mode")
+            assert panel.answers()[0] == "Postgres" and not panel.answered(1)  # kept; the draft not recorded
             await app.action_cancel()
             await _until(pilot, lambda: task.done())
             assert task.result() is None
@@ -7104,6 +7474,91 @@ def test_context_step_not_rendered_on_resume(tui):
     asyncio.run(scenario())
 
 
+def test_resume_mounts_transcript_in_one_batch(tui):
+    """A long resumed session paints in one mount, not one per message (each mount walks the container's
+    children, so per-message mounts are quadratic), in order and above the loader."""
+    from textual.containers import Vertical
+
+    async def scenario():
+        app = tui.DostuffTUI(session_id="batch")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await asyncio.wait_for(app._backend_ready.wait(), 30)  # its startup notices mount on their own
+            await pilot.pause(0.5)
+            container = app.query_one("#msg-container", Vertical)
+            loader = app._show_loader("Working...")
+            await pilot.pause()
+            app.steps_history = [
+                step for i in range(30) for step in (
+                    {"role": "user", "content": f"prompt {i}"},
+                    {"role": "assistant", "content": f"answer {i}"},
+                )
+            ]
+            calls = []
+            real_mount = container.mount
+            container.mount = lambda *ws, **kw: calls.append(len(ws)) or real_mount(*ws, **kw)  # type: ignore[method-assign]
+            app._render_history()
+            await pilot.pause()
+            assert calls == [60]
+            texts = _texts(app)
+            assert [t for t in texts if t.startswith("> prompt")] == [f"> prompt {i}" for i in range(30)]
+            assert list(container.children)[-1] is loader
+            app._stop_loader(loader)
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_resume_paints_tail_and_loads_older_on_scroll_up(tui):
+    """A long resumed session paints its last steps; scrolling to the top loads the next older chunk above
+    them without moving what the user was reading, until every step is shown and the `↑` line is gone."""
+    from textual.containers import VerticalScroll
+
+    async def scenario():
+        app = tui.DostuffTUI(session_id="tail")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            turns = 150  # 300 steps: the tail and at least two older chunks
+            app.steps_history = [
+                step for i in range(turns) for step in (
+                    {"role": "user", "content": f"prompt {i}"},
+                    {"role": "assistant", "content": f"answer {i}"},
+                )
+            ]
+            app._render_history()
+            await pilot.pause()
+
+            def prompts():
+                return [t for t in _texts(app) if t.startswith("> prompt")]
+
+            tail, chunk = tui.HISTORY_TAIL_STEPS // 2, tui.HISTORY_CHUNK_STEPS // 2  # in turns (2 steps each)
+            assert prompts() == [f"> prompt {i}" for i in range(turns - tail, turns)]
+            more = app.query_one("#history-more", tui.HistoryMore)
+            assert f"{2 * (turns - tail)} earlier steps" in str(more.content)
+
+            messages = app.query_one("#messages", VerticalScroll)
+            loads = -(-(turns - tail) // chunk)  # every older chunk, the last one partial
+            assert loads >= 2
+            for loaded in range(1, loads + 1):
+                first = next(w for w in app.query("#msg-container .msg-user") if str(w.content).startswith("> prompt"))
+                messages.scroll_home(animate=False, immediate=True)  # the user scrolls to the top: a load
+                row_on_screen = first.virtual_region.y  # with scroll_y 0
+                for _ in range(10):
+                    await pilot.pause()
+                    if not app._history_loading:
+                        break
+                assert len(prompts()) == min(turns, tail + chunk * loaded)
+                # What the user was reading stays on the same screen row; the new chunk is above it
+                assert first.virtual_region.y - round(messages.scroll_y) == row_on_screen
+                assert messages.scroll_y > tui.HISTORY_LOAD_ROWS
+            assert prompts() == [f"> prompt {i}" for i in range(turns)]
+            assert not app.query("#history-more")
+            assert app._history_hidden == 0
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
 def test_agent_view_skips_context_step(tui):
     """The /agents view renders a run's transcript with the same function, and a prefix."""
     async def scenario():
@@ -8883,6 +9338,60 @@ def test_skills_and_agents_in_command_tables(skills_tui):
             _submit(app, cli_tui, "/help")
             await pilot.pause()
             assert any("/skills" in t and "/agents" in t for t in _texts(app))
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+# --- jobs and agents lists: the most recent first; ask_user panel fits a short terminal ------------
+
+def test_agents_list_most_recent_first(tui, agents):
+    cli_tui = tui
+    from dostuff.agent.subagents.registry import AgentRun
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="agent-order")
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            registry = agents
+            for n, (name, started, status) in enumerate([("old", 100.0, "completed"), ("mid", 200.0, "running"),
+                                                         ("new", 300.0, "completed")]):
+                run = AgentRun(id=name, owner="agent-order", agent_type="general", description=name, model="m", status=status)
+                run.started = started
+                registry._runs[name] = run
+            assert [r.id for r in app._session_agents()] == ["new", "mid", "old"]  # recency, not running-first
+            await app._cleanup_and_save_session()
+
+    asyncio.run(scenario())
+
+
+def test_ask_panel_fits_short_terminal(tui):
+    """A long question, label and descriptions wrap in full, and the options window shrinks so the submit row and
+    the hint stay on screen instead of falling off the bottom."""
+    cli_tui = tui
+    long_q = {"question": "Which approach should I take to restructure the configuration loading so that project "
+                          "settings override user settings while environment variables still win? " * 2,
+              "header": "Config",
+              "options": [{"label": f"Option {i}", "description": "a long description " * 8} for i in range(1, 6)]}
+    long_label = "Use the existing greetings module and extend it rather than adding a second module beside it"
+    long_q["options"][0]["label"] = long_label
+
+    async def scenario():
+        app = cli_tui.DostuffTUI(session_id="ask-fit")
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            panel = app.query_one("#ask-panel", cli_tui.AskUserPanel)
+            task = _ask_questions(app, [long_q])
+            await _until(pilot, lambda: panel.display and app.focused is panel)
+            await pilot.pause()
+            content = str(panel.content)
+            assert "…" not in content.replace("↑", "").replace("↓", "")  # no description is cut
+            assert content.count("a long description") >= 8  # the first option's description, whole
+            assert "".join(long_label.split()) in "".join(content.split())  # a long label wraps, whole
+            assert "Submit answers" in content and "Esc cancel" in content
+            assert panel.region.bottom <= app.size.height
+            app.adapter.cancel_pending_ask()
+            await _until(pilot, lambda: task.done())
             await app._cleanup_and_save_session()
 
     asyncio.run(scenario())

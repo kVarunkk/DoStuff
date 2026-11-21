@@ -155,10 +155,48 @@ def test_cache_breakpoints_only_for_claude(monkeypatch, provider, model, enabled
     assert model_module.uses_explicit_prompt_caching() is expected
 
     monkeypatch.setattr(call_agent_module, "completion_kwargs", lambda: {"model": model})
-    monkeypatch.setattr(call_agent_module, "_supports_reasoning", lambda m: False)
+    monkeypatch.setattr(call_agent_module, "supports_reasoning", lambda m: False)
     kwargs = call_agent_module.build_request_kwargs(stream=False)
     assert ("cache_control_injection_points" in kwargs) is expected
 
+
+@pytest.mark.parametrize("max_tokens,expected", [(0, None), (8192, 8192)])
+def test_max_tokens_sent_only_when_set(monkeypatch, max_tokens, expected):
+    monkeypatch.setattr(call_agent_module, "completion_kwargs", lambda: {"model": "openai/gpt-4o"})
+    monkeypatch.setattr(call_agent_module, "supports_reasoning", lambda m: False)
+    monkeypatch.setattr(call_agent_module, "uses_explicit_prompt_caching", lambda: False)
+    monkeypatch.setattr(call_agent_module, "get_config", lambda: SimpleNamespace(
+        max_tokens=max_tokens, reasoning_effort="auto"))
+    assert call_agent_module.build_request_kwargs(stream=False).get("max_tokens") == expected
+
+
+
+def test_request_max_tokens_names_its_source(monkeypatch):
+    from dostuff.lib.model import current_max_tokens
+    monkeypatch.setattr(call_agent_module, "get_config", lambda: SimpleNamespace(max_tokens=32000))
+    assert call_agent_module.request_max_tokens() == (32000, "loop.max_tokens")
+    token = current_max_tokens.set(64000)  # a typed subagent run's own cap wins
+    try:
+        assert call_agent_module.request_max_tokens() == (64000, "the agent type's max_tokens:")
+    finally:
+        current_max_tokens.reset(token)
+
+
+@pytest.mark.parametrize("error,cap,hinted", [
+    ("model[MiniMax-M3] does not support max tokens > 524288", 600000, True),
+    ("max_tokens: 200000 > 64000, which is the maximum allowed number of output tokens", 200000, True),
+    ("Invalid 'max_output_tokens': integer above maximum value", 9999999, True),
+    ("max_completion_tokens is too large", 9999999, True),
+    ("max tokens > 524288", 0, False),  # nothing sent: provider default, not ours
+    ("This model's maximum context length is 128000 tokens", 32000, False),
+    ("tools[0].name is invalid", 32000, False),
+])
+def test_output_cap_hint(error, cap, hinted):
+    from dostuff.helpers.agent.tool_output import output_cap_hint
+    hint = output_cap_hint(error, cap, "loop.max_tokens")
+    assert bool(hint) is hinted
+    if hinted:
+        assert f"max_tokens={cap} from loop.max_tokens" in hint
 
 def test_undo_restores_multi_edit(project):
     root, store = project
@@ -169,3 +207,32 @@ def test_undo_restores_multi_edit(project):
     result = store.undo("s1")
     assert result is not None and result.restored
     assert (root / "a.txt").read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+@pytest.mark.parametrize("effort,reasoning,expected", [
+    ("auto", True, None), ("high", True, "high"), ("off", True, "none"), ("high", False, None),
+])
+def test_reasoning_effort_request(monkeypatch, effort, reasoning, expected):
+    monkeypatch.setattr(call_agent_module, "completion_kwargs", lambda: {"model": "anthropic/claude-sonnet-5-5"})
+    monkeypatch.setattr(call_agent_module, "supports_reasoning", lambda m: reasoning)
+    monkeypatch.setattr(call_agent_module, "get_config", lambda: SimpleNamespace(reasoning_effort=effort))
+    monkeypatch.setattr(call_agent_module, "uses_explicit_prompt_caching", lambda: False)
+    assert call_agent_module.build_request_kwargs(stream=False).get("reasoning_effort") == expected
+
+
+def test_reasoning_effort_config_and_session(tmp_path):
+    from dostuff.config import Config
+    path = tmp_path / "config.yaml"
+    path.write_text("loop:\n  reasoning_effort: Medium\n", encoding="utf-8")
+    cfg = Config(path)
+    assert cfg.reasoning_effort == "medium"
+    cfg.session_reasoning_effort = "low"
+    cfg.reload()
+    assert cfg.reasoning_effort == "low"
+    path.write_text("loop:\n  reasoning_effort: off\n  other: 1\n", encoding="utf-8")
+    cfg.session_reasoning_effort = None
+    cfg.reload()
+    assert cfg.reasoning_effort == "off"
+    path.write_text("loop:\n  reasoning_effort: bogus\n", encoding="utf-8")
+    cfg.reload()
+    assert cfg.reasoning_effort == "auto"

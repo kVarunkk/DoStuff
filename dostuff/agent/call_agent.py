@@ -1,10 +1,10 @@
 from typing import Any
 
-import litellm
 from litellm import acompletion
+from dostuff.config import get_config
 from dostuff.helpers.agent.attachments import content_text, hydrate
 from dostuff.tools.definitions import TOOL_SCHEMAS, default_tool_names
-from dostuff.lib.model import completion_kwargs, uses_explicit_prompt_caching
+from dostuff.lib.model import completion_kwargs, current_max_tokens, supports_reasoning, uses_explicit_prompt_caching
 from dostuff.lib.tracing import content_attr, tracer
 from opentelemetry.trace import Status, StatusCode
 
@@ -30,11 +30,12 @@ CACHE_BREAKPOINTS: list[dict[str, Any]] = [
 ]
 
 
-def _supports_reasoning(model: str) -> bool:
-    try:
-        return bool(litellm.supports_reasoning(model=model))
-    except Exception:
-        return False
+def request_max_tokens() -> tuple[int, str]:
+    """The output-token cap a model call sends, and the setting it came from (for error hints); 0 = none sent.
+    The running subagent type's own cap wins over loop.max_tokens (main agent, forks, untyped runs)."""
+    if own := current_max_tokens.get():
+        return own, "the agent type's max_tokens:"
+    return int(getattr(get_config(), "max_tokens", 0) or 0), "loop.max_tokens"
 
 
 def build_request_kwargs(stream: bool) -> dict[str, Any]:
@@ -44,7 +45,16 @@ def build_request_kwargs(stream: bool) -> dict[str, Any]:
     kwargs["stream"] = stream
     if stream:
         kwargs["stream_options"] = {"include_usage": True}
-    if _supports_reasoning(kwargs["model"]) and kwargs["model"].startswith(("gemini/", "vertex_ai/")):
+    config = get_config()
+    max_tokens, _ = request_max_tokens()
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens  # litellm maps it per provider (max_output_tokens on the Responses route)
+    effort = config.reasoning_effort
+    if effort != "auto" and supports_reasoning(kwargs["model"]):
+        # litellm maps this to each provider's own knob (Anthropic budget, Gemini thinking budget, OpenAI effort);
+        # "off" is its "none". For Gemini it also decides whether thoughts are streamed.
+        kwargs["reasoning_effort"] = "none" if effort == "off" else effort
+    elif supports_reasoning(kwargs["model"]) and kwargs["model"].startswith(("gemini/", "vertex_ai/")):
         # Ask Gemini to stream its thoughts (rendered as partial_thought)
         kwargs["thinking_config"] = {"include_thoughts": True}
     if uses_explicit_prompt_caching():
@@ -57,6 +67,16 @@ def _as_blocks(content: Any) -> list[Any]:
     if isinstance(content, list):
         return content
     return [{"type": "text", "text": content}] if content else []
+
+
+def _is_blank(content: Any) -> bool:
+    """No text worth sending: None, "", whitespace, or a block list made only of such text blocks."""
+    if isinstance(content, list):
+        return all(isinstance(b, dict) and b.get("type") == "text" and not str(b.get("text") or "").strip()
+                   for b in content)
+    if content is None or isinstance(content, str):
+        return not (content or "").strip()
+    return False
 
 
 def _join_user_content(first: Any, second: Any) -> Any:
@@ -72,10 +92,17 @@ def provider_messages(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     `meta` is dostuff's own (the turn-context marker), so it is dropped. Adjacent user steps become one message,
     because Perplexity and strict chat templates (vLLM's Gemma, Mistral) reject two in a row, and a turn's context
     step always sits right before its prompt. Same history, same result, so the cached prefix holds.
+
+    An assistant step that only calls tools goes out with `content: None`, not "": litellm turns an empty
+    text into a "[System: Empty message content sanitised ...]" block on Anthropic routes, which the model
+    then reads as its own words and starts repeating. Stored steps keep their "", so resumed sessions benefit too.
     """
     messages: list[dict[str, Any]] = []
     for step in steps:
         message = {k: v for k, v in step.items() if k != "meta"} if "meta" in step else step
+        if (message.get("role") == "assistant" and message.get("tool_calls") and message.get("content") is not None
+                and _is_blank(message["content"])):
+            message = {**message, "content": None}
         if messages and message.get("role") == "user" and messages[-1].get("role") == "user":
             messages[-1] = {**messages[-1], "content": _join_user_content(messages[-1].get("content"), message.get("content"))}
         else:

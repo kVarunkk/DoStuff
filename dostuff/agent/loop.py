@@ -1,12 +1,12 @@
 from dostuff.helpers.agent.loop_check_cancelled import CANCELLED_TURN, is_cancelled, loop_check_cancelled
 from dostuff.helpers.agent.get_model_token_limit import get_model_token_limit
-from dostuff.lib.model import current_session_id
+from dostuff.lib.model import current_compact_threshold, current_session_id
 from dostuff.helpers.agent.loop_emit import loop_emit
 from dostuff.lib.mcp.mcp_client import MCPClient
 from dostuff.lib.tracing import content_attr, tracer
 from dostuff.helpers.agent.constants import MAX_ITERATIONS
 from dostuff.helpers.agent.manage_context import compact_context
-from dostuff.agent.call_agent import call_agent, take_unavailable_attachments
+from dostuff.agent.call_agent import call_agent, request_max_tokens, take_unavailable_attachments
 from opentelemetry.trace import Status, StatusCode
 from dostuff.helpers.agent.append_step import append_step
 from dostuff.helpers.agent.attachments import ref_chips
@@ -28,6 +28,7 @@ from dostuff.helpers.hooks.events import (
 from dostuff.helpers.hooks.run_hook import payload_for
 from dostuff.config import AUTO_COMPACT_THRESHOLD, get_config
 from dostuff.tools.definitions import TOOL_MAP, default_tool_names
+from dostuff.agent.subagents import RESTRICTED_SUBAGENT_TOOLS
 from dostuff.agent.subagents.fork import ForkContext
 from dostuff.helpers.agent.notices import format_notices, get_notice_queue
 from dostuff.helpers.agent.steering import SteerMessage, SteeringQueue, frame_steered
@@ -46,7 +47,17 @@ import contextlib
 import json
 import litellm
 from dostuff.helpers.agent.consume_stream import StreamProgress, consume_stream as _consume_stream
-from dostuff.helpers.agent.tool_output import EMPTY_RESPONSE_NUDGE, format_call_label, truncate_tool_output
+from dostuff.helpers.agent.tool_output import (
+    EMPTY_RESPONSE_NUDGE,
+    OUTPUT_LIMIT_ARGS_ERROR,
+    OUTPUT_LIMIT_FINISH_REASONS,
+    OUTPUT_LIMIT_NOTE,
+    OUTPUT_LIMIT_RESULT,
+    OUTPUT_LIMIT_RETRIES,
+    output_cap_hint,
+    format_call_label,
+    truncate_tool_output,
+)
 
 TOOL_TIMEOUT_S = 120.0
 RETRY_BASE_DELAY_S = 1.0
@@ -60,6 +71,10 @@ _UNTIMED_TOOLS = frozenset({"agent", "ask_user"})
 # Never dispatched side by side, whatever its kind (ask-user spec D8): a question opens a panel, and
 # the transcript must not interleave a dialog with other results streaming in.
 _NEVER_PARALLEL = frozenset({"ask_user"})
+# A subagent's call to a main-agent-only tool (D12). A fork sees those tools' schemas, which keep its prefix cached
+SUBAGENT_TOOL_REFUSED = ("Error: '{name}' is the main agent's tool; a subagent can't use it. You are the subagent "
+                         "started for your task: don't report this error, do the task now with your other tools. Only "
+                         "if it truly needs this tool, say in your report what the main agent should do with it.")
 _FORK_TOOLS = frozenset({"agent", "send_message"})  # get the fork_context harness param (subagents spec D11)
 
 _RETRYABLE_ERRORS: tuple[type[BaseException], ...] = (
@@ -118,7 +133,11 @@ class _ToolCall:
     attachments: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _parse_tool_calls(tool_calls: list[Any], tool_names: list[str] | None) -> list[_ToolCall]:
+def _parse_tool_calls(tool_calls: list[Any], tool_names: list[str] | None, cut_off: bool = False,
+                      subagent: bool = False) -> list[_ToolCall]:
+    """`cut_off`: the reply hit the output-token cap, so arguments that don't parse were cut mid-stream.
+    `tool_names` is what may run, which can be less than the schemas sent (a fork, D11); `subagent` names the
+    refusal of a main-agent-only tool as such."""
     calls: list[_ToolCall] = []
     for tool_call in tool_calls:
         if getattr(tool_call, "type", "function") != "function":
@@ -132,14 +151,16 @@ def _parse_tool_calls(tool_calls: list[Any], tool_names: list[str] | None) -> li
             try:
                 parsed = json.loads(raw) if raw else {}
             except (json.JSONDecodeError, TypeError) as e:
-                call.error = f"Error: arguments for '{name}' are not valid JSON ({e}). Retry the call with a valid JSON object."
+                call.error = (OUTPUT_LIMIT_ARGS_ERROR.format(name=name) if cut_off else
+                              f"Error: arguments for '{name}' are not valid JSON ({e}). Retry the call with a valid JSON object.")
                 parsed = {}
             if isinstance(parsed, dict):
                 call.args = parsed
             elif call.error is None:
                 call.error = f"Error: arguments for '{name}' must be a JSON object, got {type(parsed).__name__}."
         if call.error is None and tool_names is not None and name not in tool_names:
-            call.error = f"Error: tool '{name}' is not available here."
+            call.error = (SUBAGENT_TOOL_REFUSED.format(name=name) if subagent and name in RESTRICTED_SUBAGENT_TOOLS
+                          else f"Error: tool '{name}' is not available here.")
         calls.append(call)
     return calls
 
@@ -202,7 +223,7 @@ def _job_events(owner: str, adapter: Any) -> Iterator[None]:
         registry.remove_listener(on_job)
 
 
-async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None, capabilities_baseline: tuple[str, ...] | None = None, capability_kinds: tuple[str, ...] = ALL_KINDS, memory_store: Any = None, memory_user_id: str | None = None, facts_project: str | None = None, episodic_store: Any = None) -> str:
+async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_instruction: str, mcp_client: MCPClient, working_history: list, turn_type: Literal['interactive_loop', 'subagent_loop'], current_session_history=None, steps_history=None, store=None, adapter=None, compaction_notes: str = "", session_prompt_tokens: int = 0, session_completion_tokens: int = 0, session_total_tokens: int = 0, last_input_tokens: int = 0, stream: bool = True, max_iterations: int = MAX_ITERATIONS, tool_names: list[str] | None = None, permissions: SessionPermissions | None = None, session_hook_context: dict[str, str] | None = None, owner: str | None = None, inbox: list[str] | None = None, steering: SteeringQueue | None = None, capabilities_baseline: tuple[str, ...] | None = None, capability_kinds: tuple[str, ...] = ALL_KINDS, memory_store: Any = None, memory_user_id: str | None = None, facts_project: str | None = None, episodic_store: Any = None, schema_tool_names: list[str] | None = None) -> str:
     """Run one agent turn. `working_history` is mutated in place (appends and compaction).
 
     `session_hook_context` is the caller's per-session SessionStart context (hooks spec REQ-2.4): added to
@@ -227,6 +248,10 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     `memory_user_id` defaults to the configured user.
     `episodic_store` (main session only; subagents never get episodes) adds the episode index step: one line per
     episode of this project, re-sent when that list changes.
+
+    `schema_tool_names` is the tool schemas sent to the model when they differ from `tool_names`, the tools that may
+    run (None: the same list). A fork sends the main agent's unchanged, since tools are the head of the cached prefix,
+    and a call to one it may not run is refused here, before dispatch (subagents spec D11, D12).
     """
     current_session_id.set(session_id)
     owner = owner or session_id
@@ -239,6 +264,9 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
     if turn_type == "interactive_loop":  # what a typed subagent started in this turn reads (D14); None turns it off
         facts_source.set(FactsSource(memory_store, facts_user, facts_project) if facts_user and facts_project else None)
     threshold_percent = getattr(config, "compact_threshold", AUTO_COMPACT_THRESHOLD)  # None: auto-compaction off (overflow still compacts)
+    own_threshold = current_compact_threshold.get() if turn_type == "subagent_loop" else None
+    if own_threshold is not None:  # a subagent's type or agents.compact_threshold (compaction tasks T0.1)
+        threshold_percent = own_threshold[0]
     context_token_threshold = int(token_limit * threshold_percent / 100) if threshold_percent else None
     keep_recent_token_budget = min(int(token_limit * 0.15), 20000)
     max_tool_output_chars = config.max_tool_output_chars
@@ -437,6 +465,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
 
         max_iter = max_iterations
         nudged = False
+        cut_offs = 0  # replies in a row the provider stopped at its output-token cap
         stop_blocks = 0  # Stop-hook continuations this turn, bounded by hooks.stop_block_limit
         while iteration < max_iter:
             iteration += 1
@@ -473,7 +502,7 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                             steps_history=working_history,
                             system_instruction=compose_system_instruction(
                                 dynamic_system_instruction, compaction_notes, session_hook_context),
-                            tool_names=tool_names,
+                            tool_names=schema_tool_names if schema_tool_names is not None else tool_names,
                             stream=stream,
                         )
                         for name in take_unavailable_attachments():  # resumed after a sweep (multimodal REQ-1.3)
@@ -502,10 +531,12 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                             if await _sleep_or_cancel(delay, adapter):
                                 break
                             continue
-                        await loop_emit("error", f"Model call failed: {e}", adapter=adapter)
+                        hint = output_cap_hint(str(e), *request_max_tokens()) if isinstance(
+                            e, litellm.BadRequestError) else ""
+                        await loop_emit("error", f"Model call failed: {e}{hint}", adapter=adapter)
                         turn_span.set_attribute("outcome", "model_error")
                         turn_span.set_status(Status(StatusCode.ERROR, str(e)))
-                        return f"{MODEL_ERROR_PREFIX}{e}"
+                        return f"{MODEL_ERROR_PREFIX}{e}{hint}"
 
                 if await check_cancelled():
                     return CANCELLED_TURN
@@ -517,6 +548,8 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                 message = choices[0].message if choices else None
                 tool_calls = getattr(message, "tool_calls", None) if message else None
                 content = getattr(message, "content", None) if message else None
+                cut_off = (getattr(choices[0], "finish_reason", None) if choices else None) in OUTPUT_LIMIT_FINISH_REASONS
+                cut_offs = cut_offs + 1 if cut_off else 0
 
                 # close model_span exactly once, here, before any continue/return below
                 if model_span is not None and model_span.is_recording():
@@ -555,6 +588,20 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         "content": content,
                     }
                     await append_step(model_step, steps_history, working_history, current_session_history, session_id, store, turn_type)
+                    if cut_off:
+                        # A reply stopped at the output-token cap is not a final answer: never hand it back as one
+                        if cut_offs <= OUTPUT_LIMIT_RETRIES:
+                            await loop_emit("system", "Reply cut off at the output-token limit; asking the model to "
+                                            "continue.", adapter=adapter)
+                            await append_note(OUTPUT_LIMIT_NOTE)
+                            iter_span.set_status(Status(StatusCode.OK))
+                            continue
+                        result = OUTPUT_LIMIT_RESULT.format(content=content, count=cut_offs)
+                        await loop_emit("error", f"The reply was cut off at the output-token limit {cut_offs} times "
+                                        "in a row; ending the turn.", adapter=adapter)
+                        turn_span.set_attribute("outcome", "output_limit")
+                        turn_span.set_status(Status(StatusCode.ERROR, "output_limit"))
+                        return result
                     if inbox:
                         # A send_message arrived during this call: read it instead of ending (D10) — inbox
                         # items always append at the drain, so the model always gets something new. Before
@@ -618,12 +665,13 @@ async def loop(session_id: str, turn_id: str, user_text: str, dynamic_system_ins
                         turn_span.set_status(Status(StatusCode.ERROR, "empty_response"))
                         return msg
                     nudged = True
-                    await append_step({"role": "user", "content": EMPTY_RESPONSE_NUDGE}, steps_history, working_history, current_session_history, session_id, store, turn_type)
+                    nudge = OUTPUT_LIMIT_NOTE if cut_off else EMPTY_RESPONSE_NUDGE  # the cap spent on reasoning alone
+                    await append_step({"role": "user", "content": nudge}, steps_history, working_history, current_session_history, session_id, store, turn_type)
                     iter_span.set_status(Status(StatusCode.OK))
                     continue
                 nudged = False
 
-                calls = _parse_tool_calls(tool_calls, tool_names)
+                calls = _parse_tool_calls(tool_calls, tool_names, cut_off=cut_off, subagent=turn_type == "subagent_loop")
                 assistant_tool_step = {
                     "role": "assistant",
                     "content": content,

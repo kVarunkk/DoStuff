@@ -1,9 +1,38 @@
 """Tool-output helpers shared by the loop and the TUI, kept free of heavy imports (litellm, tools)."""
 
 import json
+import re
 from typing import Callable, Mapping
 
 EMPTY_RESPONSE_NUDGE = "Continue, or say you are done."
+# A reply the provider stopped at its output-token cap (finish_reason "length") is not an answer: the loop says so and
+# keeps going, a bounded number of times in a row (OUTPUT_LIMIT_RETRIES), instead of returning the cut-off text.
+OUTPUT_LIMIT_FINISH_REASONS = ("length", "max_tokens")
+OUTPUT_LIMIT_RETRIES = 3
+OUTPUT_LIMIT_NOTE = (
+    "Your last reply was cut off at the output-token limit, so it is incomplete and nothing in it was saved. "
+    "Continue from where it stopped. Put long content (a file, a plan, a list of tasks) in tool calls, not in the "
+    "reply, and keep each call small: write a long file in parts (create it with the first part, then add the rest "
+    "with edits)."
+)
+OUTPUT_LIMIT_ARGS_ERROR = (
+    "Error: the arguments for '{name}' were cut off at the output-token limit, so the call did not run. "
+    "Retry with less content per call: split a long file across several calls."
+)
+OUTPUT_LIMIT_RESULT = (
+    "{content}\n\n[dostuff: this reply was cut off at the model's output-token limit {count} times in a row and is "
+    "incomplete. Raise loop.max_tokens or use a model with a larger output limit.]"
+)
+# A provider that rejects the cap we sent (HTTP 400) names its own limit but not dostuff's setting
+_OUTPUT_CAP_ERROR = re.compile(r"max(imum)?[ _-]*(output[ _-]*|completion[ _-]*|new[ _-]*)?tokens", re.IGNORECASE)
+
+
+def output_cap_hint(error: str, cap: int, source: str) -> str:
+    """A pointer to the setting behind a rejected output cap, or "" when no cap was sent or the error isn't about it."""
+    if cap <= 0 or not _OUTPUT_CAP_ERROR.search(error):
+        return ""
+    return f" (dostuff sent max_tokens={cap} from {source}; lower it to within this model's output limit)"
+
 
 # Per-tool call labels, names-only on purpose: this module is on the TUI's pre-first-frame path, and
 # importing TOOL_MAP here once cost 27 s of startup (NOTES.md 2026-11-01, CON-010). Each entry is a

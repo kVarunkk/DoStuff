@@ -224,6 +224,21 @@ def run_setup(first_run: bool = False) -> bool:
 
     typer.echo(
         f"\nEdit {config_path} for permissions, MCP servers and limits. "
-        "Run `dostuff setup` to switch models, `dostuff doctor` to check your install.\n"
+        "Run `dostuff setup` to switch models, `dostuff doctor` to check your install."
     )
+    typer.echo(extras_note() + "\n")
     return True
+
+
+def extras_note() -> str:
+    """The optional extras not installed, for the end of setup; empty when all are."""
+    from dostuff.helpers.extras import install_hint, missing_extras
+    from dostuff.lib.memory.chroma import chroma_available
+
+    missing = [(e.name, e.adds) for e in missing_extras()]
+    if not chroma_available():
+        missing.insert(0, ("memory", "memory recall by meaning, not just keywords"))
+    if not missing:
+        return ""
+    lines = "\n".join(f"  {name}: {adds}" for name, adds in missing)
+    return f"\nOptional extras not installed (`{install_hint('full')}` adds them all):\n{lines}"

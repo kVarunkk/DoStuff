@@ -395,10 +395,11 @@ def agent_type(monkeypatch):
     from dostuff.agent.subagents.definitions import BUILTIN_TYPES, AgentDef
 
     def register(name: str, *, tools=None, prompt: str = "", model: str = "inherit", description: str = "test type",
-                 max_iterations=None):
+                 max_iterations=None, max_tokens=None, compact_threshold=None):
         agent_def = AgentDef(name=name, description=description, prompt=prompt,
                              tools=tuple(tools) if tools is not None else None, model=model, source="test",
-                             max_iterations=max_iterations)
+                             max_iterations=max_iterations, max_tokens=max_tokens,
+                             compact_threshold=compact_threshold)
         monkeypatch.setitem(BUILTIN_TYPES, name, agent_def)
         return agent_def
     return register

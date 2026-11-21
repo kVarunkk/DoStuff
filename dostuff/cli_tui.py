@@ -8,15 +8,17 @@ which hops back to the UI thread when needed.
 import asyncio
 import contextlib
 import os
+import re
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import uuid
 from bisect import bisect_right
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, Literal
 from textual.app import App, ComposeResult
 from textual.geometry import Region
 from textual.message import Message
@@ -34,7 +36,7 @@ from rich.text import Text
 from rich.markdown import Markdown as RichMarkdown
 from textual.events import Click, Key, Paste, TextSelected
 from dostuff import __version__
-from dostuff.config import NOTIFY_KINDS, STATUS_BAR_ITEMS, get_config, parse_compact_threshold
+from dostuff.config import NOTIFY_KINDS, REASONING_EFFORTS, STATUS_BAR_ITEMS, get_config, parse_compact_threshold
 from dostuff.agent.permissions import PERMISSION_MODES, ApprovalReply, SessionPermissions, next_mode, parse_answer
 from dostuff.agent.instructions import build_base_instructions, build_system_instructions, build_turn_context
 from dostuff.helpers.agent.constants import COMMAND_DESCRIPTIONS, COMMAND_FLAGS
@@ -49,7 +51,7 @@ from dostuff.tools.bash.jobs import (
 from dostuff.lib.memory.session_store import SQLiteSessionStore
 from dostuff.lib.checkpoints import CHECKPOINT_TOOLS, UndoResult, get_checkpoint_store
 from dostuff.lib.worktree import Worktree, WorktreeError, create_worktree, detect_worktree, has_changes, remove_worktree, worktree_changes
-from dostuff.lib.model import get_model
+from dostuff.lib.model import get_litellm_model, get_model, supports_reasoning
 from dostuff.lib.tracing import session_id_var, turn_id_var
 from dostuff.helpers.agent.append_step import append_step
 from dostuff.helpers.agent.loop_check_cancelled import CANCELLED_TURN
@@ -121,6 +123,10 @@ QUEUE_BAR_MAX_ROWS = 4  # queued prompts listed above the input; /queue lists th
 QUEUE_DETAIL_LINES = 8  # rows of a queued prompt shown in its picker
 PREVIEW_CHARS_PER_LINE = 200  # preview char budget = lines * this, so one giant line can't flood the screen
 PICKER_MAX_SESSIONS = 9  # /resume picker: number keys reach every option
+# A resumed session paints its last steps; older ones load a chunk at a time when the user scrolls to the top
+HISTORY_TAIL_STEPS = 60
+HISTORY_CHUNK_STEPS = 120
+HISTORY_LOAD_ROWS = 2  # this close to the top, the next older chunk loads
 PICKER_MAX_VISIBLE = 10  # longer option lists scroll with the cursor
 EDIT_PROMPT_ESC_SECONDS = 1.5  # Esc, then Esc again within this, takes back the last prompt
 QUIT_HINT = "ctrl+q or /exit to quit"  # flashed when Esc / Ctrl+C has nothing to do
@@ -135,13 +141,17 @@ ASK_REVIEW_LABEL = "Review"  # the tab the review step adds to the strip
 ASK_REVIEW_HINT = "↑/↓ select · Enter on an answer changes it · Enter on Submit sends · ← back · Esc cancel"
 ASK_OTHER_LABEL = "Other (type your own)"
 ASK_EMPTY_INPUT_HINT = "type an answer (Esc cancels the questions)"
+ASK_EMPTY_OTHER_HINT = "type an answer (Esc goes back to the options)"
 # The current question's tab: bold orange, plus the solid bar `_tabs` puts in front of it. No background:
 # under the ansi-dark theme a hex `on` colour snaps to black, which is invisible on a dark terminal.
 ASK_CURRENT_TAB = "bold #e5c07b"
 # Gemini sends reasoning as whole summary paragraphs ~1 s apart; each new chunk is typed out
-# over THOUGHT_REVEAL_TICKS ticks so it reads like streaming instead of popping in as a block
-THOUGHT_REVEAL_INTERVAL_S = 0.03
-THOUGHT_REVEAL_TICKS = 25
+# over THOUGHT_REVEAL_TICKS ticks so it reads like streaming instead of popping in as a block.
+# A tick that wraps onto a new row re-lays-out the screen (see _update_static), so not every 30 ms
+THOUGHT_REVEAL_INTERVAL_S = 0.1
+THOUGHT_REVEAL_TICKS = 8
+# Streamed answer text reaches the screen at most this often; the chunks in between are coalesced
+STREAM_RENDER_INTERVAL_S = 1 / 15
 
 
 def _mcp_files_signature() -> tuple[tuple[int, int] | None, ...]:
@@ -190,8 +200,9 @@ def _preview_clipped(text: str, max_lines: int) -> bool:
     return len(lines) > max_lines or sum(map(len, lines)) > max_lines * PREVIEW_CHARS_PER_LINE
 
 
-def _preview(text: str, max_lines: int) -> str:
-    """First max_lines lines and at most max_lines * PREVIEW_CHARS_PER_LINE chars, with a marker for the rest."""
+def _preview(text: str, max_lines: int, hint: str = "ctrl+o to expand") -> str:
+    """First max_lines lines and at most max_lines * PREVIEW_CHARS_PER_LINE chars, with a marker for the rest
+    (`hint` says how to see it)."""
     lines = text.rstrip("\n").splitlines() or [""]
     budget = max_lines * PREVIEW_CHARS_PER_LINE
     shown: list[str] = []
@@ -199,21 +210,56 @@ def _preview(text: str, max_lines: int) -> str:
         if len(line) > budget:  # a long line (minified JSON, base64…) would wrap over the whole screen
             shown.append(line[:budget])
             hidden = len(line) - budget + sum(map(len, lines[len(shown):]))
-            return "\n".join(shown + [f"… +{hidden} chars (ctrl+o to expand)"])
+            return "\n".join(shown + [f"… +{hidden} chars ({hint})"])
         shown.append(line)
         budget -= len(line)
     extra = len(lines) - max_lines
     if extra > 0:
-        shown.append(f"… +{extra} lines (ctrl+o to expand)")
+        shown.append(f"… +{extra} lines ({hint})")
     return "\n".join(shown)
 
 
-def _tool_result_line(text: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES) -> str:
+def _tool_result_line(text: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES, hint: str = "ctrl+o to expand") -> str:
     """Tool output under its call, Claude Code style: '  ⎿  first line' + indented rest."""
-    return "  ⎿  " + _preview(text, max_lines).replace("\n", "\n     ")
+    return "  ⎿  " + _preview(text, max_lines, hint).replace("\n", "\n     ")
 
 
-class SelectableStatic(Static):
+class MessageStatic(Static):
+    """A conversation message: its height at a width is measured once per content, not on every layout.
+
+    Textual drops a widget's own height cache on every `refresh()`, and a newly mounted message refreshes,
+    so the next screen layout wrapped every message's text again. A resumed session lays out its
+    whole transcript at least twice before the first paint, and that re-wrapping was most of the wait.
+    The key is the content object (a new one on every `update()`) and, for a Text, its length, which
+    changes when it is appended to in place."""
+
+    _height_cache: tuple[object, int, int, int] | None = None
+
+    def get_content_height(self, container: Any, viewport: Any, width: int) -> int:
+        content = self.content
+        length = len(content.plain) if isinstance(content, Text) else -1
+        cached = self._height_cache
+        if cached is not None and cached[0] is content and cached[1] == width and cached[2] == length:
+            return cached[3]
+        height = self._measure_height(container, viewport, width)
+        self._height_cache = (content, width, length, height)
+        return height
+
+    def _measure_height(self, container: Any, viewport: Any, width: int) -> int:
+        return super().get_content_height(container, viewport, width)
+
+
+class HistoryMore(Static):
+    """`↑ N earlier steps` at the top of a resumed session; a click loads the next older chunk too (when
+    the shown steps fit on screen there is nothing to scroll)."""
+
+    def on_click(self) -> None:
+        load = getattr(self.app, "_load_older_history", None)
+        if load is not None:
+            load()
+
+
+class SelectableStatic(MessageStatic):
     """Static whose Rich renderables (Markdown) are flattened to Text at the current width.
 
     Textual can only select Text / Content, so a plain Static holding RichMarkdown can't be
@@ -243,14 +289,49 @@ class SelectableStatic(Static):
         return text
 
     def render(self) -> Any:
-        flat = self._flat(self.content_size.width)
+        if not isinstance(self.content, RichMarkdown):
+            return super().render()
+        # The width from `outer_size`, not `content_size`: that looks the widget up in the compositor's full
+        # map, which a reflow has just invalidated, so each message's render rebuilt the whole
+        # conversation's layout (a long resumed session took seconds to paint).
+        flat = self._flat(self.outer_size.width - self.styles.gutter.width)
         return flat if flat is not None else super().render()
 
-    def get_content_height(self, container: Any, viewport: Any, width: int) -> int:
+    def _measure_height(self, container: Any, viewport: Any, width: int) -> int:
         flat = self._flat(width)
         if flat is not None:
             return len(flat.plain.split("\n"))
-        return super().get_content_height(container, viewport, width)
+        return super()._measure_height(container, viewport, width)
+
+
+def _update_static(widget: Static, content: Any, relayout: bool = True) -> bool:
+    """`widget.update(content)`, laying out the screen only when the widget's size changes.
+
+    Textual answers a layout refresh by arranging the whole screen, every message of the conversation
+    included: ~0.4 s at 1,200 messages. The loader tick, streamed text and the status bar update many
+    times a second during a turn and mostly keep their size, so for them that pass was pure lag (typing
+    and scrolling waited behind it). Only this widget is measured here, from `outer_size`: `.size` would
+    look the widget up in the compositor's full map, itself a walk of the whole conversation.
+
+    With `relayout=False` a size change is not laid out either: the widget keeps its old size (new rows
+    past it stay hidden) and True is returned, so the caller can lay it out later."""
+    outer = widget.outer_size
+    parent = widget.parent
+    if not widget.is_mounted or not outer or not isinstance(parent, Widget):
+        widget.update(content)  # never laid out (or hidden): nothing to compare against
+        return False
+    widget.update(content, layout=False)  # also clears the widget's cached content size
+    styles, gutter, viewport = widget.styles, widget.styles.gutter, widget.app.size
+    width = outer.width - gutter.width
+    resized = (
+        (styles.width is not None and styles.width.is_auto
+         and widget.get_content_width(parent.outer_size, viewport) != width)
+        or ((styles.height is None or styles.height.is_auto)
+            and widget.get_content_height(parent.outer_size, viewport, width) != outer.height - gutter.height)
+    )
+    if resized and relayout:
+        widget.refresh(layout=True)
+    return resized and not relayout
 
 
 def _copy_to_clipboard(app: App, text: str) -> None:
@@ -268,7 +349,7 @@ def _copy_to_clipboard(app: App, text: str) -> None:
     threading.Thread(target=run_clip, daemon=True).start()
 
 
-class ToolResult(Static):
+class ToolResult(MessageStatic):
     """A tool or shell result: its first max_lines lines, or all of it once expanded.
 
     A click toggles this one; Ctrl+O toggles every result (DostuffTUI.action_toggle_tool_results).
@@ -303,6 +384,263 @@ class ToolResult(Static):
         self.set_expanded(not self.expanded)
 
 
+# How a run of tool calls reads in its one summary line: (past, present, one, many). Tools that share a tuple
+# count together (grep + glob are both "patterns"); `many` None means the noun takes no count ("checked the date").
+_ToolNoun = tuple[str, str, str, "str | None"]
+_FILES_READ: _ToolNoun = ("read", "reading", "file", "files")
+_PATTERNS: _ToolNoun = ("searched for", "searching for", "pattern", "patterns")
+_EDITS: _ToolNoun = ("edited", "editing", "file", "files")
+_MCP_LOOKUPS: _ToolNoun = ("looked up", "looking up", "MCP tool", "MCP tools")
+_MEMORIES: _ToolNoun = ("saved", "saving", "memory", "memories")
+_SETTINGS: _ToolNoun = ("changed", "changing", "setting", "settings")
+_OTHER_TOOLS: _ToolNoun = ("ran", "running", "tool", "tools")
+TOOL_SUMMARY_NOUNS: dict[str, _ToolNoun] = {
+    "read_file": _FILES_READ,
+    "write_file": ("wrote", "writing", "file", "files"),
+    "edit_file": _EDITS, "multi_edit": _EDITS,
+    "delete_file": ("deleted", "deleting", "file", "files"),
+    "list_files": ("listed", "listing", "directory", "directories"),
+    "grep": _PATTERNS, "glob": _PATTERNS,
+    "bash_command": ("ran", "running", "shell command", "shell commands"),
+    "bash_output": ("checked", "checking", "background shell", "background shells"),
+    "kill_shell": ("stopped", "stopping", "background shell", "background shells"),
+    "web_fetch": ("fetched", "fetching", "page", "pages"),
+    "web_search": ("ran", "running", "web search", "web searches"),
+    "search_memory": ("searched", "searching", "memory", None),
+    "save_memory": _MEMORIES, "save_episode": _MEMORIES,
+    "search_mcp_tools": _MCP_LOOKUPS, "get_mcp_tool_details": _MCP_LOOKUPS,
+    "call_mcp_tool": ("called", "calling", "MCP tool", "MCP tools"),
+    "read_settings": ("read", "reading", "the settings", None),
+    "edit_config": _SETTINGS, "set_mcp_server": _SETTINGS, "remove_mcp_server": _SETTINGS,
+    "get_current_datetime": ("checked", "checking", "the date", None),
+    "send_message": ("sent", "sending", "message to an agent", "messages to agents"),
+    "stop_agent": ("stopped", "stopping", "agent", "agents"),
+    "create_agent_type": ("created", "creating", "agent type", "agent types"),
+}
+# Calls that keep their own `● call` line: what they show is the point (the plan, the answers, a subagent's task)
+UNGROUPED_TOOLS = frozenset({"todo_write", "ask_user", "agent", "delegate_to_subagent"})
+
+
+_AGENT_PREFIX = re.compile(r"(?:\[agent: .*?\] )+")
+
+
+def split_agent_prefix(text: str) -> tuple[str, str]:
+    """`[agent: spec] read_file: …` → (`[agent: spec] `, `read_file: …`). A foreground subagent's calls and
+    results come prefixed (SubagentAdapter); the prefix is not part of the tool name a result is matched by,
+    and the `[agent: …]` description itself holds a `: `."""
+    match = _AGENT_PREFIX.match(text)
+    return (match.group(0), text[match.end():]) if match else ("", text)
+
+
+def summarize_tool_calls(names: list[str], running: bool = False) -> str:
+    """`Read 2 files, ran 1 shell command`: one clause per kind of call, in the order they were made."""
+    counts: dict[_ToolNoun, int] = {}
+    for name in names:
+        noun = TOOL_SUMMARY_NOUNS.get(name, _OTHER_TOOLS)
+        counts[noun] = counts.get(noun, 0) + 1
+    clauses = []
+    for (past, present, one, many), count in counts.items():
+        verb = present if running else past
+        clauses.append(f"{verb} {one}" if many is None else f"{verb} {count} {one if count == 1 else many}")
+    text = ", ".join(clauses)
+    return (text[:1].upper() + text[1:]) + ("…" if running else "")
+
+
+class _GroupedCall:
+    """One call in a ToolGroup: its label and, once it has run, its result."""
+
+    __slots__ = ("name", "label", "result", "max_lines")
+
+    def __init__(self, name: str, label: str) -> None:
+        self.name = name
+        self.label = label
+        self.result: str | None = None
+        self.max_lines = TOOL_RESULT_PREVIEW_LINES
+
+    @property
+    def failed(self) -> bool:
+        return self.result is not None and self.result.startswith("Error")
+
+
+TOOL_RUNNING_COLOR, TOOL_FAILED_COLOR, TOOL_DIM_COLOR = "#8ab4f8", "#e06c75", "#8a8a8a"
+
+
+class _ToolGroupHeader(MessageStatic):
+    """A ToolGroup's `● Read 2 files, ran 1 shell command` line; a click opens or closes the group."""
+
+    def on_click(self) -> None:
+        if self.screen.get_selected_text():
+            return  # the end of a mouse selection, not a click
+        group = self.parent
+        if isinstance(group, ToolGroup):
+            group.set_expanded(not group.expanded, full=False if group.expanded else group.full)
+
+
+class _ToolGroupCall(MessageStatic):
+    """One call in an open ToolGroup: `● label` in its own state's colour, and a preview of its result. A
+    click shows that one result in full (or its preview again) and leaves the group open."""
+
+    def __init__(self, call: _GroupedCall, full: bool = False, closed: bool = False, **kwargs: Any) -> None:
+        self.call = call
+        self.full = full
+        self.closed = closed  # the group's turn ended: no result now means the call never ran
+        super().__init__(self._content(), markup=False, **kwargs)
+        self.set_class(self.collapsible, "-clickable")
+
+    @property
+    def collapsible(self) -> bool:
+        return self.call.result is not None and _preview_clipped(self.call.result, self.call.max_lines)
+
+    def _content(self) -> Text:
+        call = self.call
+        if call.result is None:
+            bullet = TOOL_DIM_COLOR if self.closed else TOOL_RUNNING_COLOR
+            body = "  ⎿  (did not run)" if self.closed else "  ⎿  …"
+        else:
+            bullet = TOOL_FAILED_COLOR if call.failed else ""
+            body = _tool_result_line(call.result, len(call.result) if self.full else call.max_lines,
+                                     hint="click to show all")
+            if self.full and self.collapsible:
+                body += "\n     (click to collapse)"
+        text = Text("  ")
+        text.append("● ", style=bullet)
+        text.append(call.label)
+        body = "\n" + ("  " + body).replace("\n", "\n  ")  # the `⎿` under the call's label, not under its `●`
+        text.append_text(Text.from_ansi(body, style=TOOL_DIM_COLOR) if "\033[" in body
+                         else Text(body, style=TOOL_DIM_COLOR))
+        return text
+
+    def refresh_content(self) -> None:
+        if self.is_mounted:
+            _update_static(self, self._content())
+        else:
+            self.update(self._content(), layout=False)
+        self.set_class(self.collapsible, "-clickable")  # hover highlights only a row a click changes
+
+    def set_full(self, full: bool) -> None:
+        if full != self.full:
+            self.full = full
+            self.refresh_content()
+
+    def on_click(self) -> None:
+        if self.screen.get_selected_text():
+            return  # the end of a mouse selection, not a click
+        if self.collapsible:
+            self.set_full(not self.full)
+
+
+class ToolGroup(Vertical):
+    """A run of consecutive tool calls as one line, `● Read 2 files, ran 1 shell command`, like Claude Code.
+
+    A click on that line opens the group: each call on its own `● label` row (blue while it runs, red when
+    it failed) with a preview of its result, and a click on a row shows that result in full. Ctrl+O
+    (DostuffTUI.action_toggle_tool_results) opens every group with every result in full. Calls join the
+    group until another message is mounted below it; their results arrive later, matched by tool name in
+    call order (the loop announces every call of a step before it runs any, and runs the read-only ones
+    first). The rows are made the first time the group opens, so a closed group stays one line widget."""
+
+    def __init__(self, prefix: str = "", expanded: bool = False, **kwargs: Any) -> None:
+        self.prefix = prefix
+        self.calls: list[_GroupedCall] = []
+        self.expanded = expanded
+        self.full = expanded
+        self.closed = False  # the turn ended: a call still without a result never ran
+        self.rows: list[_ToolGroupCall] = []
+        self.header = _ToolGroupHeader(self._header(), markup=False, classes="tool-group-header")
+        super().__init__(self.header, **kwargs)
+
+    @property
+    def running(self) -> bool:
+        return not self.closed and any(call.result is None for call in self.calls)
+
+    def add_call(self, name: str, label: str) -> None:
+        self.calls.append(_GroupedCall(name, label))
+        self._refresh()
+
+    def take_result(self, name: str, result: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES) -> bool:
+        """Give the first call of `name` still waiting its result; False when none is waiting."""
+        if self.closed:
+            return False
+        for index, call in enumerate(self.calls):
+            if call.name == name and call.result is None:
+                call.result, call.max_lines = result, max_lines
+                if index < len(self.rows):
+                    self.rows[index].refresh_content()
+                self._refresh()
+                return True
+        return False
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            for row in self.rows:
+                row.closed = True
+                row.refresh_content()
+            self._refresh()
+
+    def set_expanded(self, expanded: bool, full: bool | None = None) -> None:
+        """Open or close the group; a changed `full` (Ctrl+O) sets every row to its whole result or preview."""
+        full = self.full if full is None else full
+        if (expanded, full) == (self.expanded, self.full):
+            return
+        if full != self.full:
+            for row in self.rows:
+                row.set_full(full)
+        self.expanded, self.full = expanded, full
+        self._refresh()
+
+    def on_mount(self) -> None:
+        self._sync_rows()  # opened (Ctrl+O) before it was mounted
+
+    def _refresh(self) -> None:
+        content = self._header()
+        if self.header.is_mounted:
+            _update_static(self.header, content)
+        else:
+            self.header.update(content, layout=False)
+        self._sync_rows()
+
+    def _sync_rows(self) -> None:
+        """A row for each call not shown yet, once the group is open (and mounted: a widget takes no
+        children before), and every row shown or hidden with the group."""
+        if not self.is_mounted:
+            return
+        if self.expanded and len(self.rows) < len(self.calls):
+            new = [_ToolGroupCall(call, full=self.full, closed=self.closed, classes="tool-group-call")
+                   for call in self.calls[len(self.rows):]]
+            self.rows.extend(new)
+            self.mount(*new)
+        for row in self.rows:
+            if row.display != self.expanded:
+                row.display = self.expanded
+
+    def _header(self) -> Text:
+        failed = sum(call.failed for call in self.calls)
+        text = Text(self.prefix)
+        text.append("● ", style=TOOL_FAILED_COLOR if failed else (TOOL_RUNNING_COLOR if self.running else ""))
+        text.append(summarize_tool_calls([call.name for call in self.calls], self.running), style=TOOL_DIM_COLOR)
+        if failed:
+            text.append(f" · {failed} failed", style=TOOL_FAILED_COLOR)
+        if not self.expanded:
+            text.append(" (ctrl+o to expand)", style=TOOL_DIM_COLOR)
+        return text
+
+
+class _ToolGroups:
+    """Where tool calls and results go: the group that takes the next call, and the groups whose calls
+    still wait for a result. One per transcript being built (the conversation, the agent view, an older
+    chunk of history), so a call in one never joins a group in another."""
+
+    def __init__(self) -> None:
+        self.open: ToolGroup | None = None
+        self.pending: list[ToolGroup] = []
+
+    def close(self) -> None:
+        for group in self.pending:
+            group.close()
+        self.open, self.pending = None, []
+
+
 class StickyPrompt(Static):
     """The top row of the conversation while its turn's prompt is scrolled out of view: that prompt on one
     row, like a sticky section header. A click goes back to the prompt.
@@ -323,7 +661,7 @@ class StickyPrompt(Static):
         self.target = target
         self.display = target is not None
         if target is not None:
-            self.update(" ".join(str(target.content).split()))
+            _update_static(self, " ".join(str(target.content).split()))
             self.set_class(target.has_class("msg-shell"), "-shell")
 
     def on_click(self) -> None:
@@ -888,14 +1226,38 @@ class AskUserPanel(Static, can_focus=True):
     def on_mount(self) -> None:
         self._render_panel()
 
-    def _tabs(self) -> Text:
+    def _tab_labels(self, width: int | None) -> list[str]:
+        """The tab labels, shortened with `…` only as far as the strip needs to fit on one `width`-cell line.
+        The current tab keeps its whole label; the others are capped to a shared length, longest first."""
+        labels = [_one_line_answer(q.get("header") or f"Q{i + 1}") for i, q in enumerate(self.questions)]
+        if width is None:
+            return labels
+        current = self.cursor_question if not self.submit_focused and not self.reviewing else -1
+        # each tab is a 2-cell mark plus its label, with ` · ` between tabs (and before the review tab)
+        overhead = 2 * len(labels) + 3 * (len(labels) - 1)
+        if self.reviewing:
+            overhead += 5 + len(ASK_REVIEW_LABEL)
+
+        def capped(cap: int) -> list[str]:
+            return [label if i == current or len(label) <= cap else label[:cap - 1] + "…"
+                    for i, label in enumerate(labels)]
+
+        cap = max((len(label) for label in labels), default=0)
+        fitted = labels
+        while cap > 4 and overhead + sum(len(label) for label in fitted) > width:
+            cap -= 1
+            fitted = capped(cap)
+        return fitted
+
+    def _tabs(self, width: int | None = None) -> Text:
         """The tab strip (D6): one tab per question, the current one unmistakable.
 
         The strip is the only thing that says which question you are on, so the current tab is bold orange
         and carries a solid bar; an answered one carries `✓` in the same slot, so every tab is the same
         width and the strip does not re-flow as answers land. Plain glyphs, never emoji: this line shares
-        its marks with the option rows' own `❯`/`✓`."""
+        its marks with the option rows' own `❯`/`✓`. Given `width`, the labels are fitted to it."""
         text = Text()
+        labels = self._tab_labels(width)
         for i, question in enumerate(self.questions):
             if i:
                 text.append(" · ", style="dim")
@@ -907,8 +1269,7 @@ class AskUserPanel(Static, can_focus=True):
             else:
                 mark, mark_style = "  ", ""
             text.append(mark, style=mark_style)
-            label = _one_line_answer(question.get("header") or f"Q{i + 1}")
-            text.append(label, style=ASK_CURRENT_TAB if here else "")
+            text.append(labels[i], style=ASK_CURRENT_TAB if here else "")
         if self.reviewing:
             text.append(" · ", style="dim")
             text.append("▌ ", style=ASK_CURRENT_TAB)
@@ -924,7 +1285,8 @@ class AskUserPanel(Static, can_focus=True):
         return ((" ❯ " if self.submit_focused else "   ") + label), style
 
     def _row_texts(self, index: int, width: int) -> list[str]:
-        """`✓ 1. label   description` per row, the description cut to one row (D6: the `detail` idea)."""
+        """`✓ 1. label   description` per row; a long one wraps under its number rather than being cut, so the
+        whole description can be read."""
         rows: list[str] = []
         for i, option in enumerate(self._options(index)):
             picked = i in self._toggles[index] if self._multi(index) else self._single[index] == _one_line_answer(option.get("label", ""))
@@ -932,20 +1294,42 @@ class AskUserPanel(Static, can_focus=True):
             line = f"{'✓' if picked else ' '} {i + 1}. {label}"
             description = _one_line_answer(option.get("description", ""))
             if description:
-                room = max(width - len(line) - 3, 8)
-                line += "   " + (description if len(description) <= room else description[:room - 1] + "…")
-            rows.append(line)
+                line += "   " + description
+            rows.append(self._wrap_row(line, f"  {i + 1}. ", width))
         typed = self._other[index]
         number = len(self._options(index)) + 1
-        rows.append(f"{'✓' if typed else ' '} {number}. {ASK_OTHER_LABEL}" + (f": {typed}" if typed else ""))
+        rows.append(self._wrap_row(f"{'✓' if typed else ' '} {number}. {ASK_OTHER_LABEL}" + (f": {typed}" if typed else ""),
+                                   f"  {number}. ", width))
         return rows
+
+    @staticmethod
+    def _wrap_row(line: str, number: str, width: int) -> str:
+        """`line` wrapped to `width` (less the 2-cell cursor mark), continuation lines under the label."""
+        return textwrap.fill(line, width=max(width - 2, 10), subsequent_indent=" " * len(number),
+                             break_long_words=True, break_on_hyphens=False)
+
+    def _fit_window(self, rows: list[str], cursor: int, start: int, end: int, room: int) -> tuple[int, int]:
+        """Narrow the option window `start:end` until its lines (and the `↑/↓ N more` markers) fit in `room`
+        lines, dropping rows from the side away from the cursor. A short terminal otherwise pushes the
+        options, the submit row and the hint off the bottom of the screen. At least one row stays."""
+        def lines(a: int, b: int) -> int:
+            return sum(row.count("\n") + 1 for row in rows[a:b]) + (a > 0) + (b < len(rows))
+
+        while end - start > 1 and lines(start, end) > room:
+            if start < cursor and (cursor - start >= end - 1 - cursor or end - 1 <= cursor):
+                start += 1
+            elif end - 1 > cursor:
+                end -= 1
+            else:
+                start += 1
+        return start, end
 
     def _render_review(self, width: int) -> None:
         """The review step: every question with its answer under it, then the submit row that sends.
 
         A question's rows carry `meta={"ask-review": i}`, so a click on the question or on its answer goes
         back to that question; the answer is shown whole (it wraps) — the review is where it gets read."""
-        text = self._tabs()
+        text = self._tabs(width + 4)
         text.append("\n   Review your answers", style="bold")
         for i, question in enumerate(self.questions):
             meta = Style(meta={"ask-review": i})
@@ -971,10 +1355,17 @@ class AskUserPanel(Static, can_focus=True):
             self._render_review(width)
             return
         index = min(self.cursor_question, len(self.questions) - 1)
-        text = self._tabs()
+        text = self._tabs(width + 4)
         text.append("\n   " + _one_line_answer(self.questions[index].get("question", "")), style="bold")
         rows = self._row_texts(index, width)
-        start, end = _option_window(len(rows), min(self.cursor_row, len(rows) - 1))
+        cursor = min(self.cursor_row, len(rows) - 1)
+        start, end = _option_window(len(rows), cursor)
+        # lines the panel needs besides the options: tabs, question, rule, submit row, hint; and the screen's own
+        # (border, status row, margins) that it must leave
+        fixed = (len(textwrap.wrap(self._tabs(width + 4).plain, width + 4) or [""])
+                 + len(textwrap.wrap(_one_line_answer(self.questions[index].get("question", "")), width + 1) or [""])
+                 + 3 + 6)
+        start, end = self._fit_window(rows, cursor, start, end, self.app.size.height - fixed)
         _append_option_rows(text, rows, self.cursor_row if not self.submit_focused else -1, start, end)
         text.append("\n   " + "─" * max(min(width - 3, 56), 10), style="dim")
         line, style = self._submit_line()
@@ -1646,7 +2037,8 @@ class TuiAdapter:
             app._append(str(data), msg_type="diff")
             return
         if event_type == "tool_call":
-            app._append(f"● {data}", msg_type="tool")
+            prefix, label = split_agent_prefix(str(data))
+            app._append_tool_call(label.partition("(")[0], label, prefix=prefix)
             return
         if event_type == "tool_result":
             text = str(data)
@@ -1658,7 +2050,10 @@ class TuiAdapter:
                 if pairs is not None:
                     app._append_answers_block(pairs)
                     return  # a cancelled or refused result has no pairs and falls through to the usual line
-            app._append_call_result(text)
+            prefix, text = split_agent_prefix(text)
+            app._append_call_result(text, prefix=prefix)
+            if text.startswith("web_search: "):
+                app._note_search_fallback()
             return
         if event_type in ("confirm", "system", "error"):
             app._append(str(data), msg_type=event_type)
@@ -1881,7 +2276,7 @@ class TuiAdapter:
             # answer to this question, so a number is text too; otherwise it answers the "Other" row.
             answer = _one_line_answer(text)
             if not answer:  # open point 4: an empty Enter records nothing; Esc is the way out
-                self._app._flash_input_hint(ASK_EMPTY_INPUT_HINT)
+                self._app._flash_input_hint(ASK_EMPTY_OTHER_HINT if self._ask_panel_owns_input else ASK_EMPTY_INPUT_HINT)
                 return
             if self._ask_panel_owns_input:
                 self._app._ask_panel_other(self._other_index, answer)
@@ -1922,7 +2317,12 @@ class DostuffTUI(App):
     # grey band (like Claude Code) so turns are easy to find when scrolling.
     CSS = """
     Screen { background: transparent; }
-    #messages { height: 1fr; background: transparent; scrollbar-size-vertical: 1; layers: base sticky; }
+    /* scrollbar-gutter: stable keeps the messages' width fixed when the conversation first overflows, so a
+       long resumed session is wrapped once instead of again at the narrower width (MessageStatic). */
+    #messages {
+        height: 1fr; background: transparent; scrollbar-size-vertical: 1; scrollbar-gutter: stable;
+        layers: base sticky;
+    }
     #msg-container { height: auto; min-height: 100%; }
     .msg { width: 100%; height: auto; padding: 0 1; margin-top: 1; background: transparent; }
     .msg-user { color: #d0d0d0; background: #373737; }
@@ -1934,13 +2334,17 @@ class DostuffTUI(App):
         height: auto; margin-top: 1; padding: 0 1; background: transparent; border: round #8ab4f8;
     }
     #ask-panel {
-        height: auto; margin-top: 1; padding: 0 1; background: transparent; border: round #8ab4f8;
+        height: auto; max-height: 100%; overflow-y: auto; margin-top: 1; padding: 0 1; background: transparent; border: round #8ab4f8;
     }
     .msg-error { color: #e06c75; }
     .msg-system { color: #8a8a8a; }
     .msg-loader { color: #8ab4f8; }
     .msg-thought { color: #8a8a8a; text-style: italic; }
     .msg-tool { }
+    ToolGroup.msg { height: auto; }
+    ToolGroup > Static { width: 100%; height: auto; }
+    /* Clickable, so they light up under the mouse like the jobs/agents bars */
+    ToolGroup > .tool-group-header:hover, ToolGroup > .tool-group-call.-clickable:hover { background: #2c2c2c; }
     .msg-tool-result { color: #8a8a8a; margin-top: 0; }
     .msg-diff { margin-top: 0; }
     .msg-shell { color: #d7769f; }
@@ -2073,6 +2477,9 @@ class DostuffTUI(App):
         self._thought_shown = 0  # chars of the live thought text revealed so far
         self._thought_step = 1
         self._thought_timer: Timer | None = None
+        self._answer_timer: Timer | None = None  # a coalesced answer render, due within STREAM_RENDER_INTERVAL_S
+        self._answer_rendered_at = 0.0  # time.monotonic() of the last one
+        self._stream_growth_held = False  # streamed rows not laid out while scrolled up (_render_stream_text)
         self._last_streamed_answer: str = ""
         self._prompt_queue: list = []
         # Mid-turn steering (plan/2026-11-04-steering): one queue per app, filled at submit and drained by
@@ -2100,6 +2507,10 @@ class DostuffTUI(App):
         self._viewport_before_prompt: int | None = None
         self._picker_callback: Callable[[str], Awaitable[None]] | None = None
         self._message_target = "#msg-container"  # where _append mounts; the agent view swaps it while rendering
+        self._mount_batch: list[Widget] | None = None  # _batched_mounts collects messages here
+        self._history_hidden = 0  # steps of a resumed session not rendered yet, above `#history-more`
+        self._history_loading = False  # a chunk is mounted and its scroll offset not yet kept
+        self._history_prepending = False  # rendering an older chunk: a prompt in it doesn't scroll to the end
         self._agent_view_run: "AgentRun | None" = None  # the agent whose transcript the agent view shows
         self._agent_view_rendered = 0  # steps of it already rendered there
         self._agent_view_timer: Timer | None = None
@@ -2116,9 +2527,12 @@ class DostuffTUI(App):
         self._settings_check_running = False
         self._reported_load_error = ""  # a broken config.yaml is reported once, not every check
         self._tool_results_expanded = False  # Ctrl+O; new results follow it
+        self._tool_groups = _ToolGroups()  # the conversation's `● Read 2 files` groups still taking calls/results
+        self._agent_view_tool_groups = _ToolGroups()  # the same for the transcript in the agent view
         self._history_path = self.config.get_data_dir() / "prompt_history.jsonl"
         self._pastes = PasteStore()  # collapsed pastes in the input (helpers/agent/pastes.py)
         self._images = clipboard.PastedImages()  # alt+v images in the input, `[Image #N]` (multimodal REQ-3)
+        self._search_extra_noted = False  # said once that web_search is on DuckDuckGo's HTML page
         self.worktree: Worktree | None = None  # set while the cwd is a dostuff git worktree
         self.exit_note = ""  # printed by cli.py after the TUI closes (e.g. a kept worktree)
         self._notify_kind = self.config.notifications  # /notifications changes it for the session
@@ -2196,12 +2610,33 @@ class DostuffTUI(App):
             # Set directly; widget.focus() would defer one more message hop
             self.screen.set_focus(inp)
 
+    def _scrolled_up(self) -> bool:
+        """The user has scrolled the conversation away from its end."""
+        messages = self.query_one("#messages", VerticalScroll)
+        return messages._anchor_released and not messages.is_vertical_scroll_end
+
     def _update_jump_to_bottom(self) -> None:
         """Show the jump-to-bottom bar only while the user has scrolled away from the end."""
-        messages = self.query_one("#messages", VerticalScroll)
-        self.query_one("#jump-bottom", JumpToBottom).display = (
-            messages._anchor_released and not messages.is_vertical_scroll_end
-        )
+        scrolled_up = self._scrolled_up()
+        self.query_one("#jump-bottom", JumpToBottom).display = scrolled_up
+        if not scrolled_up:
+            self._release_stream_growth()
+
+    def _render_stream_text(self, widget: Static, content: Any) -> None:
+        """Draw streamed text. While the user is scrolled up, a new row is not laid out: that is a pass
+        over the whole conversation (~0.4 s at 1,200 messages) for text below what they are reading,
+        and the scrolling stuttered behind it. The rows are laid out once they are back at the end."""
+        if _update_static(widget, content, relayout=not self._scrolled_up()):
+            self._stream_growth_held = True
+
+    def _release_stream_growth(self) -> None:
+        """Lay out the streamed text whose new rows `_render_stream_text` held back."""
+        if not self._stream_growth_held:
+            return
+        self._stream_growth_held = False
+        for widget in self._stream_widgets.values():
+            if widget.parent is not None:
+                widget.refresh(layout=True)
 
     def on_text_selected(self, event: TextSelected) -> None:
         """Select to copy, like Claude Code: releasing the mouse copies the selection."""
@@ -2270,6 +2705,7 @@ class DostuffTUI(App):
         messages = self.query_one("#messages", VerticalScroll)
         messages.anchor()
         self.watch(messages, "scroll_y", self._update_jump_to_bottom, init=False)
+        self.watch(messages, "scroll_y", self._maybe_load_older_history, init=False)
         inp = self.query_one("#input", EnterSubmits)
         inp.focus()
         self.watch(self.screen, "focused", self._keep_input_focus, init=False)
@@ -2409,6 +2845,17 @@ class DostuffTUI(App):
             self._start_worker(self._connect_mcp_servers(mcp_servers), name="mcp_connect")
         else:
             self._append("Running with local tools only.", msg_type="system")
+
+    def _note_search_fallback(self) -> None:
+        """After the first web_search that read DuckDuckGo's HTML page: say once that the search extra is steadier."""
+        from dostuff.tools.web_search import html_fallback_used
+
+        if self._search_extra_noted or not html_fallback_used():
+            return
+        self._search_extra_noted = True
+        from dostuff.helpers.extras import install_hint
+        self._append("web_search is using DuckDuckGo's HTML page, which rate-limits. For steadier search through "
+                     f"several engines, run `{install_hint('search')}` (or set search.searxng_url).", msg_type="system")
 
     def _note_memory_off(self) -> None:
         """memory.backend: chroma without chromadb: say so once if memories were saved before."""
@@ -2554,8 +3001,86 @@ class DostuffTUI(App):
         self._update_status(context_window_percent=f"{percent:.1f}%/{limit_str}" if limit_str else f"{percent:.1f}%")
 
     def _render_history(self) -> None:
-        for step in self.steps_history:
-            self._render_history_step(step)
+        """Render the end of the session. The older steps wait behind a line at the top and load a chunk at
+        a time as the user scrolls up to it: painting a long session's every message took seconds."""
+        self._remove_history_more()
+        start = self._history_chunk_start(len(self.steps_history), HISTORY_TAIL_STEPS)
+        self._history_hidden = start
+        self._tool_groups.close()
+        with self._batched_mounts():
+            if start:
+                self._mount_message(HistoryMore(self._history_more_text(), id="history-more",
+                                                classes="msg msg-system", markup=False))
+            for step in self.steps_history[start:]:
+                self._render_history_step(step)
+        self._tool_groups.close()  # a stored call with no result never ran; the next live call starts afresh
+
+    def _history_chunk_start(self, end: int, count: int) -> int:
+        """Where the chunk of about `count` steps that ends at `end` starts: never on a tool result, so a
+        call's `⎿` result stays under its `●` line."""
+        start = max(0, end - count)
+        while start > 0 and self.steps_history[start].get("role") == "tool":
+            start -= 1
+        return start
+
+    def _history_more_text(self) -> str:
+        n = self._history_hidden
+        return f"↑ {n} earlier step{'s' if n != 1 else ''} · scroll up or click to load"
+
+    def _remove_history_more(self) -> None:
+        self._history_hidden = 0
+        for widget in self.query("#history-more"):
+            widget.remove()
+
+    def _maybe_load_older_history(self) -> None:
+        """scroll_y watcher: near the top of the conversation, load the next older chunk."""
+        if self._history_hidden and self.query_one("#messages", VerticalScroll).scroll_y <= HISTORY_LOAD_ROWS:
+            self._load_older_history()
+
+    def _load_older_history(self) -> None:
+        """Mount the chunk of steps just above what is shown, under the `↑ N earlier steps` line, and move
+        the scroll offset by the height it adds, so the rows the user was reading stay where they were."""
+        if self._history_hidden <= 0 or self._history_loading:
+            return
+        more = next(iter(self.query("#history-more").results(HistoryMore)), None)
+        if more is None or not isinstance(more.parent, Widget):
+            self._history_hidden = 0  # the conversation was cleared under it
+            return
+        messages = self.query_one("#messages", VerticalScroll)
+        end = self._history_hidden
+        start = self._history_chunk_start(end, HISTORY_CHUNK_STEPS)
+        self._history_prepending = True
+        live_groups, self._tool_groups = self._tool_groups, _ToolGroups()  # a running turn keeps its groups
+        try:
+            with self._collected_messages() as widgets:
+                for step in self.steps_history[start:end]:
+                    self._render_history_step(step)
+        finally:
+            self._tool_groups.close()
+            self._tool_groups = live_groups
+            self._history_prepending = False
+        self._history_hidden = start
+        siblings = list(more.parent.children)
+        index = siblings.index(more)
+        anchor = siblings[index + 1] if index + 1 < len(siblings) else None  # the oldest message shown so far
+        old_y, old_scroll = (anchor.virtual_region.y, messages.scroll_y) if anchor is not None else (0, 0.0)
+        if widgets:
+            more.parent.mount(*widgets, after=more)
+        if start:
+            more.update(self._history_more_text())
+        else:
+            more.remove()
+        if anchor is None or not widgets:
+            return
+        self._history_loading = True
+
+        def keep_place() -> None:
+            self._history_loading = False
+            moved = anchor.virtual_region.y - old_y
+            if moved > 0:
+                messages.scroll_to(y=old_scroll + moved, animate=False, immediate=True)
+
+        self.call_after_refresh(keep_place)
 
     def _warn_if_model_unconfigured(self) -> None:
         if not self._backend_ready.is_set():
@@ -2585,7 +3110,7 @@ class DostuffTUI(App):
                 if pairs is not None:  # the same block the live view showed (T5.2, CON-007)
                     self._append_answers_block(pairs)
                     return
-            self._append_call_result(f"{prefix}{step.get('name', '')}: {content}")
+            self._append_call_result(f"{step.get('name', '')}: {content}", prefix=prefix)
             return
         if role == "user":
             if is_tool_attachment_step(step):  # what read_file / an MCP tool opened: the chips the live view showed
@@ -2620,8 +3145,8 @@ class DostuffTUI(App):
             self._append(prefix + content, msg_type="agent")
         for tc in step.get("tool_calls") or []:
             fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-            self._append(f"{prefix}● {format_call_label(fn.get('name', '?'), fn.get('arguments', ''))}",
-                         msg_type="tool")
+            name = fn.get("name", "?")
+            self._append_tool_call(name, format_call_label(name, fn.get("arguments", "")), prefix=prefix)
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
@@ -3108,6 +3633,21 @@ class DostuffTUI(App):
             msg_type="system",
         )
 
+    def _thinking_command(self, arg: str) -> None:
+        """/thinking [auto|off|minimal|low|medium|high]: the model's thinking level (session only)."""
+        current = self.config.reasoning_effort
+        if not arg:
+            self._append(f"Thinking: {current}. Usage: /thinking {'|'.join(REASONING_EFFORTS)} "
+                         "(loop.reasoning_effort in config.yaml sets the default; auto leaves it to the provider).",
+                         msg_type="system")
+            return
+        if arg not in REASONING_EFFORTS:
+            self._append(f"Usage: /thinking {'|'.join(REASONING_EFFORTS)}", msg_type="error")
+            return
+        self.config.session_reasoning_effort = arg
+        note = "" if supports_reasoning(get_litellm_model()) else f" ({get_model()} has no reasoning control, so it is ignored)"
+        self._append(f"Thinking set to {arg} for this session{note}.", msg_type="system")
+
     def _notifications_command(self, arg: str) -> None:
         """/notifications [on|off|bell|osc9]: notify when a turn finishes or an approval waits (session only)."""
         if not arg:
@@ -3515,7 +4055,7 @@ class DostuffTUI(App):
         registry = get_registry()
         words = arg.split()
         if not words:
-            jobs = self._session_jobs()
+            jobs = sorted(self._session_jobs(), key=lambda j: j.started, reverse=True)
             if not jobs:
                 self._append("No background jobs.", msg_type="system")
                 return
@@ -3578,10 +4118,8 @@ class DostuffTUI(App):
         self._append(detail, msg_type="system")
 
     def _session_agents(self) -> list["AgentRun"]:
-        """This session's agents: the ones that haven't ended first, then by start time."""
-        from dostuff.agent.subagents.registry import ENDED_STATUSES
-        return sorted(_agent_registry().runs(self.session_id),
-                      key=lambda r: (r.status in ENDED_STATUSES, r.started or float("inf")))
+        """This session's agents, the most recently started first (one still queued has no start yet, so it leads)."""
+        return sorted(_agent_registry().runs(self.session_id), key=lambda r: r.started or float("inf"), reverse=True)
 
     def _show_agents_list(self) -> None:
         """/agents (or a click on the agents item): pick one of this session's agents."""
@@ -3660,6 +4198,7 @@ class DostuffTUI(App):
         await self.mount(panel, before="#queue-bar")
         self._agent_view_run = run
         self._agent_view_rendered = 0
+        self._agent_view_tool_groups = _ToolGroups()
         await self._refresh_agent_view()
         self.query_one("#agent-view-scroll", VerticalScroll).anchor()
         self._agent_view_timer = self.set_interval(1.0, self._refresh_agent_view)
@@ -3680,12 +4219,17 @@ class DostuffTUI(App):
             show_result = ended and run.result and not steps and self._agent_view_rendered == 0
             if new or show_result:
                 self._message_target = "#agent-view-msgs"
+                live_groups, self._tool_groups = self._tool_groups, self._agent_view_tool_groups
                 try:
-                    for step in new:
-                        self._render_history_step(step)
-                    if show_result:
-                        self._append(run.result or "", msg_type="agent")
+                    with self._batched_mounts():
+                        for step in new:
+                            self._render_history_step(step)
+                        if show_result:
+                            self._append(run.result or "", msg_type="agent")
                 finally:
+                    if ended:
+                        self._tool_groups.close()
+                    self._tool_groups = live_groups
                     self._message_target = "#msg-container"
                 self._agent_view_rendered = len(steps) or (1 if show_result else 0)
             self.query_one("#agent-view-title", Static).update(self._agent_view_title(run))
@@ -3965,6 +4509,9 @@ class DostuffTUI(App):
         if name == "/permissions":
             self._permissions_command(arg)
             return
+        if name == "/thinking":
+            self._thinking_command(arg.lower())
+            return
         if name == "/copy" and not arg:
             self._copy_last_answer()
             return
@@ -4219,9 +4766,9 @@ class DostuffTUI(App):
         if not (question.get("options") or []):
             # A free-text question's one row *is* "Other", so naming it in the placeholder would read
             # "Other (type your own): Name the app?" — the question alone is clearer.
-            self._hand_input_over(prompt or "Type your answer (Enter sends, Esc cancels)")
+            self._hand_input_over(prompt or "Type your answer (Enter sends, Esc goes back)")
             return
-        self._hand_input_over(f"{ASK_OTHER_LABEL}: {prompt or 'Type your answer (Enter sends, Esc cancels)'}")
+        self._hand_input_over(f"{ASK_OTHER_LABEL}: {prompt or 'Type your answer (Enter sends, Esc goes back)'}")
 
     def on_ask_user_panel_inert(self, event: AskUserPanel.Inert) -> None:
         panel = self._ask_panel()
@@ -4230,8 +4777,13 @@ class DostuffTUI(App):
 
     def _ask_panel_other(self, index: int, text: str) -> None:
         """The typed `Other` answer came back: record it, give the input back and re-focus the panel."""
+        self._ask_panel().record_other(index, text)
+        self._ask_panel_back()
+
+    def _ask_panel_back(self) -> None:
+        """Leave the `Other` input for the panel: after a typed answer, or on Esc with nothing recorded (the
+        row keeps any answer it had, and the call stays open)."""
         panel = self._ask_panel()
-        panel.record_other(index, text)
         self.adapter.end_other()
         self._give_input_back()  # the draft and the placeholder come back...
         self.query_one("#input", EnterSubmits).display = False  # ...but the panel still owns the screen
@@ -4770,6 +5322,7 @@ class DostuffTUI(App):
                 # Front of `_prompt_queue`, in order — and ahead of the queued prompts on the way back in
                 self._prompt_queue[0:0] = [msg.raw for msg in leftovers]
             self._finish_stream_widgets()
+            self._tool_groups.close()  # a call cancelled before it started gets no result: say it did not run
             self._stop_loader(loader_widget)
             if started is not None:
                 self._append_turn_summary(time.time() - started, cancelled)
@@ -5021,7 +5574,7 @@ class DostuffTUI(App):
     def _render_loader(self) -> None:
         widget = self._loader_widget
         if widget is not None and widget.parent is not None:
-            widget.update(self._loader_text())
+            _update_static(widget, self._loader_text())  # once a second: the elapsed time
 
     def _stop_loader(self, loader_widget: Static | None) -> None:
         """Remove the loader widget from the conversation stream."""
@@ -5057,13 +5610,34 @@ class DostuffTUI(App):
             self._stream_widgets[kind] = widget
             if kind == "thought":
                 self._thought_shown = 0
+            else:
+                self._answer_rendered_at = time.monotonic()
             self._mount_message(widget)
         elif kind == "answer":
-            widget.update(text)
+            # A provider sends a chunk every few ms; drawing each one kept the UI thread busy. The first
+            # chunk shows at once, later ones at most every STREAM_RENDER_INTERVAL_S with the latest text
+            wait = self._answer_rendered_at + STREAM_RENDER_INTERVAL_S - time.monotonic()
+            if wait <= 0:
+                self._render_streamed_answer()
+            elif self._answer_timer is None:
+                self._answer_timer = self.set_timer(wait, self._render_streamed_answer)
         if kind == "thought":
             self._thought_step = max(1, (len(text) - self._thought_shown) // THOUGHT_REVEAL_TICKS)
             if self._thought_timer is None:
                 self._thought_timer = self.set_interval(THOUGHT_REVEAL_INTERVAL_S, self._reveal_thought)
+
+    def _render_streamed_answer(self) -> None:
+        """Draw the latest streamed answer text (now, or when the coalescing timer fires)."""
+        self._stop_answer_timer()
+        self._answer_rendered_at = time.monotonic()
+        widget = self._stream_widgets.get("answer")
+        if widget is not None and widget.parent is not None:
+            self._render_stream_text(widget, self._stream_texts.get("answer", ""))
+
+    def _stop_answer_timer(self) -> None:
+        if self._answer_timer is not None:
+            self._answer_timer.stop()
+            self._answer_timer = None
 
     def _reveal_thought(self) -> None:
         """Timer tick: show the next slice of the live thought text."""
@@ -5073,7 +5647,7 @@ class DostuffTUI(App):
             self._stop_thought_reveal()
             return
         self._thought_shown = min(len(target), self._thought_shown + self._thought_step)
-        widget.update(_thought_text(target[:self._thought_shown]))
+        self._render_stream_text(widget, _thought_text(target[:self._thought_shown]))
         if self._thought_shown >= len(target):
             self._stop_thought_reveal()
 
@@ -5085,6 +5659,8 @@ class DostuffTUI(App):
     def _finish_stream_widgets(self, interrupted: bool = False) -> None:
         """End of one model call: render the answer as markdown and detach the live widgets."""
         self._stop_thought_reveal()
+        self._stop_answer_timer()  # the update below draws the whole text
+        self._stream_growth_held = False  # ...and lays it out, held rows included
         thought_widget = self._stream_widgets.get("thought")
         if thought_widget is not None and thought_widget.parent is not None:
             thought_widget.update(_thought_text(self._stream_texts.get("thought", "")))
@@ -5107,6 +5683,9 @@ class DostuffTUI(App):
         menu = self.query_one("#command-menu", CommandMenu)
         if menu.display:
             menu.display = False
+            return
+        if self.adapter._other_mode and self.adapter._ask_panel_owns_input:
+            self._ask_panel_back()  # typing an `Other` answer: Esc leaves the input, not the questions
             return
         if self._btw_open() and not self.adapter.has_pending_prompt():
             self._close_btw()  # closes the side answer; the turn keeps running (btw spec D6)
@@ -5530,32 +6109,67 @@ class DostuffTUI(App):
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
-    def _mount_message(self, widget: Static) -> None:
+    def _mount_message(self, widget: Widget) -> None:
         """Mount above the loader (so the loader stays at the bottom). While the agent view renders a
-        transcript, `_message_target` points at that view's container instead of the conversation."""
+        transcript, `_message_target` points at that view's container instead of the conversation.
+        Inside `_batched_mounts` the widget is queued and mounted with the rest of the batch."""
+        if widget is not self._tool_groups.open:
+            self._tool_groups.open = None  # anything below a group ends it: the next call starts a new one
+        if self._mount_batch is not None:
+            self._mount_batch.append(widget)
+            return
+        self._mount_widgets([widget])
+
+    def _mount_widgets(self, widgets: list[Widget]) -> None:
+        if not widgets:
+            return
         msg_container = self.query_one(self._message_target, Vertical)
         loader = self._loader_widget
         # Children, not is_mounted: a loader mounted moments ago (before the hooks' trust question) isn't yet
         if loader is not None and loader.parent is msg_container and loader in msg_container.children:
-            msg_container.mount(widget, before=loader)
+            msg_container.mount(*widgets, before=loader)
         else:
-            msg_container.mount(widget)
+            msg_container.mount(*widgets)
+
+    @contextlib.contextmanager
+    def _collected_messages(self) -> Iterator[list[Widget]]:
+        """The messages appended inside the block, built but not mounted: the caller mounts them."""
+        outer, self._mount_batch = self._mount_batch, []
+        try:
+            yield self._mount_batch
+        finally:
+            self._mount_batch = outer
+
+    @contextlib.contextmanager
+    def _batched_mounts(self) -> Iterator[None]:
+        """Mount every message appended inside the block in one call. Textual walks the container's
+        children on each mount, so a resumed session's transcript mounted one widget at a time is
+        quadratic in its length; one mount of the lot is not."""
+        if self._mount_batch is not None:  # already batching: the outer block mounts these too
+            yield
+            return
+        widgets: list[Widget] = []
+        try:
+            with self._collected_messages() as widgets:
+                yield
+        finally:
+            self._mount_widgets(widgets)
 
     def _append(self, line: str, msg_type: str = "agent") -> None:
         """Add a message widget; msg_type picks its CSS class (text color, spacing)."""
         known = ("agent", "user", "confirm", "system", "error", "tool", "tool-result", "diff", "shell", "shell-output")
         css_class = f"msg msg-{msg_type if msg_type in known else 'agent'}"
-        if msg_type in ("user", "shell"):
+        if msg_type in ("user", "shell") and not self._history_prepending:
             # Sending a message jumps back to the bottom even if the user had scrolled up
             self.query_one("#messages", VerticalScroll).anchor()
         if msg_type == "user":
-            msg = Static(Text("> " + line.replace("\n", "\n  ")), classes=css_class, markup=False)
+            msg = MessageStatic(Text("> " + line.replace("\n", "\n  ")), classes=css_class, markup=False)
         elif msg_type == "agent" and line:
             msg = SelectableStatic(RichMarkdown(line), classes=css_class, markup=False)
         elif "\033[" in line:
-            msg = Static(Text.from_ansi(line), classes=css_class, markup=False)
+            msg = MessageStatic(Text.from_ansi(line), classes=css_class, markup=False)
         else:
-            msg = Static(line, classes=css_class, markup=False)
+            msg = MessageStatic(line, classes=css_class, markup=False)
         self._mount_message(msg)
 
     def _append_tool_result(self, text: str, max_lines: int = TOOL_RESULT_PREVIEW_LINES,
@@ -5565,13 +6179,44 @@ class DostuffTUI(App):
         self._mount_message(ToolResult(text, max_lines, expanded=self._tool_results_expanded,
                                        classes=f"msg msg-{msg_type}"))
 
-    def _append_call_result(self, text: str) -> None:
-        """A tool call's result; one Ctrl+B moved to the background collapses to that fact."""
-        job_id = detached_job_id(text) if text.startswith("bash_command: ") else None
-        if job_id is None:
-            self._append_tool_result(text)
-        else:
-            self._append_tool_result(f'moved to background as "{job_id}"\n{text}', max_lines=1)
+    def _append_tool_call(self, name: str, label: str, prefix: str = "") -> None:
+        """A tool call: it joins the group just above, or starts one (`● Ran 1 shell command`). The calls in
+        UNGROUPED_TOOLS keep their own `● label` line."""
+        if name in UNGROUPED_TOOLS:
+            self._append(f"{prefix}● {label}", msg_type="tool")
+            return
+        groups = self._tool_groups
+        group = groups.open
+        if group is None or group.prefix != prefix or not self._still_shown(group):
+            group = ToolGroup(prefix, expanded=self._tool_results_expanded, classes="msg msg-tool")
+            self._mount_message(group)
+            groups.open = group
+        if group not in groups.pending:  # one whose calls had all finished waits again for this one
+            groups.pending.append(group)
+        group.add_call(name, label)
+
+    def _still_shown(self, widget: Widget) -> bool:
+        """Mounted, or waiting in the batch being built: not removed by a /clear under it."""
+        return widget.parent is not None or (self._mount_batch is not None and widget in self._mount_batch)
+
+    def _append_call_result(self, text: str, prefix: str = "") -> None:
+        """A tool call's result (`name: result`), under its call in its group; one Ctrl+B moved to the
+        background collapses to that fact. A result no call is waiting for gets its own `⎿` line."""
+        name, _, body = text.partition(": ")
+        job_id = detached_job_id(text) if name == "bash_command" else None
+        max_lines = TOOL_RESULT_PREVIEW_LINES
+        if job_id is not None:
+            moved = f'moved to background as "{job_id}"\n'
+            text, body, max_lines = moved + text, moved + body, 1
+        shown = truncate_tool_output(body, self.config.max_tool_output_chars)
+        for group in self._tool_groups.pending:
+            if self._still_shown(group) and group.take_result(name, shown, max_lines):
+                if not group.running:
+                    self._tool_groups.pending.remove(group)
+                if job_id is None:
+                    return
+                break  # a job still running is worth its own line: the jobs bar alone doesn't say which call it was
+        self._append_tool_result(prefix + text, max_lines)
 
     def _append_answers_block(self, pairs: list[tuple[str, str]]) -> None:
         """`ask_user`'s answers as one full `⎿` block, a row per pair (D9): no preview cap and no Ctrl+O,
@@ -5595,6 +6240,8 @@ class DostuffTUI(App):
         self._tool_results_expanded = not self._tool_results_expanded
         for widget in self.query(ToolResult):
             widget.set_expanded(self._tool_results_expanded)
+        for group in self.query(ToolGroup):
+            group.set_expanded(self._tool_results_expanded, full=self._tool_results_expanded)
         self._flash_input_hint("tool output expanded · ctrl+o to collapse" if self._tool_results_expanded
                                else "tool output collapsed · ctrl+o to expand")
 
@@ -5738,7 +6385,7 @@ class DostuffTUI(App):
             else:
                 break  # one item left: Static crops it
         try:
-            self.query_one("#status", Static).update(line())
+            _update_static(self.query_one("#status", Static), line())  # on every usage event
         except Exception:
             pass  # not mounted yet / shutting down
 
@@ -5756,7 +6403,7 @@ class DostuffTUI(App):
             return  # not mounted yet / shutting down
         bar.display = text is not None
         if text is not None:
-            bar.update(text)
+            _update_static(bar, text)
         self._render_status()  # the status items get more or less room
 
     def _agents_bar_text(self) -> Text | None:
@@ -5780,7 +6427,7 @@ class DostuffTUI(App):
             return  # not mounted yet / shutting down
         bar.display = text is not None
         if text is not None:
-            bar.update(text)
+            _update_static(bar, text)
         self._render_status()
 
     def action_show_agents(self) -> None:
@@ -5807,10 +6454,10 @@ class DostuffTUI(App):
             self.action_show_jobs()
 
     def action_show_jobs(self) -> None:
-        """The jobs line was clicked (or ↓ in an empty input): pick a job, running ones first."""
+        """The jobs line was clicked (or ↓ in an empty input): pick a job, the most recently started first."""
         if self._picker_open() or self._settings_open() or self.query("#permission-prompt"):
             return
-        jobs = sorted(self._session_jobs(), key=lambda j: (j.ended is not None, j.started))
+        jobs = sorted(self._session_jobs(), key=lambda j: j.started, reverse=True)
         if not jobs:
             return
         registry = get_registry()

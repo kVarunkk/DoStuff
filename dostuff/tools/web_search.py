@@ -19,6 +19,14 @@ _BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHT
 
 Result = dict[str, str]  # title, url, snippet
 
+# Set when a search fell back to DuckDuckGo's HTML page (no SearXNG, no ddgs): the TUI says once that the
+# search extra is steadier. The model already gets the hint in the rate-limit error.
+_html_fallback_used = False
+
+
+def html_fallback_used() -> bool:
+    return _html_fallback_used
+
 
 class _DDGResults(HTMLParser):
     """Results of html.duckduckgo.com: <a class="result__a"> (title, link) and <a class="result__snippet">."""
@@ -141,4 +149,6 @@ async def web_search(query: str, max_results: int = DEFAULT_MAX_RESULTS) -> str:
         return format_results(query, "SearXNG", await _search_searxng(searxng_url, query, max_results))
     if _ddgs_available():
         return format_results(query, "ddgs", await asyncio.to_thread(_search_ddgs, query, max_results))
+    global _html_fallback_used
+    _html_fallback_used = True
     return format_results(query, "DuckDuckGo", await _search_ddg_html(query, max_results))

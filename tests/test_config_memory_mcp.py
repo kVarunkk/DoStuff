@@ -71,6 +71,13 @@ def test_retry_settings(home):
     assert (cfg.max_retries, cfg.retry_max_delay) == (0, 15.0)
 
 
+@pytest.mark.parametrize("value,expected", [(None, 0), ("4096", 4096), ("-5", 0), ("lots", 0)])
+def test_max_tokens_setting(home, value, expected):
+    user, _ = home
+    (user / ".dostuff" / "config.yaml").write_text("loop:\n" + (f"  max_tokens: {value}\n" if value else ""))
+    assert Config().max_tokens == expected  # 0: no cap sent, the provider's default applies
+
+
 @pytest.mark.parametrize("value,expected", [
     (None, "steer"),          # missing: the default reads at the next tool boundary (D2)
     ("queue", "queue"),       # opt-in batching after the turn

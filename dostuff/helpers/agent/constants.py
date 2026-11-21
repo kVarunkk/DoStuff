@@ -6,6 +6,7 @@ COMMAND_DESCRIPTIONS = {
     "/fork": "Copy this session into a new one and switch to it (/fork [--worktree] [title]); the original stays resumable",
     "/worktree": "Move this session into its own git worktree and branch (/worktree [name]); /worktree exit leaves it",
     "/model": "Switch model for this session; add --active to also make it the default for new sessions (/model [provider/model] [--active])",
+    "/thinking": "Set how hard the model thinks for this session: auto, off, minimal, low, medium or high (/thinking <level>); models without reasoning ignore it",
     "/permissions": "Switch permission mode for this session: ask, allowlist, auto or plan (/permissions <mode>; Shift+Tab cycles)",
     "/config": "Edit settings here: config.yaml or the MCP servers, user or project (/config [mcp] [project])",
     "/status": "Show session, model, tokens, context use, permissions and MCP servers",
@@ -41,6 +42,7 @@ COMMAND_ARGS = {
     "/fork": "[--worktree] [title]",
     "/worktree": "[name | exit]",
     "/model": "[provider/model] [--active]",
+    "/thinking": "[auto | off | minimal | low | medium | high]",
     "/permissions": "[ask | allowlist | auto | plan]",
     "/config": "[mcp] [project]",
     "/memory": "[project | global]",
@@ -120,6 +122,9 @@ You can help with a wide range of tasks using the tools and skills available to 
   `grep` and `read_file` can answer.
 - Give 2-4 concrete options, one line each, with the trade-off; ask everything you need in one call
   (up to 4 questions) instead of four turns; leave `options` out when the answer is free text.
+- Keep it short: the question is one plain sentence, a label is 1-5 words, a description is one short
+  phrase (about 15 words at most), never a paragraph. Background the user needs goes in your message
+  before the call, not into the question or the options.
 - Don't guess when the answer is cheap to get; don't ask when the answer is expensive to get and you
   can proceed.
 
